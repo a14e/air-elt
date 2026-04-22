@@ -1,6 +1,67 @@
-[package]
-name = "air-elt"
+[workspace]
+resolver = "3"
+members = [
+    "crates/app",
+    "crates/core",
+    "crates/commons/lib",
+    "crates/commons/testing",
+    "crates/sources/postgres",
+    "crates/sinks/postgres",
+    "crates/storages/postgres",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/andrei/air-elt"
+authors = ["Air Elt contributors"]
 
-[dependencies]
+[workspace.dependencies]
+air-elt-core = { path = "crates/core", version = "0.1.0" }
+air-elt-commons = { path = "crates/commons/lib", version = "0.1.0" }
+air-elt-commons-testing = { path = "crates/commons/testing", version = "0.1.0" }
+air-elt-source-postgres = { path = "crates/sources/postgres", version = "0.1.0" }
+air-elt-sink-postgres = { path = "crates/sinks/postgres", version = "0.1.0" }
+air-elt-storage-postgres = { path = "crates/storages/postgres", version = "0.1.0" }
+
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+async-trait = "0.1.89"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+toml = "0.9.7"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "migrate", "chrono", "uuid", "json"] }
+thiserror = "2.0.17"
+anyhow = "1.0.100"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+clap = { version = "4.5.51", features = ["derive"] }
+mimalloc = { version = "0.1.48", default-features = false }
+chrono = { version = "0.4.42", features = ["serde"] }
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
+futures = "0.3.31"
+testcontainers = "0.27.3"
+testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
+rand = "0.9.2"
+tempfile = "3.14.0"
+regex = "1.11.1"
+once_cell = "1.21.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[workspace.lints.rust]
+# `deny` (not `forbid`) so narrow `#[allow(unsafe_code)]` can be applied at a
+# single block — currently only in test helpers around `std::env::set_var`
+# (edition-2024 marks it unsafe due to the read-race contract). Prod code
+# carries zero `unsafe` blocks.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# Nested `if` / `if let` is more readable than `&&` / let-chain fusion here —
+# the project prefers explicit structure over clever flattening.
+collapsible_if = "allow"
+collapsible_else_if = "allow"
+collapsible_match = "allow"

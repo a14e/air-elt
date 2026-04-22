@@ -1,0 +1,17 @@
+[flow.users]
+source = "pg_src"
+sink = "pg_sink"
+storage = "pg_state"
+
+from = "public.users"
+to = "public.users"
+
+batch_limit = 500
+
+mapping = [
+    { from = "id", to = "id" },
+    { from = "name", to = "name" },
+    { from = "created_at", to = "created_at" },
+]
+
+cursor = { fields = ["id"], order = "asc", interval = "1s" }

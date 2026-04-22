@@ -1,0 +1,6 @@
+- [PgStorage search_path trap](pg_storage_search_path.md) — SET search_path in a pool is per-connection; sqlx::migrate! picks a fresh connection and loses it
+- [Test helper masks search_path bugs](testing_search_path_masks.md) — PgTestHandle embeds options=-c search_path in the URL, hiding per-connection search_path bugs in production paths
+- [sqlx 0.8.6 push_bind null typing](sqlx_typed_null.md) — Option<T>::None carries T's type OID into the Bind message; must match the column type or Postgres errors
+- [Row-constructor ordering rules](pg_row_compare.md) — ORDER BY direction keyword binds only to the last column; tuple compare (a,b)>(x,y) short-circuits on NULL
+- [Version pinning reality](cargo_version_pins.md) — workspace declares caret ranges so lockfile drifts within semver; AGENTS.md rule is satisfied by the explicit Cargo.toml pin
+- [PG connector call sites](pg_connector_sites.md) — where identifier escaping, value binding, and type mapping live

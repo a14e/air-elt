@@ -1,4 +1,32 @@
+# Rust build artifacts
 /target
+**/*.rs.bk
+Cargo.lock.bak
 
-.idea
+# IDE
+.idea/
+.vscode/
 *.iml
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Local overrides
+/*.local.toml
+/config.local.toml
+
+# Logs
+*.log
+
+# Test artefacts
+/tmp/
+*.tmp
+/.claude/scheduled_tasks.lock
