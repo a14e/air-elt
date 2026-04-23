@@ -1,34 +1,45 @@
 ---
 name: rust-guidelines
 description: Rust language and structural conventions for this project — ownership, borrowing, logging, module layout, struct/method naming, and the no-inline-mod rule. Read before writing or editing any Rust code in this repo so your changes stay consistent with the rest of the codebase.
+user-invocable: false
 ---
 
 # Rust guidelines
 
 ## Language style
 
-- **Use best practices.** Prefer idiomatic Rust; don't try to be clever with lifetimes or macros when ordinary structures work.
-- **Readability over efficiency.** Simple, obviously-correct code with a `.clone()` is preferred over convoluted borrow graphs. We have budget to optimise later; debugging subtle reference juggling now is not worth it.
-- **That said, prefer ownership transfer over cloning.** If you can give the value away, do. `clone` is a tool for when ownership is genuinely shared, not a default.
-- **Pass `String` by reference as `&str`.** Functions that only read accept `&str`; functions that take ownership take `String`.
-- **No `unsafe` in production code.** Enforced workspace-wide via `[workspace.lints.rust] unsafe_code = "deny"`. The only permitted `unsafe` is narrow `#[allow(unsafe_code)]` blocks in test code around edition-2024 `std::env::set_var` calls — each one must carry a `// Why:` comment explaining the race-safety argument. Nothing else.
-- **Pinned library versions.** All crate versions are explicit in `[workspace.dependencies]`. Individual crates refer to the workspace entries via `workspace = true`.
-- DO NOT use "black magic". Code should be clean and obvious. Avoid unnecessary complexity and cleverness; keep the codebase readable and maintainable.
-- Avoid magic numbers. Prefer configs instead.
+The codebase favours clarity over cleverness. Code is read far more often than written, so optimise for the reader.
+
+- Prefer idiomatic Rust. No "black magic" — no macro tricks, no lifetime gymnastics when plain structures work.
+- **Readability over efficiency.** Simple code with `.clone()` beats convoluted borrow graphs. That said, prefer ownership transfer over cloning when possible.
+- **Pass `String` by reference as `&str`.** Accept `&str` to read, `String` to take ownership.
+- **No `unsafe` in production code.** Enforced via `[workspace.lints.rust] unsafe_code = "deny"`. The only exception: narrow `#[allow(unsafe_code)]` blocks in tests around `std::env::set_var`, each with a `// Why:` comment.
+- **Pinned library versions.** All versions explicit in `[workspace.dependencies]`; crates reference them via `workspace = true`.
+- **No `unwrap()` in production code.** Enforced via `clippy::unwrap_used = "deny"`. Use `expect("reason")` for infallible cases (static regex, const parsing). Tests are exempt via `#[allow(clippy::unwrap_used)]`.
+- Avoid magic numbers — prefer configs.
+- Prefer small code duplication over coupling.
+- Avoid "nano functions" that perform a single command or a routine operation. Small methods are allowed if they comply with OOP.
+
+## Timeouts and cancellation safety
+
+- When wrapping a future in `tokio::time::timeout` or `tokio::select!`, verify the underlying driver/protocol supports cancellation without leaving inconsistent state. sqlx postgres queries are cancellation-safe (drop sends a cancel message to the server). If a driver is not cancellation-safe, document the risk and consider `spawn` + `abort` instead of `select!`.
 
 ## Logging and errors
 
-- **`tracing` only.** `println!` / `eprintln!` are forbidden in library code. Use the `tracing::{info, warn, error, debug, trace}` macros with structured fields (`field = %value` / `field = ?value`).
-- **No `#[tracing::instrument]` in this project.** The ELT engine is a flat read-batch / write-batch loop — automatic span hierarchies don't carry useful information for us. Emit explicit `info!`/`warn!`/`error!` with named fields (`flow`, `table`, `rows`, `cursor_field`) at meaningful boundaries instead.
-- **Initialise once, in `app::main`.** Every other crate just emits events.
-- **Never swallow errors silently.** `let _ = …`, `result.ok()`, `unwrap_or_default()` on a `Result` are not allowed unless the branch has already emitted `tracing::warn!` / `error!` with context. If an error is non-fatal, log it; if it's fatal, bubble it up with `?`.
-- **`thiserror` in libraries, `anyhow` only in `app`.** Library errors must preserve the `source` chain so that top-level logs print the full cause.
+All observability goes through `tracing`. Errors must never be silently discarded.
+
+- Use `tracing::{info, warn, error, debug, trace}` with structured fields. No `println!` / `eprintln!` in libraries. No `#[tracing::instrument]` — emit explicit logs at meaningful boundaries instead.
+- Initialise the subscriber once in `app::main`. Other crates only emit events.
+- **Never swallow errors.** `let _ = …` / `.ok()` / `.unwrap_or_default()` on `Result` require a preceding `warn!` / `error!` with context.
+- **`thiserror` in libraries, `anyhow` only in `app`.** Preserve the `source` chain.
 
 ## Module layout
 
-- **Directories are modules with an explicit `mod.rs`.** `mod.rs` contains **only** `mod x;` / `pub mod x;` / `pub use x::…;` declarations — **no other code** (no types, no functions, no constants).
-- **No inline modules inside `.rs` files.** `mod foo { … }` is forbidden. Split into a separate file instead. The single exception is `#[cfg(test)] mod tests { … }` for unit tests.
-- **Module nesting depth ≤ 2 levels from crate root; 1 is preferred.** Example (sources/postgres):
+Consistent structure keeps navigation predictable across crates.
+
+- **Directory modules have an explicit `mod.rs`** containing only `mod` / `pub mod` / `pub use` — no other code.
+- **No inline modules** (`mod foo { … }`). The single exception is `#[cfg(test)] mod tests`.
+- **Nesting depth ≤ 2 levels from crate root; 1 preferred.** Example:
   ```
   src/
   ├── lib.rs
@@ -40,23 +51,26 @@ description: Rust language and structural conventions for this project — owner
 
 ## File and type naming
 
-- **Main struct file uses the struct's name.** `PgSource` lives in `pg_source.rs`, not `impl_.rs`. File names describe what's inside; no generic names like `util.rs`, `helpers.rs`, `common.rs`.
-- **Method and type names must say what they do — not what category they belong to.** Avoid `Handler::handle`, `Processor::process`, `Manager::manage`, `Runner::run` as the *primary* name. Prefer specifics: `PgStorage::validate_access`, `FlowRunner::drain_once`, `SchemaIntrospector::describe_table`.
-- **Exceptions to the naming rule:** middleware, metric emitters, and callback-style traits can use generic verbs (`Middleware::handle`, `OnBatch::on_batch`) because the abstract shape *is* their purpose. Everywhere else, be specific.
+- **Main struct → matching file name.** `PgSource` lives in `pg_source.rs`. No `util.rs`, `helpers.rs`, `common.rs`.
+- **Names say what they do.** Avoid `Handler::handle`, `Manager::manage`. Prefer `PgStorage::validate_access`, `SchemaIntrospector::describe_table`.
+- Exception: middleware and callback traits can use generic verbs (`OnBatch::on_batch`).
 
 ## Stateful logic belongs in structs
 
-- **If a function carries state across calls, make it a method on a struct.** Free functions are fine for pure helpers (SQL builders, format conversions, parsers), but anything holding a connection, a cursor, a cache, or a configuration should be a struct with named methods.
-- **Name the struct after its responsibility.** `PgStorage`, not `StorageHelper`.
+- State across calls → method on a struct. Free functions for pure helpers only.
+- Name the struct after its responsibility: `PgStorage`, not `StorageHelper`.
 
 ## Tests
 
-- **Inverted pyramid.** Prefer e2e against real services over unit tests with mocks. Keep unit tests for pure logic (matrices, parsers, SQL builders).
-- **Tests in `tests/` folder per crate, or `#[cfg(test)] mod tests` inline.** Nothing else. Don't create a parallel `test_utils` module in library code.
+The test strategy is inverted pyramid: heavy e2e against real services, focused unit tests for pure logic.
+
+- **`tests/` folder is for e2e tests**, `#[cfg(test)] mod tests` is for unit tests.
 - **Do not mock databases.** Use `air_elt_commons_testing::pg::pg_pool()`.
-- **Test-only code lives in a dedicated crate.** `air-elt-commons-testing` is a sibling crate in `crates/commons/testing/` — consumers add it only under `[dev-dependencies]`. Listing it as a regular dependency would ship `testcontainers`, `sqlx`, and the probe-socket helpers into release builds. In-crate test helpers use `#[cfg(test)] mod tests`; do not expose them as public items.
-- **`unsafe { set_var(...) }` in tests** is the one permitted use of `unsafe`: wrap it in `#[allow(unsafe_code)]` with a `// Why:` comment. Favour process-environment-unique variable names (`AIR_ELT_TEST_*`) so no other test in the crate can race against them.
-- **Tests that talk to postgres via the registry / validator** must use `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` — single-threaded runtimes deadlock the async factory path.
+- Test-only utilities live in dedicated crates under `[dev-dependencies]` (e.g. `air-elt-commons-testing`). In-crate test helpers go into `#[cfg(test)] mod tests`.
+- Tests using the registry/validator need `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`.
+- Favour `AIR_ELT_TEST_*` env var names to avoid races between tests.
+- **Mocking with `mockall`.** Use `#[cfg_attr(test, mockall::automock)]` on traits in `core::traits`. For methods with `Option<&T>` parameters, add an explicit lifetime — mockall cannot handle elided lifetimes inside `Option`.
+- **Deterministic time in tests.** Use `#[tokio::test(start_paused = true)]` instead of real `sleep`/wall-clock waits. This makes tests instant and non-flaky. Ensure mocked sources drain (return empty batch after data) so Once-mode tests terminate.
 
 ## After every change
 

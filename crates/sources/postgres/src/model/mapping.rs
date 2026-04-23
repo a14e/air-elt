@@ -13,7 +13,6 @@ use air_elt_core::types::{DataType, Value};
 /// decoding is hot-path.
 pub fn decode_column(row: &PgRow, index: usize, data_type: DataType) -> RuntimeResult<Value> {
     match data_type {
-        DataType::Null => Ok(Value::Null),
         DataType::Bool => {
             nullable::<bool>(row, index).map(|o| o.map(Value::Bool).unwrap_or(Value::Null))
         }
@@ -68,7 +67,9 @@ pub fn bind_cursor_value<'q>(
     value: &'q Value,
 ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
     match value {
-        Value::Null => query.bind::<Option<i64>>(None),
+        // Why: caller must dispatch NULL via null_bind::bind_typed_null before
+        // reaching this function — see pg_source.rs::bind_or_typed_null.
+        Value::Null => unreachable!("Value::Null must be handled by bind_typed_null"),
         Value::Bool(b) => query.bind(*b),
         Value::Int16(n) => query.bind(*n),
         Value::Int32(n) => query.bind(*n),

@@ -7,20 +7,13 @@
 
 use air_elt_commons::sql::pg::identifier::{quote_columns, quote_qualified};
 use air_elt_core::config::model::CursorOrder;
-use air_elt_core::error::RuntimeResult;
-use air_elt_core::flow::state::CursorState;
+use air_elt_core::error::{RuntimeError, RuntimeResult};
+use air_elt_core::model::CursorState;
 use air_elt_core::types::Value;
 
 pub const PING: &str = "SELECT 1";
 
 pub const HAS_TABLE_SELECT: &str = "SELECT has_table_privilege(current_user, $1, 'SELECT') AS ok";
-
-/// `information_schema.columns` — returns `(column_name, is_nullable,
-/// udt_name, data_type)` sorted by ordinal position.
-pub const INFORMATION_SCHEMA: &str = "SELECT column_name, is_nullable, udt_name, data_type
-    FROM information_schema.columns
-    WHERE table_schema = $1 AND table_name = $2
-    ORDER BY ordinal_position";
 
 /// Zero-row projection used by `validate_access` to check SELECT privilege
 /// on the specific columns without reading any rows.
@@ -91,10 +84,14 @@ pub fn build_read_batch(
                     .fields
                     .iter()
                     .find(|f| f.name == *name)
-                    .expect("cursor state validated against cursor_fields upstream");
-                (name.as_str(), &f.value)
+                    .ok_or_else(|| {
+                        RuntimeError::Other(format!(
+                            "cursor field {name:?} not found in persisted cursor state"
+                        ))
+                    })?;
+                Ok((name.as_str(), &f.value))
             })
-            .collect();
+            .collect::<RuntimeResult<Vec<_>>>()?;
 
         let has_null = fields.iter().any(|(_, v)| matches!(v, Value::Null));
         if has_null {
@@ -256,13 +253,11 @@ fn nullable_cmp(
     }
 }
 
-/// Split `schema.table` → `(schema, table)`. A bare name falls back to `public`.
-pub use air_elt_commons::sql::pg::identifier::split_qualified;
-
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use air_elt_core::flow::state::CursorFieldValue;
+    use air_elt_core::model::CursorFieldValue;
 
     fn state_with(values: Vec<(&str, Value)>) -> CursorState {
         CursorState::new(
@@ -351,6 +346,23 @@ mod tests {
     }
 
     #[test]
+    fn null_aware_multi_column_mixed_null() {
+        let state = state_with(vec![("created_at", Value::Int64(100)), ("id", Value::Null)]);
+        let q = build_read_batch(
+            "public.users",
+            &["id".into()],
+            &["created_at".into(), "id".into()],
+            CursorOrder::Asc,
+            Some(&state),
+        )
+        .unwrap();
+        // k=2 branch is dropped (ASC + NULL id → empty cmp), only k=1 survives
+        assert!(q.sql.contains("\"created_at\" > $1"));
+        assert!(!q.sql.contains("IS NOT DISTINCT FROM"));
+        assert!(!q.sql.contains("WHERE FALSE"));
+    }
+
+    #[test]
     fn null_aware_desc_null_cursor_emits_not_null() {
         let state = state_with(vec![("id", Value::Null)]);
         let q = build_read_batch(
@@ -362,5 +374,52 @@ mod tests {
         )
         .unwrap();
         assert!(q.sql.contains("\"id\" IS NOT NULL"));
+    }
+
+    #[test]
+    fn non_null_cursor_produces_stable_sql() {
+        let s1 = state_with(vec![("id", Value::Int64(1))]);
+        let s2 = state_with(vec![("id", Value::Int64(999))]);
+        let q1 = build_read_batch(
+            "public.t",
+            &["id".into()],
+            &["id".into()],
+            CursorOrder::Asc,
+            Some(&s1),
+        )
+        .unwrap();
+        let q2 = build_read_batch(
+            "public.t",
+            &["id".into()],
+            &["id".into()],
+            CursorOrder::Asc,
+            Some(&s2),
+        )
+        .unwrap();
+        assert_eq!(q1.sql, q2.sql);
+        assert_eq!(q1.bind_order, q2.bind_order);
+    }
+
+    #[test]
+    fn null_cursor_produces_different_sql() {
+        let non_null = state_with(vec![("id", Value::Int64(1))]);
+        let with_null = state_with(vec![("id", Value::Null)]);
+        let q_normal = build_read_batch(
+            "public.t",
+            &["id".into()],
+            &["id".into()],
+            CursorOrder::Asc,
+            Some(&non_null),
+        )
+        .unwrap();
+        let q_null = build_read_batch(
+            "public.t",
+            &["id".into()],
+            &["id".into()],
+            CursorOrder::Asc,
+            Some(&with_null),
+        )
+        .unwrap();
+        assert_ne!(q_normal.sql, q_null.sql);
     }
 }

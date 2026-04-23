@@ -3,7 +3,7 @@ use sqlx::{PgPool, Row};
 use tracing::{debug, info};
 
 use air_elt_core::error::{RuntimeError, RuntimeResult};
-use air_elt_core::flow::state::CursorState;
+use air_elt_core::model::CursorState;
 use air_elt_core::traits::Storage;
 
 use crate::config::model::PgStorageConfig;
@@ -21,11 +21,13 @@ impl PgStorage {
         let pool = air_elt_commons::sql::pg::pool::connect(
             &config.url,
             air_elt_commons::sql::pg::pool::PoolTimeouts::from_options(
-                config.connect_timeout_secs,
-                config.acquire_timeout_secs,
-                config.idle_timeout_secs,
-                config.max_lifetime_secs,
-                config.statement_timeout_secs,
+                config.connect_timeout,
+                config.acquire_timeout,
+                config.idle_timeout,
+                config.max_lifetime,
+                config.statement_timeout,
+                config.max_connections,
+                config.min_connections,
             ),
         )
         .await?;
@@ -62,6 +64,20 @@ impl PgStorage {
         Ok(())
     }
 
+    async fn assert_cursor_table_insert_privilege(&self) -> RuntimeResult<()> {
+        let row = sqlx::query(sql::HAS_TABLE_INSERT)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(RuntimeError::backend)?;
+        let ok: bool = row.try_get("ok").map_err(RuntimeError::backend)?;
+        if !ok {
+            return Err(RuntimeError::Other(
+                "current user has no INSERT privilege on air_elt_cursors".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn assert_cursor_table_writable(&self) -> RuntimeResult<()> {
         let mut tx = self.pool.begin().await.map_err(RuntimeError::backend)?;
         // Why: zero-row INSERT inside a rolled-back tx validates INSERT
@@ -83,6 +99,7 @@ impl Storage for PgStorage {
         let exists = self.cursor_table_exists().await?;
         debug!(exists, "storage cursor table existence");
         if exists {
+            self.assert_cursor_table_insert_privilege().await?;
             self.assert_cursor_table_writable().await?;
         } else {
             self.assert_schema_create_privilege().await?;

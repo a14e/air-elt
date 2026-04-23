@@ -19,10 +19,6 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
     if source_t == sink_t {
         return true;
     }
-    if matches!(source_t, Null) {
-        return true;
-    }
-
     matches!(
         (source_t, sink_t),
         (Int16, Int32)
@@ -53,6 +49,7 @@ pub fn is_narrowing(source_t: DataType, sink_t: DataType) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -80,12 +77,6 @@ mod tests {
     fn float_widening_allowed() {
         assert!(is_compatible(DataType::Float32, DataType::Float64));
         assert!(!is_compatible(DataType::Float64, DataType::Float32));
-    }
-
-    #[test]
-    fn null_is_assignable_anywhere() {
-        assert!(is_compatible(DataType::Null, DataType::Int64));
-        assert!(is_compatible(DataType::Null, DataType::Text));
     }
 
     #[test]

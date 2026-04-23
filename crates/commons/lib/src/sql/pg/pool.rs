@@ -21,6 +21,8 @@ pub struct PoolTimeouts {
     pub idle: Duration,
     pub max_lifetime: Duration,
     pub statement: Duration,
+    pub max_connections: u32,
+    pub min_connections: u32,
 }
 
 impl PoolTimeouts {
@@ -39,27 +41,29 @@ impl PoolTimeouts {
             idle: Duration::from_secs(300),
             max_lifetime: Duration::from_secs(1800),
             statement: Duration::from_secs(30),
+            max_connections: 5,
+            min_connections: 0,
         }
     }
 
     pub fn from_options(
-        connect: Option<u64>,
-        acquire: Option<u64>,
-        idle: Option<u64>,
-        max_lifetime: Option<u64>,
-        statement: Option<u64>,
+        connect: Option<Duration>,
+        acquire: Option<Duration>,
+        idle: Option<Duration>,
+        max_lifetime: Option<Duration>,
+        statement: Option<Duration>,
+        max_connections: Option<u32>,
+        min_connections: Option<u32>,
     ) -> Self {
         let defaults = Self::defaults();
         Self {
-            connect: connect.map(Duration::from_secs).unwrap_or(defaults.connect),
-            acquire: acquire.map(Duration::from_secs).unwrap_or(defaults.acquire),
-            idle: idle.map(Duration::from_secs).unwrap_or(defaults.idle),
-            max_lifetime: max_lifetime
-                .map(Duration::from_secs)
-                .unwrap_or(defaults.max_lifetime),
-            statement: statement
-                .map(Duration::from_secs)
-                .unwrap_or(defaults.statement),
+            connect: connect.unwrap_or(defaults.connect),
+            acquire: acquire.unwrap_or(defaults.acquire),
+            idle: idle.unwrap_or(defaults.idle),
+            max_lifetime: max_lifetime.unwrap_or(defaults.max_lifetime),
+            statement: statement.unwrap_or(defaults.statement),
+            max_connections: max_connections.unwrap_or(defaults.max_connections).min(100),
+            min_connections: min_connections.unwrap_or(0),
         }
     }
 }
@@ -73,14 +77,15 @@ impl PoolTimeouts {
 /// server default is non-UTC.
 ///
 /// Why `SET statement_timeout`: a second line of defence on top of the
-/// operation timeout in the runner. Postgres kills runaway queries server-side
+/// query timeout in the runner. Postgres kills runaway queries server-side
 /// so a wedged backend cannot hold the flow forever.
 pub async fn connect(url: &str, timeouts: PoolTimeouts) -> RuntimeResult<PgPool> {
     let connect_opts = PgConnectOptions::from_str(url).map_err(RuntimeError::backend)?;
 
-    let stmt_ms = timeouts.statement.as_millis() as i64;
+    let stmt_ms = i64::try_from(timeouts.statement.as_millis()).unwrap_or(i64::MAX);
     let options: PgPoolOptions = PoolOptions::new()
-        .max_connections(5)
+        .max_connections(timeouts.max_connections)
+        .min_connections(timeouts.min_connections)
         .acquire_timeout(timeouts.acquire)
         .idle_timeout(Some(timeouts.idle))
         .max_lifetime(Some(timeouts.max_lifetime))

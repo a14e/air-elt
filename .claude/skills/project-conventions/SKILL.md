@@ -5,98 +5,114 @@ description: Mandatory shared utilities and patterns for Air Elt — load before
 
 # Project conventions — mandatory utilities
 
-Before editing Rust code in this repo, check what's listed here. If a utility exists for your need, use it. **Do not reimplement** any of the items below. If you add a new cross-crate helper, append it here.
+Before editing Rust code, check this list. If a utility exists for your need, use it. **Do not reimplement.** If you add a new cross-crate helper, append it here.
 
-## Logging — `tracing`
+## Config naming
 
-- Use `tracing::{info, warn, error, debug, trace}` macros with structured fields (`table = %spec.table`, `rows = report.rows_written`). No `#[tracing::instrument]` anywhere — our flat batch loop does not benefit from automatic span hierarchies.
-- Initialise the subscriber exactly once in `app::main` via `air_elt_commons::tracing_init::init()`. No crate should set up its own subscriber.
-- Forbidden: `println!`, `eprintln!` (outside of clap help/error printing), the `log` crate, silent `let _ = result`, `result.ok()` without a preceding warn/error.
+TOML config keys use **kebab-case** for multi-word fields (`batch-limit`, `operation-timeout-secs`, `max-connections`). Structs with multi-word fields carry `#[serde(rename_all = "kebab-case")]`.
+
+## Logging
+
+Initialise the subscriber once via `air_elt_commons::tracing_init::init()` in `app::main`. All style rules (structured fields, no instrument, no println) are in `rust-guidelines`.
 
 ## SQL — identifier escaping
 
-- **`air_elt_commons::sql::pg::identifier::quote_ident(name)`** — single-identifier quoting, doubles internal `"`.
-- **`air_elt_commons::sql::pg::identifier::quote_qualified(name)`** — dotted form like `schema.table`. The dot is emitted *outside* the double quotes: `schema.table` → `"schema"."table"`. Segments containing characters outside `[A-Za-z0-9_$]` are rejected.
-- **`air_elt_commons::sql::pg::identifier::quote_columns(&[String])`** — comma-joined quoted list for `SELECT`/`INSERT` column lists.
-- **`air_elt_commons::sql::pg::identifier::split_qualified(name)`** — splits `schema.table` → `(schema, table)`; used where `information_schema` queries need the two parts bound separately.
-- `IdentifierError` converts to `RuntimeError` via `?` thanks to `impl From<IdentifierError>` in commons — do not write ad-hoc wrapping.
+All dynamic identifiers in SQL must go through these helpers. Raw `format!("\"{}\"", name)` is forbidden.
+
+- **`quote_ident(name)`** — single identifier, doubles internal `"`.
+- **`quote_qualified(name)`** — `schema.table` → `"schema"."table"`. Rejects chars outside `[A-Za-z0-9_$]`.
+- **`quote_columns(&[String])`** — comma-joined quoted list.
+- **`split_qualified(name)`** — `schema.table` → `(schema, table)` for `information_schema` binds.
+- `IdentifierError` converts to `RuntimeError` via `impl From` — use `?` directly.
+
+All live in `air_elt_commons::sql::pg::identifier`.
 
 ## SQL — PG type mapping
 
-- **`air_elt_commons::sql::pg::pg_type::{PgType, parse, to_internal}`** — the canonical list of PG native types and the one-way map to `DataType`. The reverse (`from_internal`) is sink-specific and lives in `sinks/postgres::model::pg_type`.
-- **`timestamp` without time zone is deliberately unsupported** — `PgType::parse("timestamp")` returns `None`. Operators must migrate to `timestamptz`. Naive timestamps re-interpret under session TimeZone and are a silent data-shift hazard.
+Source-side type resolution: PG native type → canonical `DataType`.
+
+- **`air_elt_commons::sql::pg::pg_type::{PgType, parse, to_internal}`** — shared between source and sink.
+- **`timestamp` without time zone is unsupported** — `parse("timestamp")` returns `None`. Only `timestamptz` is accepted.
 
 ## SQL — NULL binding
 
-- **`air_elt_commons::sql::pg::null_bind::bind_typed_null(query, DataType)`** and **`push_typed_null(tuple, DataType)`** pick the right `Option::<T>::None` per canonical type so the bind OID matches the column OID. Any raw `query.bind::<Option<i64>>(None)` against a non-`bigint` column is a bug.
+Typed NULL binding ensures the wire OID matches the column type.
+
+- **`air_elt_commons::sql::pg::null_bind::bind_typed_null(query, DataType)`** — for cursor comparisons in source.
+- Sink-side: the NULL match is inlined inside `push_values` (the `Separated` lifetime prevents extraction).
 
 ## SQL — pool construction
 
-- **`air_elt_commons::sql::pg::pool::connect(url, PoolTimeouts)`** — all three postgres connectors open pools through this. It wires `connect_timeout` / `acquire_timeout` / `idle_timeout` / `max_lifetime` plus `SET TIME ZONE 'UTC'` and `SET statement_timeout = …` in `after_connect`.
-- **Defaults**: `PoolTimeouts::defaults()` — connect 5s, acquire 10s, idle 300s, max_lifetime 1800s, statement 30s. Per-connector overrides come from `*Config.{connect,acquire,idle,max_lifetime,statement}_timeout_secs`.
+All postgres connectors open pools through a single shared helper.
+
+- **`air_elt_commons::sql::pg::pool::connect(url, PoolTimeouts)`** — wires timeouts, `SET TIME ZONE 'UTC'`, and `SET statement_timeout` in `after_connect`.
+- **Defaults**: connect 5s, acquire 10s, idle 300s, max_lifetime 1800s, statement 30s, max_connections 5. Per-connector overrides via `*Config` fields.
+
+## SQL — schema introspection
+
+- **`air_elt_commons::sql::pg::schema::fetch_schema(pool, table)`** — shared for source and sink. Do not duplicate.
 
 ## SQL — value binding
 
-- Always bind values via sqlx `$N` placeholders and `query.bind(value)` / `QueryBuilder::push_bind`. **Never** interpolate values into the SQL string.
-- SQL statements are **composed once** at flow setup. Each connector owns its `sql_statements.rs` (e.g. `crates/storages/postgres/src/sql_statements.rs`). No ad-hoc SQL in business-logic files — if you need a new statement, add a helper there.
+- Bind values via sqlx `$N` + `query.bind()` / `QueryBuilder::push_bind`. Never interpolate values into SQL.
+- Each connector owns its `sql_statements.rs`. No ad-hoc SQL in business-logic files.
+
+## Interval parsing
+
+- **`air_elt_core::config::interval::{parse, deserialize, serialize}`** — parses `1s`, `1h30m`, `PT1H5S`, `P1W`, `1 second`, etc. into `Duration`. ISO 8601 via `iso8601-duration` crate (routed by `P`/`p` prefix); human-time is built-in with enforced unit order (w>d>h>m>s>ms). Used in `CursorConfig::interval` via serde hooks.
 
 ## Secrets and env vars
 
-- `${VAR}` / `${VAR:default}` placeholders are resolved **at config-load time** by `air_elt_core::config::env_expand::expand`. Lookup order: process env → `[secrets]` map → default clause → error. The resolver runs on the raw TOML text before the main parse; connectors see fully-resolved values.
-- `[secrets]` is a `BTreeMap<String, String>` of literals. No recursion, no vault. Vault integration is tracked separately.
-- Runtime usage of `std::env::var(...)` in connectors is forbidden — if you need a runtime string, thread it through the config.
+Config-time resolution of `${VAR}` / `${VAR:default}` placeholders.
+
+- **`air_elt_core::config::env_expand::expand`** — runs on raw TOML before parsing. Lookup: env → `[secrets]` map → default → error.
+- `[secrets]` is a literal `BTreeMap<String, String>`. No recursion, no vault (tracked separately).
+- `std::env::var(...)` in connectors is forbidden — thread runtime strings through the config.
 
 ## Config loading
 
-- Use `air_elt_core::config::loader::load(path)`. It enforces: 16 MiB file-size cap, absolute-path reject in `include`, symlink-loop dedupe via canonical paths, `${VAR}` expansion, structural validation (`batch_limit ≥ 1`, `batch_limit × mapping_cols ≤ 60_000`, cursor fields subset of mapping, no `UnsupportedInMvp` markers).
-- Config types live in `air_elt_core::config::model`.
+- **`air_elt_core::config::loader::load(path)`** — enforces: 16 MiB file-size cap, absolute-path reject in `include`, symlink-loop dedupe, `${VAR}` expansion, structural validation (`batch_limit ≥ 1`, `batch_limit × mapping_cols ≤ 60_000`, cursor fields ⊆ mapping).
+- Config types: `air_elt_core::config::model`.
 
 ## Types and the N+N matrix
 
-- Canonical types: `air_elt_core::types::{DataType, Value}`. Never introduce a parallel enum in a connector.
-- Each connector owns `native → DataType` on the source side and `DataType → native` on the sink side. The shared half (`PgType`, `parse`, `to_internal`) lives in commons; only sink-specific `from_internal` sits under `sinks/postgres/model/pg_type.rs`.
-- Compatibility predicate: `air_elt_core::types::matrix::is_compatible(source_dt, sink_dt)` — identity + safe widening + null-assignability. Used only at validation time.
-- No canonical↔canonical value conversion: if types don't match, validation fails.
+Canonical types avoid direct source↔sink coupling — each connector maps to/from the shared pivot.
+
+- **`air_elt_core::types::{DataType, Value}`** — the only type enums. Never introduce parallel enums in connectors.
+- Source owns `native → DataType`, sink owns `DataType → native`. Shared half (`PgType`, `parse`, `to_internal`) in commons.
+- **`air_elt_core::types::matrix::is_compatible(source_dt, sink_dt)`** — validation-time only. No runtime conversion.
 
 ## Testing
 
-- Use `air_elt_commons_testing::pg::pg_pool()` to get a `PgTestHandle` with a sandboxed `PgPool`. Backend auto-detection order: `AIR_ELT_TEST_PG_URL` → `DOCKER_HOST` → `/var/run/docker.sock` → rootless podman socket → macOS podman-machine socket under `$TMPDIR/podman/*-api.sock`. The detect pass runs inside `spawn_blocking` with a 300 ms timeout so a stale socket cannot block a tokio worker.
-- `pg_pool()` self-heals the shared backend at startup: any `test_<unix_ts>_*` schema older than 24 hours is dropped before the current test's sandbox is created.
-- `PgTestHandle` exposes `.pool`, `.url`, `.schema`, and `.url_with_search_path()`. Keep the handle alive for the whole test — dropping it early tears down the sandbox schema.
-- Mocks of databases are forbidden.
-- **Enable via `[dev-dependencies]` only**: `air-elt-commons-testing = { workspace = true }`. The crate pulls in `testcontainers`, `sqlx`, etc. — listing it under `[dependencies]` ships them into release builds. The production `air-elt-commons` crate contains only prod utilities and carries `forbid`-strict lints.
-- Tests that hit postgres via the registry / validator use `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`.
+- **`air_elt_commons_testing::pg::pg_pool()`** — returns a `PgTestHandle` with a sandboxed schema. Auto-detects backend (external URL or local container via podman/docker).
+- Keep the handle alive for the whole test — dropping it tears down the schema.
+- **`[dev-dependencies]` only** — listing it under `[dependencies]` ships testcontainers into release builds.
+- Database mocks are forbidden.
+- **`mockall` (dev-dependency)** — used for unit-testing runner logic. traits carry `#[cfg_attr(test, mockall::automock)]`.
 
-## Traits and the runtime contract
+## Traits and runtime contract
 
-- `air_elt_core::traits::{Source, Sink, Storage}` — `#[async_trait]`, object-safe (`Box<dyn Source>`). Do **not** change their signatures without updating every connector and the runner.
-- `Batch { rows, next_cursor }`, `Row { values: Vec<Value> }`, `ReadSpec`, `WriteSpec`, `WriteReport`, `CursorState` all live in `core::{traits, flow::state}`. Reuse these types — connectors must not define their own batch/row structs.
+- **`air_elt_core::traits::{Source, Sink, Storage}`** — `#[async_trait]`, object-safe. Do not change signatures without updating all connectors and the runner.
+- Shared types: `Batch { rows, next_cursor }`, `Row { values }`, `ReadSpec`, `WriteSpec`, `WriteReport`, `CursorState`. Connectors must not define their own.
 
-## Connector registration (factories)
+## Connector registration
 
-- Factories are `#[async_trait]` traits: `core::registry::{SourceFactory, SinkFactory, StorageFactory}`, each with a single `async fn build(&self, cfg: &ComponentConfig)`. Registration stores `Arc<dyn SourceFactory>` (etc.), not closures.
-- Wire every connector in `app::registry::build_registry()` via zero-sized unit structs (`struct PgSourceFactory;` with `impl SourceFactory`). No sync wrappers, no `block_in_runtime`.
-- Do not construct `PgSource`/`PgSink`/`PgStorage` directly from flow code — go through the registry.
+Factories are `#[async_trait]` traits in `core::registry`, each with `async fn build(&self, cfg: &ComponentConfig)`. Registration stores `Arc<dyn *Factory>`.
 
-## Runner and operation timeouts
+Wire connectors in `app::registry::build_registry()` via zero-sized structs (`struct PgSourceFactory;`). Do not construct connectors directly from flow code.
 
-- `core::flow::runner::run_all_flows` is the single fan-out entry point (app imports it directly). It wraps every `read_batch`/`write_batch`/`save_cursor`/`load_cursor` call in `tokio::time::timeout` + `tokio::select!` with the shutdown watcher.
-- `operation_timeout_secs` on `FlowConfig` overrides the 30-second default. Pool and statement timeouts are set on `PgXConfig`.
+## Runner and timeouts
 
-## Cursor semantics
-
-- Cursor comparison uses engineer-intuitive "NULL > everything" algebra, matching Postgres default `ORDER BY` (ASC NULLS LAST / DESC NULLS FIRST).
-- The fast path uses standard `(c1, c2) > ($1, $2)` SQL when the cursor state is entirely non-null. If any cursor field is NULL, the SQL rewrites to an explicit null-aware predicate so pipelines don't stall on three-valued logic.
-- `CursorOrder::Desc` emits `ORDER BY c1 DESC, c2 DESC` (direction per column). Do not rely on SQL's "direction applies to the last column" default.
+- **`core::flow::runner::run_all_flows`** — single fan-out entry point. Wraps every DB call in `tokio::time::timeout` + `tokio::select!` with shutdown watcher.
+- `operation_timeout_secs` on `FlowConfig` overrides the 30s default.
 
 ## Errors
 
-- `thiserror` in library crates. `anyhow` is allowed only in `app`.
-- Wrap third-party errors with `RuntimeError::backend(err)` so the `source` chain is preserved.
-- Every error variant must have a useful `Display` that includes the relevant context (flow, table, column, cursor field).
-- Dedicated variants: `ValidationError::NullabilityMismatch`, `TypeError::NullSinkColumn`, `ConfigError::{UnresolvedReference, ConfigTooLarge, AbsoluteIncludeNotAllowed}`. Do not reuse `UnsupportedCast` for nullability or unrelated problems.
+Dedicated error variants — use the right one instead of generic `RuntimeError::Other`.
+
+- Wrap third-party errors with `RuntimeError::backend(err)` to preserve the `source` chain.
+- `ValidationError::NullabilityMismatch`, `TypeError::NullSinkColumn`, `ConfigError::{UnresolvedReference, ConfigTooLarge, AbsoluteIncludeNotAllowed}`.
 
 ## After changes
 
-- `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 - Add a line to this file if you introduced a new utility others must use.

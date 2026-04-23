@@ -1,136 +1,167 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::flow::state::CursorState;
-use crate::traits::Batch;
+use crate::model::{Batch, CursorState};
 use crate::validation::pipeline::ResolvedFlow;
 
-/// How the caller wants the runner to behave.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
-    /// Loop forever: read → write → save cursor → sleep interval when idle.
     Daemon,
-    /// Drain the source once (repeatedly pull while batches are full) and exit.
     Once,
 }
 
-/// Run a single flow. Shutdown is signalled by `shutdown.changed()` flipping to true.
-pub async fn run_flow(
+const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const BACKOFF_CAP: Duration = Duration::from_secs(3600);
+const BACKOFF_MULTIPLIER: u32 = 4;
+
+pub struct FlowRunner {
     flow: Arc<ResolvedFlow>,
     mode: RunMode,
-    mut shutdown: watch::Receiver<bool>,
-) -> RuntimeResult<()> {
-    let mut cursor = with_timeout(
-        &flow,
-        "load_cursor",
-        flow.storage.load_cursor(&flow.name),
-        &mut shutdown,
-    )
-    .await?;
-    info!(flow = %flow.name, has_cursor = cursor.is_some(), "flow started");
+    shutdown: watch::Receiver<bool>,
+    cursor: Option<CursorState>,
+    backoff: Duration,
+}
 
-    loop {
-        if *shutdown.borrow() {
-            info!(flow = %flow.name, "shutdown signalled");
-            return Ok(());
+impl FlowRunner {
+    pub fn new(flow: Arc<ResolvedFlow>, mode: RunMode, shutdown: watch::Receiver<bool>) -> Self {
+        Self {
+            flow,
+            mode,
+            shutdown,
+            cursor: None,
+            backoff: BACKOFF_INITIAL,
+        }
+    }
+
+    pub async fn run(mut self) -> RuntimeResult<()> {
+        loop {
+            match self.tick().await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    self.backoff = BACKOFF_INITIAL;
+                }
+                Err(e) => {
+                    if matches!(self.mode, RunMode::Once) {
+                        return Err(e);
+                    }
+                    error!(
+                        flow = %self.flow.name,
+                        error = %e,
+                        retry_in_secs = self.backoff.as_secs(),
+                        "flow iteration failed; backing off"
+                    );
+                    tokio::select! {
+                        _ = sleep(self.backoff) => {}
+                        _ = self.shutdown.changed() => {
+                            info!(flow = %self.flow.name, "shutdown during backoff");
+                            return Ok(());
+                        }
+                    }
+                    self.backoff = (self.backoff * BACKOFF_MULTIPLIER).min(BACKOFF_CAP);
+                }
+            }
+        }
+    }
+
+    async fn tick(&mut self) -> Result<bool, RuntimeError> {
+        if self.cursor.is_none() {
+            self.cursor = with_timeout(
+                &self.flow,
+                "load_cursor",
+                self.flow.storage.load_cursor(&self.flow.name),
+                &mut self.shutdown,
+            )
+            .await?;
+            info!(flow = %self.flow.name, has_cursor = self.cursor.is_some(), "flow started");
+        }
+
+        if *self.shutdown.borrow() {
+            info!(flow = %self.flow.name, "shutdown signalled");
+            return Ok(true);
         }
 
         let batch = with_timeout(
-            &flow,
+            &self.flow,
             "read_batch",
-            flow.source.read_batch(&flow.read_spec, cursor.as_ref()),
-            &mut shutdown,
+            self.flow
+                .source
+                .read_batch(&self.flow.read_spec, self.cursor.as_ref()),
+            &mut self.shutdown,
         )
         .await?;
         let batch_size = batch.rows.len();
 
         if batch_size == 0 {
-            if matches!(mode, RunMode::Once) {
-                info!(flow = %flow.name, "drain complete");
-                return Ok(());
+            if matches!(self.mode, RunMode::Once) {
+                debug!(flow = %self.flow.name, "drain complete");
+                return Ok(true);
             }
-            // Idle — wait for either the configured interval or a shutdown signal.
             tokio::select! {
-                _ = sleep(flow.interval) => {}
-                _ = shutdown.changed() => {
-                    return Ok(());
+                _ = sleep(self.flow.interval) => {}
+                _ = self.shutdown.changed() => {
+                    return Ok(true);
                 }
             }
-            continue;
+            return Ok(false);
         }
 
-        write_and_commit(&flow, &batch, &mut cursor, &mut shutdown).await?;
+        self.write_and_commit(&batch).await?;
 
-        // If the source returned a partial batch, the next read will be empty
-        // and we either exit (Once) or sleep (Daemon) on the next iteration.
-        if batch_size < flow.read_spec.limit && matches!(mode, RunMode::Once) {
-            return Ok(());
+        if batch_size < self.flow.read_spec.limit && matches!(self.mode, RunMode::Once) {
+            return Ok(true);
         }
+        Ok(false)
     }
-}
 
-async fn write_and_commit(
-    flow: &ResolvedFlow,
-    batch: &Batch,
-    cursor: &mut Option<CursorState>,
-    shutdown: &mut watch::Receiver<bool>,
-) -> RuntimeResult<()> {
-    let report = match with_timeout(
-        flow,
-        "write_batch",
-        flow.sink.write_batch(&flow.write_spec, batch),
-        shutdown,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            error!(flow = %flow.name, error = %e, "write_batch failed");
-            return Err(e);
-        }
-    };
-    info!(
-        flow = %flow.name,
-        rows = report.rows_written,
-        "batch written"
-    );
-
-    if let Some(next) = &batch.next_cursor {
-        if let Err(e) = with_timeout(
-            flow,
-            "save_cursor",
-            flow.storage.save_cursor(&flow.name, next),
-            shutdown,
+    async fn write_and_commit(&mut self, batch: &Batch) -> RuntimeResult<()> {
+        let report = match with_timeout(
+            &self.flow,
+            "write_batch",
+            self.flow.sink.write_batch(&self.flow.write_spec, batch),
+            &mut self.shutdown,
         )
         .await
         {
-            // Why: cursor loss = re-emit rows on restart. If we cannot persist,
-            // we must abort the flow — a later retry will pick up from the last
-            // successfully saved cursor rather than silently double-writing.
-            error!(flow = %flow.name, error = %e, "save_cursor failed; flow will abort to avoid drift");
-            return Err(e);
-        }
-        *cursor = Some(next.clone());
-    } else {
-        warn!(
-            flow = %flow.name,
-            "source returned a batch without a next cursor; skipping cursor save"
+            Ok(r) => r,
+            Err(e) => {
+                error!(flow = %self.flow.name, error = %e, "write_batch failed");
+                return Err(e);
+            }
+        };
+        debug!(
+            flow = %self.flow.name,
+            rows = report.rows_written,
+            "batch written"
         );
+
+        if let Some(next) = &batch.next_cursor {
+            if let Err(e) = with_timeout(
+                &self.flow,
+                "save_cursor",
+                self.flow.storage.save_cursor(&self.flow.name, next),
+                &mut self.shutdown,
+            )
+            .await
+            {
+                error!(flow = %self.flow.name, error = %e, "save_cursor failed; flow will abort to avoid drift");
+                return Err(e);
+            }
+            self.cursor = Some(next.clone());
+        } else {
+            warn!(
+                flow = %self.flow.name,
+                "source returned a batch without a next cursor; skipping cursor save"
+            );
+        }
+        Ok(())
     }
-    Ok(())
 }
 
-/// Wrap an async DB-touching future in `operation_timeout` plus a
-/// `shutdown.changed()` race. Propagates `RuntimeError::Other` on both timeout
-/// and shutdown-cancel so the caller can distinguish from a backend failure.
-///
-/// Why a single helper: `read_batch`/`write_batch`/`save_cursor`/`load_cursor`
-/// all share the same "bail on shutdown or after N seconds" rule — centralising
-/// it prevents drift.
 async fn with_timeout<F, T>(
     flow: &ResolvedFlow,
     op: &'static str,
@@ -141,12 +172,12 @@ where
     F: std::future::Future<Output = RuntimeResult<T>>,
 {
     tokio::select! {
-        res = tokio::time::timeout(flow.operation_timeout, fut) => match res {
+        res = tokio::time::timeout(flow.query_timeout, fut) => match res {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(RuntimeError::Other(format!(
                 "flow {:?} operation {op:?} timed out after {:?}",
-                flow.name, flow.operation_timeout
+                flow.name, flow.query_timeout
             ))),
         },
         _ = shutdown.changed() => Err(RuntimeError::Other(format!(
@@ -156,12 +187,6 @@ where
     }
 }
 
-/// Spawn each resolved flow as its own tokio task and wait for them all.
-///
-/// Why "first error wins, others logged": a single failure shouldn't hide the
-/// rest of the failures in the output, but we need to return one concrete
-/// error to the caller. Operators see every failure in logs and can act on
-/// them in parallel.
 pub async fn run_all_flows(
     flows: Vec<Arc<ResolvedFlow>>,
     mode: RunMode,
@@ -174,7 +199,8 @@ pub async fn run_all_flows(
         let rx = shutdown.clone();
         let flow_name = flow.name.clone();
         handles.push(tokio::spawn(async move {
-            let result = run_flow(flow, mode, rx).await;
+            let runner = FlowRunner::new(flow, mode, rx);
+            let result = runner.run().await;
             (flow_name, result)
         }));
     }
@@ -201,5 +227,239 @@ pub async fn run_all_flows(
     match first_error {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::config::model::CursorOrder;
+    use crate::model::{
+        Batch, CursorFieldValue, CursorState, ReadSpec, Row, WriteReport, WriteSpec,
+    };
+    use crate::traits::{MockSink, MockSource, MockStorage};
+    use crate::types::value::Value;
+
+    fn one_row_batch() -> Batch {
+        Batch {
+            rows: vec![Row {
+                values: vec![Value::Int64(1)],
+            }],
+            next_cursor: Some(CursorState::new(vec![CursorFieldValue {
+                name: "id".into(),
+                value: Value::Int64(1),
+            }])),
+        }
+    }
+
+    fn mock_source_ok() -> MockSource {
+        let call = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut s = MockSource::new();
+        s.expect_read_batch().returning(move |_, _| {
+            let n = call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Ok(one_row_batch())
+            } else {
+                Ok(Batch::default())
+            }
+        });
+        s
+    }
+
+    fn mock_source_empty() -> MockSource {
+        let mut s = MockSource::new();
+        s.expect_read_batch().returning(|_, _| Ok(Batch::default()));
+        s
+    }
+
+    fn mock_source_no_cursor() -> MockSource {
+        let call = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut s = MockSource::new();
+        s.expect_read_batch().returning(move |_, _| {
+            let n = call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Ok(Batch {
+                    rows: vec![Row {
+                        values: vec![Value::Int64(1)],
+                    }],
+                    next_cursor: None,
+                })
+            } else {
+                Ok(Batch::default())
+            }
+        });
+        s
+    }
+
+    fn mock_source_failing(times: u32) -> MockSource {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(times));
+        let call = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut s = MockSource::new();
+        s.expect_read_batch().returning(move |_, _| {
+            let remaining = counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            if remaining > 0 {
+                Err(RuntimeError::Other("source boom".into()))
+            } else {
+                let n = call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    Ok(one_row_batch())
+                } else {
+                    Ok(Batch::default())
+                }
+            }
+        });
+        s
+    }
+
+    fn mock_sink_ok() -> MockSink {
+        let mut s = MockSink::new();
+        s.expect_write_batch().returning(|_, batch| {
+            Ok(WriteReport {
+                rows_written: batch.rows.len() as u64,
+            })
+        });
+        s
+    }
+
+    fn mock_storage_ok() -> MockStorage {
+        let mut s = MockStorage::new();
+        s.expect_load_cursor().returning(|_| Ok(None));
+        s.expect_save_cursor().returning(|_, _| Ok(()));
+        s
+    }
+
+    fn mock_storage_save_fails() -> MockStorage {
+        let mut s = MockStorage::new();
+        s.expect_load_cursor().returning(|_| Ok(None));
+        s.expect_save_cursor()
+            .returning(|_, _| Err(RuntimeError::Other("storage boom".into())));
+        s
+    }
+
+    fn test_flow_named(
+        name: &str,
+        source: MockSource,
+        sink: MockSink,
+        storage: MockStorage,
+    ) -> Arc<ResolvedFlow> {
+        Arc::new(ResolvedFlow {
+            name: name.into(),
+            source: Arc::new(source),
+            sink: Arc::new(sink),
+            storage: Arc::new(storage),
+            read_spec: ReadSpec {
+                columns: vec!["id".into()],
+                table: "public.t".into(),
+                cursor_fields: vec!["id".into()],
+                cursor_order: CursorOrder::Asc,
+                limit: 1,
+            },
+            write_spec: WriteSpec {
+                columns: vec!["id".into()],
+                table: "public.t".into(),
+            },
+            interval: Duration::from_millis(10),
+            query_timeout: Duration::from_secs(5),
+        })
+    }
+
+    fn test_flow(source: MockSource, sink: MockSink, storage: MockStorage) -> Arc<ResolvedFlow> {
+        test_flow_named("test_flow", source, sink, storage)
+    }
+
+    fn run(flow: Arc<ResolvedFlow>, mode: RunMode, rx: watch::Receiver<bool>) -> FlowRunner {
+        FlowRunner::new(flow, mode, rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn once_happy_path() {
+        let flow = test_flow(mock_source_ok(), mock_sink_ok(), mock_storage_ok());
+        let (_tx, rx) = watch::channel(false);
+        assert!(run(flow, RunMode::Once, rx).run().await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn once_empty_source_completes() {
+        let flow = test_flow(mock_source_empty(), mock_sink_ok(), mock_storage_ok());
+        let (_tx, rx) = watch::channel(false);
+        assert!(run(flow, RunMode::Once, rx).run().await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn once_mode_propagates_error() {
+        let flow = test_flow(mock_source_failing(1), mock_sink_ok(), mock_storage_ok());
+        let (_tx, rx) = watch::channel(false);
+        let result = run(flow, RunMode::Once, rx).run().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("source boom"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn save_cursor_failure_aborts_iteration() {
+        let flow = test_flow(mock_source_ok(), mock_sink_ok(), mock_storage_save_fails());
+        let (_tx, rx) = watch::channel(false);
+        let result = run(flow, RunMode::Once, rx).run().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("storage boom"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_cursor_in_batch_skips_save() {
+        let flow = test_flow(mock_source_no_cursor(), mock_sink_ok(), mock_storage_ok());
+        let (_tx, rx) = watch::channel(false);
+        assert!(run(flow, RunMode::Once, rx).run().await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_backoff_returns_ok() {
+        let flow = test_flow(mock_source_failing(100), mock_sink_ok(), mock_storage_ok());
+        let (tx, rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { FlowRunner::new(flow, RunMode::Daemon, rx).run().await });
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tx.send(true).unwrap();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_retries_after_failure_then_succeeds() {
+        let flow = test_flow(mock_source_failing(2), mock_sink_ok(), mock_storage_ok());
+        let (tx, rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { FlowRunner::new(flow, RunMode::Daemon, rx).run().await });
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tx.send(true).unwrap();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_all_flows_collects_first_error() {
+        let ok_flow = test_flow(mock_source_ok(), mock_sink_ok(), mock_storage_ok());
+        let fail_flow = test_flow_named(
+            "failing",
+            mock_source_failing(1),
+            mock_sink_ok(),
+            mock_storage_ok(),
+        );
+        let (_tx, rx) = watch::channel(false);
+        assert!(
+            run_all_flows(vec![ok_flow, fail_flow], RunMode::Once, rx)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_all_flows_all_ok() {
+        let f1 = test_flow(mock_source_ok(), mock_sink_ok(), mock_storage_ok());
+        let f2 = test_flow_named(
+            "flow_2",
+            mock_source_ok(),
+            mock_sink_ok(),
+            mock_storage_ok(),
+        );
+        let (_tx, rx) = watch::channel(false);
+        assert!(run_all_flows(vec![f1, f2], RunMode::Once, rx).await.is_ok());
     }
 }

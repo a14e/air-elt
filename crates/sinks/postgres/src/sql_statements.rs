@@ -1,15 +1,9 @@
 //! SQL emitted by the sink.
 
-pub use air_elt_commons::sql::pg::identifier::split_qualified;
 use air_elt_commons::sql::pg::identifier::{quote_columns, quote_qualified};
 use air_elt_core::error::RuntimeResult;
 
 pub const PING: &str = "SELECT 1";
-
-pub const INFORMATION_SCHEMA: &str = "SELECT column_name, is_nullable, udt_name, data_type
-    FROM information_schema.columns
-    WHERE table_schema = $1 AND table_name = $2
-    ORDER BY ordinal_position";
 
 pub const HAS_TABLE_INSERT: &str = "SELECT has_table_privilege(current_user, $1, 'INSERT') AS ok";
 
@@ -31,6 +25,7 @@ pub fn insert_prefix(table: &str, columns: &[String]) -> RuntimeResult<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

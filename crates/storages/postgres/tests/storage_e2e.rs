@@ -1,5 +1,6 @@
+#![allow(clippy::unwrap_used)]
 use air_elt_commons_testing::pg::pg_pool;
-use air_elt_core::flow::state::{CursorFieldValue, CursorState};
+use air_elt_core::model::{CursorFieldValue, CursorState};
 use air_elt_core::traits::Storage;
 use air_elt_core::types::Value;
 use air_elt_storage_postgres::{PgStorage, PgStorageConfig};

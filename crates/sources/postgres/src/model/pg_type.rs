@@ -2,4 +2,4 @@
 //! `commons::sql::pg::pg_type` — imported here as `PgType` and `to_internal`
 //! so call sites keep short paths.
 
-pub use air_elt_commons::sql::pg::pg_type::{PgType, parse_or_err, to_internal};
+pub use air_elt_commons::sql::pg::pg_type::{PgType, to_internal};

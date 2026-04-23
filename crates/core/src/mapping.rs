@@ -38,16 +38,8 @@ pub fn build(flow: &FlowConfig) -> Result<Vec<ColumnMapping>, ConfigError> {
         .collect()
 }
 
-/// Source column names preserving mapping order.
-pub fn source_columns(mappings: &[ColumnMapping]) -> Vec<String> {
-    mappings.iter().map(|m| m.from.clone()).collect()
-}
-
-pub fn sink_columns(mappings: &[ColumnMapping]) -> Vec<String> {
-    mappings.iter().map(|m| m.to.clone()).collect()
-}
-
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::config::model::{CursorConfig, CursorOrder, FlowConfig, SimpleMapping};
@@ -63,10 +55,10 @@ mod tests {
             cursor: CursorConfig {
                 fields: vec!["id".into()],
                 order: CursorOrder::Asc,
-                interval: "1s".into(),
+                interval: std::time::Duration::from_secs(1),
             },
             batch_limit: 100,
-            operation_timeout_secs: None,
+            query_timeout: None,
         }
     }
 
@@ -85,7 +77,7 @@ mod tests {
             },
         )]))
         .unwrap();
-        assert_eq!(source_columns(&mappings), vec!["a".to_string()]);
-        assert_eq!(sink_columns(&mappings), vec!["b".to_string()]);
+        assert_eq!(mappings[0].from, "a");
+        assert_eq!(mappings[0].to, "b");
     }
 }

@@ -61,9 +61,7 @@ impl Registry {
             .ok_or_else(|| RuntimeError::NotRegistered {
                 component: format!("source:{}", cfg.kind),
             })?;
-        f.build(cfg)
-            .await
-            .map_err(|e| RuntimeError::Other(e.to_string()))
+        f.build(cfg).await.map_err(RuntimeError::Config)
     }
 
     pub async fn build_sink(&self, cfg: &ComponentConfig) -> RuntimeResult<Arc<dyn Sink>> {
@@ -73,9 +71,7 @@ impl Registry {
             .ok_or_else(|| RuntimeError::NotRegistered {
                 component: format!("sink:{}", cfg.kind),
             })?;
-        f.build(cfg)
-            .await
-            .map_err(|e| RuntimeError::Other(e.to_string()))
+        f.build(cfg).await.map_err(RuntimeError::Config)
     }
 
     pub async fn build_storage(&self, cfg: &ComponentConfig) -> RuntimeResult<Arc<dyn Storage>> {
@@ -85,8 +81,6 @@ impl Registry {
             .ok_or_else(|| RuntimeError::NotRegistered {
                 component: format!("storage:{}", cfg.kind),
             })?;
-        f.build(cfg)
-            .await
-            .map_err(|e| RuntimeError::Other(e.to_string()))
+        f.build(cfg).await.map_err(RuntimeError::Config)
     }
 }

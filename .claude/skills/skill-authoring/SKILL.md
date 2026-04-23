@@ -16,6 +16,11 @@ description: Rules and requirements for writing and maintaining skills in this r
 9. Before lists of requirements, always add context (except when the requirements are unrelated).
 10. Before writing a skill, think the plan through in detail and write according to the plan.
 11. Each next stage or topic of a skill must follow from the previous one, so the text stays clear and logical.
+12. When condensing text for consistency, keep the high-level intent and philosophy rather than technical details. Technical details can always be looked up in the code; the reasoning behind them has to be interpreted.
+    (this refers to calls to specific methods and interfaces; what's important is where to find them and where they are
+    located)
+13. Do not modify if there are strict code constraints (e.g., fixed version) -- this is important
+14. Also, if we want to describe some structure and requirements for it -- this is also important
 
 If your text matches one of the following types, use the corresponding template (for the content).
 

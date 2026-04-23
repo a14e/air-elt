@@ -20,6 +20,8 @@ pub const TABLE_EXISTS: &str = "SELECT EXISTS (
 pub const HAS_CREATE_PRIVILEGE: &str =
     "SELECT has_schema_privilege(current_user, current_schema(), 'CREATE') AS ok";
 
+pub const HAS_TABLE_INSERT: &str = "SELECT has_table_privilege(current_user, current_schema() || '.air_elt_cursors', 'INSERT') AS ok";
+
 pub const PROBE_INSERT_WHERE_FALSE: &str = "INSERT INTO air_elt_cursors (flow, state) \
     SELECT flow, state FROM air_elt_cursors WHERE false";
 

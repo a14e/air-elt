@@ -17,7 +17,7 @@ use crate::error::ConfigError;
 // ${NAME} or ${NAME:default}. NAME is POSIX-ish identifier; default extends
 // to the closing `}` and may be empty.
 static REF_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\$\{([a-zA-Z_][0-9a-zA-Z_]*)(?::([^}]*))?\}").unwrap());
+    Lazy::new(|| Regex::new(r"\$\{([a-zA-Z_][0-9a-zA-Z_]*)(?::([^}]*))?\}").expect("static regex"));
 
 /// Resolve every `${VAR}` / `${VAR:default}` in `raw`.
 ///
@@ -61,6 +61,7 @@ pub fn expand(raw: &str, secrets: &BTreeMap<String, String>) -> Result<String, C
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +49,7 @@ pub struct ComponentConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct FlowConfig {
     pub source: String,
     pub sink: String,
@@ -59,10 +61,12 @@ pub struct FlowConfig {
     pub cursor: CursorConfig,
     #[serde(default = "default_batch_limit")]
     pub batch_limit: usize,
-    /// Operation-level timeout wrapping each `read_batch` / `write_batch` /
-    /// `save_cursor` call. Overrides the workspace default of 30 s.
-    #[serde(default)]
-    pub operation_timeout_secs: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "crate::config::interval::deserialize_opt",
+        serialize_with = "crate::config::interval::serialize_opt"
+    )]
+    pub query_timeout: Option<Duration>,
 }
 
 fn default_batch_limit() -> usize {
@@ -93,6 +97,7 @@ pub struct ObjectMapping {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct ObjectMappingFrom {
     pub name: String,
     #[serde(default)]
@@ -108,8 +113,12 @@ pub struct CursorConfig {
     pub fields: Vec<String>,
     #[serde(default = "default_order")]
     pub order: CursorOrder,
-    #[serde(default = "default_interval")]
-    pub interval: String,
+    #[serde(
+        default = "default_interval",
+        deserialize_with = "crate::config::interval::deserialize",
+        serialize_with = "crate::config::interval::serialize"
+    )]
+    pub interval: std::time::Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -123,6 +132,6 @@ fn default_order() -> CursorOrder {
     CursorOrder::Asc
 }
 
-fn default_interval() -> String {
-    "1s".to_string()
+fn default_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(1)
 }

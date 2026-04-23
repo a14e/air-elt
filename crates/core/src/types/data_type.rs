@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataType {
-    Null,
     Bool,
     Int16,
     Int32,
@@ -21,7 +20,6 @@ pub enum DataType {
 impl DataType {
     pub fn name(self) -> &'static str {
         match self {
-            DataType::Null => "null",
             DataType::Bool => "bool",
             DataType::Int16 => "int16",
             DataType::Int32 => "int32",

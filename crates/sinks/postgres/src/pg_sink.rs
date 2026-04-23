@@ -8,20 +8,25 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use air_elt_commons::sql::pg::identifier::split_qualified;
-use air_elt_commons::sql::pg::pg_type::{self, PgType};
 use air_elt_commons::sql::pg::pool;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
-use air_elt_core::schema::{Field, Schema};
-use air_elt_core::traits::{Batch, Sink, WriteReport, WriteSpec};
+use air_elt_core::model::Schema;
+use air_elt_core::model::{Batch, WriteReport, WriteSpec};
+use air_elt_core::traits::Sink;
 use air_elt_core::types::{DataType, Value};
 
 use crate::config::model::PgSinkConfig;
 use crate::sql_statements as sql;
 
+struct SinkFlowCache {
+    schema: Arc<Schema>,
+    column_types: Arc<Vec<DataType>>,
+    insert_prefix: Arc<String>,
+}
+
 pub struct PgSink {
     pool: PgPool,
-    schema_cache: Mutex<HashMap<String, Arc<Schema>>>,
+    cache: Mutex<HashMap<String, SinkFlowCache>>,
 }
 
 impl PgSink {
@@ -29,17 +34,19 @@ impl PgSink {
         let pool = pool::connect(
             &config.url,
             pool::PoolTimeouts::from_options(
-                config.connect_timeout_secs,
-                config.acquire_timeout_secs,
-                config.idle_timeout_secs,
-                config.max_lifetime_secs,
-                config.statement_timeout_secs,
+                config.connect_timeout,
+                config.acquire_timeout,
+                config.idle_timeout,
+                config.max_lifetime,
+                config.statement_timeout,
+                config.max_connections,
+                config.min_connections,
             ),
         )
         .await?;
         Ok(Self {
             pool,
-            schema_cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -80,70 +87,19 @@ impl PgSink {
         Ok(())
     }
 
-    async fn cached_schema(&self, table: &str) -> RuntimeResult<Arc<Schema>> {
-        let mut cache = self.schema_cache.lock().await;
-        if let Some(p) = cache.get(table) {
-            return Ok(p.clone());
+    async fn cached_flow(
+        &self,
+        spec: &WriteSpec,
+    ) -> RuntimeResult<(Arc<Vec<DataType>>, Arc<String>)> {
+        {
+            let guard = self.cache.lock().await;
+            if let Some(entry) = guard.get(&spec.table) {
+                return Ok((entry.column_types.clone(), entry.insert_prefix.clone()));
+            }
         }
-        let schema = Arc::new(self.fetch_schema(table).await?);
-        cache.insert(table.to_string(), schema.clone());
-        Ok(schema)
-    }
-
-    async fn fetch_schema(&self, table: &str) -> RuntimeResult<Schema> {
-        let (schema_name, table_name) = split_qualified(table);
-        let rows: Vec<(String, String, String, String)> = sqlx::query_as(sql::INFORMATION_SCHEMA)
-            .bind(&schema_name)
-            .bind(&table_name)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(RuntimeError::backend)?;
-
-        if rows.is_empty() {
-            return Err(RuntimeError::Other(format!(
-                "table {schema_name:?}.{table_name:?} not found or not visible to current user"
-            )));
-        }
-
-        let mut fields = Vec::with_capacity(rows.len());
-        for (col, is_null, udt, data_type) in rows {
-            let pg: PgType = PgType::parse(&udt)
-                .or_else(|| PgType::parse(&data_type))
-                .ok_or_else(|| {
-                    RuntimeError::Other(format!(
-                        "unsupported pg type for column {col:?}: udt={udt:?}, data_type={data_type:?}"
-                    ))
-                })?;
-            fields.push(Field {
-                name: col,
-                data_type: pg_type::to_internal(pg),
-                nullable: is_null.eq_ignore_ascii_case("YES"),
-            });
-        }
-        Ok(Schema::new(fields))
-    }
-}
-
-#[async_trait]
-impl Sink for PgSink {
-    async fn validate_access(&self, spec: &WriteSpec) -> RuntimeResult<()> {
-        self.ensure_connection_alive().await?;
-        self.assert_table_writable(spec).await?;
-        info!(table = %spec.table, "sink access validated");
-        Ok(())
-    }
-
-    async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema> {
-        let schema = self.cached_schema(table).await?;
-        Ok((*schema).clone())
-    }
-
-    async fn write_batch(&self, spec: &WriteSpec, batch: &Batch) -> RuntimeResult<WriteReport> {
-        if batch.rows.is_empty() {
-            return Ok(WriteReport { rows_written: 0 });
-        }
-
-        let schema = self.cached_schema(&spec.table).await?;
+        let schema = Arc::new(
+            air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, &spec.table).await?,
+        );
         let column_types: Vec<DataType> = spec
             .columns
             .iter()
@@ -157,13 +113,51 @@ impl Sink for PgSink {
             })
             .collect::<RuntimeResult<_>>()?;
         let prefix = sql::insert_prefix(&spec.table, &spec.columns)?;
-        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(prefix);
+        let column_types = Arc::new(column_types);
+        let prefix = Arc::new(prefix);
+        let mut guard = self.cache.lock().await;
+        let entry = guard.entry(spec.table.clone()).or_insert(SinkFlowCache {
+            schema,
+            column_types: column_types.clone(),
+            insert_prefix: prefix.clone(),
+        });
+        Ok((entry.column_types.clone(), entry.insert_prefix.clone()))
+    }
+}
+
+#[async_trait]
+impl Sink for PgSink {
+    async fn validate_access(&self, spec: &WriteSpec) -> RuntimeResult<()> {
+        self.ensure_connection_alive().await?;
+        self.assert_table_writable(spec).await?;
+        info!(table = %spec.table, "sink access validated");
+        Ok(())
+    }
+
+    async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema> {
+        {
+            let guard = self.cache.lock().await;
+            if let Some(entry) = guard.get(table) {
+                return Ok((*entry.schema).clone());
+            }
+        }
+        let schema = air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, table).await?;
+        Ok(schema)
+    }
+
+    async fn write_batch(&self, spec: &WriteSpec, batch: &Batch) -> RuntimeResult<WriteReport> {
+        if batch.rows.is_empty() {
+            return Ok(WriteReport { rows_written: 0 });
+        }
+
+        let (column_types, prefix) = self.cached_flow(spec).await?;
+        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new((*prefix).clone());
         let column_types_ref = &column_types;
         qb.push_values(batch.rows.iter(), |mut tuple, row| {
             for (value, dt) in row.values.iter().zip(column_types_ref.iter()) {
                 match value {
                     Value::Null => match *dt {
-                        DataType::Null | DataType::Int64 => {
+                        DataType::Int64 => {
                             tuple.push_bind::<Option<i64>>(None);
                         }
                         DataType::Bool => {
@@ -247,7 +241,7 @@ impl Sink for PgSink {
             .map_err(RuntimeError::backend)?;
 
         let rows_written = result.rows_affected();
-        info!(rows_written, "sink batch inserted");
+        debug!(rows_written, "sink batch inserted");
         Ok(WriteReport { rows_written })
     }
 }

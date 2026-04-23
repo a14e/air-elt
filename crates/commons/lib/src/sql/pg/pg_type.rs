@@ -6,7 +6,6 @@
 //! the dialect, not of the direction of data flow. Keeping one authoritative
 //! table avoids drift between source and sink when a new type is added.
 
-use air_elt_core::error::TypeError;
 use air_elt_core::types::DataType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,12 +59,6 @@ impl PgType {
     }
 }
 
-pub fn parse_or_err(name: &str) -> Result<PgType, TypeError> {
-    PgType::parse(name).ok_or_else(|| TypeError::UnsupportedNativeType {
-        native: name.to_string(),
-    })
-}
-
 pub fn to_internal(pg: PgType) -> DataType {
     match pg {
         PgType::Bool => DataType::Bool,
@@ -84,6 +77,7 @@ pub fn to_internal(pg: PgType) -> DataType {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

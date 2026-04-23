@@ -1,30 +1,49 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
+use air_elt_core::config::interval;
 use air_elt_core::config::model::ComponentConfig;
 use air_elt_core::error::ConfigError;
 
-/// Storage connection config.
-///
-/// Why no `schema` field: Postgres schema/search_path interaction with
-/// `$user`, default schema, and role privileges is noisy enough that MVP
-/// punts on it. If an operator needs the cursor table in a non-default
-/// schema, they encode it in the URL via
-/// `?options=-c%20search_path%3Danalytics`. libpq applies this on every new
-/// pool connection, so the embedded `sqlx::migrate!` also lands in the
-/// chosen schema automatically.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct PgStorageConfig {
     pub url: String,
+    #[serde(
+        default,
+        deserialize_with = "interval::deserialize_opt",
+        serialize_with = "interval::serialize_opt"
+    )]
+    pub connect_timeout: Option<Duration>,
+    #[serde(
+        default,
+        deserialize_with = "interval::deserialize_opt",
+        serialize_with = "interval::serialize_opt"
+    )]
+    pub acquire_timeout: Option<Duration>,
+    #[serde(
+        default,
+        deserialize_with = "interval::deserialize_opt",
+        serialize_with = "interval::serialize_opt"
+    )]
+    pub idle_timeout: Option<Duration>,
+    #[serde(
+        default,
+        deserialize_with = "interval::deserialize_opt",
+        serialize_with = "interval::serialize_opt"
+    )]
+    pub max_lifetime: Option<Duration>,
+    #[serde(
+        default,
+        deserialize_with = "interval::deserialize_opt",
+        serialize_with = "interval::serialize_opt"
+    )]
+    pub statement_timeout: Option<Duration>,
     #[serde(default)]
-    pub connect_timeout_secs: Option<u64>,
+    pub max_connections: Option<u32>,
     #[serde(default)]
-    pub acquire_timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub idle_timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub max_lifetime_secs: Option<u64>,
-    #[serde(default)]
-    pub statement_timeout_secs: Option<u64>,
+    pub min_connections: Option<u32>,
 }
 
 // Why: dedicated TryFrom per connector keeps config parsing co-located with

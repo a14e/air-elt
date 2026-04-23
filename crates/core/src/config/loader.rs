@@ -23,10 +23,10 @@ const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 /// visit each real file at most once.
 pub fn load<P: AsRef<Path>>(path: P) -> Result<RootConfig, ConfigError> {
     let path = path.as_ref().to_path_buf();
-    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut cycle = PathCycleDetector::new();
 
     let raw_root = read_single(&path)?;
-    mark_visited(&mut visited, &path);
+    cycle.mark(&path);
     let secrets = extract_secrets(&raw_root, &path)?;
     let expanded_root = env_expand::expand(&raw_root, &secrets)?;
     let mut root = parse_root(&expanded_root, &path)?;
@@ -44,7 +44,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<RootConfig, ConfigError> {
             });
         }
         let resolved = base_dir.join(include);
-        merge_include(&mut root, &resolved, &secrets, &mut visited)?;
+        merge_include(&mut root, &resolved, &secrets, &mut cycle)?;
     }
 
     validate_post_merge(&root)?;
@@ -94,23 +94,35 @@ fn extract_secrets(raw: &str, path: &Path) -> Result<BTreeMap<String, String>, C
     Ok(parsed.secrets)
 }
 
-fn mark_visited(visited: &mut HashSet<PathBuf>, path: &Path) {
-    if let Ok(canon) = std::fs::canonicalize(path) {
-        visited.insert(canon);
-    }
+struct PathCycleDetector {
+    visited: HashSet<PathBuf>,
 }
 
-fn already_visited(visited: &HashSet<PathBuf>, path: &Path) -> bool {
-    std::fs::canonicalize(path)
-        .map(|canon| visited.contains(&canon))
-        .unwrap_or(false)
+impl PathCycleDetector {
+    fn new() -> Self {
+        Self {
+            visited: HashSet::new(),
+        }
+    }
+
+    fn mark(&mut self, path: &Path) {
+        if let Ok(canon) = std::fs::canonicalize(path) {
+            self.visited.insert(canon);
+        }
+    }
+
+    fn seen(&self, path: &Path) -> bool {
+        std::fs::canonicalize(path)
+            .map(|canon| self.visited.contains(&canon))
+            .unwrap_or(false)
+    }
 }
 
 fn merge_include(
     root: &mut RootConfig,
     include: &Path,
     secrets: &BTreeMap<String, String>,
-    visited: &mut HashSet<PathBuf>,
+    cycle: &mut PathCycleDetector,
 ) -> Result<(), ConfigError> {
     if include.is_dir() {
         let mut entries: Vec<PathBuf> = std::fs::read_dir(include)
@@ -124,19 +136,19 @@ fn merge_include(
             .collect();
         entries.sort();
         for entry in entries {
-            if already_visited(visited, &entry) {
+            if cycle.seen(&entry) {
                 debug!(path = ?entry, "skipping already-visited include file");
                 continue;
             }
-            merge_file(root, &entry, secrets, visited)?;
+            merge_file(root, &entry, secrets, cycle)?;
         }
         Ok(())
     } else {
-        if already_visited(visited, include) {
+        if cycle.seen(include) {
             debug!(path = ?include, "skipping already-visited include file");
             return Ok(());
         }
-        merge_file(root, include, secrets, visited)
+        merge_file(root, include, secrets, cycle)
     }
 }
 
@@ -144,9 +156,9 @@ fn merge_file(
     root: &mut RootConfig,
     path: &Path,
     secrets: &BTreeMap<String, String>,
-    visited: &mut HashSet<PathBuf>,
+    cycle: &mut PathCycleDetector,
 ) -> Result<(), ConfigError> {
-    mark_visited(visited, path);
+    cycle.mark(path);
     let raw = read_single(path)?;
     let expanded = env_expand::expand(&raw, secrets)?;
     let extra = parse_root(&expanded, path)?;
@@ -216,7 +228,7 @@ fn validate_post_merge(root: &RootConfig) -> Result<(), ConfigError> {
         }
         if flow.batch_limit == 0 {
             return Err(ConfigError::Invalid {
-                reason: format!("flow {flow_name:?} has batch_limit = 0"),
+                reason: format!("flow {flow_name:?} has batch-limit = 0"),
             });
         }
         // Why: Postgres rejects statements with more than 65 535 bind parameters
@@ -259,6 +271,7 @@ fn validate_post_merge(root: &RootConfig) -> Result<(), ConfigError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -450,7 +463,7 @@ sink = "pg"
 storage = "pg"
 from = "t"
 to = "t"
-batch_limit = 5000
+batch-limit = 5000
 mapping = [
 {mapping_lines}]
 cursor = {{ fields = ["c0"] }}

@@ -1,5 +1,7 @@
+#![allow(clippy::unwrap_used)]
 use air_elt_commons_testing::pg::pg_pool;
-use air_elt_core::traits::{Batch, Row as CoreRow, Sink, WriteSpec};
+use air_elt_core::model::{Batch, Row as CoreRow, WriteSpec};
+use air_elt_core::traits::Sink;
 use air_elt_core::types::{DataType, Value};
 use air_elt_sink_postgres::{PgSink, PgSinkConfig};
 use chrono::{NaiveDate, TimeZone, Utc};

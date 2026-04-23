@@ -6,28 +6,27 @@ use sqlx::{Column, PgPool, Row};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use air_elt_commons::sql::pg::identifier::split_qualified;
 use air_elt_commons::sql::pg::null_bind;
-use air_elt_commons::sql::pg::pg_type::{self, PgType};
 use air_elt_commons::sql::pg::pool;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
-use air_elt_core::flow::state::{CursorFieldValue, CursorState};
-use air_elt_core::schema::{Field, Schema};
-use air_elt_core::traits::{Batch, ReadSpec, Row as CoreRow, Source};
+use air_elt_core::model::Schema;
+use air_elt_core::model::{Batch, ReadSpec, Row as CoreRow};
+use air_elt_core::model::{CursorFieldValue, CursorState};
+use air_elt_core::traits::Source;
 use air_elt_core::types::{DataType, Value};
 
 use crate::config::model::PgSourceConfig;
 use crate::model::mapping as value_codec;
 use crate::sql_statements as sql;
 
+struct FlowCache {
+    schema: Arc<Schema>,
+    read_query: Option<Arc<sql::ReadQuery>>,
+}
+
 pub struct PgSource {
     pool: PgPool,
-    // Why: validation's `describe_schema` is the only introspection round-trip
-    // we need per flow lifetime — the schema does not change under a running
-    // daemon. Caching it here means `read_batch` never hits information_schema
-    // on the hot path. Runtime schema drift is not detected (fails loud at
-    // first sqlx binding mismatch), tracked for a later iteration.
-    schema_cache: Mutex<HashMap<String, Arc<Schema>>>,
+    cache: Mutex<HashMap<String, FlowCache>>,
 }
 
 impl PgSource {
@@ -35,17 +34,19 @@ impl PgSource {
         let pool = pool::connect(
             &config.url,
             pool::PoolTimeouts::from_options(
-                config.connect_timeout_secs,
-                config.acquire_timeout_secs,
-                config.idle_timeout_secs,
-                config.max_lifetime_secs,
-                config.statement_timeout_secs,
+                config.connect_timeout,
+                config.acquire_timeout,
+                config.idle_timeout,
+                config.max_lifetime,
+                config.statement_timeout,
+                config.max_connections,
+                config.min_connections,
             ),
         )
         .await?;
         Ok(Self {
             pool,
-            schema_cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -58,9 +59,6 @@ impl PgSource {
     }
 
     async fn assert_table_readable(&self, spec: &ReadSpec) -> RuntimeResult<()> {
-        // Symmetric to sink: cheap has_table_privilege pre-check, then the
-        // zero-row SELECT actually validates column-level SELECT privilege
-        // and existence.
         let row = sqlx::query(sql::HAS_TABLE_SELECT)
             .bind(&spec.table)
             .fetch_one(&self.pool)
@@ -83,46 +81,69 @@ impl PgSource {
     }
 
     async fn cached_schema(&self, table: &str) -> RuntimeResult<Arc<Schema>> {
-        let mut cache = self.schema_cache.lock().await;
-        if let Some(p) = cache.get(table) {
-            return Ok(p.clone());
+        {
+            let guard = self.cache.lock().await;
+            if let Some(entry) = guard.get(table) {
+                return Ok(entry.schema.clone());
+            }
         }
-        let schema = Arc::new(self.fetch_schema(table).await?);
-        cache.insert(table.to_string(), schema.clone());
-        Ok(schema)
+        let schema =
+            Arc::new(air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, table).await?);
+        let mut guard = self.cache.lock().await;
+        Ok(guard
+            .entry(table.to_string())
+            .or_insert(FlowCache {
+                schema: schema.clone(),
+                read_query: None,
+            })
+            .schema
+            .clone())
     }
 
-    async fn fetch_schema(&self, table: &str) -> RuntimeResult<Schema> {
-        let (schema_name, table_name) = split_qualified(table);
-        let rows: Vec<(String, String, String, String)> = sqlx::query_as(sql::INFORMATION_SCHEMA)
-            .bind(&schema_name)
-            .bind(&table_name)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(RuntimeError::backend)?;
+    async fn cached_read_query(
+        &self,
+        spec: &ReadSpec,
+        cursor: Option<&CursorState>,
+    ) -> RuntimeResult<Arc<sql::ReadQuery>> {
+        let all_non_null = cursor
+            .map(|c| c.fields.iter().all(|f| !f.value.is_null()))
+            .unwrap_or(false);
 
-        if rows.is_empty() {
-            return Err(RuntimeError::Other(format!(
-                "table {schema_name:?}.{table_name:?} not found or not visible to current user"
-            )));
-        }
+        if all_non_null {
+            let guard = self.cache.lock().await;
+            if let Some(entry) = guard.get(&spec.table) {
+                if let Some(cached) = &entry.read_query {
+                    return Ok(cached.clone());
+                }
+            }
+            drop(guard);
 
-        let mut fields = Vec::with_capacity(rows.len());
-        for (col, is_null, udt, data_type) in rows {
-            let pg: PgType = PgType::parse(&udt)
-                .or_else(|| PgType::parse(&data_type))
-                .ok_or_else(|| {
-                    RuntimeError::Other(format!(
-                        "unsupported pg type for column {col:?}: udt={udt:?}, data_type={data_type:?}"
-                    ))
-                })?;
-            fields.push(Field {
-                name: col,
-                data_type: pg_type::to_internal(pg),
-                nullable: is_null.eq_ignore_ascii_case("YES"),
+            let plan = Arc::new(sql::build_read_batch(
+                &spec.table,
+                &spec.columns,
+                &spec.cursor_fields,
+                spec.cursor_order,
+                cursor,
+            )?);
+
+            let mut guard = self.cache.lock().await;
+            let entry = guard.entry(spec.table.clone()).or_insert(FlowCache {
+                schema: Arc::new(Schema::default()),
+                read_query: None,
             });
+            if entry.read_query.is_none() {
+                entry.read_query = Some(plan.clone());
+            }
+            Ok(entry.read_query.as_ref().expect("just inserted").clone())
+        } else {
+            Ok(Arc::new(sql::build_read_batch(
+                &spec.table,
+                &spec.columns,
+                &spec.cursor_fields,
+                spec.cursor_order,
+                cursor,
+            )?))
         }
-        Ok(Schema::new(fields))
     }
 }
 
@@ -141,22 +162,16 @@ impl Source for PgSource {
         Ok((*schema).clone())
     }
 
-    async fn read_batch(
+    async fn read_batch<'a>(
         &self,
         spec: &ReadSpec,
-        cursor: Option<&CursorState>,
+        cursor: Option<&'a CursorState>,
     ) -> RuntimeResult<Batch> {
         let schema = self.cached_schema(&spec.table).await?;
         let column_types = resolve_types(&schema, &spec.columns, &spec.table)?;
         let cursor_types = resolve_types(&schema, &spec.cursor_fields, &spec.table)?;
 
-        let query_plan = sql::build_read_batch(
-            &spec.table,
-            &spec.columns,
-            &spec.cursor_fields,
-            spec.cursor_order,
-            cursor,
-        )?;
+        let query_plan = self.cached_read_query(spec, cursor).await?;
         debug!(sql = %query_plan.sql, "read_batch sql");
 
         let mut query = sqlx::query(&query_plan.sql);

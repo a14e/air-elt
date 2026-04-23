@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 use std::sync::Arc;
 
 use air_elt_app::registry::build_registry;
@@ -107,7 +108,7 @@ sink = "pg_sink"
 storage = "pg_state"
 from = "{src}.users"
 to = "{dst}.users"
-batch_limit = 2
+batch-limit = 2
 
 mapping = [
     {{ from = "id", to = "id" }},
@@ -171,7 +172,7 @@ cursor = {{ fields = ["created_at", "id"], order = "asc", interval = "200ms" }}
     assert_eq!(cursors.len(), 1);
     assert_eq!(cursors[0].0, "users");
 
-    let parsed: air_elt_core::flow::state::CursorState =
+    let parsed: air_elt_core::model::CursorState =
         serde_json::from_value(cursors[0].1.clone()).unwrap();
     assert_eq!(
         parsed.fields.len(),

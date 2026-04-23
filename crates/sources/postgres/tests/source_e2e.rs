@@ -1,6 +1,7 @@
+#![allow(clippy::unwrap_used)]
 use air_elt_commons_testing::pg::pg_pool;
-use air_elt_core::flow::state::CursorState;
-use air_elt_core::traits::{ReadSpec, Source};
+use air_elt_core::model::ReadSpec;
+use air_elt_core::traits::Source;
 use air_elt_core::types::{DataType, Value};
 use air_elt_source_postgres::{PgSource, PgSourceConfig};
 use sqlx::Executor;
@@ -87,7 +88,4 @@ async fn describe_and_read_with_cursor() {
         .expect("read_batch drained");
     assert!(empty.rows.is_empty());
     assert!(empty.next_cursor.is_none());
-
-    // Empty cursor state round-trip
-    let _ = CursorState::new(vec![]);
 }

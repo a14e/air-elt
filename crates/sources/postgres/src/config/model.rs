@@ -1,21 +1,49 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
+use air_elt_core::config::interval;
 use air_elt_core::config::model::ComponentConfig;
 use air_elt_core::error::ConfigError;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct PgSourceConfig {
     pub url: String,
+    #[serde(
+        default,
+        deserialize_with = "interval::deserialize_opt",
+        serialize_with = "interval::serialize_opt"
+    )]
+    pub connect_timeout: Option<Duration>,
+    #[serde(
+        default,
+        deserialize_with = "interval::deserialize_opt",
+        serialize_with = "interval::serialize_opt"
+    )]
+    pub acquire_timeout: Option<Duration>,
+    #[serde(
+        default,
+        deserialize_with = "interval::deserialize_opt",
+        serialize_with = "interval::serialize_opt"
+    )]
+    pub idle_timeout: Option<Duration>,
+    #[serde(
+        default,
+        deserialize_with = "interval::deserialize_opt",
+        serialize_with = "interval::serialize_opt"
+    )]
+    pub max_lifetime: Option<Duration>,
+    #[serde(
+        default,
+        deserialize_with = "interval::deserialize_opt",
+        serialize_with = "interval::serialize_opt"
+    )]
+    pub statement_timeout: Option<Duration>,
     #[serde(default)]
-    pub connect_timeout_secs: Option<u64>,
+    pub max_connections: Option<u32>,
     #[serde(default)]
-    pub acquire_timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub idle_timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub max_lifetime_secs: Option<u64>,
-    #[serde(default)]
-    pub statement_timeout_secs: Option<u64>,
+    pub min_connections: Option<u32>,
 }
 
 // Why: per-connector TryFrom keeps parsing co-located; see PgStorageConfig.

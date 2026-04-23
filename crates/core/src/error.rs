@@ -116,7 +116,7 @@ pub enum ValidationError {
         component: &'static str,
         name: String,
         #[source]
-        source: RuntimeError,
+        source: Box<RuntimeError>,
     },
 
     #[error("cursor field {field:?} is missing in source schema for flow {flow:?}")]
@@ -142,6 +142,9 @@ pub enum RuntimeError {
 
     #[error("component {component:?} not registered in factory registry")]
     NotRegistered { component: String },
+
+    #[error("config error: {0}")]
+    Config(#[from] ConfigError),
 
     #[error("{0}")]
     Other(String),

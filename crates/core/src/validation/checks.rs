@@ -1,6 +1,6 @@
 use crate::error::{TypeError, ValidationError};
 use crate::mapping::ColumnMapping;
-use crate::schema::Schema;
+use crate::model::Schema;
 use crate::types::matrix;
 
 /// Verify that every mapped column exists on both sides and that the source's
@@ -81,9 +81,10 @@ pub fn check_cursor(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::schema::Field;
+    use crate::model::Field;
     use crate::types::DataType;
 
     fn mapping(from: &str, to: &str) -> ColumnMapping {

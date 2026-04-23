@@ -97,16 +97,19 @@ pub async fn pg_pool() -> PgTestHandle {
         Err(e) => panic!("{e}"),
         Ok(TestBackend::ExternalUrl) => unreachable!("handled above"),
         Ok(TestBackend::Container { socket }) => {
-            if std::env::var_os("DOCKER_HOST").is_none() {
+            #[allow(unsafe_code)]
+            unsafe {
                 // Why: testcontainers reads DOCKER_HOST on first call; we
                 // export the auto-discovered socket before it runs so it
                 // doesn't fall back to a stale /var/run/docker.sock and hang.
-                // `set_var` is unsafe in edition 2024 due to the read-race
-                // contract — we're still before any tokio worker starts using
-                // the env variable, so the race window is closed.
-                #[allow(unsafe_code)]
-                unsafe {
+                if std::env::var_os("DOCKER_HOST").is_none() {
                     std::env::set_var("DOCKER_HOST", &socket);
+                }
+                // Why: testcontainers disables ryuk for podman by default,
+                // but ryuk works fine with our podman setup and prevents
+                // orphaned containers after interrupted tests.
+                if std::env::var_os("TESTCONTAINERS_RYUK_DISABLED").is_none() {
+                    std::env::set_var("TESTCONTAINERS_RYUK_DISABLED", "false");
                 }
             }
             spawn_container().await
@@ -241,6 +244,13 @@ async fn external_with_sandbox(url: &str) -> PgTestHandle {
         .await
         .expect("create sandbox schema failed");
 
+    // Why: guard is live immediately so if the scoped connect below panics,
+    // Drop will clean up the schema instead of leaving it orphaned.
+    let cleanup = CleanupGuard::ExternalSchema {
+        pool: bootstrap_pool.clone(),
+        schema: schema.clone(),
+    };
+
     let scoped_url = format!("{url}?options=-c%20search_path%3D{schema}");
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -251,11 +261,8 @@ async fn external_with_sandbox(url: &str) -> PgTestHandle {
     PgTestHandle {
         pool,
         url: url.to_string(),
-        schema: schema.clone(),
-        _cleanup: CleanupGuard::ExternalSchema {
-            pool: bootstrap_pool,
-            schema,
-        },
+        schema,
+        _cleanup: cleanup,
     }
 }
 

@@ -6,7 +6,7 @@ storage = "pg_state"
 from = "public.users"
 to = "public.users"
 
-batch_limit = 500
+batch-limit = 500
 
 mapping = [
     { from = "id", to = "id" },

@@ -1,6 +1,7 @@
 ---
 name: air-elt-overview
 description: Architecture and product overview of the Air Elt ELT service — features, tech stack, workspace layout, and config format. Load this before making non-trivial changes so you understand the product shape, crate boundaries, and the GitOps/declarative flow model.
+user-invocable: false
 ---
 
 # Air Elt — project overview
@@ -18,13 +19,13 @@ Air Elt is a Rust service for moving data between systems with **minimal transfo
    5. Field/type compatibility between source and sink via the canonical-type matrix.
    6. *(Optional)* Sample-value conversion check.
 3. **Micro-batch + drain.** Flows run sub-second micro-batches with drain semantics (pull while full, sleep when empty). A classic nightly mode is also allowed via a long interval.
-4. **Monitoring is first-class.** All processes emit structured logs and metrics via `tracing`.
+4. **Monitoring is first-class.** All processes emit structured logs via `tracing`.
 5. **Minimal resources.** Run centralised, or place instances next to each data plane (nginx-style).
 6. **Static SQL.** All SQL is composed during config-init, not per-row.
 
 ## Tech stack
 
-Rust 1.90 stable (pinned via `rust-toolchain.toml`), tokio, async-trait, sqlx (postgres / migrate / chrono / uuid / json), tracing, clap, mimalloc, thiserror. `unsafe` is forbidden by `AGENTS.md`.
+Rust 1.90 stable (pinned via `rust-toolchain.toml`), tokio, async-trait, sqlx (postgres / migrate / chrono / uuid / json), tracing, clap, mimalloc, thiserror.
 
 ## Workspace layout
 
@@ -35,7 +36,7 @@ air-elt/
 ├── crates/
 │   ├── app/                         # bin air-elt (CLI, mimalloc, tracing init, registry wiring)
 │   ├── core/                        # traits, types, config, validation, flow runner
-│   ├── commons/                     # tracing-init, secret resolve, sql::pg quoting, testing helpers
+│   ├── commons/                     # tracing-init, sql::pg quoting, testing helpers
 │   ├── sources/postgres/            # PgSource
 │   ├── sinks/postgres/              # PgSink
 │   └── storages/postgres/           # PgStorage + migrations
@@ -43,16 +44,16 @@ air-elt/
 └── examples/pg-to-pg/               # usage example
 ```
 
-**Cross-dependencies between `sources/*`, `sinks/*`, `storages/*` are forbidden.** Each depends only on `core` (and optionally `commons`). Connectors are wired into the app via the `core::registry::Registry`.
+**Cross-dependencies between `sources/*`, `sinks/*`, `storages/*` are forbidden.** Each depends only on `core` (and optionally `commons`). Connectors are wired into the app via `core::registry::Registry`.
 
 ## Type model (canonical pivot, N+N matrix)
 
-Internal canonical `DataType`s: `Null, Bool, Int16, Int32, Int64, Float32, Float64, Text, Bytes, Date, Timestamp (UTC), Uuid, Json`.
+Internal canonical `DataType`s: `Bool, Int16, Int32, Int64, Float32, Float64, Text, Bytes, Date, Timestamp (UTC), Uuid, Json`. Nullability is a property of `Field`, not a type — `Value::Null` represents "no data".
 
-- Each source defines `native_type → DataType` (e.g. `sources/postgres/src/model/pg_type.rs::to_internal`).
-- Each sink defines `DataType → native_type` (same shape, opposite direction).
-- **There is no canonical↔canonical value conversion.** `core::types::matrix::is_compatible` is a predicate used at validation time only: identity + safe widening + null-assignability.
-- Narrowing / bool↔int / text↔scalar auto-coercion are rejected by validation. Users either fix schemas or add explicit transforms later (out of MVP).
+- Each source maps `native → DataType`, each sink maps `DataType → native`. This gives N+N mappings instead of N×N.
+- **No canonical↔canonical value conversion.** Compatibility is checked at validation time only (identity + safe widening + null-assignability).
+- Narrowing / bool↔int / text↔scalar auto-coercion are rejected. Users fix schemas or add explicit transforms later (out of MVP).
+- Config format details are in the `config-format` skill.
 
 ## Config (TOML only in MVP)
 
@@ -86,11 +87,25 @@ from    = "public.users"          # source table (dot-qualified allowed)
 to      = "analytics.users"       # sink table
 mapping = [{ from = "id", to = "id" }, { from = "name", to = "name" }]
 cursor  = { fields = ["id"], order = "asc", interval = "1s" }
-batch_limit = 1024
+batch-limit = 1024
 ```
 
 - Flow names must be unique across the root file and every `include`'d file.
 - `mapping` transform/timezone fields parse but fail with `UnsupportedInMvp` until transforms land.
+
+## Operating philosophy
+
+Validation phase prioritises **correctness**: every access probe, type check, and config constraint must pass before any data moves. Runtime phase prioritises **fault tolerance**: individual flow failures are logged and retried, never crashing the whole process.
+
+## Fault tolerance
+
+- Flows retry independently with exponential backoff (1s → 4x → 1h cap). One flow's failure does not affect others.
+- `--once` mode propagates errors immediately.
+- `save_cursor` failure aborts the iteration (not the process) to prevent duplicate writes.
+
+## NULL-cursor algebra
+
+Cursor columns may be nullable. Non-null cursors use `(c1,c2) > ($1,$2)`; if any cursor field is NULL, SQL rewrites to a null-aware predicate ("NULL > everything", matching Postgres NULLS LAST). All-NULL cursor returns `FALSE` — drain stalls deliberately. Direction is per-column (`c1 DESC, c2 DESC`).
 
 ## Explicit out-of-MVP list
 
@@ -109,6 +124,4 @@ batch_limit = 1024
 
 ## Testing
 
-- Unit tests alongside the code (`#[cfg(test)] mod tests`).
-- E2E tests in each crate's `tests/` folder via `air_elt_commons::testing::pg::pg_pool()`, which either connects to `AIR_ELT_TEST_PG_URL` (CI) or spins up an ephemeral postgres container (local via podman).
-- Pyramid is inverted: few heavy e2e tests, few focused unit tests. No mocks for databases.
+Inverted pyramid: heavy e2e tests against real Postgres, focused unit tests for pure logic. No database mocks.
