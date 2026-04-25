@@ -51,48 +51,42 @@ pub async fn assemble(
         let source = if let Some(existing) = sources.get(&source_cfg.name) {
             existing.clone()
         } else {
-            let built: Arc<dyn Source> = Arc::from(
-                registry
-                    .build_source(source_cfg)
-                    .await
-                    .map_err(|e| ValidationError::AccessFailed {
+            let built: Arc<dyn Source> =
+                Arc::from(registry.build_source(source_cfg).await.map_err(|e| {
+                    ValidationError::AccessFailed {
                         component: "source",
                         name: source_cfg.name.clone(),
                         source: Box::new(e),
-                    })?,
-            );
+                    }
+                })?);
             sources.insert(source_cfg.name.clone(), built.clone());
             built
         };
         let sink = if let Some(existing) = sinks.get(&sink_cfg.name) {
             existing.clone()
         } else {
-            let built: Arc<dyn Sink> = Arc::from(
-                registry
-                    .build_sink(sink_cfg)
-                    .await
-                    .map_err(|e| ValidationError::AccessFailed {
+            let built: Arc<dyn Sink> =
+                Arc::from(registry.build_sink(sink_cfg).await.map_err(|e| {
+                    ValidationError::AccessFailed {
                         component: "sink",
                         name: sink_cfg.name.clone(),
                         source: Box::new(e),
-                    })?,
-            );
+                    }
+                })?);
             sinks.insert(sink_cfg.name.clone(), built.clone());
             built
         };
         let storage = if let Some(existing) = storages.get(&storage_cfg.name) {
             existing.clone()
         } else {
-            let built: Arc<dyn Storage> = Arc::from(
-                registry
-                    .build_storage(storage_cfg)
-                    .await
-                    .map_err(|e| ValidationError::AccessFailed {
+            let built: Arc<dyn Storage> =
+                Arc::from(registry.build_storage(storage_cfg).await.map_err(|e| {
+                    ValidationError::AccessFailed {
                         component: "storage",
                         name: storage_cfg.name.clone(),
                         source: Box::new(e),
-                    })?,
-            );
+                    }
+                })?);
             storages.insert(storage_cfg.name.clone(), built.clone());
             built
         };
