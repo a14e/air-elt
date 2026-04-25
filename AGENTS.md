@@ -40,3 +40,4 @@ After a compaction, assume skills are not loaded — load them again before star
 * Prefer standard / typical components over hand-rolled code.
 * Do not delete comments without reason.
 * If you find a bug in the code via tests, fix it (even if it was outside the task scope). Tests exist precisely to catch and fix bugs.
+* perform reasoning in English
