@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -23,8 +24,8 @@ pub(crate) struct FlowRunner {
     shutdown: watch::Receiver<bool>,
     cursor: Option<CursorState>,
     backoff: Duration,
-    source_ctx: Option<Box<dyn SourceCtx>>,
-    sink_ctx: Option<Box<dyn SinkCtx>>,
+    source_ctx: Option<Arc<dyn SourceCtx>>,
+    sink_ctx: Option<Arc<dyn SinkCtx>>,
 }
 
 impl FlowRunner {
@@ -72,10 +73,10 @@ impl FlowRunner {
 
     async fn ensure_contexts(&mut self) -> RuntimeResult<()> {
         if self.source_ctx.is_none() {
-            self.source_ctx = Some(self.flow.source.init_context(&self.flow.read_spec).await?);
+            self.source_ctx = Some(self.flow.source.build_context(&self.flow.read_spec).await?);
         }
         if self.sink_ctx.is_none() {
-            self.sink_ctx = Some(self.flow.sink.init_context(&self.flow.write_spec).await?);
+            self.sink_ctx = Some(self.flow.sink.build_context(&self.flow.write_spec).await?);
         }
         Ok(())
     }
@@ -99,11 +100,16 @@ impl FlowRunner {
             return Ok(true);
         }
 
-        // Functional-style context threading: take ownership, pass through
-        // read_batch, get it back. If timeout/shutdown cancels the future,
-        // ctx is dropped — ensure_contexts() will recreate it on next tick.
-        let src_ctx = self.source_ctx.take().expect("ensured by ensure_contexts");
-        let (batch, src_ctx) = with_timeout(
+        // Arc-shared context: runner keeps its clone in self.source_ctx,
+        // future holds another. On async cancellation only the future's
+        // clone is dropped — runner state and cached schema / read_query
+        // survive into the next tick.
+        let src_ctx = self
+            .source_ctx
+            .as_ref()
+            .expect("ensured by ensure_contexts")
+            .clone();
+        let batch = with_timeout(
             &self.flow,
             "read_batch",
             self.flow
@@ -112,7 +118,6 @@ impl FlowRunner {
             &mut self.shutdown,
         )
         .await?;
-        self.source_ctx = Some(src_ctx);
 
         let batch_size = batch.rows.len();
 
@@ -139,9 +144,12 @@ impl FlowRunner {
     }
 
     async fn write_and_commit(&mut self, batch: &Batch) -> RuntimeResult<()> {
-        // See source_ctx comment in tick() — same cancellation-safety caveat.
-        let sink_ctx = self.sink_ctx.take().expect("ensured by ensure_contexts");
-        let (report, sink_ctx) = match with_timeout(
+        let sink_ctx = self
+            .sink_ctx
+            .as_ref()
+            .expect("ensured by ensure_contexts")
+            .clone();
+        let report = match with_timeout(
             &self.flow,
             "write_batch",
             self.flow
@@ -157,7 +165,6 @@ impl FlowRunner {
                 return Err(e);
             }
         };
-        self.sink_ctx = Some(sink_ctx);
 
         debug!(
             flow = %self.flow.name,
@@ -201,15 +208,16 @@ where
         res = tokio::time::timeout(flow.query_timeout, fut) => match res {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(RuntimeError::Other(format!(
-                "flow {:?} operation {op:?} timed out after {:?}",
-                flow.name, flow.query_timeout
-            ))),
+            Err(_) => Err(RuntimeError::Timeout {
+                flow: flow.name.clone(),
+                op,
+                after: flow.query_timeout,
+            }),
         },
-        _ = shutdown.changed() => Err(RuntimeError::Other(format!(
-            "flow {:?} operation {op:?} cancelled by shutdown",
-            flow.name
-        ))),
+        _ = shutdown.changed() => Err(RuntimeError::Cancelled {
+            flow: flow.name.clone(),
+            op,
+        }),
     }
 }
 
@@ -264,10 +272,24 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn shutdown_during_backoff_returns_ok() {
-        let flow = test_flow(mock_source_failing(100), mock_sink_ok(), mock_storage_ok());
+        // Build the source inline so we can enforce `.times(1..)`, proving
+        // that read_batch was actually called (and failed) before shutdown
+        // interrupted the subsequent backoff sleep.
+        let mut source = crate::traits::MockSource::new();
+        source
+            .expect_build_context()
+            .returning(|_| Ok(Arc::new(UnitSourceCtx)));
+        source
+            .expect_read_batch()
+            .times(1..) // must be called at least once; panics on drop if not
+            .returning(|_, _, _| Err(crate::error::RuntimeError::Other("source boom".into())));
+
+        let flow = test_flow(source, mock_sink_ok(), mock_storage_ok());
         let (tx, rx) = watch::channel(false);
         let handle =
             tokio::spawn(async move { FlowRunner::new(flow, RunMode::Daemon, rx).run().await });
+        // 500 ms < BACKOFF_INITIAL (1 s): runner is sleeping in backoff when
+        // shutdown fires, so the result must be Ok(()).
         tokio::time::advance(Duration::from_millis(500)).await;
         tx.send(true).unwrap();
         assert!(handle.await.unwrap().is_ok());

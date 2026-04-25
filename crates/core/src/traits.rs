@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::error::RuntimeResult;
@@ -10,13 +12,17 @@ use crate::model::{
 pub trait Source: Send + Sync {
     async fn validate_access(&self, spec: &ReadSpec) -> RuntimeResult<()>;
     async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema>;
-    async fn init_context(&self, spec: &ReadSpec) -> RuntimeResult<Box<dyn SourceCtx>>;
+    async fn build_context(&self, spec: &ReadSpec) -> RuntimeResult<Arc<dyn SourceCtx>>;
+    /// Read a batch. `ctx` is shared via `Arc`: the runner keeps its own
+    /// clone, the future holds another. Async cancellation (timeout /
+    /// shutdown) drops only the future's clone — the runner's ctx survives,
+    /// preserving any cached state inside ctx across ticks.
     async fn read_batch<'a>(
         &self,
         spec: &ReadSpec,
-        ctx: Box<dyn SourceCtx>,
+        ctx: Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
-    ) -> RuntimeResult<(Batch, Box<dyn SourceCtx>)>;
+    ) -> RuntimeResult<Batch>;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -24,13 +30,13 @@ pub trait Source: Send + Sync {
 pub trait Sink: Send + Sync {
     async fn validate_access(&self, spec: &WriteSpec) -> RuntimeResult<()>;
     async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema>;
-    async fn init_context(&self, spec: &WriteSpec) -> RuntimeResult<Box<dyn SinkCtx>>;
+    async fn build_context(&self, spec: &WriteSpec) -> RuntimeResult<Arc<dyn SinkCtx>>;
     async fn write_batch(
         &self,
         spec: &WriteSpec,
-        ctx: Box<dyn SinkCtx>,
+        ctx: Arc<dyn SinkCtx>,
         batch: &Batch,
-    ) -> RuntimeResult<(WriteReport, Box<dyn SinkCtx>)>;
+    ) -> RuntimeResult<WriteReport>;
 }
 
 #[cfg_attr(test, mockall::automock)]

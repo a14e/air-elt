@@ -141,6 +141,29 @@ mod tests {
     }
 
     #[test]
+    fn nullability_mismatch_rejected() {
+        let src = Schema::new(vec![Field {
+            name: "col".into(),
+            data_type: DataType::Int32,
+            nullable: true,
+        }]);
+        let dst = Schema::new(vec![Field {
+            name: "col".into(),
+            data_type: DataType::Int32,
+            nullable: false,
+        }]);
+        let err = check_mapping(&src, &dst, &[mapping("col", "col")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::NullabilityMismatch {
+                source_nullable: true,
+                sink_nullable: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn cursor_must_exist_in_source() {
         let src = Schema::new(vec![Field {
             name: "id".into(),

@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -22,9 +23,6 @@ struct PgSinkCtx {
 
 impl SinkCtx for PgSinkCtx {
     fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
     }
 }
@@ -105,7 +103,7 @@ impl Sink for PgSink {
         Ok(schema)
     }
 
-    async fn init_context(&self, spec: &WriteSpec) -> RuntimeResult<Box<dyn SinkCtx>> {
+    async fn build_context(&self, spec: &WriteSpec) -> RuntimeResult<Arc<dyn SinkCtx>> {
         let schema =
             air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, &spec.table).await?;
         let column_types: Vec<DataType> = spec
@@ -113,15 +111,15 @@ impl Sink for PgSink {
             .iter()
             .map(|c| {
                 schema.find(c).map(|f| f.data_type).ok_or_else(|| {
-                    RuntimeError::Other(format!(
-                        "column {c:?} missing in sink schema for {:?}",
-                        spec.table
-                    ))
+                    RuntimeError::SchemaColumnMissing {
+                        table: spec.table.clone(),
+                        column: c.clone(),
+                    }
                 })
             })
             .collect::<RuntimeResult<_>>()?;
         let insert_statement = sql::insert_statement(&spec.table, &spec.columns)?;
-        Ok(Box::new(PgSinkCtx {
+        Ok(Arc::new(PgSinkCtx {
             column_types,
             insert_statement,
         }))
@@ -130,23 +128,21 @@ impl Sink for PgSink {
     async fn write_batch(
         &self,
         _spec: &WriteSpec,
-        ctx: Box<dyn SinkCtx>,
+        ctx: Arc<dyn SinkCtx>,
         batch: &Batch,
-    ) -> RuntimeResult<(WriteReport, Box<dyn SinkCtx>)> {
+    ) -> RuntimeResult<WriteReport> {
         if batch.rows.is_empty() {
-            return Ok((WriteReport { rows_written: 0 }, ctx));
+            return Ok(WriteReport { rows_written: 0 });
         }
 
-        let pg_ctx = ctx
-            .as_any()
-            .downcast_ref::<PgSinkCtx>()
-            .ok_or_else(|| RuntimeError::Other("invalid sink context type".into()))?;
+        let pg_ctx = ctx.downcast_ref_to::<PgSinkCtx>()?;
 
         let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(&pg_ctx.insert_statement);
         let column_types_ref = &pg_ctx.column_types;
         qb.push_values(batch.rows.iter(), |mut tuple, row| {
             for (value, dt) in row.values.iter().zip(column_types_ref.iter()) {
                 match value {
+                    // Keep in sync with air_elt_commons::sql::pg::null_bind::bind_typed_null — the Separated lifetime forces inlining here.
                     Value::Null => match *dt {
                         DataType::Int64 => {
                             tuple.push_bind::<Option<i64>>(None);
@@ -233,6 +229,6 @@ impl Sink for PgSink {
 
         let rows_written = result.rows_affected();
         debug!(rows_written, "sink batch inserted");
-        Ok((WriteReport { rows_written }, ctx))
+        Ok(WriteReport { rows_written })
     }
 }

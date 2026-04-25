@@ -146,6 +146,22 @@ pub enum RuntimeError {
     #[error("config error: {0}")]
     Config(#[from] ConfigError),
 
+    #[error("flow {flow:?} operation {op} timed out after {after:?}")]
+    Timeout {
+        flow: String,
+        op: &'static str,
+        after: std::time::Duration,
+    },
+
+    #[error("flow {flow:?} operation {op} cancelled by shutdown")]
+    Cancelled { flow: String, op: &'static str },
+
+    #[error("context type mismatch: expected {expected}")]
+    ContextMismatch { expected: &'static str },
+
+    #[error("schema for table {table:?} is missing column {column:?}")]
+    SchemaColumnMissing { table: String, column: String },
+
     #[error("{0}")]
     Other(String),
 }

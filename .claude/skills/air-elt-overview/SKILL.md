@@ -36,7 +36,7 @@ air-elt/
 ├── crates/
 │   ├── app/                         # bin air-elt (CLI, mimalloc, tracing init, registry wiring)
 │   ├── core/                        # traits, types, config, validation, flow runner
-│   ├── commons/                     # tracing-init, sql::pg quoting, testing helpers
+│   ├── commons/                     # tracing-init, sql::pg (identifier, pool, schema, null_bind, pg_type), testing helpers
 │   ├── sources/postgres/            # PgSource
 │   ├── sinks/postgres/              # PgSink
 │   └── storages/postgres/           # PgStorage + migrations
@@ -92,6 +92,7 @@ batch-limit = 1024
 
 - Flow names must be unique across the root file and every `include`'d file.
 - `mapping` transform/timezone fields parse but fail with `UnsupportedInMvp` until transforms land.
+- Architecturally we allow an unbounded number of `include` files — only the per-file 16 MiB cap applies.
 
 ## Operating philosophy
 

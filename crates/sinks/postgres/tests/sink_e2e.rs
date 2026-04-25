@@ -73,8 +73,8 @@ async fn write_batch_and_validate_access() {
         ],
         next_cursor: None,
     };
-    let ctx = sink.init_context(&spec).await.expect("init_context");
-    let (report, _ctx) = sink.write_batch(&spec, ctx, &batch).await.expect("write");
+    let ctx = sink.build_context(&spec).await.expect("build_context");
+    let report = sink.write_batch(&spec, ctx, &batch).await.expect("write");
     assert_eq!(report.rows_written, 2);
 
     let rows: Vec<(i64, String, Option<serde_json::Value>)> =
@@ -151,8 +151,8 @@ async fn all_nulls_across_data_types() {
         rows: vec![CoreRow { values: row }],
         next_cursor: None,
     };
-    let ctx = sink.init_context(&spec).await.expect("init_context");
-    let (report, _ctx) = sink.write_batch(&spec, ctx, &batch).await.expect("write");
+    let ctx = sink.build_context(&spec).await.expect("build_context");
+    let report = sink.write_batch(&spec, ctx, &batch).await.expect("write");
     assert_eq!(report.rows_written, 1);
 
     // All NOT NULL arms decoded back as NULL. Separate query_as blocks keep
@@ -276,8 +276,8 @@ async fn all_types_non_null_round_trip() {
         next_cursor: None,
     };
 
-    let ctx = sink.init_context(&spec).await.expect("init_context");
-    let (report, _ctx) = sink.write_batch(&spec, ctx, &batch).await.expect("write");
+    let ctx = sink.build_context(&spec).await.expect("build_context");
+    let report = sink.write_batch(&spec, ctx, &batch).await.expect("write");
     assert_eq!(report.rows_written, 1);
 
     let (c_bool, c_i16, c_i32, c_i64): (bool, i16, i32, i64) =

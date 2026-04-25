@@ -456,4 +456,30 @@ cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
     .unwrap();
     assert_eq!(c_bytes.len(), 100);
     assert_eq!(c_json, serde_json::json!({"nested": {"deep": true}}));
+
+    // Verify row 2 extreme values survive the round-trip without corruption.
+    // Row 2 uses: i64::MAX, 0.0_f32 (zero-float binding), empty string, empty bytes,
+    // d2 (2026-12-31), ts2, u2, a JSON array, and all nullable columns NULL.
+    #[allow(clippy::type_complexity)]
+    let (c_bool2, c_i16_2, c_i32_2, c_i64_2, c_f32_2, c_f64_2, c_text2, c_bytes2, c_date2, c_ts2, c_uuid2, c_json2):
+        (bool, i16, i32, i64, f32, f64, String, Vec<u8>, NaiveDate, chrono::DateTime<chrono::Utc>, Uuid, serde_json::Value) =
+        sqlx::query_as(&format!(
+            "SELECT c_bool, c_i16, c_i32, c_i64, c_f32, c_f64, c_text, c_bytes, c_date, c_ts, c_uuid, c_json \
+             FROM \"{dst_schema}\".all_types WHERE id = 2"
+        ))
+        .fetch_one(&handle.pool)
+        .await
+        .unwrap();
+    assert!(!c_bool2, "row2 c_bool should be false");
+    assert_eq!(c_i16_2, -1_i16, "row2 c_i16");
+    assert_eq!(c_i32_2, -500_i32, "row2 c_i32");
+    assert_eq!(c_i64_2, i64::MAX, "row2 c_i64 must survive as i64::MAX");
+    assert_eq!(c_f32_2, 0.0_f32, "row2 c_f32 zero must not be dropped");
+    assert_eq!(c_f64_2, f64::MIN_POSITIVE, "row2 c_f64");
+    assert_eq!(c_text2, "", "row2 c_text should be empty string");
+    assert!(c_bytes2.is_empty(), "row2 c_bytes should be empty");
+    assert_eq!(c_date2, d2, "row2 c_date should match d2 (2026-12-31)");
+    assert_eq!(c_ts2, ts2, "row2 c_ts should match ts2");
+    assert_eq!(c_uuid2, u2, "row2 c_uuid should match u2");
+    assert_eq!(c_json2, serde_json::json!([1, 2, 3]), "row2 c_json array");
 }

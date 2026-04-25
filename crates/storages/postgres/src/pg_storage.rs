@@ -83,11 +83,15 @@ impl PgStorage {
         // Why: zero-row INSERT inside a rolled-back tx validates INSERT
         // privilege + column-type alignment without tripping sequences or
         // row-level triggers.
-        sqlx::query(sql::PROBE_INSERT_WHERE_FALSE)
+        // Store exec result first so rollback is always called even on error.
+        let exec_result = sqlx::query(sql::PROBE_INSERT_WHERE_FALSE)
             .execute(&mut *tx)
-            .await
-            .map_err(RuntimeError::backend)?;
+            .await;
+        // Why: explicit rollback even on error — sqlx Transaction::Drop sends
+        // async ROLLBACK via tokio::spawn, which may not complete if the runtime
+        // is shutting down. Explicit cleanup is more predictable.
         tx.rollback().await.map_err(RuntimeError::backend)?;
+        exec_result.map_err(RuntimeError::backend)?;
         Ok(())
     }
 }

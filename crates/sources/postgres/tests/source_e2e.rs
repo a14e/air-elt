@@ -60,10 +60,10 @@ async fn describe_and_read_with_cursor() {
     assert!(!id_field.nullable);
     assert_eq!(schema.find("name").unwrap().data_type, DataType::Text);
 
-    let ctx = source.init_context(&spec).await.expect("init_context");
+    let ctx = source.build_context(&spec).await.expect("build_context");
 
-    let (batch, ctx) = source
-        .read_batch(&spec, ctx, None)
+    let batch = source
+        .read_batch(&spec, ctx.clone(), None)
         .await
         .expect("read_batch initial");
     assert_eq!(batch.rows.len(), 3);
@@ -72,8 +72,8 @@ async fn describe_and_read_with_cursor() {
     assert_eq!(next.fields[0].name, "id");
     assert_eq!(next.fields[0].value, Value::Int64(3));
 
-    let (batch, ctx) = source
-        .read_batch(&spec, ctx, Some(&next))
+    let batch = source
+        .read_batch(&spec, ctx.clone(), Some(&next))
         .await
         .expect("read_batch continued");
     assert_eq!(batch.rows.len(), 2);
@@ -81,7 +81,7 @@ async fn describe_and_read_with_cursor() {
     assert_eq!(batch.rows[1].values[0], Value::Int64(5));
 
     let tail = batch.next_cursor.clone().unwrap();
-    let (empty, _ctx) = source
+    let empty = source
         .read_batch(&spec, ctx, Some(&tail))
         .await
         .expect("read_batch drained");
@@ -131,10 +131,13 @@ async fn read_with_nullable_cursor() {
         limit: 2,
     };
 
-    let ctx = source.init_context(&spec).await.expect("init_context");
+    let ctx = source.build_context(&spec).await.expect("build_context");
 
     // First batch: NULL rows come first (NULLS FIRST): (NULL,2), (NULL,4)
-    let (batch, ctx) = source.read_batch(&spec, ctx, None).await.expect("batch 1");
+    let batch = source
+        .read_batch(&spec, ctx.clone(), None)
+        .await
+        .expect("batch 1");
     assert_eq!(batch.rows.len(), 2);
     assert_eq!(batch.rows[0].values[1], Value::Null);
     assert_eq!(batch.rows[0].values[0], Value::Int64(2));
@@ -151,8 +154,8 @@ async fn read_with_nullable_cursor() {
 
     // Second batch: cursor=(NULL,4) → null-aware path.
     // ASC + NULL cursor: col > NULL → IS NOT NULL. Gets non-null rows: (1,1), (3,3)
-    let (batch, ctx) = source
-        .read_batch(&spec, ctx, Some(&cursor1))
+    let batch = source
+        .read_batch(&spec, ctx.clone(), Some(&cursor1))
         .await
         .expect("batch 2");
     assert_eq!(batch.rows.len(), 2);
@@ -161,7 +164,7 @@ async fn read_with_nullable_cursor() {
 
     // Drain
     let cursor2 = batch.next_cursor.expect("cursor after batch 2");
-    let (empty, _ctx) = source
+    let empty = source
         .read_batch(&spec, ctx, Some(&cursor2))
         .await
         .expect("drain");

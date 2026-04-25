@@ -17,15 +17,23 @@ use crate::model::codec;
 use crate::sql_statements as sql;
 
 struct PgSourceCtx {
-    schema: Arc<Schema>,
-    read_query: Option<Arc<sql::ReadQuery>>,
+    /// Pre-built plan for the initial tick (no cursor → no WHERE).
+    initial_read_query: Arc<sql::ReadQuery>,
+    /// Pre-built plan for the all-non-null cursor path. Cursor values are
+    /// bound per-call; only the SQL shape is cached. The null-cursor path
+    /// rebuilds per call because its predicate shape varies per null
+    /// pattern.
+    non_null_read_query: Arc<sql::ReadQuery>,
+    column_types: Vec<DataType>,
+    cursor_types: Vec<DataType>,
+    cursor_nullable: Vec<bool>,
+    /// Pre-computed cursor → column index lookup, hoisted out of the row
+    /// decode loop.
+    cursor_to_column: Vec<Option<usize>>,
 }
 
 impl SourceCtx for PgSourceCtx {
     fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
     }
 }
@@ -97,71 +105,85 @@ impl Source for PgSource {
         Ok(schema)
     }
 
-    async fn init_context(&self, spec: &ReadSpec) -> RuntimeResult<Box<dyn SourceCtx>> {
+    async fn build_context(&self, spec: &ReadSpec) -> RuntimeResult<Arc<dyn SourceCtx>> {
         let schema = Arc::new(
             air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, &spec.table).await?,
         );
-        Ok(Box::new(PgSourceCtx {
-            schema,
-            read_query: None,
+        let column_types = resolve_types(&schema, &spec.columns, &spec.table)?;
+        let cursor_types = resolve_types(&schema, &spec.cursor_fields, &spec.table)?;
+        let cursor_nullable: Vec<bool> = spec
+            .cursor_fields
+            .iter()
+            .map(|name| schema.find(name).map(|f| f.nullable).unwrap_or(false))
+            .collect();
+        let cursor_to_column: Vec<Option<usize>> = spec
+            .cursor_fields
+            .iter()
+            .map(|cf| spec.columns.iter().position(|c| c == cf))
+            .collect();
+        // Pre-build two static plans up front. Cursor values are bound at
+        // call time; only SQL shape is cached. The null-aware path stays
+        // dynamic because its predicate shape varies per null pattern.
+        let initial_read_query = Arc::new(sql::build_read_batch(
+            &spec.table,
+            &spec.columns,
+            &spec.cursor_fields,
+            spec.cursor_order,
+            None,
+            &cursor_nullable,
+        )?);
+        // Build a sentinel cursor state with non-null placeholder values to
+        // stamp out the SQL shape for the all-non-null path. The placeholder
+        // type doesn't matter — bind_order is positional and real values are
+        // bound at read time.
+        let sentinel_fields: Vec<CursorFieldValue> = spec
+            .cursor_fields
+            .iter()
+            .map(|name| CursorFieldValue {
+                name: name.clone(),
+                value: Value::Int64(0),
+            })
+            .collect();
+        let sentinel_state = CursorState::new(sentinel_fields);
+        let non_null_read_query = Arc::new(sql::build_read_batch(
+            &spec.table,
+            &spec.columns,
+            &spec.cursor_fields,
+            spec.cursor_order,
+            Some(&sentinel_state),
+            &cursor_nullable,
+        )?);
+        Ok(Arc::new(PgSourceCtx {
+            initial_read_query,
+            non_null_read_query,
+            column_types,
+            cursor_types,
+            cursor_nullable,
+            cursor_to_column,
         }))
     }
 
     async fn read_batch<'a>(
         &self,
         spec: &ReadSpec,
-        ctx: Box<dyn SourceCtx>,
+        ctx: Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
-    ) -> RuntimeResult<(Batch, Box<dyn SourceCtx>)> {
-        let mut pg_ctx = ctx
-            .into_any()
-            .downcast::<PgSourceCtx>()
-            .map_err(|_| RuntimeError::Other("invalid source context type".into()))?;
+    ) -> RuntimeResult<Batch> {
+        let pg_ctx = ctx.downcast_ref_to::<PgSourceCtx>()?;
 
-        let column_types = resolve_types(&pg_ctx.schema, &spec.columns, &spec.table)?;
-        let cursor_types = resolve_types(&pg_ctx.schema, &spec.cursor_fields, &spec.table)?;
-        let cursor_nullable: Vec<bool> = spec
-            .cursor_fields
-            .iter()
-            .map(|name| {
-                pg_ctx
-                    .schema
-                    .find(name)
-                    .map(|f| f.nullable)
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        // Cache read_query for non-null cursors; rebuild when any cursor value
-        // is NULL because the SQL predicate changes per null-pattern.
-        let all_non_null = cursor
-            .map(|c| c.fields.iter().all(|f| !f.value.is_null()))
-            .unwrap_or(false);
-
-        let query_plan = if all_non_null {
-            if let Some(cached) = &pg_ctx.read_query {
-                cached.clone()
-            } else {
-                let plan = Arc::new(sql::build_read_batch(
-                    &spec.table,
-                    &spec.columns,
-                    &spec.cursor_fields,
-                    spec.cursor_order,
-                    cursor,
-                    &cursor_nullable,
-                )?);
-                pg_ctx.read_query = Some(plan.clone());
-                plan
+        let query_plan = match cursor {
+            None => pg_ctx.initial_read_query.clone(),
+            Some(c) if c.fields.iter().all(|f| !f.value.is_null()) => {
+                pg_ctx.non_null_read_query.clone()
             }
-        } else {
-            Arc::new(sql::build_read_batch(
+            Some(_) => Arc::new(sql::build_read_batch(
                 &spec.table,
                 &spec.columns,
                 &spec.cursor_fields,
                 spec.cursor_order,
                 cursor,
-                &cursor_nullable,
-            )?)
+                &pg_ctx.cursor_nullable,
+            )?),
         };
 
         debug!(sql = %query_plan.sql, "read_batch sql");
@@ -183,7 +205,7 @@ impl Source for PgSource {
                             field.name
                         ))
                     })?;
-                let dt = cursor_types[cursor_field_pos];
+                let dt = pg_ctx.cursor_types[cursor_field_pos];
                 query = codec::bind_cursor_value(query, &field.value, dt);
             }
         }
@@ -200,14 +222,14 @@ impl Source for PgSource {
         let mut last_cursor_values: Option<Vec<Value>> = None;
         for row in &rows {
             let mut values = Vec::with_capacity(spec.columns.len());
-            for (idx, dt) in column_types.iter().enumerate() {
+            for (idx, dt) in pg_ctx.column_types.iter().enumerate() {
                 values.push(codec::decode_column(row, idx, *dt)?);
             }
 
             let mut cursor_values = Vec::with_capacity(spec.cursor_fields.len());
             for (cf_idx, cursor_field) in spec.cursor_fields.iter().enumerate() {
-                let dt = cursor_types[cf_idx];
-                let value = match spec.columns.iter().position(|c| c == cursor_field) {
+                let dt = pg_ctx.cursor_types[cf_idx];
+                let value = match pg_ctx.cursor_to_column[cf_idx] {
                     Some(i) => values[i].clone(),
                     None => {
                         // Cursor fields are guaranteed by validation to also
@@ -245,13 +267,10 @@ impl Source for PgSource {
             CursorState::new(fields)
         });
 
-        Ok((
-            Batch {
-                rows: out_rows,
-                next_cursor,
-            },
-            pg_ctx as Box<dyn SourceCtx>,
-        ))
+        Ok(Batch {
+            rows: out_rows,
+            next_cursor,
+        })
     }
 }
 

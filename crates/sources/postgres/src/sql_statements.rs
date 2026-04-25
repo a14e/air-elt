@@ -5,7 +5,7 @@
 //! reused across ticks (the sink builds its own INSERT per batch via
 //! `QueryBuilder`).
 
-use air_elt_commons::sql::pg::identifier::{quote_columns, quote_qualified};
+use air_elt_commons::sql::pg::identifier::{quote_columns, quote_ident, quote_qualified};
 use air_elt_core::config::model::CursorOrder;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::model::CursorState;
@@ -70,7 +70,7 @@ pub fn build_read_batch(
         if i > 0 {
             order_by.push_str(", ");
         }
-        let quoted = air_elt_commons::sql::pg::identifier::quote_ident(cf);
+        let quoted = quote_ident(cf);
         order_by.push_str(&format!("{quoted} {order_sql} {nulls_sql}"));
     }
 
@@ -139,7 +139,7 @@ fn plain_tuple_compare(
     };
     let quoted_cols = cursor_fields
         .iter()
-        .map(|c| air_elt_commons::sql::pg::identifier::quote_ident(c))
+        .map(|c| quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
     let mut placeholders = String::new();
@@ -191,7 +191,7 @@ fn null_aware_gt(
 
 /// `col IS NOT DISTINCT FROM $N` (postgres NULL-safe equality).
 fn nullable_eq(col: &str, v: &Value, bind_order: &mut Vec<usize>, state: &CursorState) -> String {
-    let quoted = air_elt_commons::sql::pg::identifier::quote_ident(col);
+    let quoted = quote_ident(col);
     if matches!(v, Value::Null) {
         format!("{quoted} IS NULL")
     } else {
@@ -214,7 +214,7 @@ fn nullable_cmp(
     bind_order: &mut Vec<usize>,
     state: &CursorState,
 ) -> String {
-    let quoted = air_elt_commons::sql::pg::identifier::quote_ident(col);
+    let quoted = quote_ident(col);
     match (order, matches!(v, Value::Null)) {
         (CursorOrder::Asc, true) => {
             // ASC strict-gt: col > NULL. Since NULL is minimum, anything

@@ -93,6 +93,10 @@ async fn cursor_roundtrip_all_value_variants() {
         ("c_ts", Value::Timestamp(ts)),
         ("c_uuid", Value::Uuid(uuid)),
         ("c_json", Value::Json(json.clone())),
+        // edge cases: empty collections
+        ("c_bytes_empty", Value::Bytes(vec![])),
+        ("c_text_empty", Value::Text(String::new())),
+        ("c_json_empty_obj", Value::Json(serde_json::json!({}))),
     ];
 
     for (flow, value) in &variants {

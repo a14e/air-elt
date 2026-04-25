@@ -90,6 +90,7 @@ pub async fn assemble(
             source,
             sink,
             storage,
+            mappings,
             read_spec,
             write_spec,
             interval,
@@ -150,20 +151,7 @@ pub async fn validate(flows: &[FlowState]) -> Result<(), ValidationError> {
             })?;
 
         checks::check_cursor(&flow.name, &src_schema, &flow.read_spec.cursor_fields)?;
-
-        // Invariant: read_spec.columns and write_spec.columns are positionally
-        // paired by assemble() — both derived from the same ordered mappings vec.
-        let mappings: Vec<crate::mapping::ColumnMapping> = flow
-            .read_spec
-            .columns
-            .iter()
-            .zip(flow.write_spec.columns.iter())
-            .map(|(from, to)| crate::mapping::ColumnMapping {
-                from: from.clone(),
-                to: to.clone(),
-            })
-            .collect();
-        checks::check_mapping(&src_schema, &dst_schema, &mappings)?;
+        checks::check_mapping(&src_schema, &dst_schema, &flow.mappings)?;
 
         info!(flow = %flow.name, "flow validated");
     }

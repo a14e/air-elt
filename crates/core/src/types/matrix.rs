@@ -91,4 +91,38 @@ mod tests {
         assert!(!is_compatible(DataType::Text, DataType::Uuid));
         assert!(!is_compatible(DataType::Date, DataType::Timestamp));
     }
+
+    #[test]
+    fn int_to_float_lossy_rejected() {
+        // Int32 mantissa exceeds f32 precision — rejected
+        assert!(!is_compatible(DataType::Int32, DataType::Float32));
+        // Float64→Int64 is a lossy narrowing — rejected
+        assert!(!is_compatible(DataType::Float64, DataType::Int64));
+    }
+
+    #[test]
+    fn int_to_float_widening_allowed() {
+        // These widening paths must remain allowed
+        assert!(is_compatible(DataType::Int16, DataType::Float32));
+        assert!(is_compatible(DataType::Int16, DataType::Float64));
+        assert!(is_compatible(DataType::Int32, DataType::Float64));
+    }
+
+    #[test]
+    fn bytes_text_incompatible_both_directions() {
+        assert!(!is_compatible(DataType::Bytes, DataType::Text));
+        assert!(!is_compatible(DataType::Text, DataType::Bytes));
+    }
+
+    #[test]
+    fn json_text_incompatible_both_directions() {
+        assert!(!is_compatible(DataType::Json, DataType::Text));
+        assert!(!is_compatible(DataType::Text, DataType::Json));
+    }
+
+    #[test]
+    fn date_timestamp_incompatible_both_directions() {
+        assert!(!is_compatible(DataType::Date, DataType::Timestamp));
+        assert!(!is_compatible(DataType::Timestamp, DataType::Date));
+    }
 }
