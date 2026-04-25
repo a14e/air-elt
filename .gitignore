@@ -31,3 +31,4 @@ Thumbs.db
 *.tmp
 /.claude/scheduled_tasks.lock
 /.claude/settings.json
+/.claude/agent-memory
