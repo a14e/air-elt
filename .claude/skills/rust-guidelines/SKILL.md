@@ -19,6 +19,7 @@ The codebase favours clarity over cleverness. Code is read far more often than w
 - Avoid magic numbers — prefer configs.
 - Prefer small code duplication over coupling.
 - Avoid "nano functions" that perform a single command or a routine operation. Small methods are allowed if they comply with OOP.
+- use ahash instead of std::collections::HashMap
 
 ## Timeouts and cancellation safety
 

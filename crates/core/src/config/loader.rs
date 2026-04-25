@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+
+use ahash::AHashSet;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -19,7 +21,7 @@ const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 /// Include entries are **relative to the including file's directory**;
 /// absolute paths are rejected so operators can't accidentally walk the whole
 /// filesystem. Directories are read non-recursively for `*.toml` files in
-/// sorted order. Canonical paths are tracked in a HashSet so symlink loops
+/// sorted order. Canonical paths are tracked in a AHashSet so symlink loops
 /// visit each real file at most once.
 pub fn load<P: AsRef<Path>>(path: P) -> Result<RootConfig, ConfigError> {
     let path = path.as_ref().to_path_buf();
@@ -95,13 +97,13 @@ fn extract_secrets(raw: &str, path: &Path) -> Result<BTreeMap<String, String>, C
 }
 
 struct PathCycleDetector {
-    visited: HashSet<PathBuf>,
+    visited: AHashSet<PathBuf>,
 }
 
 impl PathCycleDetector {
     fn new() -> Self {
         Self {
-            visited: HashSet::new(),
+            visited: AHashSet::new(),
         }
     }
 
@@ -231,6 +233,18 @@ fn validate_post_merge(root: &RootConfig) -> Result<(), ConfigError> {
                 reason: format!("flow {flow_name:?} has batch-limit = 0"),
             });
         }
+        if flow.cursor.interval.is_zero() {
+            return Err(ConfigError::Invalid {
+                reason: format!("flow {flow_name:?} has zero cursor interval"),
+            });
+        }
+        if let Some(t) = flow.query_timeout {
+            if t.is_zero() {
+                return Err(ConfigError::Invalid {
+                    reason: format!("flow {flow_name:?} has zero query-timeout"),
+                });
+            }
+        }
         // Why: Postgres rejects statements with more than 65 535 bind parameters
         // (wire protocol uses u16 for bind-count). A sink batch of N rows over
         // C mapped columns emits N*C binds; we cap below the hard limit so
@@ -249,7 +263,7 @@ fn validate_post_merge(root: &RootConfig) -> Result<(), ConfigError> {
         // Cursor fields must appear in mapping.from — otherwise the source
         // SELECT will not project them and runtime will emit a misleading
         // error. This used to be a silent dead-fallback in pg_source.
-        let mapped_froms: HashSet<&str> = flow
+        let mapped_froms: AHashSet<&str> = flow
             .mapping
             .iter()
             .map(|m| match m {
@@ -472,6 +486,79 @@ cursor = {{ fields = ["c0"] }}
         );
         let err = load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid { .. }));
+    }
+
+    #[test]
+    fn zero_cursor_interval_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "config.toml",
+            r#"
+[[sources]]
+name = "pg"
+type = "postgres"
+config = {}
+[[sinks]]
+name = "pg"
+type = "postgres"
+config = {}
+[[storages]]
+name = "pg"
+type = "postgres"
+config = {}
+[flow.f]
+source = "pg"
+sink = "pg"
+storage = "pg"
+from = "t"
+to = "t"
+mapping = [{ from = "id", to = "id" }]
+cursor = { fields = ["id"], interval = "0s" }
+"#,
+        );
+        let err = load(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("zero"),
+            "expected zero-duration error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_query_timeout_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "config.toml",
+            r#"
+[[sources]]
+name = "pg"
+type = "postgres"
+config = {}
+[[sinks]]
+name = "pg"
+type = "postgres"
+config = {}
+[[storages]]
+name = "pg"
+type = "postgres"
+config = {}
+[flow.f]
+source = "pg"
+sink = "pg"
+storage = "pg"
+from = "t"
+to = "t"
+query-timeout = "0s"
+mapping = [{ from = "id", to = "id" }]
+cursor = { fields = ["id"] }
+"#,
+        );
+        let err = load(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("zero"),
+            "expected zero-duration error, got: {err}"
+        );
     }
 
     #[test]

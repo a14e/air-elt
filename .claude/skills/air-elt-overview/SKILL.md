@@ -105,7 +105,7 @@ Validation phase prioritises **correctness**: every access probe, type check, an
 
 ## NULL-cursor algebra
 
-Cursor columns may be nullable. Non-null cursors use `(c1,c2) > ($1,$2)`; if any cursor field is NULL, SQL rewrites to a null-aware predicate ("NULL > everything", matching Postgres NULLS LAST). All-NULL cursor returns `FALSE` — drain stalls deliberately. Direction is per-column (`c1 DESC, c2 DESC`).
+Cursor columns may be nullable. NULL is treated as the minimum element: `NULL < any_non_null` and `NULL == NULL`. ORDER BY uses `ASC NULLS FIRST` / `DESC NULLS LAST` to match. Non-null cursors use plain `(c1,c2) > ($1,$2)`; if any cursor value is NULL, SQL rewrites to a null-aware lexicographic predicate. ASC + all-NULL cursor reads all non-null rows (NULL is minimum); DESC + all-NULL cursor returns `FALSE` (nothing below minimum). Direction is per-column.
 
 ## Explicit out-of-MVP list
 
@@ -121,6 +121,7 @@ Cursor columns may be nullable. Non-null cursors use `(c1,c2) > ($1,$2)`; if any
 - `air-elt validate --config <path>` — full validation pipeline (runs real access probes).
 - `air-elt migrate --config <path>` — runs `Storage::migrate` for every declared storage.
 - `air-elt run --config <path>` — daemon (micro-batch + drain) with graceful shutdown on SIGTERM/Ctrl-C. Use `--once` to drain a single tick and exit (used by e2e tests).
+- `air-elt` (no subcommand) — shorthand for `run --config ./config.toml`.
 
 ## Testing
 

@@ -1,32 +1,36 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::any::Any;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{PgPool, QueryBuilder, Row};
-use tokio::sync::Mutex;
 use tracing::{debug, info};
 use uuid::Uuid;
 
 use air_elt_commons::sql::pg::pool;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
-use air_elt_core::model::Schema;
-use air_elt_core::model::{Batch, WriteReport, WriteSpec};
+use air_elt_core::model::{Batch, Schema, SinkCtx, WriteReport, WriteSpec};
 use air_elt_core::traits::Sink;
 use air_elt_core::types::{DataType, Value};
 
 use crate::config::model::PgSinkConfig;
 use crate::sql_statements as sql;
 
-struct SinkFlowCache {
-    schema: Arc<Schema>,
-    column_types: Arc<Vec<DataType>>,
-    insert_prefix: Arc<String>,
+struct PgSinkCtx {
+    column_types: Vec<DataType>,
+    insert_statement: String,
+}
+
+impl SinkCtx for PgSinkCtx {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
 }
 
 pub struct PgSink {
     pool: PgPool,
-    cache: Mutex<HashMap<String, SinkFlowCache>>,
 }
 
 impl PgSink {
@@ -44,10 +48,7 @@ impl PgSink {
             ),
         )
         .await?;
-        Ok(Self {
-            pool,
-            cache: Mutex::new(HashMap::new()),
-        })
+        Ok(Self { pool })
     }
 
     async fn ensure_connection_alive(&self) -> RuntimeResult<()> {
@@ -79,49 +80,14 @@ impl PgSink {
         // and column types.
         let stmt = sql::probe_insert_where_false(&spec.table, &spec.columns)?;
         let mut tx = self.pool.begin().await.map_err(RuntimeError::backend)?;
-        sqlx::query(&stmt)
-            .execute(&mut *tx)
-            .await
-            .map_err(RuntimeError::backend)?;
+        let exec_result = sqlx::query(&stmt).execute(&mut *tx).await;
+        // Why: explicit rollback even on error — sqlx Transaction::Drop sends
+        // async ROLLBACK via tokio::spawn, which may not complete if the runtime
+        // is shutting down. The probe has no side effects, but explicit cleanup
+        // is more predictable.
         tx.rollback().await.map_err(RuntimeError::backend)?;
+        exec_result.map_err(RuntimeError::backend)?;
         Ok(())
-    }
-
-    async fn cached_flow(
-        &self,
-        spec: &WriteSpec,
-    ) -> RuntimeResult<(Arc<Vec<DataType>>, Arc<String>)> {
-        {
-            let guard = self.cache.lock().await;
-            if let Some(entry) = guard.get(&spec.table) {
-                return Ok((entry.column_types.clone(), entry.insert_prefix.clone()));
-            }
-        }
-        let schema = Arc::new(
-            air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, &spec.table).await?,
-        );
-        let column_types: Vec<DataType> = spec
-            .columns
-            .iter()
-            .map(|c| {
-                schema.find(c).map(|f| f.data_type).ok_or_else(|| {
-                    RuntimeError::Other(format!(
-                        "column {c:?} missing in sink schema for {:?}",
-                        spec.table
-                    ))
-                })
-            })
-            .collect::<RuntimeResult<_>>()?;
-        let prefix = sql::insert_prefix(&spec.table, &spec.columns)?;
-        let column_types = Arc::new(column_types);
-        let prefix = Arc::new(prefix);
-        let mut guard = self.cache.lock().await;
-        let entry = guard.entry(spec.table.clone()).or_insert(SinkFlowCache {
-            schema,
-            column_types: column_types.clone(),
-            insert_prefix: prefix.clone(),
-        });
-        Ok((entry.column_types.clone(), entry.insert_prefix.clone()))
     }
 }
 
@@ -135,24 +101,49 @@ impl Sink for PgSink {
     }
 
     async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema> {
-        {
-            let guard = self.cache.lock().await;
-            if let Some(entry) = guard.get(table) {
-                return Ok((*entry.schema).clone());
-            }
-        }
         let schema = air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, table).await?;
         Ok(schema)
     }
 
-    async fn write_batch(&self, spec: &WriteSpec, batch: &Batch) -> RuntimeResult<WriteReport> {
+    async fn init_context(&self, spec: &WriteSpec) -> RuntimeResult<Box<dyn SinkCtx>> {
+        let schema =
+            air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, &spec.table).await?;
+        let column_types: Vec<DataType> = spec
+            .columns
+            .iter()
+            .map(|c| {
+                schema.find(c).map(|f| f.data_type).ok_or_else(|| {
+                    RuntimeError::Other(format!(
+                        "column {c:?} missing in sink schema for {:?}",
+                        spec.table
+                    ))
+                })
+            })
+            .collect::<RuntimeResult<_>>()?;
+        let insert_statement = sql::insert_statement(&spec.table, &spec.columns)?;
+        Ok(Box::new(PgSinkCtx {
+            column_types,
+            insert_statement,
+        }))
+    }
+
+    async fn write_batch(
+        &self,
+        _spec: &WriteSpec,
+        ctx: Box<dyn SinkCtx>,
+        batch: &Batch,
+    ) -> RuntimeResult<(WriteReport, Box<dyn SinkCtx>)> {
         if batch.rows.is_empty() {
-            return Ok(WriteReport { rows_written: 0 });
+            return Ok((WriteReport { rows_written: 0 }, ctx));
         }
 
-        let (column_types, prefix) = self.cached_flow(spec).await?;
-        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new((*prefix).clone());
-        let column_types_ref = &column_types;
+        let pg_ctx = ctx
+            .as_any()
+            .downcast_ref::<PgSinkCtx>()
+            .ok_or_else(|| RuntimeError::Other("invalid sink context type".into()))?;
+
+        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(&pg_ctx.insert_statement);
+        let column_types_ref = &pg_ctx.column_types;
         qb.push_values(batch.rows.iter(), |mut tuple, row| {
             for (value, dt) in row.values.iter().zip(column_types_ref.iter()) {
                 match value {
@@ -242,6 +233,6 @@ impl Sink for PgSink {
 
         let rows_written = result.rows_affected();
         debug!(rows_written, "sink batch inserted");
-        Ok(WriteReport { rows_written })
+        Ok((WriteReport { rows_written }, ctx))
     }
 }

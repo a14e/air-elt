@@ -26,6 +26,7 @@ air-elt-source-postgres = { path = "crates/sources/postgres", version = "0.1.0" 
 air-elt-sink-postgres = { path = "crates/sinks/postgres", version = "0.1.0" }
 air-elt-storage-postgres = { path = "crates/storages/postgres", version = "0.1.0" }
 
+ahash = "0.8.11"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "test-util"] }
 async-trait = "0.1.89"
 serde = { version = "1.0.228", features = ["derive"] }

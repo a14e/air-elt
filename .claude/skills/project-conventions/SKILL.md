@@ -101,10 +101,11 @@ Factories are `#[async_trait]` traits in `core::registry`, each with `async fn b
 
 Wire connectors in `app::registry::build_registry()` via zero-sized structs (`struct PgSourceFactory;`). Do not construct connectors directly from flow code.
 
-## Runner and timeouts
+## Engine and timeouts
 
-- **`core::flow::runner::run_all_flows`** — single fan-out entry point. Wraps every DB call in `tokio::time::timeout` + `tokio::select!` with shutdown watcher.
-- `operation_timeout_secs` on `FlowConfig` overrides the 30s default.
+- **`core::flow::engine::FlowEngine`** — fan-out entry point. `FlowEngine::new(flows, mode, shutdown).run()` spawns one `FlowRunner` per flow. Each runner wraps every DB call in `tokio::time::timeout` + `tokio::select!` with shutdown watcher.
+- **`core::flow::runner::FlowRunner`** — per-flow tick loop with exponential backoff (pub(crate), used by FlowEngine).
+- `query_timeout` on `FlowConfig` overrides the 30s default.
 
 ## Errors
 

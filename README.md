@@ -27,6 +27,9 @@ cargo run -p air-elt-app -- run --config examples/pg-to-pg/config.toml
 
 # One-shot drain
 cargo run -p air-elt-app -- run --once --config examples/pg-to-pg/config.toml
+
+# Shorthand: no subcommand → daemon mode with ./config.toml
+cargo run -p air-elt-app
 ```
 
 ## Tests

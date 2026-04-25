@@ -1,41 +1,42 @@
-# Рекомендации по проекту
+# Project guidelines
 
-## Обязательные skill'ы
+## Mandatory skills
 
-(Обязательно) При исследовании проекта читай `air-elt-overview`
-(Обязательно) При написании кода и планирвоании используй также `rust-guidelines`, `project-conventions`
-Если треббуется работа с конфигами использой `config-format`.
-Экономь контекст и используй для этого `context-saving`.
-Используй тулы для скилов вместо прямого чтения файлов.
+(Mandatory) When exploring the project, read `air-elt-overview`.
+(Mandatory) When writing code or planning, also use `rust-guidelines` and `project-conventions`.
+If you need to work with configs, use `config-format`.
+Save context using `context-saving`.
+Use the skill tools rather than reading skill files directly.
 
-Если добавляется новая общая утилита — задокументируй её в `project-conventions`.
+If you add a new shared utility — document it in `project-conventions`.
 
-(Обязательно) При редактировании скилов использую соответствующий скил `skill-authoring`
+(Mandatory) When editing skills, use the `skill-authoring` skill.
 
-При обновлении конфигов также обновляй и `config-format`
+When updating configs, also update `config-format`.
 
-После компакшена считай что скилы не были прогружены и их надо грузить заново перед началом соответствующих работ.
+After a compaction, assume skills are not loaded — load them again before starting the corresponding work.
 
-## Правила работы
+## Working rules
 
-* На каждую доработку (кроме тестов и метрик) пиши тесты.
-* Всегда проверяй тесты после работы.
-* Все версии библиотек всегда должны быть явно указаны.
-* Избегай git-операций на апдейте.
-* Инструкции для человека — в `README.md`.
-* Задания агентам ведутся в `agent_tasks/`.
-* Если не работает Docker, проверяй podman; используй подман в первом приоритете.
-* Удаляй все временные файлы, которые создаёшь.
-* После каждой доработки вызывай `cargo fmt` и `cargo clippy --all-targets --workspace -- -D warnings`.
-* Пропускать этапы из плана можно только с согласия пользователя.
-* После выполнения задач запускай агентов-валидаторов.
-* выбирай как можно больше агентов, исключай только те, которые явно не были задеты. если косвенно задеты -- вызывай
-* Добавляй файлы в `.gitignore`, если они временные или не нужны в гите.
-* запускай скилы по расту, структуре проекта и по конвенциям в проекте перед выполнением задач (агента также должны их читать)
-* после выполнения каждой задачи запускай агентов-валидаторов (см. ниже)
-* когда нужно прочитать скилы -- используй тулы для скилов вместо прямого чтения файлов
-* с пользователем общаешься на его языке. но в коде строго английский
-* не используй редактирование кода как способ задать вопрос пользователю. (иногда включен  auto edit). 
-в случае вопросов либо запроси форму вопроса, либо остановись и подожди ответа
-* старайся предпочитать стандартные/типовые компоненты по сравнению с самописным кодом
-* не удаляй комментарии просто так
+* Every change (except tests and metrics) must come with tests.
+* Always run tests after the work is done.
+* All library versions must be pinned explicitly.
+* Avoid git operations on update.
+* Human-facing instructions live in `README.md`.
+* Agent tasks live in `agent_tasks/`.
+* If Docker is unavailable, check podman; prefer podman.
+* Delete every temporary file you create.
+* After every change, run `cargo fmt` and `cargo clippy --all-targets --workspace -- -D warnings`.
+* You may skip plan steps only with the user's consent.
+* After completing tasks, run validator agents.
+* Pick as many agents as possible; exclude only those clearly untouched. If touched indirectly — invoke them.
+* Add files to `.gitignore` if they are temporary or do not belong in git.
+* Run the Rust, project-structure, and project-conventions skills before tasks (agents must read them too).
+* After each task, run validator agents (see below).
+* When you need to read a skill — use the skill tools instead of reading the file directly.
+* Talk to the user in their language. In code, strictly English.
+* Do not use code edits as a way to ask the user a question (auto edit may be on).
+  If you have a question, either request a question form or stop and wait for an answer.
+* Prefer standard / typical components over hand-rolled code.
+* Do not delete comments without reason.
+* If you find a bug in the code via tests, fix it (even if it was outside the task scope). Tests exist precisely to catch and fix bugs.

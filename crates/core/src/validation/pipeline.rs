@@ -1,36 +1,26 @@
-use std::sync::Arc;
+use std::time::Duration;
 
 use tracing::info;
 
 use crate::config::model::RootConfig;
 use crate::error::{RuntimeError, ValidationError};
-use crate::mapping::{self};
-use crate::model::{ReadSpec, WriteSpec};
+use crate::mapping;
+use crate::model::{FlowState, ReadSpec, WriteSpec};
 use crate::registry::Registry;
-use crate::traits::{Sink, Source, Storage};
 use crate::validation::checks;
 
-/// The bundle of resolved components + compiled artifacts for a single flow.
-pub struct ResolvedFlow {
-    pub name: String,
-    pub source: Arc<dyn Source>,
-    pub sink: Arc<dyn Sink>,
-    pub storage: Arc<dyn Storage>,
-    pub read_spec: ReadSpec,
-    pub write_spec: WriteSpec,
-    pub interval: std::time::Duration,
-    pub query_timeout: std::time::Duration,
-}
+const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Stepped validator. Each step emits a typed error and logs the outcome.
-pub async fn validate(
+/// Assemble flows from config: look up components, build via registry,
+/// construct ReadSpec/WriteSpec. No I/O validation — just wiring.
+pub async fn assemble(
     root: &RootConfig,
     registry: &Registry,
-) -> Result<Vec<ResolvedFlow>, ValidationError> {
-    let mut resolved = Vec::with_capacity(root.flow.len());
+) -> Result<Vec<FlowState>, ValidationError> {
+    let mut flows = Vec::with_capacity(root.flow.len());
 
     for (flow_name, flow) in &root.flow {
-        info!(flow = %flow_name, "validating flow");
+        info!(flow = %flow_name, "assembling flow");
 
         let source_cfg = root
             .sources
@@ -92,59 +82,10 @@ pub async fn validate(
             table: flow.to.clone(),
         };
 
-        // Access checks — actual DB connections, ping SELECT 1 + insert-where-false etc.
-        storage
-            .validate_access()
-            .await
-            .map_err(|e| ValidationError::AccessFailed {
-                component: "storage",
-                name: storage_cfg.name.clone(),
-                source: Box::new(e),
-            })?;
-        source
-            .validate_access(&read_spec)
-            .await
-            .map_err(|e| ValidationError::AccessFailed {
-                component: "source",
-                name: source_cfg.name.clone(),
-                source: Box::new(e),
-            })?;
-        sink.validate_access(&write_spec)
-            .await
-            .map_err(|e| ValidationError::AccessFailed {
-                component: "sink",
-                name: sink_cfg.name.clone(),
-                source: Box::new(e),
-            })?;
-
-        // Schemas + type matrix.
-        let src_schema = source.describe_schema(&flow.from).await.map_err(|e| {
-            ValidationError::AccessFailed {
-                component: "source:schema",
-                name: source_cfg.name.clone(),
-                source: Box::new(e),
-            }
-        })?;
-        let dst_schema =
-            sink.describe_schema(&flow.to)
-                .await
-                .map_err(|e| ValidationError::AccessFailed {
-                    component: "sink:schema",
-                    name: sink_cfg.name.clone(),
-                    source: Box::new(e),
-                })?;
-
-        checks::check_cursor(flow_name, &src_schema, &flow.cursor.fields)?;
-        checks::check_mapping(&src_schema, &dst_schema, &mappings)?;
-
         let interval = flow.cursor.interval;
+        let query_timeout = flow.query_timeout.unwrap_or(DEFAULT_QUERY_TIMEOUT);
 
-        let query_timeout = flow
-            .query_timeout
-            .unwrap_or_else(|| std::time::Duration::from_secs(30));
-
-        info!(flow = %flow_name, "flow validated");
-        resolved.push(ResolvedFlow {
+        flows.push(FlowState {
             name: flow_name.clone(),
             source,
             sink,
@@ -156,5 +97,76 @@ pub async fn validate(
         });
     }
 
-    Ok(resolved)
+    Ok(flows)
+}
+
+/// I/O validation: access checks, schema introspection, type compatibility.
+pub async fn validate(flows: &[FlowState]) -> Result<(), ValidationError> {
+    for flow in flows {
+        info!(flow = %flow.name, "validating flow");
+
+        flow.storage
+            .validate_access()
+            .await
+            .map_err(|e| ValidationError::AccessFailed {
+                component: "storage",
+                name: flow.name.clone(),
+                source: Box::new(e),
+            })?;
+        flow.source
+            .validate_access(&flow.read_spec)
+            .await
+            .map_err(|e| ValidationError::AccessFailed {
+                component: "source",
+                name: flow.name.clone(),
+                source: Box::new(e),
+            })?;
+        flow.sink
+            .validate_access(&flow.write_spec)
+            .await
+            .map_err(|e| ValidationError::AccessFailed {
+                component: "sink",
+                name: flow.name.clone(),
+                source: Box::new(e),
+            })?;
+
+        let src_schema = flow
+            .source
+            .describe_schema(&flow.read_spec.table)
+            .await
+            .map_err(|e| ValidationError::AccessFailed {
+                component: "source:schema",
+                name: flow.name.clone(),
+                source: Box::new(e),
+            })?;
+        let dst_schema = flow
+            .sink
+            .describe_schema(&flow.write_spec.table)
+            .await
+            .map_err(|e| ValidationError::AccessFailed {
+                component: "sink:schema",
+                name: flow.name.clone(),
+                source: Box::new(e),
+            })?;
+
+        checks::check_cursor(&flow.name, &src_schema, &flow.read_spec.cursor_fields)?;
+
+        // Invariant: read_spec.columns and write_spec.columns are positionally
+        // paired by assemble() — both derived from the same ordered mappings vec.
+        let mappings: Vec<crate::mapping::ColumnMapping> = flow
+            .read_spec
+            .columns
+            .iter()
+            .zip(flow.write_spec.columns.iter())
+            .map(|(from, to)| crate::mapping::ColumnMapping {
+                from: from.clone(),
+                to: to.clone(),
+            })
+            .collect();
+        checks::check_mapping(&src_schema, &dst_schema, &mappings)?;
+
+        info!(flow = %flow.name, "flow validated");
+    }
+
+    Ok(())
 }

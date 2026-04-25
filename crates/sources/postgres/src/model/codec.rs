@@ -3,6 +3,7 @@ use sqlx::Row;
 use sqlx::postgres::PgRow;
 use uuid::Uuid;
 
+use air_elt_commons::sql::pg::null_bind;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::types::{DataType, Value};
 
@@ -58,18 +59,18 @@ where
         .map_err(RuntimeError::backend)
 }
 
-/// Bind a `Value` into a sqlx query builder for cursor comparisons.
+/// Bind a `Value` into a sqlx query for cursor comparisons.
 ///
-/// We always bind as the canonical type — sqlx's Postgres layer handles any
-/// safe widening when the target column is actually wider.
+/// NULL values are bound as typed NULLs (correct wire OID) via the shared
+/// `null_bind` helper. Non-null values bind as the canonical type — sqlx's
+/// Postgres layer handles any safe widening.
 pub fn bind_cursor_value<'q>(
     query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     value: &'q Value,
+    dt: DataType,
 ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
     match value {
-        // Why: caller must dispatch NULL via null_bind::bind_typed_null before
-        // reaching this function — see pg_source.rs::bind_or_typed_null.
-        Value::Null => unreachable!("Value::Null must be handled by bind_typed_null"),
+        Value::Null => null_bind::bind_typed_null(query, dt),
         Value::Bool(b) => query.bind(*b),
         Value::Int16(n) => query.bind(*n),
         Value::Int32(n) => query.bind(*n),

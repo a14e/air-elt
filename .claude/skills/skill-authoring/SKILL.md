@@ -21,6 +21,7 @@ description: Rules and requirements for writing and maintaining skills in this r
     located)
 13. Do not modify if there are strict code constraints (e.g., fixed version) -- this is important
 14. Also, if we want to describe some structure and requirements for it -- this is also important
+15. function and method names must start with verbs, except for properties, attributes, and stateless stories
 
 If your text matches one of the following types, use the corresponding template (for the content).
 

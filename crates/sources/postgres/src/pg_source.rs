@@ -1,32 +1,37 @@
-use std::collections::HashMap;
+use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use sqlx::{Column, PgPool, Row};
-use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use air_elt_commons::sql::pg::null_bind;
 use air_elt_commons::sql::pg::pool;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
-use air_elt_core::model::Schema;
-use air_elt_core::model::{Batch, ReadSpec, Row as CoreRow};
+use air_elt_core::model::{Batch, ReadSpec, Row as CoreRow, Schema, SourceCtx};
 use air_elt_core::model::{CursorFieldValue, CursorState};
 use air_elt_core::traits::Source;
 use air_elt_core::types::{DataType, Value};
 
 use crate::config::model::PgSourceConfig;
-use crate::model::mapping as value_codec;
+use crate::model::codec;
 use crate::sql_statements as sql;
 
-struct FlowCache {
+struct PgSourceCtx {
     schema: Arc<Schema>,
     read_query: Option<Arc<sql::ReadQuery>>,
 }
 
+impl SourceCtx for PgSourceCtx {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
 pub struct PgSource {
     pool: PgPool,
-    cache: Mutex<HashMap<String, FlowCache>>,
 }
 
 impl PgSource {
@@ -44,10 +49,7 @@ impl PgSource {
             ),
         )
         .await?;
-        Ok(Self {
-            pool,
-            cache: Mutex::new(HashMap::new()),
-        })
+        Ok(Self { pool })
     }
 
     async fn ensure_connection_alive(&self) -> RuntimeResult<()> {
@@ -79,72 +81,6 @@ impl PgSource {
             .map_err(RuntimeError::backend)?;
         Ok(())
     }
-
-    async fn cached_schema(&self, table: &str) -> RuntimeResult<Arc<Schema>> {
-        {
-            let guard = self.cache.lock().await;
-            if let Some(entry) = guard.get(table) {
-                return Ok(entry.schema.clone());
-            }
-        }
-        let schema =
-            Arc::new(air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, table).await?);
-        let mut guard = self.cache.lock().await;
-        Ok(guard
-            .entry(table.to_string())
-            .or_insert(FlowCache {
-                schema: schema.clone(),
-                read_query: None,
-            })
-            .schema
-            .clone())
-    }
-
-    async fn cached_read_query(
-        &self,
-        spec: &ReadSpec,
-        cursor: Option<&CursorState>,
-    ) -> RuntimeResult<Arc<sql::ReadQuery>> {
-        let all_non_null = cursor
-            .map(|c| c.fields.iter().all(|f| !f.value.is_null()))
-            .unwrap_or(false);
-
-        if all_non_null {
-            let guard = self.cache.lock().await;
-            if let Some(entry) = guard.get(&spec.table) {
-                if let Some(cached) = &entry.read_query {
-                    return Ok(cached.clone());
-                }
-            }
-            drop(guard);
-
-            let plan = Arc::new(sql::build_read_batch(
-                &spec.table,
-                &spec.columns,
-                &spec.cursor_fields,
-                spec.cursor_order,
-                cursor,
-            )?);
-
-            let mut guard = self.cache.lock().await;
-            let entry = guard.entry(spec.table.clone()).or_insert(FlowCache {
-                schema: Arc::new(Schema::default()),
-                read_query: None,
-            });
-            if entry.read_query.is_none() {
-                entry.read_query = Some(plan.clone());
-            }
-            Ok(entry.read_query.as_ref().expect("just inserted").clone())
-        } else {
-            Ok(Arc::new(sql::build_read_batch(
-                &spec.table,
-                &spec.columns,
-                &spec.cursor_fields,
-                spec.cursor_order,
-                cursor,
-            )?))
-        }
-    }
 }
 
 #[async_trait]
@@ -157,21 +93,77 @@ impl Source for PgSource {
     }
 
     async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema> {
-        // Warms the cache so subsequent read_batch calls are lookup-only.
-        let schema = self.cached_schema(table).await?;
-        Ok((*schema).clone())
+        let schema = air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, table).await?;
+        Ok(schema)
+    }
+
+    async fn init_context(&self, spec: &ReadSpec) -> RuntimeResult<Box<dyn SourceCtx>> {
+        let schema = Arc::new(
+            air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, &spec.table).await?,
+        );
+        Ok(Box::new(PgSourceCtx {
+            schema,
+            read_query: None,
+        }))
     }
 
     async fn read_batch<'a>(
         &self,
         spec: &ReadSpec,
+        ctx: Box<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
-    ) -> RuntimeResult<Batch> {
-        let schema = self.cached_schema(&spec.table).await?;
-        let column_types = resolve_types(&schema, &spec.columns, &spec.table)?;
-        let cursor_types = resolve_types(&schema, &spec.cursor_fields, &spec.table)?;
+    ) -> RuntimeResult<(Batch, Box<dyn SourceCtx>)> {
+        let mut pg_ctx = ctx
+            .into_any()
+            .downcast::<PgSourceCtx>()
+            .map_err(|_| RuntimeError::Other("invalid source context type".into()))?;
 
-        let query_plan = self.cached_read_query(spec, cursor).await?;
+        let column_types = resolve_types(&pg_ctx.schema, &spec.columns, &spec.table)?;
+        let cursor_types = resolve_types(&pg_ctx.schema, &spec.cursor_fields, &spec.table)?;
+        let cursor_nullable: Vec<bool> = spec
+            .cursor_fields
+            .iter()
+            .map(|name| {
+                pg_ctx
+                    .schema
+                    .find(name)
+                    .map(|f| f.nullable)
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        // Cache read_query for non-null cursors; rebuild when any cursor value
+        // is NULL because the SQL predicate changes per null-pattern.
+        let all_non_null = cursor
+            .map(|c| c.fields.iter().all(|f| !f.value.is_null()))
+            .unwrap_or(false);
+
+        let query_plan = if all_non_null {
+            if let Some(cached) = &pg_ctx.read_query {
+                cached.clone()
+            } else {
+                let plan = Arc::new(sql::build_read_batch(
+                    &spec.table,
+                    &spec.columns,
+                    &spec.cursor_fields,
+                    spec.cursor_order,
+                    cursor,
+                    &cursor_nullable,
+                )?);
+                pg_ctx.read_query = Some(plan.clone());
+                plan
+            }
+        } else {
+            Arc::new(sql::build_read_batch(
+                &spec.table,
+                &spec.columns,
+                &spec.cursor_fields,
+                spec.cursor_order,
+                cursor,
+                &cursor_nullable,
+            )?)
+        };
+
         debug!(sql = %query_plan.sql, "read_batch sql");
 
         let mut query = sqlx::query(&query_plan.sql);
@@ -192,7 +184,7 @@ impl Source for PgSource {
                         ))
                     })?;
                 let dt = cursor_types[cursor_field_pos];
-                query = bind_or_typed_null(query, &field.value, dt);
+                query = codec::bind_cursor_value(query, &field.value, dt);
             }
         }
         query = query.bind(i64::try_from(spec.limit).map_err(|_| {
@@ -209,7 +201,7 @@ impl Source for PgSource {
         for row in &rows {
             let mut values = Vec::with_capacity(spec.columns.len());
             for (idx, dt) in column_types.iter().enumerate() {
-                values.push(value_codec::decode_column(row, idx, *dt)?);
+                values.push(codec::decode_column(row, idx, *dt)?);
             }
 
             let mut cursor_values = Vec::with_capacity(spec.cursor_fields.len());
@@ -231,7 +223,7 @@ impl Source for PgSource {
                                     "cursor field {cursor_field:?} not present in SELECT"
                                 ))
                             })?;
-                        value_codec::decode_column(row, idx, dt)?
+                        codec::decode_column(row, idx, dt)?
                     }
                 };
                 cursor_values.push(value);
@@ -253,10 +245,13 @@ impl Source for PgSource {
             CursorState::new(fields)
         });
 
-        Ok(Batch {
-            rows: out_rows,
-            next_cursor,
-        })
+        Ok((
+            Batch {
+                rows: out_rows,
+                next_cursor,
+            },
+            pg_ctx as Box<dyn SourceCtx>,
+        ))
     }
 }
 
@@ -271,15 +266,4 @@ fn resolve_types(schema: &Schema, names: &[String], table: &str) -> RuntimeResul
             })
         })
         .collect()
-}
-
-fn bind_or_typed_null<'q>(
-    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
-    value: &'q Value,
-    dt: DataType,
-) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
-    match value {
-        Value::Null => null_bind::bind_typed_null(query, dt),
-        _ => value_codec::bind_cursor_value(query, value),
-    }
 }

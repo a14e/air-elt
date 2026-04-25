@@ -1,18 +1,22 @@
 use async_trait::async_trait;
 
 use crate::error::RuntimeResult;
-use crate::model::{Batch, CursorState, ReadSpec, Schema, WriteReport, WriteSpec};
+use crate::model::{
+    Batch, CursorState, ReadSpec, Schema, SinkCtx, SourceCtx, WriteReport, WriteSpec,
+};
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait Source: Send + Sync {
     async fn validate_access(&self, spec: &ReadSpec) -> RuntimeResult<()>;
     async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema>;
+    async fn init_context(&self, spec: &ReadSpec) -> RuntimeResult<Box<dyn SourceCtx>>;
     async fn read_batch<'a>(
         &self,
         spec: &ReadSpec,
+        ctx: Box<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
-    ) -> RuntimeResult<Batch>;
+    ) -> RuntimeResult<(Batch, Box<dyn SourceCtx>)>;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -20,7 +24,13 @@ pub trait Source: Send + Sync {
 pub trait Sink: Send + Sync {
     async fn validate_access(&self, spec: &WriteSpec) -> RuntimeResult<()>;
     async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema>;
-    async fn write_batch(&self, spec: &WriteSpec, batch: &Batch) -> RuntimeResult<WriteReport>;
+    async fn init_context(&self, spec: &WriteSpec) -> RuntimeResult<Box<dyn SinkCtx>>;
+    async fn write_batch(
+        &self,
+        spec: &WriteSpec,
+        ctx: Box<dyn SinkCtx>,
+        batch: &Batch,
+    ) -> RuntimeResult<(WriteReport, Box<dyn SinkCtx>)>;
 }
 
 #[cfg_attr(test, mockall::automock)]

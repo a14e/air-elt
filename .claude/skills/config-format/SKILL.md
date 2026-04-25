@@ -56,10 +56,11 @@ Flat `key = "value"` map. Used by `${VAR}` expansion (env → secrets → defaul
 
 Simple form: `{ from = "col_a", to = "col_b" }`
 
-Object form (MVP: parses but rejected with `UnsupportedInMvp`):
+Object form (**not supported in MVP** — parses but rejected with `UnsupportedInMvp`):
 ```toml
 { from = { name = "col_a", transform = "...", timezone = "...", data-type = "..." }, to = "col_b" }
 ```
+Fields `transform`, `timezone`, `data-type` are reserved for future use. Any config using them will fail validation.
 
 ### `cursor`
 
@@ -82,6 +83,8 @@ All Duration fields accept two formats, routed by prefix:
 - Flow names unique across root + includes
 - `batch-limit ≥ 1`
 - `batch-limit × mapping_cols ≤ 60,000`
+- `cursor.interval > 0` (zero interval causes spin-loop)
+- `query-timeout > 0` when specified
 - Cursor fields ⊆ mapping `from` columns
 - File size ≤ 16 MiB
 - No absolute include paths

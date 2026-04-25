@@ -6,8 +6,9 @@
 //! async thread-scope bridge — the registry is simply called from the
 //! already-async validation pipeline.
 
-use std::collections::HashMap;
 use std::sync::Arc;
+
+use ahash::AHashMap;
 
 use async_trait::async_trait;
 
@@ -17,24 +18,24 @@ use crate::traits::{Sink, Source, Storage};
 
 #[async_trait]
 pub trait SourceFactory: Send + Sync {
-    async fn build(&self, cfg: &ComponentConfig) -> Result<Arc<dyn Source>, ConfigError>;
+    async fn build(&self, cfg: &ComponentConfig) -> Result<Box<dyn Source>, ConfigError>;
 }
 
 #[async_trait]
 pub trait SinkFactory: Send + Sync {
-    async fn build(&self, cfg: &ComponentConfig) -> Result<Arc<dyn Sink>, ConfigError>;
+    async fn build(&self, cfg: &ComponentConfig) -> Result<Box<dyn Sink>, ConfigError>;
 }
 
 #[async_trait]
 pub trait StorageFactory: Send + Sync {
-    async fn build(&self, cfg: &ComponentConfig) -> Result<Arc<dyn Storage>, ConfigError>;
+    async fn build(&self, cfg: &ComponentConfig) -> Result<Box<dyn Storage>, ConfigError>;
 }
 
 #[derive(Default, Clone)]
 pub struct Registry {
-    sources: HashMap<String, Arc<dyn SourceFactory>>,
-    sinks: HashMap<String, Arc<dyn SinkFactory>>,
-    storages: HashMap<String, Arc<dyn StorageFactory>>,
+    sources: AHashMap<String, Arc<dyn SourceFactory>>,
+    sinks: AHashMap<String, Arc<dyn SinkFactory>>,
+    storages: AHashMap<String, Arc<dyn StorageFactory>>,
 }
 
 impl Registry {
@@ -54,7 +55,7 @@ impl Registry {
         self.storages.insert(kind.to_string(), factory);
     }
 
-    pub async fn build_source(&self, cfg: &ComponentConfig) -> RuntimeResult<Arc<dyn Source>> {
+    pub async fn build_source(&self, cfg: &ComponentConfig) -> RuntimeResult<Box<dyn Source>> {
         let f = self
             .sources
             .get(&cfg.kind)
@@ -64,7 +65,7 @@ impl Registry {
         f.build(cfg).await.map_err(RuntimeError::Config)
     }
 
-    pub async fn build_sink(&self, cfg: &ComponentConfig) -> RuntimeResult<Arc<dyn Sink>> {
+    pub async fn build_sink(&self, cfg: &ComponentConfig) -> RuntimeResult<Box<dyn Sink>> {
         let f = self
             .sinks
             .get(&cfg.kind)
@@ -74,7 +75,7 @@ impl Registry {
         f.build(cfg).await.map_err(RuntimeError::Config)
     }
 
-    pub async fn build_storage(&self, cfg: &ComponentConfig) -> RuntimeResult<Arc<dyn Storage>> {
+    pub async fn build_storage(&self, cfg: &ComponentConfig) -> RuntimeResult<Box<dyn Storage>> {
         let f = self
             .storages
             .get(&cfg.kind)

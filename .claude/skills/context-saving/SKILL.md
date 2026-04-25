@@ -1,32 +1,34 @@
 ---
 name: context-saving
-description: Материалы и рекомендации для экономии контекстного окна — вызывай когда требуется экономия контекста
+description: Materials and recommendations for saving context window — invoke when context conservation is needed
 user-invocable: false
 ---
 *Written by a human*
 
-# Следуй этим правилам для экономии контекста
-Базовые рекомендации
-1. Не читай большие файлы целиком, читай их сегментами. Загружай в контекст файлы только если они разумного размера
-2. При выводе в терминал запросов используй лимиты и не читай сразу весь вывод
-3. При отладке начинай с самых шумных по логам ошибок и иди потом к более локальным. (Идем сверху по принципу Парето 80 на 20)
-4. В случае целесообразности (а в большинстве случаев целесообразно) используй инструменты, которые будут описываться ниже
-5. обращай внимание на команды с большим выводом (это grep файлов, выводы линтеров, компилятора, запуска приложения, тестов)
-6. избегай лишних команд. например, в директории проекта не переходи в нее же с помощью cd
-7. для небольших массовых изменений используй bash чтобы не менять большое число файлов по одному.
-Перед использованием -- пробуй dry run и посмотри не поломал ли что
-8. для поиска в интернете запускай отдельного агента, чтобы анализ не засорял контекст
-9. для типового поиска и иследования кода запускай агентов чтобы не засорять контекст (кроме тривиальных случаев, когда ты выполняешь работу)
+# Follow these rules to save context
 
-Если команды ниже не устанволены и пользователь не желает их ставить (явно предложи установить), игнорируй инструкции по ним.
-Устанавливай ТОЛЬКО если пользователь согласен их ставить
+Basic recommendations:
+1. Don't read large files in full — read them in segments. Load files into context only if they are reasonably sized.
+2. When running terminal queries, use limits and don't read the entire output at once.
+3. When debugging, start from the noisiest log errors and move to more local ones (top-down via the 80/20 Pareto principle).
+4. Whenever it's reasonable (and it usually is), use the tools described below.
+5. Watch out for commands with large output (file greps, linter/compiler output, app launches, tests).
+6. Avoid redundant commands. For example, don't `cd` into the project directory while already inside it.
+7. For small bulk changes, use bash instead of editing files one by one.
+   Before applying — try a dry run and check that nothing is broken.
+8. For internet searches, spawn a separate agent so the analysis doesn't pollute context.
+9. For routine code search and exploration, spawn agents to keep context clean (except trivial cases done inline).
+
+If the tools below are not installed and the user does not want to install them (offer it explicitly), ignore their instructions.
+Install ONLY if the user agrees.
 
 
-# Сжатый cli вывод
-Для сжатого cli вывода используй rtk
+# Compact CLI output
+
+For compact CLI output, use `rtk`:
 https://github.com/rtk-ai/rtk
 
-Если не установлена, то способ установки
+Installation, if missing:
 ```
 brew install rtk
 ```
@@ -34,47 +36,47 @@ brew install rtk
 cargo install --git https://github.com/rtk-ai/rtk
 ```
 
-Работает как прокси для cli команд и выдает сжатый результат.
-(В случае подозрений в некорректности вывода вызывай оригинальную команду)
+It works as a proxy for CLI commands and produces compact output.
+(If you suspect the output is incorrect, run the original command.)
 
-Используй их только для чтения. Не используй на операциях записи.
-Не устанавливай, чтобы он не перезаписывал команды в cli, вызывай только явно.
+Use it for read-only operations only. Do not use it on write operations.
+Do not install it as a CLI override — invoke it explicitly.
 
-Проверка существования
+Existence check:
 ```
 rtk --version
 ```
 
-## Как использовать
+## How to use
 
-Есть два режима вызова:
+There are two invocation modes:
 
-1. **`rtk <cmd>`** — если `<cmd>` имеет встроенную спец-обработку (см список ниже), применяется доменно-специфичное сжатие. Иначе — обычный passthrough с трекингом.
-2. **Общие фильтры** поверх любой команды:
-   - `rtk test <cmd>` — только падения тестов
-   - `rtk err <cmd>` — только errors/warnings
-   - `rtk proxy <cmd>` — passthrough без фильтрации (с трекингом)
-   - `rtk summary <cmd>` — эвристическое сжатие
+1. **`rtk <cmd>`** — if `<cmd>` has built-in special handling (see list below), domain-specific compression is applied. Otherwise it's a regular passthrough with tracking.
+2. **Generic filters** over any command:
+   - `rtk test <cmd>` — only test failures
+   - `rtk err <cmd>` — only errors/warnings
+   - `rtk proxy <cmd>` — passthrough without filtering (with tracking)
+   - `rtk summary <cmd>` — heuristic compression
 
-Флаги: `-u` (ultra-compact), `-v/-vv/-vvv` (verbosity)
+Flags: `-u` (ultra-compact), `-v/-vv/-vvv` (verbosity)
 
-## Полный список команд со спец-обработкой
+## Full list of commands with special handling
 
-**Файлы**: `ls`, `read` (с `-l aggressive` — только сигнатуры), `smart`, `find`, `grep`, `diff`
+**Files**: `ls`, `read` (with `-l aggressive` — signatures only), `smart`, `find`, `grep`, `diff`
 
 **Git**: `git status/log/diff/add/commit/push/pull`
-(НО: для краткой статистики `git diff --stat` компактнее чем `rtk git diff`)
+(NOTE: for short stats, `git diff --stat` is more compact than `rtk git diff`.)
 
 **GitHub CLI**: `gh` (pr list, issue list, run list)
 
-**Тесты**: `cargo test`, `pytest`, `vitest`, `playwright`, `go test`, `rake test`, `rspec`
+**Tests**: `cargo test`, `pytest`, `vitest`, `playwright`, `go test`, `rake test`, `rspec`
 
 **Build/Lint**: `cargo`, `tsc`, `lint` (ESLint/biome), `ruff`, `rubocop`, `next`, `prettier --check`
 
 **Package managers**: `pnpm`, `pip` (list/outdated), `bundle`, `prisma`
 
-**Инфраструктура**: `aws`, `docker`, `kubectl`
+**Infrastructure**: `aws`, `docker`, `kubectl`
 
-**Данные**: `json` (структура без значений), `deps`, `env -f <filter>`, `log` (дедуп), `curl` (auto JSON schema), `wget` (без progress bars)
+**Data**: `json` (structure without values), `deps`, `env -f <filter>`, `log` (dedup), `curl` (auto JSON schema), `wget` (no progress bars)
 
-**Аналитика**: `gain`, `discover`, `session`, `summary`
+**Analytics**: `gain`, `discover`, `session`, `summary`

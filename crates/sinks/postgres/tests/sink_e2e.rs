@@ -73,7 +73,8 @@ async fn write_batch_and_validate_access() {
         ],
         next_cursor: None,
     };
-    let report = sink.write_batch(&spec, &batch).await.expect("write");
+    let ctx = sink.init_context(&spec).await.expect("init_context");
+    let (report, _ctx) = sink.write_batch(&spec, ctx, &batch).await.expect("write");
     assert_eq!(report.rows_written, 2);
 
     let rows: Vec<(i64, String, Option<serde_json::Value>)> =
@@ -150,7 +151,8 @@ async fn all_nulls_across_data_types() {
         rows: vec![CoreRow { values: row }],
         next_cursor: None,
     };
-    let report = sink.write_batch(&spec, &batch).await.expect("write");
+    let ctx = sink.init_context(&spec).await.expect("init_context");
+    let (report, _ctx) = sink.write_batch(&spec, ctx, &batch).await.expect("write");
     assert_eq!(report.rows_written, 1);
 
     // All NOT NULL arms decoded back as NULL. Separate query_as blocks keep
@@ -200,4 +202,109 @@ async fn all_nulls_across_data_types() {
     assert!(probe2.3.is_none());
     assert!(probe2.4.is_none());
     assert!(probe2.5.is_none());
+}
+
+/// Non-null values for all 12 DataType variants — complementary to
+/// `all_nulls_across_data_types` which covers the NULL path.
+#[tokio::test]
+async fn all_types_non_null_round_trip() {
+    let handle = pg_pool().await;
+    handle
+        .pool
+        .execute(
+            "CREATE TABLE all_vals (
+                id BIGINT PRIMARY KEY,
+                c_bool BOOLEAN NOT NULL,
+                c_i16 SMALLINT NOT NULL,
+                c_i32 INTEGER NOT NULL,
+                c_i64 BIGINT NOT NULL,
+                c_f32 REAL NOT NULL,
+                c_f64 DOUBLE PRECISION NOT NULL,
+                c_text TEXT NOT NULL,
+                c_bytes BYTEA NOT NULL,
+                c_date DATE NOT NULL,
+                c_ts TIMESTAMPTZ NOT NULL,
+                c_uuid UUID NOT NULL,
+                c_json JSONB NOT NULL
+            )",
+        )
+        .await
+        .expect("create all_vals");
+
+    let sink = PgSink::connect(PgSinkConfig {
+        url: handle.url_with_search_path(),
+        ..Default::default()
+    })
+    .await
+    .expect("connect sink");
+
+    let columns: Vec<String> = vec![
+        "id", "c_bool", "c_i16", "c_i32", "c_i64", "c_f32", "c_f64", "c_text", "c_bytes", "c_date",
+        "c_ts", "c_uuid", "c_json",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    let spec = WriteSpec {
+        columns: columns.clone(),
+        table: format!("{}.all_vals", handle.schema),
+    };
+
+    let ts = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
+    let date = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+    let uid = Uuid::parse_str("a1a2a3a4-b1b2-c1c2-d1d2-e1e2e3e4e5e6").unwrap();
+
+    let batch = Batch {
+        rows: vec![CoreRow {
+            values: vec![
+                Value::Int64(1),
+                Value::Bool(true),
+                Value::Int16(i16::MAX),
+                Value::Int32(i32::MIN),
+                Value::Int64(i64::MAX),
+                Value::Float32(std::f32::consts::PI),
+                Value::Float64(std::f64::consts::E),
+                Value::Text("test-text".into()),
+                Value::Bytes(vec![0xCA, 0xFE]),
+                Value::Date(date),
+                Value::Timestamp(ts),
+                Value::Uuid(uid),
+                Value::Json(serde_json::json!({"k": [1, 2]})),
+            ],
+        }],
+        next_cursor: None,
+    };
+
+    let ctx = sink.init_context(&spec).await.expect("init_context");
+    let (report, _ctx) = sink.write_batch(&spec, ctx, &batch).await.expect("write");
+    assert_eq!(report.rows_written, 1);
+
+    let (c_bool, c_i16, c_i32, c_i64): (bool, i16, i32, i64) =
+        sqlx::query_as("SELECT c_bool, c_i16, c_i32, c_i64 FROM all_vals WHERE id = 1")
+            .fetch_one(&handle.pool)
+            .await
+            .unwrap();
+    assert!(c_bool);
+    assert_eq!(c_i16, i16::MAX);
+    assert_eq!(c_i32, i32::MIN);
+    assert_eq!(c_i64, i64::MAX);
+
+    let (c_text, c_bytes, c_uuid, c_json): (String, Vec<u8>, Uuid, serde_json::Value) =
+        sqlx::query_as("SELECT c_text, c_bytes, c_uuid, c_json FROM all_vals WHERE id = 1")
+            .fetch_one(&handle.pool)
+            .await
+            .unwrap();
+    assert_eq!(c_text, "test-text");
+    assert_eq!(c_bytes, vec![0xCA, 0xFE]);
+    assert_eq!(c_uuid, uid);
+    assert_eq!(c_json, serde_json::json!({"k": [1, 2]}));
+
+    let (c_date, c_ts): (NaiveDate, chrono::DateTime<Utc>) =
+        sqlx::query_as("SELECT c_date, c_ts FROM all_vals WHERE id = 1")
+            .fetch_one(&handle.pool)
+            .await
+            .unwrap();
+    assert_eq!(c_date, date);
+    assert_eq!(c_ts, ts);
 }

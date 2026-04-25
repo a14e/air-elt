@@ -18,7 +18,7 @@ type: reference
   direction).
 - `crates/sinks/postgres/src/sql_statements.rs` — PING, HAS_TABLE_INSERT,
   INFORMATION_SCHEMA, probe_insert_where_false (wrapped in BEGIN/ROLLBACK
-  by caller), insert_prefix.
+  by caller), insert_statement.
 - `crates/storages/postgres/src/sql_statements.rs` — PING, TABLE_EXISTS,
   HAS_CREATE_PRIVILEGE, PROBE_INSERT_WHERE_FALSE, SELECT_CURSOR,
   UPSERT_CURSOR (JSONB ON CONFLICT DO UPDATE with `updated_at = now()`).
@@ -36,11 +36,11 @@ type: reference
   to `TimestampTz` because canonical time is UTC.
 
 ## Value codec
-- Decode: `crates/sources/postgres/src/model/mapping.rs::decode_column` —
+- Decode: `crates/sources/postgres/src/model/codec.rs::decode_column` —
   typed `try_get::<Option<T>>` per `DataType`, NULL folds to `Value::Null`.
-- Bind (cursor): `crates/sources/postgres/src/model/mapping.rs::bind_cursor_value`
+- Bind (cursor): `crates/sources/postgres/src/model/codec.rs::bind_cursor_value`
   — NULL path still binds `Option::<i64>::None` unconditionally (callers
-  in `pg_source.rs` route through `bind_or_typed_null` which dispatches to
+  in `pg_source.rs` route through `bind_cursor_value (handles NULL via null_bind)` which dispatches to
   `null_bind::bind_typed_null` when the value is Null, so the wrong-OID
   branch in bind_cursor_value is effectively unreachable).
 - Bind (sink bulk): `crates/sinks/postgres/src/pg_sink.rs::write_batch` —

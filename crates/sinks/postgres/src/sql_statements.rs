@@ -17,8 +17,8 @@ pub fn probe_insert_where_false(table: &str, columns: &[String]) -> RuntimeResul
     ))
 }
 
-/// Prefix consumed by `QueryBuilder::push_values`; caller appends `VALUES ...`.
-pub fn insert_prefix(table: &str, columns: &[String]) -> RuntimeResult<String> {
+/// INSERT statement consumed by `QueryBuilder::push_values`; caller appends `VALUES ...`.
+pub fn insert_statement(table: &str, columns: &[String]) -> RuntimeResult<String> {
     let quoted_table = quote_qualified(table)?;
     let cols = quote_columns(columns)?;
     Ok(format!("INSERT INTO {quoted_table} ({cols}) "))
@@ -40,8 +40,8 @@ mod tests {
     }
 
     #[test]
-    fn insert_prefix_form() {
-        let sql = insert_prefix("analytics.events", &["event_id".into()]).unwrap();
+    fn insert_statement_form() {
+        let sql = insert_statement("analytics.events", &["event_id".into()]).unwrap();
         assert_eq!(sql, "INSERT INTO \"analytics\".\"events\" (\"event_id\") ");
     }
 }

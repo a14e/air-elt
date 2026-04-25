@@ -60,9 +60,10 @@ async fn describe_and_read_with_cursor() {
     assert!(!id_field.nullable);
     assert_eq!(schema.find("name").unwrap().data_type, DataType::Text);
 
-    // First tick: no cursor, should get 3 rows
-    let batch = source
-        .read_batch(&spec, None)
+    let ctx = source.init_context(&spec).await.expect("init_context");
+
+    let (batch, ctx) = source
+        .read_batch(&spec, ctx, None)
         .await
         .expect("read_batch initial");
     assert_eq!(batch.rows.len(), 3);
@@ -71,21 +72,98 @@ async fn describe_and_read_with_cursor() {
     assert_eq!(next.fields[0].name, "id");
     assert_eq!(next.fields[0].value, Value::Int64(3));
 
-    // Second tick: continue from cursor, two remaining rows
-    let batch = source
-        .read_batch(&spec, Some(&next))
+    let (batch, ctx) = source
+        .read_batch(&spec, ctx, Some(&next))
         .await
         .expect("read_batch continued");
     assert_eq!(batch.rows.len(), 2);
     assert_eq!(batch.rows[0].values[0], Value::Int64(4));
     assert_eq!(batch.rows[1].values[0], Value::Int64(5));
 
-    // Drain: cursor at the end, expect empty batch, no next cursor
     let tail = batch.next_cursor.clone().unwrap();
-    let empty = source
-        .read_batch(&spec, Some(&tail))
+    let (empty, _ctx) = source
+        .read_batch(&spec, ctx, Some(&tail))
         .await
         .expect("read_batch drained");
     assert!(empty.rows.is_empty());
     assert!(empty.next_cursor.is_none());
+}
+
+/// Nullable cursor with mixed NULL/non-null data. With `NULL < everything`
+/// algebra and `ASC NULLS FIRST`, NULLs are read first, then non-null values.
+#[tokio::test]
+async fn read_with_nullable_cursor() {
+    let handle = pg_pool().await;
+    handle
+        .pool
+        .execute(
+            "CREATE TABLE ranked (
+                id BIGSERIAL PRIMARY KEY,
+                rank INT
+            )",
+        )
+        .await
+        .expect("create ranked");
+
+    // rank: 1, NULL, 3, NULL
+    // ASC NULLS FIRST ordering by (rank, id): (NULL,2), (NULL,4), (1,1), (3,3)
+    for (id, rank) in [(1, Some(1)), (2, None), (3, Some(3)), (4, None)] {
+        sqlx::query("INSERT INTO ranked (id, rank) VALUES ($1, $2)")
+            .bind(id as i64)
+            .bind(rank)
+            .execute(&handle.pool)
+            .await
+            .expect("insert");
+    }
+
+    let source = PgSource::connect(PgSourceConfig {
+        url: handle.url_with_search_path(),
+        ..Default::default()
+    })
+    .await
+    .expect("connect source");
+
+    let spec = ReadSpec {
+        columns: vec!["id".into(), "rank".into()],
+        table: format!("{}.ranked", handle.schema),
+        cursor_fields: vec!["rank".into(), "id".into()],
+        cursor_order: air_elt_core::config::model::CursorOrder::Asc,
+        limit: 2,
+    };
+
+    let ctx = source.init_context(&spec).await.expect("init_context");
+
+    // First batch: NULL rows come first (NULLS FIRST): (NULL,2), (NULL,4)
+    let (batch, ctx) = source.read_batch(&spec, ctx, None).await.expect("batch 1");
+    assert_eq!(batch.rows.len(), 2);
+    assert_eq!(batch.rows[0].values[1], Value::Null);
+    assert_eq!(batch.rows[0].values[0], Value::Int64(2));
+    assert_eq!(batch.rows[1].values[1], Value::Null);
+    assert_eq!(batch.rows[1].values[0], Value::Int64(4));
+    let cursor1 = batch.next_cursor.expect("cursor after batch 1");
+    assert!(
+        cursor1
+            .fields
+            .iter()
+            .any(|f| f.name == "rank" && f.value == Value::Null),
+        "cursor must carry NULL rank"
+    );
+
+    // Second batch: cursor=(NULL,4) → null-aware path.
+    // ASC + NULL cursor: col > NULL → IS NOT NULL. Gets non-null rows: (1,1), (3,3)
+    let (batch, ctx) = source
+        .read_batch(&spec, ctx, Some(&cursor1))
+        .await
+        .expect("batch 2");
+    assert_eq!(batch.rows.len(), 2);
+    assert_eq!(batch.rows[0].values[1], Value::Int32(1));
+    assert_eq!(batch.rows[1].values[1], Value::Int32(3));
+
+    // Drain
+    let cursor2 = batch.next_cursor.expect("cursor after batch 2");
+    let (empty, _ctx) = source
+        .read_batch(&spec, ctx, Some(&cursor2))
+        .await
+        .expect("drain");
+    assert!(empty.rows.is_empty());
 }
