@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use std::time::Duration;
 
+use ahash::AHashMap;
 use tracing::info;
 
 use crate::config::model::RootConfig;
@@ -7,17 +9,25 @@ use crate::error::{RuntimeError, ValidationError};
 use crate::mapping;
 use crate::model::{FlowState, ReadSpec, WriteSpec};
 use crate::registry::Registry;
+use crate::traits::{Sink, Source, Storage};
 use crate::validation::checks;
 
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Assemble flows from config: look up components, build via registry,
 /// construct ReadSpec/WriteSpec. No I/O validation — just wiring.
+///
+/// Sources / sinks / storages are shared by name across flows: building each
+/// instance only once means a single pool per declared component, regardless
+/// of how many flows reference it.
 pub async fn assemble(
     root: &RootConfig,
     registry: &Registry,
 ) -> Result<Vec<FlowState>, ValidationError> {
     let mut flows = Vec::with_capacity(root.flow.len());
+    let mut sources: AHashMap<String, Arc<dyn Source>> = AHashMap::new();
+    let mut sinks: AHashMap<String, Arc<dyn Sink>> = AHashMap::new();
+    let mut storages: AHashMap<String, Arc<dyn Storage>> = AHashMap::new();
 
     for (flow_name, flow) in &root.flow {
         info!(flow = %flow_name, "assembling flow");
@@ -38,31 +48,54 @@ pub async fn assemble(
             .find(|c| c.name == flow.storage)
             .ok_or_else(|| ValidationError::UnknownStorage(flow.storage.clone()))?;
 
-        let source =
-            registry
-                .build_source(source_cfg)
-                .await
-                .map_err(|e| ValidationError::AccessFailed {
-                    component: "source",
-                    name: source_cfg.name.clone(),
-                    source: Box::new(e),
-                })?;
-        let sink =
-            registry
-                .build_sink(sink_cfg)
-                .await
-                .map_err(|e| ValidationError::AccessFailed {
-                    component: "sink",
-                    name: sink_cfg.name.clone(),
-                    source: Box::new(e),
-                })?;
-        let storage = registry.build_storage(storage_cfg).await.map_err(|e| {
-            ValidationError::AccessFailed {
-                component: "storage",
-                name: storage_cfg.name.clone(),
-                source: Box::new(e),
-            }
-        })?;
+        let source = if let Some(existing) = sources.get(&source_cfg.name) {
+            existing.clone()
+        } else {
+            let built: Arc<dyn Source> = Arc::from(
+                registry
+                    .build_source(source_cfg)
+                    .await
+                    .map_err(|e| ValidationError::AccessFailed {
+                        component: "source",
+                        name: source_cfg.name.clone(),
+                        source: Box::new(e),
+                    })?,
+            );
+            sources.insert(source_cfg.name.clone(), built.clone());
+            built
+        };
+        let sink = if let Some(existing) = sinks.get(&sink_cfg.name) {
+            existing.clone()
+        } else {
+            let built: Arc<dyn Sink> = Arc::from(
+                registry
+                    .build_sink(sink_cfg)
+                    .await
+                    .map_err(|e| ValidationError::AccessFailed {
+                        component: "sink",
+                        name: sink_cfg.name.clone(),
+                        source: Box::new(e),
+                    })?,
+            );
+            sinks.insert(sink_cfg.name.clone(), built.clone());
+            built
+        };
+        let storage = if let Some(existing) = storages.get(&storage_cfg.name) {
+            existing.clone()
+        } else {
+            let built: Arc<dyn Storage> = Arc::from(
+                registry
+                    .build_storage(storage_cfg)
+                    .await
+                    .map_err(|e| ValidationError::AccessFailed {
+                        component: "storage",
+                        name: storage_cfg.name.clone(),
+                        source: Box::new(e),
+                    })?,
+            );
+            storages.insert(storage_cfg.name.clone(), built.clone());
+            built
+        };
 
         let mappings = mapping::build(flow).map_err(|e| ValidationError::AccessFailed {
             component: "mapping",
