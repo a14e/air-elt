@@ -1,0 +1,29 @@
+[config]
+include = ["flows"]
+
+# `${VAR}` / `${VAR:default}` references are resolved at load time from process
+# env first, then the `[secrets]` map below. Missing references with no default
+# fail the validate step.
+
+[secrets]
+PG_SRC_URL = "postgres://postgres:postgres@localhost:5432/source"
+PG_SINK_URL = "postgres://postgres:postgres@localhost:5432/target"
+PG_STATE_URL = "postgres://postgres:postgres@localhost:5432/state"
+
+[[sources]]
+name = "pg_src"
+type = "postgres"
+config = { url = "${PG_SRC_URL}" }
+
+[[sinks]]
+name = "pg_sink"
+type = "postgres"
+config = { url = "${PG_SINK_URL}" }
+
+[[storages]]
+name = "pg_state"
+type = "postgres"
+# If you need the cursor table in a non-default schema, append
+# `?options=-c%20search_path%3Danalytics` to the URL. There is no `schema`
+# field in MVP — this keeps pool-session / migrate / runtime queries aligned.
+config = { url = "${PG_STATE_URL}" }

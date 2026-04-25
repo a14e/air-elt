@@ -1,0 +1,43 @@
+# Project guidelines
+
+## Mandatory skills
+
+(Mandatory) When exploring the project, read `air-elt-overview`.
+(Mandatory) When writing code or planning, also use `rust-guidelines` and `project-conventions`.
+If you need to work with configs, use `config-format`.
+Save context using `context-saving`.
+Use the skill tools rather than reading skill files directly.
+
+If you add a new shared utility — document it in `project-conventions`.
+
+(Mandatory) When editing skills, use the `skill-authoring` skill.
+
+When updating configs, also update `config-format`.
+
+After a compaction, assume skills are not loaded — load them again before starting the corresponding work.
+
+## Working rules
+
+* Every change (except tests and metrics) must come with tests.
+* Always run tests after the work is done.
+* All library versions must be pinned explicitly.
+* Avoid git operations on update.
+* Human-facing instructions live in `README.md`.
+* Agent tasks live in `agent_tasks/`.
+* If Docker is unavailable, check podman; prefer podman.
+* Delete every temporary file you create.
+* After every change, run `cargo fmt` and `cargo clippy --all-targets --workspace -- -D warnings`.
+* You may skip plan steps only with the user's consent.
+* After completing tasks, run validator agents.
+* Pick as many agents as possible; exclude only those clearly untouched. If touched indirectly — invoke them.
+* Add files to `.gitignore` if they are temporary or do not belong in git.
+* Run the Rust, project-structure, and project-conventions skills before tasks (agents must read them too).
+* After each task, run validator agents (see below).
+* When you need to read a skill — use the skill tools instead of reading the file directly.
+* Talk to the user in their language. In code, strictly English.
+* Do not use code edits as a way to ask the user a question (auto edit may be on).
+  If you have a question, either request a question form or stop and wait for an answer.
+* Prefer standard / typical components over hand-rolled code.
+* Do not delete comments without reason.
+* If you find a bug in the code via tests, fix it (even if it was outside the task scope). Tests exist precisely to catch and fix bugs.
+* perform reasoning in English

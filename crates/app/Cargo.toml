@@ -1,0 +1,36 @@
+[package]
+name = "air-elt-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "air-elt"
+path = "src/main.rs"
+
+[dependencies]
+air-elt-core = { workspace = true }
+air-elt-commons = { workspace = true }
+air-elt-source-postgres = { workspace = true }
+air-elt-sink-postgres = { workspace = true }
+air-elt-storage-postgres = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+mimalloc = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+air-elt-commons-testing = { workspace = true }
+sqlx = { workspace = true }
+tempfile = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true
