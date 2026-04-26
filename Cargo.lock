@@ -108,12 +108,14 @@ dependencies = [
  "ahash",
  "air-elt-commons",
  "async-trait",
+ "base64 0.22.1",
  "bigdecimal",
  "chrono",
  "iso8601-duration",
  "mockall",
  "num-bigint",
  "once_cell",
+ "quick-xml",
  "regex",
  "serde",
  "serde_json",
@@ -2109,6 +2111,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8991c4cbdb8bc5b11f0b074ffe286c30e523de90fee5ba8132f1399f23cb3dd7"
 dependencies = [
  "prost",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.39.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "958f21e8e7ceb5a1aa7fa87fab28e7c75976e0bfe7e23ff069e0a260f894067d"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

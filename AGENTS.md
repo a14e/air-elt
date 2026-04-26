@@ -40,6 +40,7 @@ After a compaction, assume skills are not loaded — load them again before star
 * Do not delete comments without reason.
 * If you find a bug in the code via tests, fix it (even if it was outside the task scope). Tests exist precisely to catch and fix bugs.
 * perform reasoning in English
+* **No future-proofing config fields.** Do not introduce config keys, struct fields, or enum variants whose only purpose is "we might want this later". Add the field together with the feature that consumes it. Reserved-for-future fields rot, drift, and create misleading docs. If a feature is on the near horizon, file an `agent_tasks/` ticket — don't pre-wire the surface.
 
 ## On `(Mandatory)`
 

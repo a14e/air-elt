@@ -20,6 +20,7 @@ The codebase favours clarity over cleverness. Code is read far more often than w
 - Prefer small code duplication over coupling.
 - Avoid "nano functions" that perform a single command or a routine operation. Small methods are allowed if they comply with OOP.
 - use ahash instead of std::collections::HashMap
+- **No future-proofing config or struct fields.** Do not introduce TOML keys, struct fields, or enum variants for hypothetical future features. Add the field together with the feature that consumes it. The previous "object form mapping" with reserved `transform` / `timezone` / `data-type` was a concrete example of this anti-pattern — reserved fields rot and create misleading parser surface. If a feature is on the near horizon, file an `agent_tasks/` ticket; don't pre-wire the surface.
 
 ## Timeouts and cancellation safety
 

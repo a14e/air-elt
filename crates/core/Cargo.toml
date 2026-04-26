@@ -24,6 +24,8 @@ bigdecimal = { workspace = true }
 tokio = { workspace = true }
 regex = { workspace = true }
 once_cell = { workspace = true }
+quick-xml = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

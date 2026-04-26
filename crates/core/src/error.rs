@@ -124,6 +124,20 @@ pub enum ValidationError {
 
     #[error("cursor field {field:?} is missing in source schema for flow {flow:?}")]
     MissingCursorField { flow: String, field: String },
+
+    #[error(
+        "field {column:?}: `default` is set but the source column is NOT NULL — \
+         the default would never be applied"
+    )]
+    DefaultOnNotNullSource { flow: String, column: String },
+
+    #[error("field {column:?}: failed to parse default literal: {source}")]
+    DefaultParse {
+        flow: String,
+        column: String,
+        #[source]
+        source: crate::types::default_value::DefaultParseError,
+    },
 }
 
 #[derive(Debug, Error)]

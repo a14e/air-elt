@@ -172,16 +172,27 @@ pub fn to_internal(
             size: char_max_length,
         },
         MySqlType::TinyText => DataType::Text { size: Some(255) },
-        MySqlType::Text | MySqlType::MediumText | MySqlType::LongText => {
-            DataType::Text { size: None }
-        }
+        // MySQL `text` family carries a fixed maximum-byte size per the
+        // reference — surface them as bounded `Text { size }` so the matrix
+        // can apply concrete narrowing checks. `text` itself is 64 KiB-1.
+        MySqlType::Text => DataType::Text { size: Some(65_535) },
+        MySqlType::MediumText => DataType::Text {
+            size: Some(16_777_215),
+        },
+        MySqlType::LongText => DataType::Text {
+            size: Some(4_294_967_295),
+        },
         MySqlType::Binary | MySqlType::VarBinary => DataType::Bytes {
             size: char_max_length,
         },
         MySqlType::TinyBlob => DataType::Bytes { size: Some(255) },
-        MySqlType::Blob | MySqlType::MediumBlob | MySqlType::LongBlob => {
-            DataType::Bytes { size: None }
-        }
+        MySqlType::Blob => DataType::Bytes { size: Some(65_535) },
+        MySqlType::MediumBlob => DataType::Bytes {
+            size: Some(16_777_215),
+        },
+        MySqlType::LongBlob => DataType::Bytes {
+            size: Some(4_294_967_295),
+        },
         MySqlType::Date => DataType::Date,
         MySqlType::Timestamp => DataType::Timestamp,
         MySqlType::Json => DataType::Json,
@@ -245,9 +256,32 @@ mod tests {
     }
 
     #[test]
-    fn longtext_unbounded() {
+    fn longtext_carries_concrete_size() {
         let dt = to_internal(MySqlType::LongText, None, None, None);
-        assert_eq!(dt, DataType::Text { size: None });
+        assert_eq!(
+            dt,
+            DataType::Text {
+                size: Some(4_294_967_295),
+            }
+        );
+    }
+
+    #[test]
+    fn mediumtext_carries_concrete_size() {
+        assert_eq!(
+            to_internal(MySqlType::MediumText, None, None, None),
+            DataType::Text {
+                size: Some(16_777_215),
+            }
+        );
+    }
+
+    #[test]
+    fn text_carries_64k_size() {
+        assert_eq!(
+            to_internal(MySqlType::Text, None, None, None),
+            DataType::Text { size: Some(65_535) }
+        );
     }
 
     #[test]

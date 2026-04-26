@@ -49,5 +49,9 @@ pub fn bind_typed_null<'q>(
         DataType::Timestamp => query.bind::<Option<DateTime<Utc>>>(None),
         DataType::Uuid => query.bind::<Option<Uuid>>(None),
         DataType::Json => query.bind::<Option<serde_json::Value>>(None),
+        // Xml carries the canonical text payload over the wire. sqlx has no
+        // native `xml` type — bind as text; Postgres accepts text-typed
+        // NULLs into `xml` columns.
+        DataType::Xml => query.bind::<Option<String>>(None),
     }
 }

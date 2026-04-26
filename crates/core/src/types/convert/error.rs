@@ -16,4 +16,16 @@ pub enum ConvertError {
 
     #[error("source value variant does not match declared source DataType {src}")]
     ValueShapeMismatch { src: DataType },
+
+    #[error("conversion {src} → {dst} forbids truncation (would corrupt syntax)")]
+    TruncationForbidden { src: DataType, dst: DataType },
+
+    #[error("value overflows target {dst}")]
+    Overflow { dst: DataType },
+
+    #[error("input is not well-formed XML: {reason}")]
+    InvalidXml { reason: String },
+
+    #[error("string {value:?} is not a recognised boolean literal")]
+    InvalidBool { value: String },
 }

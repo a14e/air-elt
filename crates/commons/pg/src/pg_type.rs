@@ -28,6 +28,10 @@ pub enum PgType {
     /// `numeric` / `decimal`. Precision and scale come from a separate
     /// information_schema column — see `to_internal`.
     Numeric,
+    /// PG `xml` — surfaces over the wire as text but is its own canonical
+    /// `DataType` so the matrix can apply XML-specific rules (well-formed
+    /// validation, forbidden Xml→Xml truncation).
+    Xml,
 }
 
 impl PgType {
@@ -56,6 +60,7 @@ impl PgType {
             "json" => PgType::Json,
             "jsonb" => PgType::Jsonb,
             "numeric" | "decimal" => PgType::Numeric,
+            "xml" => PgType::Xml,
             // `timestamp` / `timestamp without time zone` intentionally omitted.
             _ => return None,
         };
@@ -112,6 +117,7 @@ pub fn to_internal(
             // Precision without scale is non-canonical in PG; treat as scale 0.
             (Some(p), None) => DataType::BigInt { width: Some(p) },
         },
+        PgType::Xml => DataType::Xml,
     }
 }
 

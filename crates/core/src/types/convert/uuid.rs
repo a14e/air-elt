@@ -17,43 +17,61 @@ use uuid::Uuid;
 use super::error::ConvertError;
 
 /// Parse a UUID from a textual representation. Trims surrounding whitespace.
+///
+/// Zero-allocation: walks the trimmed input byte-by-byte, skips dashes,
+/// validates hex on the fly, and packs the 16 result bytes directly into a
+/// stack array. No intermediate `String` is built on either the success or
+/// the failure path. Pathologically long inputs are rejected after the
+/// first 36 byte-budget overflow rather than scanned in full.
 pub fn parse_text(input: &str) -> Result<Uuid, ConvertError> {
-    let trimmed = input.trim();
-    let stripped = trimmed
-        .strip_prefix('{')
-        .and_then(|s| s.strip_suffix('}'))
-        .unwrap_or(trimmed);
+    let trimmed = input.trim().as_bytes();
+    let stripped: &[u8] =
+        if trimmed.first() == Some(&b'{') && trimmed.last() == Some(&b'}') && trimmed.len() >= 2 {
+            &trimmed[1..trimmed.len() - 1]
+        } else {
+            trimmed
+        };
 
-    // Bound the work up front: canonical (36) is the longest accepted
-    // length after brace-stripping. Anything bigger is a malformed input —
-    // refusing early prevents O(N) scans on pathological strings.
     if stripped.len() > 36 {
         return Err(ConvertError::InvalidUuid {
-            reason: format!("input too long: {} chars", stripped.len()),
-        });
-    }
-
-    // Strip optional dashes; remaining chars must be 32 hex digits.
-    let mut hex = String::with_capacity(32);
-    for ch in stripped.chars() {
-        if ch == '-' {
-            continue;
-        }
-        if !ch.is_ascii_hexdigit() {
-            return Err(ConvertError::InvalidHex);
-        }
-        hex.push(ch);
-    }
-    if hex.len() != 32 {
-        return Err(ConvertError::InvalidUuid {
-            reason: format!("expected 32 hex digits, got {}", hex.len()),
+            reason: format!("input too long: {} bytes", stripped.len()),
         });
     }
 
     let mut bytes = [0u8; 16];
-    for i in 0..16 {
-        let pair = &hex[i * 2..i * 2 + 2];
-        bytes[i] = u8::from_str_radix(pair, 16).map_err(|_| ConvertError::InvalidHex)?;
+    let mut hi: Option<u8> = None;
+    let mut written = 0usize;
+    for &b in stripped {
+        if b == b'-' {
+            continue;
+        }
+        let nibble = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return Err(ConvertError::InvalidHex),
+        };
+        match hi {
+            None => hi = Some(nibble),
+            Some(h) => {
+                if written == 16 {
+                    return Err(ConvertError::InvalidUuid {
+                        reason: "more than 32 hex digits".into(),
+                    });
+                }
+                bytes[written] = (h << 4) | nibble;
+                written += 1;
+                hi = None;
+            }
+        }
+    }
+    if hi.is_some() || written != 16 {
+        return Err(ConvertError::InvalidUuid {
+            reason: format!(
+                "expected 32 hex digits, got {}",
+                written * 2 + hi.map_or(0, |_| 1)
+            ),
+        });
     }
     Ok(Uuid::from_bytes(bytes))
 }

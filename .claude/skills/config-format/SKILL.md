@@ -56,13 +56,42 @@ The same field set applies to both `"postgres"` and `"mysql"` types — only the
 
 ### `mapping`
 
-Simple form: `{ from = "col_a", to = "col_b" }`
+Single flat shape (object form with reserved future-fields was removed — see the no-future-proofing rule in `rust-guidelines`):
 
-Object form (**not supported in MVP** — parses but rejected with `UnsupportedInMvp`):
 ```toml
-{ from = { name = "col_a", transform = "...", timezone = "...", data-type = "..." }, to = "col_b" }
+mapping = [
+  { from = "col_a", to = "col_b" },
+  { from = "long_text",  to = "summary",   truncate = true },
+  { from = "blob_in",    to = "blob_out",  default = "hex:00" },
+]
 ```
-Fields `transform`, `timezone`, `data-type` are reserved for future use. Any config using them will fail validation.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `from` | string | required | Source column name |
+| `to` | string | required | Sink column name |
+| `truncate` | bool | `false` | Opt the column into narrowing conversions: text/bytes shrink (UTF-safe for text), integer/float saturate to target's max/min, decimal scale drop, json/xml → `text(n)` serialize. Forbidden combinations (`Json → Json`, `Xml → Xml`, UUID truncations, `Date → Timestamp`) remain rejected. |
+| `default` | scalar / table | none | Fallback value substituted when the source value is `Null`. Permits mapping a nullable source into a `NOT NULL` sink. Validation rejects `default` if the source column is `NOT NULL` (the substitution would never fire). The literal is parsed against the resolved sink `DataType` (see grammar below). |
+
+`#[serde(deny_unknown_fields)]` rejects any additional keys at parse time — this includes the previously-reserved `transform`, `timezone`, `data-type` placeholders, which are now removed.
+
+#### `default` value grammar
+
+| Sink type | Literal | Example |
+|-----------|---------|---------|
+| `Bytes` | `"hex:<even-hex>"`, `"base64:<b64>"`, `"utf8:<utf8>"`, `"bin:<bits>"` (length must be byte-aligned, no whitespace) | `default = "hex:deadbeef"` |
+| `Text` | TOML string; UTF-char count ≤ declared `size` | `default = "n/a"` |
+| `Bool` | TOML bool only | `default = false` |
+| `Int*` / `UInt*` | TOML integer; range-checked | `default = 0` |
+| `Float*` | TOML float / int | `default = 0.0` |
+| `BigInt(width)` / `Decimal(p, s)` | TOML string for big numbers (recommended) or numeric literal | `default = "12.34"` |
+| `Date` | ISO 8601 date string | `default = "1970-01-01"` |
+| `Timestamp` | RFC 3339 string | `default = "1970-01-01T00:00:00Z"` |
+| `Uuid` | canonical UUID string | `default = "00000000-0000-0000-0000-000000000000"` |
+| `Json` | any TOML value | `default = { a = 1 }` |
+| `Xml` | well-formed XML string (validated via `quick-xml`) | `default = "<root/>"` |
+
+`Bytes` columns require one of the four prefixes; bare strings are rejected. Other types use the plain literal — there is no prefix grammar.
 
 ### `cursor`
 

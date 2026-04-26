@@ -178,6 +178,10 @@ impl Sink for MySqlSink {
                         DataType::UInt64 => {
                             tuple.push_bind::<Option<u64>>(None);
                         }
+                        // MySQL has no native xml type — bind as text.
+                        DataType::Xml => {
+                            tuple.push_bind::<Option<String>>(None);
+                        }
                     },
                     Value::Bool(b) => {
                         tuple.push_bind(*b);

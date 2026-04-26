@@ -185,24 +185,50 @@ pub async fn validate(assembled: Vec<AssembledFlow>) -> Result<Vec<FlowState>, V
         checks::check_cursor(&flow.name, &src_schema, &flow.read_spec.cursor_fields)?;
         checks::check_mapping(&src_schema, &dst_schema, &flow.mappings)?;
 
-        let conversions: Vec<(crate::types::DataType, crate::types::DataType)> = flow
+        let flow_name = flow.name.clone();
+        let conversions: Vec<crate::model::ConversionPlan> = flow
             .mappings
             .iter()
             .map(|m| {
-                let src_dt = src_schema
-                    .find(&m.from)
-                    .map(|f| f.data_type)
-                    .ok_or_else(|| ValidationError::MissingField {
-                        side: "source",
-                        field: m.from.clone(),
-                    })?;
+                let src_field =
+                    src_schema
+                        .find(&m.from)
+                        .ok_or_else(|| ValidationError::MissingField {
+                            side: "source",
+                            field: m.from.clone(),
+                        })?;
                 let sink_dt = dst_schema.find(&m.to).map(|f| f.data_type).ok_or_else(|| {
                     ValidationError::MissingField {
                         side: "sink",
                         field: m.to.clone(),
                     }
                 })?;
-                Ok((src_dt, sink_dt))
+                // `default` on a NOT NULL source column is meaningless —
+                // reject at validate time before the runner ever sees it.
+                if m.default_literal.is_some() && !src_field.nullable {
+                    return Err(ValidationError::DefaultOnNotNullSource {
+                        flow: flow_name.clone(),
+                        column: m.from.clone(),
+                    });
+                }
+                let parsed_default = match &m.default_literal {
+                    Some(lit) => Some(crate::types::default_value::parse(lit, &sink_dt).map_err(
+                        |e| ValidationError::DefaultParse {
+                            flow: flow_name.clone(),
+                            column: m.from.clone(),
+                            source: e,
+                        },
+                    )?),
+                    None => None,
+                };
+                let mut ctx = crate::types::ConversionContext::passthrough();
+                ctx.truncate = m.truncate;
+                ctx.default = parsed_default;
+                Ok(crate::model::ConversionPlan {
+                    source: src_field.data_type,
+                    sink: sink_dt,
+                    ctx,
+                })
             })
             .collect::<Result<_, ValidationError>>()?;
 
