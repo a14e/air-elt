@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use sqlx::{Column, PgPool, Row};
 use tracing::{debug, info};
 
-use air_elt_commons::sql::pg::pool;
+use air_elt_commons_pg::pool;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::model::{Batch, ReadSpec, Row as CoreRow, Schema, SourceCtx};
 use air_elt_core::model::{CursorFieldValue, CursorState};
@@ -101,14 +101,13 @@ impl Source for PgSource {
     }
 
     async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema> {
-        let schema = air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, table).await?;
+        let schema = air_elt_commons_pg::schema::fetch_schema(&self.pool, table).await?;
         Ok(schema)
     }
 
     async fn build_context(&self, spec: &ReadSpec) -> RuntimeResult<Arc<dyn SourceCtx>> {
-        let schema = Arc::new(
-            air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, &spec.table).await?,
-        );
+        let schema =
+            Arc::new(air_elt_commons_pg::schema::fetch_schema(&self.pool, &spec.table).await?);
         let column_types = resolve_types(&schema, &spec.columns, &spec.table)?;
         let cursor_types = resolve_types(&schema, &spec.cursor_fields, &spec.table)?;
         let cursor_nullable: Vec<bool> = spec

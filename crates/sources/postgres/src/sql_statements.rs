@@ -5,7 +5,7 @@
 //! reused across ticks (the sink builds its own INSERT per batch via
 //! `QueryBuilder`).
 
-use air_elt_commons::sql::pg::identifier::{quote_columns, quote_ident, quote_qualified};
+use air_elt_commons_pg::identifier::{quote_columns, quote_ident, quote_qualified};
 use air_elt_core::config::model::CursorOrder;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::model::CursorState;

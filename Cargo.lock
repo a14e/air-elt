@@ -31,8 +31,11 @@ dependencies = [
  "air-elt-commons",
  "air-elt-commons-testing",
  "air-elt-core",
+ "air-elt-sink-mysql",
  "air-elt-sink-postgres",
+ "air-elt-source-mysql",
  "air-elt-source-postgres",
+ "air-elt-storage-mysql",
  "air-elt-storage-postgres",
  "anyhow",
  "async-trait",
@@ -51,17 +54,34 @@ dependencies = [
 name = "air-elt-commons"
 version = "0.1.0"
 dependencies = [
- "air-elt-core",
- "chrono",
- "once_cell",
- "regex",
- "serde",
- "serde_json",
- "sqlx",
  "thiserror",
- "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "air-elt-commons-mysql"
+version = "0.1.0"
+dependencies = [
+ "air-elt-commons",
+ "air-elt-core",
+ "chrono",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "air-elt-commons-pg"
+version = "0.1.0"
+dependencies = [
+ "air-elt-commons",
+ "air-elt-core",
+ "chrono",
+ "serde_json",
+ "sqlx",
+ "tokio",
  "uuid",
 ]
 
@@ -84,6 +104,7 @@ name = "air-elt-core"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "air-elt-commons",
  "async-trait",
  "chrono",
  "iso8601-duration",
@@ -101,10 +122,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "air-elt-sink-mysql"
+version = "0.1.0"
+dependencies = [
+ "air-elt-commons",
+ "air-elt-commons-mysql",
+ "air-elt-commons-testing",
+ "air-elt-core",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "air-elt-sink-postgres"
 version = "0.1.0"
 dependencies = [
  "air-elt-commons",
+ "air-elt-commons-pg",
+ "air-elt-commons-testing",
+ "air-elt-core",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "air-elt-source-mysql"
+version = "0.1.0"
+dependencies = [
+ "air-elt-commons",
+ "air-elt-commons-mysql",
  "air-elt-commons-testing",
  "air-elt-core",
  "async-trait",
@@ -122,6 +180,25 @@ name = "air-elt-source-postgres"
 version = "0.1.0"
 dependencies = [
  "air-elt-commons",
+ "air-elt-commons-pg",
+ "air-elt-commons-testing",
+ "air-elt-core",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "air-elt-storage-mysql"
+version = "0.1.0"
+dependencies = [
+ "air-elt-commons",
+ "air-elt-commons-mysql",
  "air-elt-commons-testing",
  "air-elt-core",
  "async-trait",
@@ -139,6 +216,7 @@ name = "air-elt-storage-postgres"
 version = "0.1.0"
 dependencies = [
  "air-elt-commons",
+ "air-elt-commons-pg",
  "air-elt-commons-testing",
  "air-elt-core",
  "async-trait",

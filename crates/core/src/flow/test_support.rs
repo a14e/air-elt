@@ -5,8 +5,8 @@ use std::time::Duration;
 use crate::config::model::CursorOrder;
 use crate::error::RuntimeError;
 use crate::model::{
-    Batch, CursorFieldValue, CursorState, FlowState, ReadSpec, Row, SinkCtx, SourceCtx,
-    WriteReport, WriteSpec,
+    AssembledFlow, Batch, CursorFieldValue, CursorState, FlowState, ReadSpec, Row, SinkCtx,
+    SourceCtx, WriteReport, WriteSpec,
 };
 use crate::traits::{MockSink, MockSource, MockStorage};
 use crate::types::value::Value;
@@ -138,7 +138,7 @@ pub fn test_flow_named(
     sink: MockSink,
     storage: MockStorage,
 ) -> FlowState {
-    FlowState {
+    let assembled = AssembledFlow {
         name: name.into(),
         source: Arc::new(source),
         sink: Arc::new(sink),
@@ -160,7 +160,8 @@ pub fn test_flow_named(
         },
         interval: Duration::from_millis(10),
         query_timeout: Duration::from_secs(5),
-    }
+    };
+    FlowState::new_unchecked(assembled, Vec::new())
 }
 
 pub fn test_flow(source: MockSource, sink: MockSink, storage: MockStorage) -> FlowState {

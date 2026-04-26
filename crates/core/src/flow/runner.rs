@@ -7,6 +7,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::model::{Batch, CursorState, FlowState, SinkCtx, SourceCtx};
+use crate::types::{Value, convert};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
@@ -119,6 +120,7 @@ impl FlowRunner {
         )
         .await?;
 
+        let batch = apply_conversions(batch, &self.flow.conversions)?;
         let batch_size = batch.rows.len();
 
         if batch_size == 0 {
@@ -193,6 +195,37 @@ impl FlowRunner {
         }
         Ok(())
     }
+}
+
+/// Walk every cell whose source DataType differs from its sink DataType and
+/// dispatch through `types::convert::convert`. Identity columns are
+/// untouched. Empty `conversions` (e.g. tests that skip validation) and
+/// all-identity column lists short-circuit — no per-row allocation happens
+/// in either case.
+fn apply_conversions(
+    mut batch: Batch,
+    conversions: &[(crate::types::DataType, crate::types::DataType)],
+) -> RuntimeResult<Batch> {
+    if conversions.is_empty() || conversions.iter().all(|(s, d)| s == d) {
+        return Ok(batch);
+    }
+    for row in &mut batch.rows {
+        if row.values.len() != conversions.len() {
+            return Err(RuntimeError::Other(format!(
+                "row has {} values but {} conversions configured — schema drift?",
+                row.values.len(),
+                conversions.len()
+            )));
+        }
+        for (slot, (src_dt, sink_dt)) in row.values.iter_mut().zip(conversions.iter()) {
+            if src_dt == sink_dt {
+                continue;
+            }
+            let owned = std::mem::replace(slot, Value::Null);
+            *slot = convert::convert(owned, src_dt, sink_dt)?;
+        }
+    }
+    Ok(batch)
 }
 
 async fn with_timeout<F, T>(
@@ -293,6 +326,63 @@ mod tests {
         tokio::time::advance(Duration::from_millis(500)).await;
         tx.send(true).unwrap();
         assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[test]
+    fn apply_conversions_identity_short_circuit() {
+        use crate::model::{Batch, Row};
+        use crate::types::DataType;
+        let batch = Batch {
+            rows: vec![Row {
+                values: vec![Value::Int32(1), Value::Text("x".into())],
+            }],
+            next_cursor: None,
+        };
+        let convs = vec![
+            (DataType::Int32, DataType::Int32),
+            (DataType::text(), DataType::text()),
+        ];
+        let out = apply_conversions(batch, &convs).unwrap();
+        assert_eq!(
+            out.rows[0].values,
+            vec![Value::Int32(1), Value::Text("x".into())]
+        );
+    }
+
+    #[test]
+    fn apply_conversions_runs_per_cell() {
+        use crate::model::{Batch, Row};
+        use crate::types::DataType;
+        let batch = Batch {
+            rows: vec![Row {
+                values: vec![Value::Int16(7), Value::Int32(3)],
+            }],
+            next_cursor: None,
+        };
+        let convs = vec![
+            (DataType::Int16, DataType::Int64),
+            (DataType::Int32, DataType::Int32),
+        ];
+        let out = apply_conversions(batch, &convs).unwrap();
+        assert_eq!(out.rows[0].values, vec![Value::Int64(7), Value::Int32(3)]);
+    }
+
+    #[test]
+    fn apply_conversions_length_mismatch_errors() {
+        use crate::model::{Batch, Row};
+        use crate::types::DataType;
+        let batch = Batch {
+            rows: vec![Row {
+                values: vec![Value::Int32(1)],
+            }],
+            next_cursor: None,
+        };
+        let convs = vec![
+            (DataType::Int32, DataType::Int64),
+            (DataType::Int32, DataType::Int64),
+        ];
+        let res = apply_conversions(batch, &convs);
+        assert!(res.is_err());
     }
 
     #[tokio::test(start_paused = true)]

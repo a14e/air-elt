@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+air-elt-commons = { workspace = true }
 ahash = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

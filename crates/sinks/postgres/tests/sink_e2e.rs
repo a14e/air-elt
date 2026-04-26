@@ -42,7 +42,7 @@ async fn write_batch_and_validate_access() {
 
     let schema = sink.describe_schema(&spec.table).await.expect("describe");
     assert_eq!(schema.find("id").unwrap().data_type, DataType::Int64);
-    assert_eq!(schema.find("label").unwrap().data_type, DataType::Text);
+    assert_eq!(schema.find("label").unwrap().data_type, DataType::text());
     assert_eq!(schema.find("at").unwrap().data_type, DataType::Timestamp);
     assert_eq!(schema.find("payload").unwrap().data_type, DataType::Json);
     assert!(!schema.find("id").unwrap().nullable, "PK must be NOT NULL");

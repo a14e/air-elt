@@ -1,0 +1,29 @@
+[config]
+include = ["flows"]
+
+# `${VAR}` / `${VAR:default}` references are resolved at load time from process
+# env first, then the `[secrets]` map below. Missing references with no default
+# fail the validate step.
+
+[secrets]
+MYSQL_SRC_URL = "mysql://root@localhost:3306/source"
+MYSQL_SINK_URL = "mysql://root@localhost:3306/target"
+MYSQL_STATE_URL = "mysql://root@localhost:3306/state"
+
+[[sources]]
+name = "mysql_src"
+type = "mysql"
+config = { url = "${MYSQL_SRC_URL}" }
+
+[[sinks]]
+name = "mysql_sink"
+type = "mysql"
+config = { url = "${MYSQL_SINK_URL}" }
+
+[[storages]]
+name = "mysql_state"
+type = "mysql"
+# The cursor table lives in the database selected by the URL's path component
+# (`/state` above). Migrations and runtime queries operate on whatever
+# database the connection pins to — there is no `schema` field in MVP.
+config = { url = "${MYSQL_STATE_URL}" }

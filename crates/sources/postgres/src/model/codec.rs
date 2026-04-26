@@ -3,7 +3,7 @@ use sqlx::Row;
 use sqlx::postgres::PgRow;
 use uuid::Uuid;
 
-use air_elt_commons::sql::pg::null_bind;
+use air_elt_commons_pg::null_bind;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::types::{DataType, Value};
 
@@ -32,10 +32,10 @@ pub fn decode_column(row: &PgRow, index: usize, data_type: DataType) -> RuntimeR
         DataType::Float64 => {
             nullable::<f64>(row, index).map(|o| o.map(Value::Float64).unwrap_or(Value::Null))
         }
-        DataType::Text => {
+        DataType::Text { .. } => {
             nullable::<String>(row, index).map(|o| o.map(Value::Text).unwrap_or(Value::Null))
         }
-        DataType::Bytes => {
+        DataType::Bytes { .. } => {
             nullable::<Vec<u8>>(row, index).map(|o| o.map(Value::Bytes).unwrap_or(Value::Null))
         }
         DataType::Date => {

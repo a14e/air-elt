@@ -6,19 +6,21 @@ use air_elt_core::model::{Field, Schema};
 use super::identifier::split_qualified;
 use super::pg_type::{self, PgType};
 
-const INFORMATION_SCHEMA: &str = "SELECT column_name, is_nullable, udt_name, data_type
-    FROM information_schema.columns
-    WHERE table_schema = $1 AND table_name = $2
+const INFORMATION_SCHEMA: &str = "SELECT column_name, is_nullable, udt_name, data_type, \
+                                  character_maximum_length \
+    FROM information_schema.columns \
+    WHERE table_schema = $1 AND table_name = $2 \
     ORDER BY ordinal_position";
 
 pub async fn fetch_schema(pool: &PgPool, table: &str) -> RuntimeResult<Schema> {
-    let (schema_name, table_name) = split_qualified(table);
-    let rows: Vec<(String, String, String, String)> = sqlx::query_as(INFORMATION_SCHEMA)
-        .bind(&schema_name)
-        .bind(&table_name)
-        .fetch_all(pool)
-        .await
-        .map_err(RuntimeError::backend)?;
+    let (schema_name, table_name) = split_qualified(table)?;
+    let rows: Vec<(String, String, String, String, Option<i32>)> =
+        sqlx::query_as(INFORMATION_SCHEMA)
+            .bind(&schema_name)
+            .bind(&table_name)
+            .fetch_all(pool)
+            .await
+            .map_err(RuntimeError::backend)?;
 
     if rows.is_empty() {
         return Err(RuntimeError::Other(format!(
@@ -27,7 +29,7 @@ pub async fn fetch_schema(pool: &PgPool, table: &str) -> RuntimeResult<Schema> {
     }
 
     let mut fields = Vec::with_capacity(rows.len());
-    for (col, is_null, udt, data_type) in rows {
+    for (col, is_null, udt, data_type, char_max_length) in rows {
         let pg: PgType = PgType::parse(&udt)
             .or_else(|| PgType::parse(&data_type))
             .ok_or_else(|| {
@@ -35,9 +37,10 @@ pub async fn fetch_schema(pool: &PgPool, table: &str) -> RuntimeResult<Schema> {
                     "unsupported pg type for column {col:?}: udt={udt:?}, data_type={data_type:?}"
                 ))
             })?;
+        let size = char_max_length.and_then(|n| if n > 0 { Some(n as u32) } else { None });
         fields.push(Field {
             name: col,
-            data_type: pg_type::to_internal(pg),
+            data_type: pg_type::to_internal(pg, size),
             nullable: is_null.eq_ignore_ascii_case("YES"),
         });
     }
