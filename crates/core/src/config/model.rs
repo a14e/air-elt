@@ -4,8 +4,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::data_type::DataType;
-
 /// Root configuration file (TOML).
 ///
 /// Top-level shape intentionally tracks the README: `[[sources]]`,
@@ -73,39 +71,28 @@ fn default_batch_limit() -> usize {
     1024
 }
 
-/// One mapping rule. MVP: string form only.
+/// One mapping rule. Single flat shape:
+/// `{ from = "a", to = "b", truncate = bool, default = <value> }`.
 ///
-/// The object form with `transform`/`timezone`/`data_type` is parsed but the
-/// loader emits `ConfigError::UnsupportedInMvp` when any of those are set.
+/// `truncate` opts into otherwise-rejected narrowing conversions (text/bytes
+/// shrink, integer/float saturate, decimal scale drop, json→text serialize).
+/// `default` substitutes when the source value is `Null`. The default
+/// literal is parsed against the resolved sink `DataType` at validation
+/// time. Bytes columns require a typed prefix (`hex:`, `base64:`, `utf8:`,
+/// `bin:`); other types use the plain TOML literal.
+///
+/// `#[serde(deny_unknown_fields)]` blocks the previously-reserved fields
+/// (`transform`, `timezone`, `data-type`) and any future leakage of
+/// "for-the-future" knobs into the config surface.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum MappingEntry {
-    Simple(SimpleMapping),
-    Object(ObjectMapping),
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SimpleMapping {
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct MappingEntry {
     pub from: String,
     pub to: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ObjectMapping {
-    pub from: ObjectMappingFrom,
-    pub to: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct ObjectMappingFrom {
-    pub name: String,
     #[serde(default)]
-    pub transform: Option<String>,
+    pub truncate: bool,
     #[serde(default)]
-    pub timezone: Option<String>,
-    #[serde(default)]
-    pub data_type: Option<DataType>,
+    pub default: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

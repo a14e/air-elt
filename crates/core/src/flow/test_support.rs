@@ -146,6 +146,8 @@ pub fn test_flow_named(
         mappings: vec![crate::mapping::ColumnMapping {
             from: "id".into(),
             to: "id".into(),
+            truncate: false,
+            default_literal: None,
         }],
         read_spec: ReadSpec {
             columns: vec!["id".into()],

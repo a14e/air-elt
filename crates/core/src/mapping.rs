@@ -2,11 +2,21 @@ use crate::config::model::{FlowConfig, MappingEntry};
 use crate::error::ConfigError;
 
 /// Column-level mapping derived from the flow config.
-/// Only `from → to` is supported in MVP — the loader rejects transforms earlier.
+///
+/// `truncate` opts the column into narrowing conversions. `default_literal`
+/// is the raw TOML literal supplied by the operator — it cannot be parsed
+/// into a typed `Value` here because the sink's `DataType` is unknown until
+/// schema introspection runs in `validation::pipeline::validate`. That
+/// stage reads `default_literal`, parses it against the resolved sink
+/// `DataType`, and stores the typed result on the corresponding
+/// `ConversionPlan::ctx.default`. Past validation the literal is no longer
+/// needed.
 #[derive(Debug, Clone)]
 pub struct ColumnMapping {
     pub from: String,
     pub to: String,
+    pub truncate: bool,
+    pub default_literal: Option<toml::Value>,
 }
 
 pub fn build(flow: &FlowConfig) -> Result<Vec<ColumnMapping>, ConfigError> {
@@ -18,22 +28,13 @@ pub fn build(flow: &FlowConfig) -> Result<Vec<ColumnMapping>, ConfigError> {
 
     flow.mapping
         .iter()
-        .map(|entry| match entry {
-            MappingEntry::Simple(m) => Ok(ColumnMapping {
-                from: m.from.clone(),
-                to: m.to.clone(),
-            }),
-            MappingEntry::Object(obj) => {
-                if obj.from.transform.is_some() || obj.from.timezone.is_some() {
-                    return Err(ConfigError::UnsupportedInMvp {
-                        what: format!("transform/timezone on field {:?}", obj.from.name),
-                    });
-                }
-                Ok(ColumnMapping {
-                    from: obj.from.name.clone(),
-                    to: obj.to.clone(),
-                })
-            }
+        .map(|entry: &MappingEntry| {
+            Ok(ColumnMapping {
+                from: entry.from.clone(),
+                to: entry.to.clone(),
+                truncate: entry.truncate,
+                default_literal: entry.default.clone(),
+            })
         })
         .collect()
 }
@@ -42,7 +43,7 @@ pub fn build(flow: &FlowConfig) -> Result<Vec<ColumnMapping>, ConfigError> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::config::model::{CursorConfig, CursorOrder, FlowConfig, SimpleMapping};
+    use crate::config::model::{CursorConfig, CursorOrder, FlowConfig};
 
     fn flow_with_mappings(entries: Vec<MappingEntry>) -> FlowConfig {
         FlowConfig {
@@ -70,14 +71,16 @@ mod tests {
 
     #[test]
     fn simple_mappings_pass_through() {
-        let mappings = build(&flow_with_mappings(vec![MappingEntry::Simple(
-            SimpleMapping {
-                from: "a".into(),
-                to: "b".into(),
-            },
-        )]))
+        let mappings = build(&flow_with_mappings(vec![MappingEntry {
+            from: "a".into(),
+            to: "b".into(),
+            truncate: false,
+            default: None,
+        }]))
         .unwrap();
         assert_eq!(mappings[0].from, "a");
         assert_eq!(mappings[0].to, "b");
+        assert!(!mappings[0].truncate);
+        assert!(mappings[0].default_literal.is_none());
     }
 }

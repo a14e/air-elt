@@ -79,6 +79,13 @@ pub fn decode_column(row: &MySqlRow, index: usize, data_type: DataType) -> Runti
             None => Ok(Value::Null),
             Some(d) => Ok(Value::Decimal(d)),
         },
+        // MySQL has no native xml type; pipelines reach this arm only when
+        // the operator declares a text column as `DataType::Xml` upstream
+        // (or a future MySQL version surfaces an xml-like type). Decode as
+        // text — the canonical XML payload lives in `Value::Text`.
+        DataType::Xml => {
+            nullable::<String>(row, index).map(|o| o.map(Value::Text).unwrap_or(Value::Null))
+        }
     }
 }
 

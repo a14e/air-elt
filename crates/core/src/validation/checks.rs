@@ -29,7 +29,15 @@ pub fn check_mapping(
                 field: m.to.clone(),
             })?;
 
-        if !matrix::is_compatible(src_field.data_type, sink_field.data_type) {
+        // `truncate=true` opts the column into the wider compatibility
+        // matrix (`is_compatible_with_truncate`); without it we only allow
+        // the lossless set.
+        let compatible = if m.truncate {
+            matrix::is_compatible_with_truncate(src_field.data_type, sink_field.data_type)
+        } else {
+            matrix::is_compatible(src_field.data_type, sink_field.data_type)
+        };
+        if !compatible {
             let type_err = if matrix::is_narrowing(src_field.data_type, sink_field.data_type) {
                 TypeError::NarrowingNotAllowed {
                     from: src_field.data_type,
@@ -49,10 +57,9 @@ pub fn check_mapping(
             });
         }
 
-        // Nullability: if source allows null but sink doesn't, reject with a
-        // dedicated error variant so the message doesn't claim "no cast from
-        // Int32 to Int32" when the types are identical.
-        if src_field.nullable && !sink_field.nullable {
+        // Nullability: if source allows null but sink doesn't, a `default`
+        // bridges the gap. Without one, reject with a dedicated error.
+        if src_field.nullable && !sink_field.nullable && m.default_literal.is_none() {
             return Err(ValidationError::NullabilityMismatch {
                 field: format!("{} -> {}", m.from, m.to),
                 source_nullable: src_field.nullable,
@@ -91,6 +98,8 @@ mod tests {
         ColumnMapping {
             from: from.into(),
             to: to.into(),
+            truncate: false,
+            default_literal: None,
         }
     }
 

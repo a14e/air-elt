@@ -101,9 +101,78 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
             },
         ) => decimal_fits_decimal(pa, sa, pb, sb),
 
+        // Xml/Json → unbounded text. Identity covers Xml→Xml and Json→Json.
+        // `Xml → Text*` and `Json → Text*` (unbounded sink) are allowed
+        // without truncate because no truncation is ever needed.
+        // Bounded variants `* → Text(n)` are gated by
+        // `is_compatible_with_truncate` and not allowed here.
+        (Xml, Text { size: None }) => true,
+        (Json, Text { size: None }) => true,
+        // `Text → Xml` is permitted; the convert dispatcher validates
+        // well-formedness at runtime via `quick-xml`.
+        (Text { .. }, Xml) => true,
+
+        // `Text → Bool` lexer accepts `y/t/1/true/yes` and `n/f/0/false/no`
+        // (case-insensitive). Allowed without truncate — the value-set is
+        // well-defined and small. Runtime may still raise `InvalidBool`.
+        (Text { .. }, Bool) => true,
+
         // Narrowing from BigInt/Decimal back into fixed-width or integer
         // types is *not* supported — every reverse path is potentially
         // lossy. Users adding such pipelines must do an explicit transform.
+        _ => false,
+    }
+}
+
+/// Variant of [`is_compatible`] that admits the additional pairs the user
+/// has explicitly opted into via `truncate=true` on the mapping. Forbidden
+/// combinations (`Json→Json`, `Xml→Xml`, `Uuid` truncations,
+/// `Date→Timestamp`) return `false` here too, signalling that no consent
+/// can rescue them.
+pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool {
+    use DataType::*;
+    if is_compatible(source_t, sink_t) {
+        // truncate=true on a pair that's already lossless: harmless no-op,
+        // BUT explicitly forbid Json→Json / Xml→Xml. The dispatcher will
+        // raise TruncationForbidden at runtime; we mirror that at the
+        // matrix level so validation surfaces it pre-runtime as well.
+        return !matches!((source_t, sink_t), (Json, Json) | (Xml, Xml));
+    }
+
+    match (source_t, sink_t) {
+        // Forbidden under truncate.
+        (Json, Json) | (Xml, Xml) => false,
+        (Date, Timestamp) => false,
+        // UUID truncations don't have defined semantics — explicitly reject.
+        (Uuid, Text { size: Some(n) }) if n < 36 => false,
+        (Uuid, Bytes { size: Some(n) }) if n < 16 => false,
+        // Text/Bytes narrowing: ok.
+        (Text { .. }, Text { .. }) => true,
+        (Bytes { .. }, Bytes { .. }) => true,
+        // Signed → smaller signed, signed → unsigned (sat-to-zero), unsigned
+        // → smaller unsigned, unsigned → smaller signed.
+        (Int64, Int32 | Int16 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        (Int32, Int16 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        (Int16, UInt64 | UInt32 | UInt16 | UInt8) => true,
+        (UInt64, UInt32 | UInt16 | UInt8 | Int64 | Int32 | Int16) => true,
+        (UInt32, UInt16 | UInt8 | Int32 | Int16) => true,
+        (UInt16, UInt8 | Int16) => true,
+        // Float narrowing.
+        (Float64, Float32) => true,
+        (Float64, Int64 | Int32 | Int16 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        // BigInt narrowing.
+        (BigInt { .. }, BigInt { .. }) => true,
+        (BigInt { .. }, Int64 | Int32 | Int16 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        // Decimal narrowing.
+        (Decimal { .. }, Decimal { .. }) => true,
+        (Decimal { .. }, BigInt { .. }) => true,
+        (Decimal { .. }, Int64 | Int32 | Int16 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        // Json → Text(n).
+        (Json, Text { size: Some(_) }) => true,
+        // Xml → Text(n).
+        (Xml, Text { size: Some(_) }) => true,
+        // Timestamp → Date.
+        (Timestamp, Date) => true,
         _ => false,
     }
 }
@@ -334,8 +403,12 @@ mod tests {
     }
 
     #[test]
-    fn json_text_incompatible_both_directions() {
-        assert!(!is_compatible(DataType::Json, TEXT));
+    fn json_to_unbounded_text_allowed_text_to_json_rejected() {
+        // Json → Text* is allowed without truncate (no truncation needed).
+        assert!(is_compatible(DataType::Json, TEXT));
+        // Json → Text(n) (bounded) requires truncate consent.
+        assert!(!is_compatible(DataType::Json, text(100)));
+        // Text → Json is not modelled.
         assert!(!is_compatible(TEXT, DataType::Json));
     }
 
@@ -523,5 +596,108 @@ mod tests {
         assert!(!is_compatible(DataType::Float32, BIGINT_UNB));
         assert!(!is_compatible(dec(10, 2), DataType::Float64));
         assert!(!is_compatible(BIGINT_UNB, DataType::Float64));
+    }
+
+    // ---- Xml + truncate matrix coverage ----
+
+    #[test]
+    fn xml_identity_and_unbounded_text() {
+        assert!(is_compatible(DataType::Xml, DataType::Xml));
+        assert!(is_compatible(DataType::Xml, TEXT));
+        // Bounded sink without truncate is rejected.
+        assert!(!is_compatible(DataType::Xml, text(100)));
+    }
+
+    #[test]
+    fn text_to_xml_compatible() {
+        assert!(is_compatible(text(36), DataType::Xml));
+        assert!(is_compatible(TEXT, DataType::Xml));
+    }
+
+    #[test]
+    fn text_to_bool_compatible() {
+        assert!(is_compatible(text(10), DataType::Bool));
+        assert!(is_compatible(TEXT, DataType::Bool));
+    }
+
+    #[test]
+    fn truncate_unlocks_text_narrow() {
+        assert!(!is_compatible(text(20), text(10)));
+        assert!(is_compatible_with_truncate(text(20), text(10)));
+        // Unbounded → bounded gated as well.
+        assert!(!is_compatible(TEXT, text(10)));
+        assert!(is_compatible_with_truncate(TEXT, text(10)));
+    }
+
+    #[test]
+    fn truncate_unlocks_int_narrow_and_sign_loss() {
+        assert!(!is_compatible(DataType::Int64, DataType::Int32));
+        assert!(is_compatible_with_truncate(
+            DataType::Int64,
+            DataType::Int32
+        ));
+        assert!(!is_compatible(DataType::Int32, DataType::UInt32));
+        assert!(is_compatible_with_truncate(
+            DataType::Int32,
+            DataType::UInt32
+        ));
+    }
+
+    #[test]
+    fn truncate_unlocks_float_to_int() {
+        assert!(!is_compatible(DataType::Float64, DataType::Int32));
+        assert!(is_compatible_with_truncate(
+            DataType::Float64,
+            DataType::Int32
+        ));
+    }
+
+    #[test]
+    fn truncate_unlocks_decimal_to_bigint_to_int() {
+        assert!(!is_compatible(dec(10, 2), BIGINT_UNB));
+        assert!(is_compatible_with_truncate(dec(10, 2), BIGINT_UNB));
+        assert!(!is_compatible(BIGINT_UNB, DataType::Int32));
+        assert!(is_compatible_with_truncate(BIGINT_UNB, DataType::Int32));
+    }
+
+    #[test]
+    fn truncate_unlocks_json_xml_to_bounded_text() {
+        assert!(!is_compatible(DataType::Json, text(100)));
+        assert!(is_compatible_with_truncate(DataType::Json, text(100)));
+        assert!(!is_compatible(DataType::Xml, text(100)));
+        assert!(is_compatible_with_truncate(DataType::Xml, text(100)));
+    }
+
+    #[test]
+    fn truncate_unlocks_timestamp_to_date() {
+        assert!(!is_compatible(DataType::Timestamp, DataType::Date));
+        assert!(is_compatible_with_truncate(
+            DataType::Timestamp,
+            DataType::Date
+        ));
+    }
+
+    #[test]
+    fn truncate_forbids_json_xml_identity() {
+        // identity is allowed without truncate (no-op), but truncate=true on
+        // Json→Json / Xml→Xml is explicitly forbidden — would corrupt syntax.
+        assert!(is_compatible(DataType::Json, DataType::Json));
+        assert!(!is_compatible_with_truncate(DataType::Json, DataType::Json));
+        assert!(is_compatible(DataType::Xml, DataType::Xml));
+        assert!(!is_compatible_with_truncate(DataType::Xml, DataType::Xml));
+    }
+
+    #[test]
+    fn truncate_forbids_uuid_short_text_or_bytes() {
+        assert!(!is_compatible_with_truncate(DataType::Uuid, text(35)));
+        assert!(!is_compatible_with_truncate(DataType::Uuid, bytes(15)));
+    }
+
+    #[test]
+    fn truncate_does_not_unlock_date_to_timestamp() {
+        assert!(!is_compatible_with_truncate(
+            DataType::Date,
+            DataType::Timestamp
+        ));
     }
 }

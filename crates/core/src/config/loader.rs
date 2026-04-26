@@ -7,7 +7,7 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::config::env_expand;
-use crate::config::model::{MappingEntry, RootConfig};
+use crate::config::model::RootConfig;
 use crate::error::ConfigError;
 
 /// Hard cap on a single config file. Operator-controlled files in MVP are
@@ -209,20 +209,6 @@ fn merge_file(
 /// Structural checks after all files are merged.
 fn validate_post_merge(root: &RootConfig) -> Result<(), ConfigError> {
     for (flow_name, flow) in &root.flow {
-        for entry in &flow.mapping {
-            if let MappingEntry::Object(obj) = entry
-                && (obj.from.transform.is_some()
-                    || obj.from.timezone.is_some()
-                    || obj.from.data_type.is_some())
-            {
-                return Err(ConfigError::UnsupportedInMvp {
-                    what: format!(
-                        "mapping transform/timezone/data_type on field {:?} of flow {flow_name:?}",
-                        obj.from.name
-                    ),
-                });
-            }
-        }
         if flow.cursor.fields.is_empty() {
             return Err(ConfigError::Invalid {
                 reason: format!("flow {flow_name:?} has empty cursor.fields"),
@@ -263,14 +249,7 @@ fn validate_post_merge(root: &RootConfig) -> Result<(), ConfigError> {
         // Cursor fields must appear in mapping.from — otherwise the source
         // SELECT will not project them and runtime will emit a misleading
         // error. This used to be a silent dead-fallback in pg_source.
-        let mapped_froms: AHashSet<&str> = flow
-            .mapping
-            .iter()
-            .map(|m| match m {
-                MappingEntry::Simple(s) => s.from.as_str(),
-                MappingEntry::Object(o) => o.from.name.as_str(),
-            })
-            .collect();
+        let mapped_froms: AHashSet<&str> = flow.mapping.iter().map(|m| m.from.as_str()).collect();
         for cf in &flow.cursor.fields {
             if !mapped_froms.contains(cf.as_str()) {
                 return Err(ConfigError::Invalid {
@@ -381,37 +360,52 @@ cursor = { fields = ["id"] }
         );
     }
 
+    /// `transform` / `timezone` / `data-type` were placeholder reserved
+    /// fields. The "no future-proofing config fields" rule means they no
+    /// longer exist in the model — `deny_unknown_fields` makes them parse
+    /// errors, which is a stronger guarantee than the previous
+    /// `UnsupportedInMvp` runtime check.
     #[test]
-    fn transform_in_mapping_rejected_in_mvp() {
+    fn reserved_mapping_fields_now_parse_error() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write(
-            dir.path(),
-            "config.toml",
-            r#"
+        for field in [
+            "transform = \"seconds\"",
+            "timezone = \"UTC\"",
+            "data-type = \"text\"",
+        ] {
+            let mapping_line =
+                format!("mapping = [{{ from = \"created_at\", to = \"x\", {field} }}]");
+            let cfg = format!(
+                r#"
 [[sources]]
 name = "pg"
 type = "postgres"
-config = {}
+config = {{}}
 [[sinks]]
 name = "pg"
 type = "postgres"
-config = {}
+config = {{}}
 [[storages]]
 name = "pg"
 type = "postgres"
-config = {}
+config = {{}}
 [flow.f]
 source = "pg"
 sink = "pg"
 storage = "pg"
 from = "t"
 to = "t"
-mapping = [{ from = { name = "created_at", transform = "seconds" }, to = "created_at" }]
-cursor = { fields = ["created_at"] }
-"#,
-        );
-        let err = load(&path).unwrap_err();
-        assert!(matches!(err, ConfigError::UnsupportedInMvp { .. }));
+{mapping_line}
+cursor = {{ fields = ["created_at"] }}
+"#
+            );
+            let path = write(dir.path(), "config.toml", &cfg);
+            let err = load(&path).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::TomlParse { .. }),
+                "expected TomlParse for reserved field {field:?}, got {err:?}"
+            );
+        }
     }
 
     #[test]

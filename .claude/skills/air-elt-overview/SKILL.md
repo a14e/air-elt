@@ -96,7 +96,7 @@ batch-limit = 1024
 ```
 
 - Flow names must be unique across the root file and every `include`'d file.
-- `mapping` transform/timezone fields parse but fail with `UnsupportedInMvp` until transforms land.
+- `mapping` accepts only `from`, `to`, `truncate`, `default` — `deny_unknown_fields` rejects every other key at parse time. The previously-reserved `transform` / `timezone` / `data-type` placeholders are gone, in line with the project rule "no future-proofing config fields" (see `rust-guidelines`).
 - Architecturally we allow an unbounded number of `include` files — only the per-file 16 MiB cap applies.
 
 ## Operating philosophy
@@ -116,7 +116,6 @@ Cursor columns may be nullable. NULL is treated as the minimum element: `NULL < 
 ## Explicit out-of-MVP list
 
 - Vault secret retrieval (only `$ENV_VAR` / literals work).
-- Value transforms (`transform = "seconds"`, `timezone`).
 - Privilege-excess check and sample-conversion check.
 - Prometheus/OTel metrics.
 - Connectors beyond postgres + mysql.

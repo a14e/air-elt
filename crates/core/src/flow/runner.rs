@@ -204,9 +204,9 @@ impl FlowRunner {
 /// in either case.
 fn apply_conversions(
     mut batch: Batch,
-    conversions: &[(crate::types::DataType, crate::types::DataType)],
+    conversions: &[crate::model::ConversionPlan],
 ) -> RuntimeResult<Batch> {
-    if conversions.is_empty() || conversions.iter().all(|(s, d)| s == d) {
+    if conversions.is_empty() || conversions.iter().all(|p| p.is_identity()) {
         return Ok(batch);
     }
     for row in &mut batch.rows {
@@ -217,12 +217,12 @@ fn apply_conversions(
                 conversions.len()
             )));
         }
-        for (slot, (src_dt, sink_dt)) in row.values.iter_mut().zip(conversions.iter()) {
-            if src_dt == sink_dt {
+        for (slot, plan) in row.values.iter_mut().zip(conversions.iter()) {
+            if plan.is_identity() {
                 continue;
             }
             let owned = std::mem::replace(slot, Value::Null);
-            *slot = convert::convert(owned, src_dt, sink_dt)?;
+            *slot = convert::convert(owned, &plan.source, &plan.sink, &plan.ctx)?;
         }
     }
     Ok(batch)
@@ -339,8 +339,8 @@ mod tests {
             next_cursor: None,
         };
         let convs = vec![
-            (DataType::Int32, DataType::Int32),
-            (DataType::text(), DataType::text()),
+            crate::model::ConversionPlan::identity(DataType::Int32),
+            crate::model::ConversionPlan::identity(DataType::text()),
         ];
         let out = apply_conversions(batch, &convs).unwrap();
         assert_eq!(
@@ -360,8 +360,12 @@ mod tests {
             next_cursor: None,
         };
         let convs = vec![
-            (DataType::Int16, DataType::Int64),
-            (DataType::Int32, DataType::Int32),
+            crate::model::ConversionPlan {
+                source: DataType::Int16,
+                sink: DataType::Int64,
+                ctx: crate::types::ConversionContext::passthrough(),
+            },
+            crate::model::ConversionPlan::identity(DataType::Int32),
         ];
         let out = apply_conversions(batch, &convs).unwrap();
         assert_eq!(out.rows[0].values, vec![Value::Int64(7), Value::Int32(3)]);
@@ -378,8 +382,16 @@ mod tests {
             next_cursor: None,
         };
         let convs = vec![
-            (DataType::Int32, DataType::Int64),
-            (DataType::Int32, DataType::Int64),
+            crate::model::ConversionPlan {
+                source: DataType::Int32,
+                sink: DataType::Int64,
+                ctx: crate::types::ConversionContext::passthrough(),
+            },
+            crate::model::ConversionPlan {
+                source: DataType::Int32,
+                sink: DataType::Int64,
+                ctx: crate::types::ConversionContext::passthrough(),
+            },
         ];
         let res = apply_conversions(batch, &convs);
         assert!(res.is_err());

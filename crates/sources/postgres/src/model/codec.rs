@@ -49,6 +49,12 @@ pub fn decode_column(row: &PgRow, index: usize, data_type: DataType) -> RuntimeR
         }
         DataType::Json => nullable::<serde_json::Value>(row, index)
             .map(|o| o.map(Value::Json).unwrap_or(Value::Null)),
+        // PG `xml` columns stream as text on the wire — sqlx has no native
+        // XmlValue type. The XML payload lives in `Value::Text`; the
+        // `DataType::Xml` tag carries the schema-level distinction.
+        DataType::Xml => {
+            nullable::<String>(row, index).map(|o| o.map(Value::Text).unwrap_or(Value::Null))
+        }
         // BigInt and Decimal are both stored as `numeric` in pg, so sqlx
         // surfaces them through `BigDecimal`. The column's declared scale
         // is 0 (schema invariant) but the wire-level `dscale` may not

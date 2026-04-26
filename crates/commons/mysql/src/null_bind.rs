@@ -39,5 +39,9 @@ pub fn bind_typed_null<'q>(
         DataType::UInt16 => query.bind::<Option<u16>>(None),
         DataType::UInt32 => query.bind::<Option<u32>>(None),
         DataType::UInt64 => query.bind::<Option<u64>>(None),
+        // MySQL has no native xml type. Operators carrying canonical-text
+        // XML through MySQL columns map them to text-family columns, so
+        // this null-bind reaches the same wire type as Text.
+        DataType::Xml => query.bind::<Option<String>>(None),
     }
 }

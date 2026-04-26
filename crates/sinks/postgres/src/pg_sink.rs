@@ -188,6 +188,11 @@ impl Sink for PgSink {
                         | DataType::UInt64 => {
                             unreachable!("postgres has no unsigned integer column types")
                         }
+                        // Xml — sqlx has no native xml type; bind text-typed
+                        // NULL. PG accepts text NULLs into xml columns.
+                        DataType::Xml => {
+                            tuple.push_bind::<Option<String>>(None);
+                        }
                     },
                     Value::Bool(b) => {
                         tuple.push_bind(*b);

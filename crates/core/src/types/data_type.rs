@@ -49,6 +49,11 @@ pub enum DataType {
     Timestamp,
     Uuid,
     Json,
+    /// XML payload, carried as canonical text. Distinct from `Text` so the
+    /// matrix and convert dispatcher can apply XML-specific rules
+    /// (well-formedness validation on `Text → Xml`, forbidding
+    /// `Xml → Xml` truncation).
+    Xml,
 }
 
 impl DataType {
@@ -98,6 +103,7 @@ impl std::fmt::Display for DataType {
             DataType::Timestamp => f.write_str("timestamp"),
             DataType::Uuid => f.write_str("uuid"),
             DataType::Json => f.write_str("json"),
+            DataType::Xml => f.write_str("xml"),
         }
     }
 }
