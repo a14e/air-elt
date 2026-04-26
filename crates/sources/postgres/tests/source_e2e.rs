@@ -58,7 +58,7 @@ async fn describe_and_read_with_cursor() {
     let id_field = schema.find("id").unwrap();
     assert_eq!(id_field.data_type, DataType::Int64);
     assert!(!id_field.nullable);
-    assert_eq!(schema.find("name").unwrap().data_type, DataType::Text);
+    assert_eq!(schema.find("name").unwrap().data_type, DataType::text());
 
     let ctx = source.build_context(&spec).await.expect("build_context");
 

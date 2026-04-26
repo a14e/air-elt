@@ -15,8 +15,8 @@ use crate::signal::wait_for_shutdown;
 pub async fn cmd_validate(config: PathBuf) -> anyhow::Result<()> {
     let root = loader::load(&config)?;
     let registry = build_registry();
-    let flows = assemble(&root, &registry).await?;
-    validate(&flows).await?;
+    let assembled = assemble(&root, &registry).await?;
+    let flows = validate(assembled).await?;
     info!(flow_count = flows.len(), "validation successful");
     Ok(())
 }
@@ -24,8 +24,8 @@ pub async fn cmd_validate(config: PathBuf) -> anyhow::Result<()> {
 pub async fn cmd_migrate(config: PathBuf) -> anyhow::Result<()> {
     let root = loader::load(&config)?;
     let registry = build_registry();
-    let flows = assemble(&root, &registry).await?;
-    validate(&flows).await?;
+    let assembled = assemble(&root, &registry).await?;
+    let flows = validate(assembled).await?;
     for flow in &flows {
         flow.storage.migrate().await?;
     }
@@ -36,8 +36,8 @@ pub async fn cmd_migrate(config: PathBuf) -> anyhow::Result<()> {
 pub async fn cmd_run(config: PathBuf, once: bool) -> anyhow::Result<()> {
     let root = loader::load(&config)?;
     let registry = build_registry();
-    let flows = assemble(&root, &registry).await?;
-    validate(&flows).await?;
+    let assembled = assemble(&root, &registry).await?;
+    let flows = validate(assembled).await?;
 
     let (tx, rx) = watch::channel(false);
     let mode = if once { RunMode::Once } else { RunMode::Daemon };

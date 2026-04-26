@@ -28,11 +28,10 @@ After a compaction, assume skills are not loaded — load them again before star
 * Delete every temporary file you create.
 * After every change, run `cargo fmt` and `cargo clippy --all-targets --workspace -- -D warnings`.
 * You may skip plan steps only with the user's consent.
-* After completing tasks, run validator agents.
-* Pick as many agents as possible; exclude only those clearly untouched. If touched indirectly — invoke them.
+* **(Mandatory)** After completing every task, run validator agents — this is non-negotiable, not opt-in. Skipping is allowed only with the user's explicit consent for the specific task.
+* **(Mandatory)** Pick as many validator agents as possible; exclude only those clearly untouched. If touched indirectly — invoke them. Run independent agents in parallel.
 * Add files to `.gitignore` if they are temporary or do not belong in git.
 * Run the Rust, project-structure, and project-conventions skills before tasks (agents must read them too).
-* After each task, run validator agents (see below).
 * When you need to read a skill — use the skill tools instead of reading the file directly.
 * Talk to the user in their language. In code, strictly English.
 * Do not use code edits as a way to ask the user a question (auto edit may be on).
@@ -41,3 +40,7 @@ After a compaction, assume skills are not loaded — load them again before star
 * Do not delete comments without reason.
 * If you find a bug in the code via tests, fix it (even if it was outside the task scope). Tests exist precisely to catch and fix bugs.
 * perform reasoning in English
+
+## On `(Mandatory)`
+
+`(Mandatory)` marks top-priority rules. Every other rule in this file is also obligatory — the tag only flags the priority short-list, not optional-vs-required.

@@ -1,6 +1,6 @@
 //! SQL emitted by the sink.
 
-use air_elt_commons::sql::pg::identifier::{quote_columns, quote_qualified};
+use air_elt_commons_pg::identifier::{quote_columns, quote_qualified};
 use air_elt_core::error::RuntimeResult;
 
 pub const PING: &str = "SELECT 1";

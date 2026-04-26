@@ -7,7 +7,7 @@ use tracing::info;
 use crate::config::model::RootConfig;
 use crate::error::{RuntimeError, ValidationError};
 use crate::mapping;
-use crate::model::{FlowState, ReadSpec, WriteSpec};
+use crate::model::{AssembledFlow, FlowState, ReadSpec, WriteSpec};
 use crate::registry::Registry;
 use crate::traits::{Sink, Source, Storage};
 use crate::validation::checks;
@@ -23,7 +23,7 @@ const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 pub async fn assemble(
     root: &RootConfig,
     registry: &Registry,
-) -> Result<Vec<FlowState>, ValidationError> {
+) -> Result<Vec<AssembledFlow>, ValidationError> {
     let mut flows = Vec::with_capacity(root.flow.len());
     let mut sources: AHashMap<String, Arc<dyn Source>> = AHashMap::new();
     let mut sinks: AHashMap<String, Arc<dyn Sink>> = AHashMap::new();
@@ -112,7 +112,7 @@ pub async fn assemble(
         let interval = flow.cursor.interval;
         let query_timeout = flow.query_timeout.unwrap_or(DEFAULT_QUERY_TIMEOUT);
 
-        flows.push(FlowState {
+        flows.push(AssembledFlow {
             name: flow_name.clone(),
             source,
             sink,
@@ -129,8 +129,13 @@ pub async fn assemble(
 }
 
 /// I/O validation: access checks, schema introspection, type compatibility.
-pub async fn validate(flows: &[FlowState]) -> Result<(), ValidationError> {
-    for flow in flows {
+/// Consumes assembled flows and returns validated `FlowState`s with their
+/// per-column conversions populated. The two-stage typing (`AssembledFlow`
+/// → `FlowState`) makes "skipped validation" unrepresentable for the
+/// runner.
+pub async fn validate(assembled: Vec<AssembledFlow>) -> Result<Vec<FlowState>, ValidationError> {
+    let mut out = Vec::with_capacity(assembled.len());
+    for flow in assembled {
         info!(flow = %flow.name, "validating flow");
 
         flow.storage
@@ -180,8 +185,30 @@ pub async fn validate(flows: &[FlowState]) -> Result<(), ValidationError> {
         checks::check_cursor(&flow.name, &src_schema, &flow.read_spec.cursor_fields)?;
         checks::check_mapping(&src_schema, &dst_schema, &flow.mappings)?;
 
+        let conversions: Vec<(crate::types::DataType, crate::types::DataType)> = flow
+            .mappings
+            .iter()
+            .map(|m| {
+                let src_dt = src_schema
+                    .find(&m.from)
+                    .map(|f| f.data_type)
+                    .ok_or_else(|| ValidationError::MissingField {
+                        side: "source",
+                        field: m.from.clone(),
+                    })?;
+                let sink_dt = dst_schema.find(&m.to).map(|f| f.data_type).ok_or_else(|| {
+                    ValidationError::MissingField {
+                        side: "sink",
+                        field: m.to.clone(),
+                    }
+                })?;
+                Ok((src_dt, sink_dt))
+            })
+            .collect::<Result<_, ValidationError>>()?;
+
         info!(flow = %flow.name, "flow validated");
+        out.push(FlowState::new(flow, conversions));
     }
 
-    Ok(())
+    Ok(out)
 }

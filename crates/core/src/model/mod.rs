@@ -6,6 +6,6 @@ pub mod spec;
 
 pub use context::{SinkCtx, SourceCtx};
 pub use cursor::{CursorFieldValue, CursorState};
-pub use flow_state::FlowState;
+pub use flow_state::{AssembledFlow, FlowState};
 pub use schema::{Field, Schema};
 pub use spec::{Batch, ReadSpec, Row, WriteReport, WriteSpec};

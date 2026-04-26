@@ -45,8 +45,37 @@ jobs:
           --health-interval=5s
           --health-timeout=5s
           --health-retries=10
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: airelt
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+      mariadb:
+        # Pinned to 11.x: native UUID column (added in 10.7) is required by
+        # the MariaDB e2e suite. Mapped to host port 3307 so it doesn't
+        # collide with the mysql service.
+        image: mariadb:11.4
+        env:
+          MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: "1"
+          MARIADB_DATABASE: airelt
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
     env:
       AIR_ELT_TEST_PG_URL: "postgres://postgres:postgres@localhost:5432/postgres"
+      AIR_ELT_TEST_MYSQL_URL: "mysql://root@localhost:3306/airelt"
+      AIR_ELT_TEST_MARIADB_URL: "mysql://root@localhost:3307/airelt"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain

@@ -7,7 +7,7 @@ use sqlx::{PgPool, QueryBuilder, Row};
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use air_elt_commons::sql::pg::pool;
+use air_elt_commons_pg::pool;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::model::{Batch, Schema, SinkCtx, WriteReport, WriteSpec};
 use air_elt_core::traits::Sink;
@@ -35,7 +35,7 @@ impl PgSink {
     pub async fn connect(config: PgSinkConfig) -> RuntimeResult<Self> {
         let pool = pool::connect(
             &config.url,
-            pool::PoolTimeouts::from_options(
+            pool::PoolSettings::from_options(
                 config.connect_timeout,
                 config.acquire_timeout,
                 config.idle_timeout,
@@ -99,13 +99,12 @@ impl Sink for PgSink {
     }
 
     async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema> {
-        let schema = air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, table).await?;
+        let schema = air_elt_commons_pg::schema::fetch_schema(&self.pool, table).await?;
         Ok(schema)
     }
 
     async fn build_context(&self, spec: &WriteSpec) -> RuntimeResult<Arc<dyn SinkCtx>> {
-        let schema =
-            air_elt_commons::sql::pg::schema::fetch_schema(&self.pool, &spec.table).await?;
+        let schema = air_elt_commons_pg::schema::fetch_schema(&self.pool, &spec.table).await?;
         let column_types: Vec<DataType> = spec
             .columns
             .iter()
@@ -142,7 +141,7 @@ impl Sink for PgSink {
         qb.push_values(batch.rows.iter(), |mut tuple, row| {
             for (value, dt) in row.values.iter().zip(column_types_ref.iter()) {
                 match value {
-                    // Keep in sync with air_elt_commons::sql::pg::null_bind::bind_typed_null — the Separated lifetime forces inlining here.
+                    // Keep in sync with air_elt_commons_pg::null_bind::bind_typed_null — the Separated lifetime forces inlining here.
                     Value::Null => match *dt {
                         DataType::Int64 => {
                             tuple.push_bind::<Option<i64>>(None);
@@ -162,10 +161,10 @@ impl Sink for PgSink {
                         DataType::Float64 => {
                             tuple.push_bind::<Option<f64>>(None);
                         }
-                        DataType::Text => {
+                        DataType::Text { .. } => {
                             tuple.push_bind::<Option<String>>(None);
                         }
-                        DataType::Bytes => {
+                        DataType::Bytes { .. } => {
                             tuple.push_bind::<Option<Vec<u8>>>(None);
                         }
                         DataType::Date => {
@@ -179,6 +178,15 @@ impl Sink for PgSink {
                         }
                         DataType::Json => {
                             tuple.push_bind::<Option<serde_json::Value>>(None);
+                        }
+                        DataType::BigInt { .. } | DataType::Decimal { .. } => {
+                            tuple.push_bind::<Option<bigdecimal::BigDecimal>>(None);
+                        }
+                        DataType::UInt8
+                        | DataType::UInt16
+                        | DataType::UInt32
+                        | DataType::UInt64 => {
+                            unreachable!("postgres has no unsigned integer column types")
                         }
                     },
                     Value::Bool(b) => {
@@ -216,6 +224,22 @@ impl Sink for PgSink {
                     }
                     Value::Json(j) => {
                         tuple.push_bind(j);
+                    }
+                    Value::BigInt(b) => {
+                        // Lift BigInt to BigDecimal with scale 0 — sqlx's PG
+                        // numeric encoding only goes through BigDecimal.
+                        tuple.push_bind(bigdecimal::BigDecimal::new(b.clone(), 0));
+                    }
+                    Value::Decimal(d) => {
+                        tuple.push_bind(d.clone());
+                    }
+                    Value::UInt8(_) | Value::UInt16(_) | Value::UInt32(_) | Value::UInt64(_) => {
+                        unreachable!(
+                            "unsigned values cannot reach a postgres sink: pg schemas never \
+                             produce UInt* (no native unsigned int columns), and the convert \
+                             dispatcher rewrites every UInt → Int*/BigInt/Decimal mapping into \
+                             the target variant before binding"
+                        )
                     }
                 }
             }

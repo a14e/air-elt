@@ -133,18 +133,18 @@ cursor = {{ fields = ["created_at", "id"], order = "asc", interval = "200ms" }}
     let registry = build_registry();
 
     // Migrate storage first
-    let flows_pre = assemble(&root, &registry)
+    let assembled_pre = assemble(&root, &registry)
         .await
         .expect("pre-migrate assemble");
-    validate(&flows_pre).await.expect("pre-migrate validate");
+    let flows_pre = validate(assembled_pre).await.expect("pre-migrate validate");
     for f in &flows_pre {
         f.storage.migrate().await.expect("migrate");
     }
     drop(flows_pre);
 
     // Re-assemble + validate so the sink's access probe runs against the migrated storage.
-    let flows = assemble(&root, &registry).await.expect("assemble");
-    validate(&flows).await.expect("validate");
+    let assembled = assemble(&root, &registry).await.expect("assemble");
+    let flows = validate(assembled).await.expect("validate");
     let (_tx, rx) = watch::channel(false);
     FlowEngine::new(flows, RunMode::Once, rx)
         .run()
@@ -402,15 +402,15 @@ cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
     let root = loader::load(&config_path).expect("load");
     let registry = build_registry();
 
-    let flows_pre = assemble(&root, &registry).await.expect("assemble");
-    validate(&flows_pre).await.expect("validate");
+    let assembled_pre = assemble(&root, &registry).await.expect("assemble");
+    let flows_pre = validate(assembled_pre).await.expect("validate");
     for f in &flows_pre {
         f.storage.migrate().await.expect("migrate");
     }
     drop(flows_pre);
 
-    let flows = assemble(&root, &registry).await.expect("assemble2");
-    validate(&flows).await.expect("validate2");
+    let assembled = assemble(&root, &registry).await.expect("assemble2");
+    let flows = validate(assembled).await.expect("validate2");
     let (_tx, rx) = watch::channel(false);
     FlowEngine::new(flows, RunMode::Once, rx)
         .run()

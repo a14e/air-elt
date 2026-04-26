@@ -6,11 +6,9 @@
 //!    sandbox schema per test. The schema is dropped when the handle is
 //!    dropped. CI uses this mode (GHA `services.postgres`).
 //! 2. Otherwise launch a fresh postgres container via `testcontainers`.
-//!
-//! Callers see the same `PgTestHandle` either way.
 
-use rand::distr::Alphanumeric;
-use rand::{Rng, rng};
+use rand::distr::{Alphanumeric, SampleString};
+use rand::rng;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use testcontainers::runners::AsyncRunner;
@@ -18,7 +16,10 @@ use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres as PgImage;
 use tracing::{info, warn};
 
-/// Live handle to a postgres instance for a test. Drop → cleanup.
+use crate::backend::{TestBackend, detect_with_timeout, prepare_container_env};
+
+const URL_VAR: &str = "AIR_ELT_TEST_PG_URL";
+
 pub struct PgTestHandle {
     pub pool: PgPool,
     pub url: String,
@@ -27,7 +28,6 @@ pub struct PgTestHandle {
 }
 
 impl PgTestHandle {
-    /// URL with `search_path` already bound to the sandbox schema.
     pub fn url_with_search_path(&self) -> String {
         format!("{}?options=-c%20search_path%3D{}", self.url, self.schema)
     }
@@ -49,177 +49,56 @@ impl Drop for CleanupGuard {
             CleanupGuard::ExternalSchema { pool, schema } => {
                 let pool = pool.clone();
                 let schema = schema.clone();
-                // Run cleanup on a fresh OS thread with its own current-thread runtime
-                // — avoids deadlocks whether we're inside a live tokio runtime or not.
                 let join = std::thread::spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                         .expect("build cleanup runtime");
                     rt.block_on(async move {
+                        // Bound the cleanup so a hung server can't wedge the
+                        // test process forever. Stale schemas are reaped on
+                        // the next run via `drop_stale_test_schemas`.
                         let stmt = format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE");
-                        if let Err(e) = sqlx::query(&stmt).execute(&pool).await {
-                            warn!(error = %e, schema, "failed to drop test schema");
+                        let drop_fut = sqlx::query(&stmt).execute(&pool);
+                        match tokio::time::timeout(std::time::Duration::from_secs(5), drop_fut)
+                            .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => {
+                                warn!(error = %e, schema, "failed to drop test schema");
+                            }
+                            Err(_) => {
+                                warn!(schema, "drop schema timed out — relying on self-heal");
+                            }
                         }
+                        let _ =
+                            tokio::time::timeout(std::time::Duration::from_secs(2), pool.close())
+                                .await;
                     });
                 });
                 if let Err(e) = join.join() {
                     warn!(?e, "cleanup thread panicked");
                 }
             }
-            CleanupGuard::Container { .. } => {
-                // testcontainers handles teardown on its own Drop.
-            }
+            CleanupGuard::Container { .. } => {}
         }
     }
 }
 
-/// Entry point. Must be called from within a tokio runtime.
-///
-/// Fails fast with a human-readable panic message if the machine has no way
-/// to reach a postgres (no `AIR_ELT_TEST_PG_URL`, no container runtime) — this
-/// saves 30-120s of waiting on a bollard connect timeout.
 pub async fn pg_pool() -> PgTestHandle {
-    if let Ok(external) = std::env::var("AIR_ELT_TEST_PG_URL") {
+    if let Ok(external) = std::env::var(URL_VAR) {
         return external_with_sandbox(&external).await;
     }
-    // Why spawn_blocking + 300ms timeout: unix socket probing uses sync
-    // `UnixStream::connect` on a potentially-wedged docker.sock; without the
-    // bound, a misbehaving socket can block a tokio worker for seconds.
-    let backend = tokio::time::timeout(
-        std::time::Duration::from_millis(300),
-        tokio::task::spawn_blocking(detect_backend),
-    )
-    .await
-    .unwrap_or_else(|_| panic!("detect_backend timed out after 300ms"))
-    .unwrap_or_else(|e| panic!("detect_backend task panicked: {e}"));
+    let backend = detect_with_timeout(URL_VAR)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     match backend {
-        Err(e) => panic!("{e}"),
-        Ok(TestBackend::ExternalUrl) => unreachable!("handled above"),
-        Ok(TestBackend::Container { socket }) => {
-            #[allow(unsafe_code)]
-            unsafe {
-                // Why: testcontainers reads DOCKER_HOST on first call; we
-                // export the auto-discovered socket before it runs so it
-                // doesn't fall back to a stale /var/run/docker.sock and hang.
-                if std::env::var_os("DOCKER_HOST").is_none() {
-                    std::env::set_var("DOCKER_HOST", &socket);
-                }
-                // Why: testcontainers disables ryuk for podman by default,
-                // but ryuk works fine with our podman setup and prevents
-                // orphaned containers after interrupted tests.
-                if std::env::var_os("TESTCONTAINERS_RYUK_DISABLED").is_none() {
-                    std::env::set_var("TESTCONTAINERS_RYUK_DISABLED", "false");
-                }
-            }
+        TestBackend::ExternalUrl => unreachable!("handled above"),
+        TestBackend::Container { socket } => {
+            prepare_container_env(&socket);
             spawn_container().await
         }
     }
-}
-
-/// Report whether a usable backend is available. `Ok(mode)` tells you what
-/// the test will run against; `Err` is a human-readable description of why
-/// nothing works — tests may call this directly to short-circuit early.
-pub fn detect_backend() -> Result<TestBackend, BackendError> {
-    if std::env::var("AIR_ELT_TEST_PG_URL").is_ok() {
-        return Ok(TestBackend::ExternalUrl);
-    }
-    if let Some(path) = which_container_socket() {
-        return Ok(TestBackend::Container { socket: path });
-    }
-    Err(BackendError::NoBackend)
-}
-
-#[derive(Debug, Clone)]
-pub enum TestBackend {
-    ExternalUrl,
-    Container { socket: String },
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum BackendError {
-    #[error(
-        "no postgres backend for e2e tests.\n\n\
-         Set one of:\n\
-         - AIR_ELT_TEST_PG_URL=postgres://…  (CI / shared DB)\n\
-         - DOCKER_HOST=unix:///path/to/docker-or-podman.sock  (testcontainers)\n\n\
-         On macOS with podman, check `podman machine list` and point DOCKER_HOST at\n\
-         the `-api.sock` file inside /var/folders/.../T/podman/, e.g.\n\
-         DOCKER_HOST=unix:///var/folders/<uid>/T/podman/podman-machine-default-api.sock"
-    )]
-    NoBackend,
-}
-
-fn which_container_socket() -> Option<String> {
-    if let Ok(host) = std::env::var("DOCKER_HOST")
-        && host_is_alive(&host)
-    {
-        return Some(host);
-    }
-    // Default docker socket on Linux (also works for Docker Desktop on macOS).
-    if socket_reachable("/var/run/docker.sock") {
-        return Some("unix:///var/run/docker.sock".to_string());
-    }
-    // Rootless podman on Linux.
-    if let Some(uid) = best_effort_uid() {
-        let linux_podman = format!("/run/user/{uid}/podman/podman.sock");
-        if socket_reachable(&linux_podman) {
-            return Some(format!("unix://{linux_podman}"));
-        }
-    }
-    // Podman on macOS — `podman machine` exposes the docker-API socket under
-    // `$TMPDIR/podman/<machine>-api.sock`. We scan the standard location so
-    // the user doesn't have to set DOCKER_HOST by hand.
-    if let Some(path) = scan_macos_podman_sockets() {
-        return Some(format!("unix://{path}"));
-    }
-    None
-}
-
-fn scan_macos_podman_sockets() -> Option<String> {
-    let tmp = std::env::var("TMPDIR").ok()?;
-    let dir = std::path::PathBuf::from(tmp).join("podman");
-    let entries = std::fs::read_dir(&dir).ok()?;
-    // Prefer the `-api.sock` file, that's the docker-compatible endpoint.
-    let mut best: Option<String> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.ends_with("-api.sock") {
-            continue;
-        }
-        let Some(path_str) = path.to_str() else {
-            continue;
-        };
-        if socket_reachable(path_str) {
-            best = Some(path_str.to_string());
-            break;
-        }
-    }
-    best
-}
-
-/// We need the POSIX uid only to build the rootless-podman socket path on Linux.
-/// To avoid a `libc` dependency (and any `unsafe`), we read `$UID` — set by
-/// every POSIX shell. Returning `None` just skips the rootless-podman probe;
-/// the macOS branch and the explicit `DOCKER_HOST` fallback still apply.
-fn best_effort_uid() -> Option<u32> {
-    std::env::var("UID").ok().and_then(|s| s.parse().ok())
-}
-
-fn host_is_alive(host: &str) -> bool {
-    if let Some(path) = host.strip_prefix("unix://") {
-        socket_reachable(path)
-    } else {
-        // TCP / npipe — assume the user knows what they set.
-        true
-    }
-}
-
-fn socket_reachable(path: &str) -> bool {
-    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 async fn external_with_sandbox(url: &str) -> PgTestHandle {
@@ -232,10 +111,6 @@ async fn external_with_sandbox(url: &str) -> PgTestHandle {
         .await
         .expect("connect to AIR_ELT_TEST_PG_URL failed");
 
-    // Self-heal: previous test runs that crashed before Drop leave orphaned
-    // `test_<unix_ts>_*` schemas. Every pg_pool() call cleans up any schema
-    // older than 24h — cheap single-statement janitorial work that keeps
-    // shared CI DBs from accumulating tens of thousands of stale schemas.
     drop_stale_test_schemas(&bootstrap_pool, 24 * 3600).await;
 
     let create = format!("CREATE SCHEMA \"{schema}\"");
@@ -244,8 +119,6 @@ async fn external_with_sandbox(url: &str) -> PgTestHandle {
         .await
         .expect("create sandbox schema failed");
 
-    // Why: guard is live immediately so if the scoped connect below panics,
-    // Drop will clean up the schema instead of leaving it orphaned.
     let cleanup = CleanupGuard::ExternalSchema {
         pool: bootstrap_pool.clone(),
         schema: schema.clone(),
@@ -280,7 +153,6 @@ async fn spawn_container() -> PgTestHandle {
         .await
         .expect("container port");
 
-    // Default credentials from testcontainers-modules Postgres.
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -298,9 +170,6 @@ async fn spawn_container() -> PgTestHandle {
     }
 }
 
-/// Drop every `test_<unix_ts>_<suffix>` schema whose timestamp component is
-/// older than `max_age_secs`. Failures are logged but do not abort the test —
-/// the worst case is continued accumulation, not false failures.
 async fn drop_stale_test_schemas(pool: &PgPool, max_age_secs: u64) {
     let cutoff = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -322,7 +191,6 @@ async fn drop_stale_test_schemas(pool: &PgPool, max_age_secs: u64) {
     };
 
     for (schema_name,) in rows {
-        // schema_name is like `test_1700000000_abcd1234`; parse the middle part.
         let ts = schema_name
             .strip_prefix("test_")
             .and_then(|s| s.split_once('_'))
@@ -343,11 +211,9 @@ async fn drop_stale_test_schemas(pool: &PgPool, max_age_secs: u64) {
 }
 
 fn random_schema() -> String {
-    let suffix: String = rng()
-        .sample_iter(&Alphanumeric)
-        .take(8)
-        .map(|c| (c as char).to_ascii_lowercase())
-        .collect();
+    let suffix = Alphanumeric
+        .sample_string(&mut rng(), 8)
+        .to_ascii_lowercase();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

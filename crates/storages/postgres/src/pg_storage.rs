@@ -18,9 +18,9 @@ impl PgStorage {
     /// `migrate` can hit it immediately; timeouts and the UTC session TZ are
     /// applied by the commons pool helper.
     pub async fn connect(config: PgStorageConfig) -> RuntimeResult<Self> {
-        let pool = air_elt_commons::sql::pg::pool::connect(
+        let pool = air_elt_commons_pg::pool::connect(
             &config.url,
-            air_elt_commons::sql::pg::pool::PoolTimeouts::from_options(
+            air_elt_commons_pg::pool::PoolSettings::from_options(
                 config.connect_timeout,
                 config.acquire_timeout,
                 config.idle_timeout,

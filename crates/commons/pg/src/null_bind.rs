@@ -11,6 +11,7 @@
 //! comparisons. Sink-side inlines the same match inside `push_values` because
 //! the `Separated` lifetime prevents extracting it into a helper.
 
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::postgres::{PgArguments, Postgres};
 use sqlx::query::Query;
@@ -29,8 +30,21 @@ pub fn bind_typed_null<'q>(
         DataType::Int32 => query.bind::<Option<i32>>(None),
         DataType::Float32 => query.bind::<Option<f32>>(None),
         DataType::Float64 => query.bind::<Option<f64>>(None),
-        DataType::Text => query.bind::<Option<String>>(None),
-        DataType::Bytes => query.bind::<Option<Vec<u8>>>(None),
+        // PG `numeric` accepts BigDecimal-typed NULLs for any (p, s) and
+        // unbounded numeric — the OID is the same.
+        DataType::BigInt { .. } | DataType::Decimal { .. } => {
+            query.bind::<Option<BigDecimal>>(None)
+        }
+        // PG has no native unsigned integer types — these variants only
+        // exist on the MySQL side. The runner reaches this null-bind path
+        // only for source/sink columns that are *PG* columns, so unsigned
+        // can never appear here. Defensive panic preserves exhaustiveness
+        // without inventing a wire type.
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            unreachable!("postgres has no unsigned integer types")
+        }
+        DataType::Text { .. } => query.bind::<Option<String>>(None),
+        DataType::Bytes { .. } => query.bind::<Option<Vec<u8>>>(None),
         DataType::Date => query.bind::<Option<NaiveDate>>(None),
         DataType::Timestamp => query.bind::<Option<DateTime<Utc>>>(None),
         DataType::Uuid => query.bind::<Option<Uuid>>(None),

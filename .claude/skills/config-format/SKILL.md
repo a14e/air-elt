@@ -22,10 +22,12 @@ Flat `key = "value"` map. Used by `${VAR}` expansion (env → secrets → defaul
 | Field | Type | Required | Description |
 |-------|------|:--------:|-------------|
 | `name` | string | yes | Unique identifier |
-| `type` | string | yes | Connector kind (`"postgres"`) |
+| `type` | string | yes | Connector kind (`"postgres"` or `"mysql"`) |
 | `config` | table | yes | Connector-specific config (see below) |
 
-### Postgres connector config (`config = { ... }`)
+### Postgres / MySQL connector config (`config = { ... }`)
+
+The same field set applies to both `"postgres"` and `"mysql"` types — only the URL scheme differs (`postgres://...` vs `mysql://...`). For MySQL, the database name is taken from the URL path (`mysql://user@host:3306/dbname`); table identifiers may also be schema-qualified (`appdb.users`).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

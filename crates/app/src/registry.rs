@@ -3,8 +3,11 @@
 use std::sync::Arc;
 
 use air_elt_core::registry::Registry;
+use air_elt_sink_mysql::MySqlSinkFactory;
 use air_elt_sink_postgres::PgSinkFactory;
+use air_elt_source_mysql::MySqlSourceFactory;
 use air_elt_source_postgres::PgSourceFactory;
+use air_elt_storage_mysql::MySqlStorageFactory;
 use air_elt_storage_postgres::PgStorageFactory;
 
 pub fn build_registry() -> Registry {
@@ -12,5 +15,8 @@ pub fn build_registry() -> Registry {
     registry.register_source("postgres", Arc::new(PgSourceFactory));
     registry.register_sink("postgres", Arc::new(PgSinkFactory));
     registry.register_storage("postgres", Arc::new(PgStorageFactory));
+    registry.register_source("mysql", Arc::new(MySqlSourceFactory));
+    registry.register_sink("mysql", Arc::new(MySqlSinkFactory));
+    registry.register_storage("mysql", Arc::new(MySqlStorageFactory));
     registry
 }

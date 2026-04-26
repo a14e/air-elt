@@ -1,9 +1,10 @@
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 use uuid::Uuid;
 
-use air_elt_commons::sql::pg::null_bind;
+use air_elt_commons_pg::null_bind;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::types::{DataType, Value};
 
@@ -32,10 +33,10 @@ pub fn decode_column(row: &PgRow, index: usize, data_type: DataType) -> RuntimeR
         DataType::Float64 => {
             nullable::<f64>(row, index).map(|o| o.map(Value::Float64).unwrap_or(Value::Null))
         }
-        DataType::Text => {
+        DataType::Text { .. } => {
             nullable::<String>(row, index).map(|o| o.map(Value::Text).unwrap_or(Value::Null))
         }
-        DataType::Bytes => {
+        DataType::Bytes { .. } => {
             nullable::<Vec<u8>>(row, index).map(|o| o.map(Value::Bytes).unwrap_or(Value::Null))
         }
         DataType::Date => {
@@ -48,6 +49,30 @@ pub fn decode_column(row: &PgRow, index: usize, data_type: DataType) -> RuntimeR
         }
         DataType::Json => nullable::<serde_json::Value>(row, index)
             .map(|o| o.map(Value::Json).unwrap_or(Value::Null)),
+        // BigInt and Decimal are both stored as `numeric` in pg, so sqlx
+        // surfaces them through `BigDecimal`. The column's declared scale
+        // is 0 (schema invariant) but the wire-level `dscale` may not
+        // exactly match for values like `1000` if a future sqlx normalises
+        // them. Force-rescale to 0 first so the integer mantissa we extract
+        // is the canonical column value regardless of normalisation.
+        DataType::BigInt { .. } => match nullable::<BigDecimal>(row, index)? {
+            None => Ok(Value::Null),
+            Some(d) => {
+                let (mantissa, _) = d.with_scale(0).into_bigint_and_exponent();
+                Ok(Value::BigInt(mantissa))
+            }
+        },
+        DataType::Decimal { .. } => match nullable::<BigDecimal>(row, index)? {
+            None => Ok(Value::Null),
+            Some(d) => Ok(Value::Decimal(d)),
+        },
+        // Postgres has no unsigned int columns — these `DataType` variants
+        // exist only on the MySQL/MariaDB side. The pg source schema
+        // introspector never emits them, so this arm is structurally
+        // unreachable.
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            unreachable!("postgres has no unsigned integer types")
+        }
     }
 }
 
@@ -83,5 +108,10 @@ pub fn bind_cursor_value<'q>(
         Value::Timestamp(ts) => query.bind(*ts),
         Value::Uuid(u) => query.bind(*u),
         Value::Json(j) => query.bind(j),
+        Value::BigInt(b) => query.bind(BigDecimal::new(b.clone(), 0)),
+        Value::Decimal(d) => query.bind(d.clone()),
+        Value::UInt8(_) | Value::UInt16(_) | Value::UInt32(_) | Value::UInt64(_) => {
+            unreachable!("postgres has no unsigned int columns; cursor cannot carry unsigned")
+        }
     }
 }

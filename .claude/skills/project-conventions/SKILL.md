@@ -7,6 +7,14 @@ description: Mandatory shared utilities and patterns for Air Elt — load before
 
 Before editing Rust code, check this list. If a utility exists for your need, use it. **Do not reimplement.** If you add a new cross-crate helper, append it here.
 
+## Commons isolation
+
+`air-elt-commons` (`crates/commons/lib`) is the foundational utility crate and **MUST NOT depend on any other `air-elt-*` crate**, including `air-elt-core`. It hosts only project-internal-dep-free helpers: `tracing_init`, `identifier` (validation + `IdentifierError`), `pool_timeouts`.
+
+Direction of dependency is the inverse: `core` (and connectors) depend on `commons`, never the other way around. If you find yourself wanting to import `air-elt-core` into commons, the type or impl belongs somewhere downstream — in `core` itself, or in `commons-pg` / `commons-mysql` (which legitimately depend on both core and commons).
+
+Example: `impl From<IdentifierError> for RuntimeError` lives in `core::error`, not in `commons::identifier`, even though it bridges the two — the `From` impl is needed for `?`-ergonomics in connector code, and core is allowed to know about commons.
+
 ## Config naming
 
 TOML config keys use **kebab-case** for multi-word fields (`batch-limit`, `operation-timeout-secs`, `max-connections`). Structs with multi-word fields carry `#[serde(rename_all = "kebab-case")]`.
@@ -17,40 +25,41 @@ Initialise the subscriber once via `air_elt_commons::tracing_init::init()` in `a
 
 ## SQL — identifier escaping
 
-All dynamic identifiers in SQL must go through these helpers. Raw `format!("\"{}\"", name)` is forbidden.
+All dynamic identifiers in SQL must go through these helpers. Raw `format!` quoting is forbidden.
 
-- **`quote_ident(name)`** — single identifier, doubles internal `"`.
-- **`quote_qualified(name)`** — `schema.table` → `"schema"."table"`. Rejects chars outside `[A-Za-z0-9_$]`.
-- **`quote_columns(&[String])`** — comma-joined quoted list.
-- **`split_qualified(name)`** — `schema.table` → `(schema, table)` for `information_schema` binds.
-- `IdentifierError` converts to `RuntimeError` via `impl From` — use `?` directly.
+- Validation primitives in **`air_elt_commons::identifier`** (`IdentifierError`, `is_bare_ident_char`, `validate_segment`) — db-agnostic.
+- pg quoting (`"`): **`air_elt_commons_pg::identifier::{quote_ident, quote_qualified, quote_columns, split_qualified}`** (`split_qualified` defaults to `public`).
+- mysql quoting (backtick): **`air_elt_commons_mysql::identifier::{quote_ident, quote_qualified, quote_columns, split_qualified}`** (`split_qualified` returns `(Option<db>, table)` — bare names default to `SELECT DATABASE()`).
+- `IdentifierError → RuntimeError` via `impl From` (lives in `core::error`) — use `?` directly.
 
-All live in `air_elt_commons::sql::pg::identifier`.
+## SQL — type tables
 
-## SQL — PG type mapping
+Source-side type resolution: native type → canonical `DataType`. Each table folds the column's declared length into `Text { size }` / `Bytes { size }` (or unbounded for `text`/`blob`-family).
 
-Source-side type resolution: PG native type → canonical `DataType`.
-
-- **`air_elt_commons::sql::pg::pg_type::{PgType, parse, to_internal}`** — shared between source and sink.
-- **`timestamp` without time zone is unsupported** — `parse("timestamp")` returns `None`. Only `timestamptz` is accepted.
+- **`air_elt_commons_pg::pg_type::{PgType, parse, to_internal}`** — accepts `timestamptz` only; naive `timestamp` returns `None`.
+- **`air_elt_commons_mysql::mysql_type::{MySqlType, parse, to_internal}`** — `tinyint(1)` → `Bool`, other tinyints → `Int16`. `datetime` is rejected; only `timestamp` is accepted (UTC).
 
 ## SQL — NULL binding
 
-Typed NULL binding ensures the wire OID matches the column type.
+Typed NULL binding ensures the wire type matches the column.
 
-- **`air_elt_commons::sql::pg::null_bind::bind_typed_null(query, DataType)`** — for cursor comparisons in source.
+- **`air_elt_commons_pg::null_bind::bind_typed_null(query, DataType)`**
+- **`air_elt_commons_mysql::null_bind::bind_typed_null(query, DataType)`**
 - Sink-side: the NULL match is inlined inside `push_values` (the `Separated` lifetime prevents extraction).
 
 ## SQL — pool construction
 
-All postgres connectors open pools through a single shared helper.
+All postgres / mysql connectors open pools through a shared helper. Both reuse the same `PoolTimeouts` (db-agnostic).
 
-- **`air_elt_commons::sql::pg::pool::connect(url, PoolTimeouts)`** — wires timeouts, `SET TIME ZONE 'UTC'`, and `SET statement_timeout` in `after_connect`.
-- **Defaults**: connect 5s, acquire 10s, idle 300s, max_lifetime 1800s, statement 30s, max_connections 5. Per-connector overrides via `*Config` fields.
+- **`air_elt_commons::pool_timeouts::PoolTimeouts`** — provider-agnostic struct (`defaults()`, `from_options(...)`).
+- **`air_elt_commons_pg::pool::connect(url, PoolTimeouts)`** — wires `SET TIME ZONE 'UTC'` + `SET statement_timeout`.
+- **`air_elt_commons_mysql::pool::connect(url, PoolTimeouts)`** — wires `SET SESSION time_zone='+00:00'` + `SET SESSION max_execution_time`.
+- **Defaults**: connect 5s, acquire 10s, idle 300s, max_lifetime 1800s, statement 30s, max_connections 5.
 
 ## SQL — schema introspection
 
-- **`air_elt_commons::sql::pg::schema::fetch_schema(pool, table)`** — shared for source and sink. Do not duplicate.
+- **`air_elt_commons_pg::schema::fetch_schema(pool, table)`** — pg `information_schema.columns` (reads `character_maximum_length` for sized text/bytes).
+- **`air_elt_commons_mysql::schema::fetch_schema(pool, table)`** — mysql `information_schema.COLUMNS` (reads `column_type` for `tinyint(1)` discrimination + `character_maximum_length`).
 
 ## SQL — value binding
 
@@ -78,14 +87,18 @@ Config-time resolution of `${VAR}` / `${VAR:default}` placeholders.
 
 Canonical types avoid direct source↔sink coupling — each connector maps to/from the shared pivot.
 
-- **`air_elt_core::types::{DataType, Value}`** — the only type enums. Never introduce parallel enums in connectors.
-- Source owns `native → DataType`, sink owns `DataType → native`. Shared half (`PgType`, `parse`, `to_internal`) in commons.
-- **`air_elt_core::types::matrix::is_compatible(source_dt, sink_dt)`** — validation-time only. No runtime conversion.
+- **`air_elt_core::types::{DataType, Value}`** — the only type enums. Never introduce parallel enums in connectors. `Text`/`Bytes` carry `size: Option<u32>`. `BigInt { width }` and `Decimal { precision, scale }` cover SQL `numeric`/`decimal`: scale-0 columns map to `BigInt` (carrying `num_bigint::BigInt`), scale > 0 to `Decimal` (carrying `bigdecimal::BigDecimal`). Sources read both via sqlx `BigDecimal`; the BigInt arm extracts the integer mantissa with no arithmetic.
+- Source owns `native → DataType`, sink owns `DataType → native`. Shared halves (`PgType`, `MySqlType`, `parse`, `to_internal`) in `commons-pg` / `commons-mysql`.
+- **`air_elt_core::types::matrix::is_compatible(source_dt, sink_dt)`** — validation-time width check (no narrowing, no unbounded→bounded), plus `Uuid ↔ Text/Bytes`, `Int* ↔ Bool`, `Int*/BigInt → BigInt/Decimal` widening allowances. Reverse paths (`BigInt/Decimal → Int*`, `Float ↔ BigInt/Decimal`) are deliberately rejected — every one is potentially lossy.
+- **`air_elt_core::types::convert::{convert, ConvertError}`** — single dispatcher `convert(value, src, dst)` for runtime per-cell conversion. Identity / pure-widening pairs return the value unchanged. UUID parsing accepts canonical `8-4-4-4-12`, hex-only, MS-style `{...}` (any case). Connectors must NOT implement these conversions themselves.
+- **`FlowState::conversions: Vec<(DataType, DataType)>`** — populated by `validation::pipeline::validate` from src/sink schemas; the runner uses it to skip identity columns and dispatch through `convert` for the rest.
 
 ## Testing
 
-- **`air_elt_commons_testing::pg::pg_pool()`** — returns a `PgTestHandle` with a sandboxed schema. Auto-detects backend (external URL or local container via podman/docker).
-- Keep the handle alive for the whole test — dropping it tears down the schema.
+- **`air_elt_commons_testing::pg::pg_pool()`** — `PgTestHandle` with sandboxed schema. Honours `AIR_ELT_TEST_PG_URL` or auto-detects podman/docker.
+- **`air_elt_commons_testing::mysql::mysql_pool()`** — `MySqlTestHandle` with sandboxed database. Honours `AIR_ELT_TEST_MYSQL_URL` or auto-detects podman/docker.
+- **`air_elt_commons_testing::mariadb::mariadb_pool()`** — `MariaDbTestHandle` for the MariaDB test target of the mysql connector (validates legacy `VALUES()` UPSERT and native UUID divergences). Honours `AIR_ELT_TEST_MARIADB_URL` or auto-detects podman/docker. Uses an extra connect-retry loop to absorb the MariaDB image's bootstrap-then-restart sequence.
+- Keep the handle alive for the whole test — dropping it tears down the schema/database.
 - **`[dev-dependencies]` only** — listing it under `[dependencies]` ships testcontainers into release builds.
 - Database mocks are forbidden.
 - **`mockall` (dev-dependency)** — used for unit-testing runner logic. traits carry `#[cfg_attr(test, mockall::automock)]`.

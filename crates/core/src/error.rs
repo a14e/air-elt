@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use air_elt_commons::identifier::IdentifierError;
+
+use crate::types::convert::ConvertError;
 use crate::types::data_type::DataType;
 
 #[derive(Debug, Error)]
@@ -72,7 +75,7 @@ pub enum TypeError {
     UnsupportedNativeType { native: String },
 
     #[error(
-        "column {column:?}: canonical `Null` has no pg representation — a sink column's \
+        "column {column:?}: canonical `Null` has no native representation — a sink column's \
          DataType cannot be `Null`"
     )]
     NullSinkColumn { column: String },
@@ -161,6 +164,12 @@ pub enum RuntimeError {
 
     #[error("schema for table {table:?} is missing column {column:?}")]
     SchemaColumnMissing { table: String, column: String },
+
+    #[error("value conversion failed: {0}")]
+    Conversion(#[from] ConvertError),
+
+    #[error("invalid identifier: {0}")]
+    Identifier(#[from] IdentifierError),
 
     #[error("{0}")]
     Other(String),

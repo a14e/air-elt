@@ -2,37 +2,182 @@ use crate::types::data_type::DataType;
 
 /// Compatibility predicate for validation.
 ///
-/// There is **no** core-to-core value conversion. Each connector owns its
-/// `native_type ↔ DataType` mapping, and values flow through the runner in
-/// whatever canonical form the source emitted. This matrix only answers:
-/// "if the source produces `source_t`, can a sink whose column canonicalises
-/// to `sink_t` accept it?" Rejected pairings fail at `validate`, before any
-/// runtime work.
+/// Each connector owns its `native_type ↔ DataType` mapping; this matrix only
+/// answers: "if the source produces `source_t`, can a sink whose column
+/// canonicalises to `sink_t` accept it?". Rejected pairings fail at
+/// `validate`, before any runtime work.
 ///
-/// Rules: exact match always allowed; NULL is assignable anywhere; integer and
-/// float widening allowed; everything else requires the pair to be identical
-/// (narrowing and bool↔int coercions are refused so users stay honest about
-/// their schemas).
+/// Rules:
+/// * exact match always allowed (modulo size widening for `Text`/`Bytes`);
+/// * integer and float widening allowed;
+/// * `Text(a) → Text(b)` requires `b` unbounded *or* (`a` bounded ∧ `a ≤ b`)
+///   — same for `Bytes`. No narrowing, no unbounded-into-bounded;
+/// * UUID round-trips through text/bytes when the sink is wide enough
+///   (`Text ≥ 36`, `Bytes ≥ 16`); reverse direction is allowed under the same
+///   width rule (final parse validation deferred to runtime in `convert`);
+/// * `Int* ↔ Bool` allowed (runtime conversion: `0 ↔ false`, non-zero → true);
+/// * everything else requires an exact match.
 pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
     use DataType::*;
 
     if source_t == sink_t {
         return true;
     }
-    matches!(
-        (source_t, sink_t),
-        (Int16, Int32)
-            | (Int16, Int64)
-            | (Int32, Int64)
-            | (Float32, Float64)
-            | (Int16, Float32)
-            | (Int16, Float64)
-            | (Int32, Float64)
-    )
+
+    match (source_t, sink_t) {
+        // Integer widening
+        (Int16, Int32) | (Int16, Int64) | (Int32, Int64) => true,
+        // Float widening
+        (Float32, Float64) => true,
+        // Int-to-float widening (lossless mantissa fits)
+        (Int16, Float32) | (Int16, Float64) | (Int32, Float64) => true,
+
+        // Text size widening: Text(a) → Text(b)
+        (Text { size: a }, Text { size: b }) => fits_size(a, b),
+        // Bytes size widening
+        (Bytes { size: a }, Bytes { size: b }) => fits_size(a, b),
+
+        // UUID ↔ text (CHAR(36)) — needs ≥ 36 bytes either way
+        (Uuid, Text { size: b }) => b.is_none_or(|n| n >= 36),
+        (Text { size: a }, Uuid) => a.is_none_or(|n| n >= 36),
+
+        // UUID ↔ bytes (BINARY(16)) — needs ≥ 16 bytes either way
+        (Uuid, Bytes { size: b }) => b.is_none_or(|n| n >= 16),
+        (Bytes { size: a }, Uuid) => a.is_none_or(|n| n >= 16),
+
+        // Int ↔ Bool runtime coercion
+        (Int16 | Int32 | Int64, Bool) => true,
+        (Bool, Int16 | Int32 | Int64) => true,
+
+        // Unsigned widening: each step climbs one width. UInt8 also fits any
+        // wider signed; UInt16 fits Int32+/Int64; UInt32 fits Int64. UInt64
+        // does *not* fit any signed Int* (i64 max < u64 max), so it can only
+        // widen into BigInt or wider unsigned.
+        (UInt8, UInt16 | UInt32 | UInt64) => true,
+        (UInt16, UInt32 | UInt64) => true,
+        (UInt32, UInt64) => true,
+        (UInt8, Int16 | Int32 | Int64) => true,
+        (UInt16, Int32 | Int64) => true,
+        (UInt32, Int64) => true,
+        // Unsigned → BigInt: always lossless.
+        (UInt8 | UInt16 | UInt32 | UInt64, BigInt { .. }) => true,
+        // Unsigned → Decimal: digit widths 3 / 5 / 10 / 20.
+        (UInt8, Decimal { precision, scale }) => decimal_fits_int_digits(precision, scale, 3),
+        (UInt16, Decimal { precision, scale }) => decimal_fits_int_digits(precision, scale, 5),
+        (UInt32, Decimal { precision, scale }) => decimal_fits_int_digits(precision, scale, 10),
+        (UInt64, Decimal { precision, scale }) => decimal_fits_int_digits(precision, scale, 20),
+        // Unsigned ↔ Bool: same algebra as signed Int ↔ Bool.
+        (UInt8 | UInt16 | UInt32 | UInt64, Bool) => true,
+        (Bool, UInt8 | UInt16 | UInt32 | UInt64) => true,
+
+        // Fixed-width int → BigInt: always lossless.
+        (Int16 | Int32 | Int64, BigInt { .. }) => true,
+        // BigInt → BigInt: only widen (target unbounded, or wider).
+        (BigInt { width: a }, BigInt { width: b }) => fits_size(a, b),
+
+        // Int → Decimal: ok when target precision-scale ≥ source digit width,
+        // or target unbounded.
+        (Int16, Decimal { precision, scale }) => decimal_fits_int_digits(precision, scale, 5),
+        (Int32, Decimal { precision, scale }) => decimal_fits_int_digits(precision, scale, 10),
+        (Int64, Decimal { precision, scale }) => decimal_fits_int_digits(precision, scale, 19),
+
+        // BigInt → Decimal: target must be fully unbounded, or target's
+        // integer-digits cover source width (or source unbounded only into
+        // unbounded target).
+        (BigInt { width: a }, Decimal { precision, scale }) => {
+            decimal_fits_bigint(a, precision, scale)
+        }
+
+        // Decimal → Decimal: integer-digits and scale both widen (or target
+        // fully unbounded).
+        (
+            Decimal {
+                precision: pa,
+                scale: sa,
+            },
+            Decimal {
+                precision: pb,
+                scale: sb,
+            },
+        ) => decimal_fits_decimal(pa, sa, pb, sb),
+
+        // Narrowing from BigInt/Decimal back into fixed-width or integer
+        // types is *not* supported — every reverse path is potentially
+        // lossy. Users adding such pipelines must do an explicit transform.
+        _ => false,
+    }
+}
+
+/// Source has `digits` decimal digits (e.g. i32 → 10). Target is
+/// `Decimal { precision, scale }`. Compatible if target is fully unbounded,
+/// or if it has enough integer-digits room.
+fn decimal_fits_int_digits(precision: Option<u32>, scale: Option<u32>, digits: u32) -> bool {
+    match (precision, scale) {
+        (None, _) => true,
+        (Some(p), Some(s)) => p.saturating_sub(s) >= digits,
+        // precision without scale is non-canonical; treat as unbounded scale=0.
+        (Some(p), None) => p >= digits,
+    }
+}
+
+/// Source `BigInt { width }` into `Decimal { precision, scale }`. Same idea:
+/// integer-digits must cover source width.
+fn decimal_fits_bigint(
+    bigint_width: Option<u32>,
+    precision: Option<u32>,
+    scale: Option<u32>,
+) -> bool {
+    match (bigint_width, precision) {
+        (_, None) => true,        // any → unbounded decimal: ok.
+        (None, Some(_)) => false, // unbounded → bounded: rejected.
+        (Some(w), Some(p)) => p.saturating_sub(scale.unwrap_or(0)) >= w,
+    }
+}
+
+/// `Decimal{pa,sa} → Decimal{pb,sb}`: target unbounded, or integer-digits and
+/// scale each widen.
+fn decimal_fits_decimal(
+    pa: Option<u32>,
+    sa: Option<u32>,
+    pb: Option<u32>,
+    sb: Option<u32>,
+) -> bool {
+    match (pa, pb) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(pa), Some(pb)) => {
+            let sa = sa.unwrap_or(0);
+            let sb = sb.unwrap_or(0);
+            sb >= sa && pb.saturating_sub(sb) >= pa.saturating_sub(sa)
+        }
+    }
+}
+
+/// `Text(a) → Text(b)` (or `Bytes`) compatibility on size only.
+/// Bounded → bounded ok if `a ≤ b`. Bounded → unbounded ok. Unbounded →
+/// bounded **rejected** (potential overflow). Unbounded → unbounded ok.
+fn fits_size(source: Option<u32>, sink: Option<u32>) -> bool {
+    match (source, sink) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(a), Some(b)) => a <= b,
+    }
 }
 
 pub fn is_narrowing(source_t: DataType, sink_t: DataType) -> bool {
     use DataType::*;
+    if let (Text { size: Some(a) }, Text { size: Some(b) }) = (source_t, sink_t) {
+        return a > b;
+    }
+    if let (Bytes { size: Some(a) }, Bytes { size: Some(b) }) = (source_t, sink_t) {
+        return a > b;
+    }
+    if let (Text { size: None }, Text { size: Some(_) }) = (source_t, sink_t) {
+        return true;
+    }
+    if let (Bytes { size: None }, Bytes { size: Some(_) }) = (source_t, sink_t) {
+        return true;
+    }
     matches!(
         (source_t, sink_t),
         (Int32, Int16)
@@ -45,6 +190,17 @@ pub fn is_narrowing(source_t: DataType, sink_t: DataType) -> bool {
             | (Float64, Int16)
             | (Float64, Int32)
             | (Float64, Int64)
+            // Unsigned narrowing.
+            | (UInt16, UInt8)
+            | (UInt32, UInt8)
+            | (UInt32, UInt16)
+            | (UInt64, UInt8)
+            | (UInt64, UInt16)
+            | (UInt64, UInt32)
+            // Signed → unsigned (sign loss) is also narrowing.
+            | (Int16, UInt8 | UInt16 | UInt32 | UInt64)
+            | (Int32, UInt8 | UInt16 | UInt32 | UInt64)
+            | (Int64, UInt8 | UInt16 | UInt32 | UInt64)
     )
 }
 
@@ -53,10 +209,22 @@ pub fn is_narrowing(source_t: DataType, sink_t: DataType) -> bool {
 mod tests {
     use super::*;
 
+    const TEXT: DataType = DataType::text();
+    const BYTES: DataType = DataType::bytes();
+
+    fn text(n: u32) -> DataType {
+        DataType::Text { size: Some(n) }
+    }
+
+    fn bytes(n: u32) -> DataType {
+        DataType::Bytes { size: Some(n) }
+    }
+
     #[test]
     fn identical_types_compatible() {
         assert!(is_compatible(DataType::Int32, DataType::Int32));
-        assert!(is_compatible(DataType::Text, DataType::Text));
+        assert!(is_compatible(TEXT, TEXT));
+        assert!(is_compatible(text(36), text(36)));
         assert!(is_compatible(DataType::Uuid, DataType::Uuid));
     }
 
@@ -80,49 +248,280 @@ mod tests {
     }
 
     #[test]
-    fn bool_to_int_rejected() {
-        // no implicit 0/1 coercion — sources declaring bool must stay bool
-        assert!(!is_compatible(DataType::Bool, DataType::Int32));
+    fn int_to_bool_allowed_now() {
+        assert!(is_compatible(DataType::Int16, DataType::Bool));
+        assert!(is_compatible(DataType::Int32, DataType::Bool));
+        assert!(is_compatible(DataType::Int64, DataType::Bool));
+        assert!(is_compatible(DataType::Bool, DataType::Int32));
     }
 
     #[test]
     fn distinct_scalars_not_auto_compatible() {
-        // text/uuid/date do not widen into each other
-        assert!(!is_compatible(DataType::Text, DataType::Uuid));
+        assert!(!is_compatible(TEXT, DataType::Json));
         assert!(!is_compatible(DataType::Date, DataType::Timestamp));
     }
 
     #[test]
     fn int_to_float_lossy_rejected() {
-        // Int32 mantissa exceeds f32 precision — rejected
         assert!(!is_compatible(DataType::Int32, DataType::Float32));
-        // Float64→Int64 is a lossy narrowing — rejected
         assert!(!is_compatible(DataType::Float64, DataType::Int64));
     }
 
     #[test]
     fn int_to_float_widening_allowed() {
-        // These widening paths must remain allowed
         assert!(is_compatible(DataType::Int16, DataType::Float32));
         assert!(is_compatible(DataType::Int16, DataType::Float64));
         assert!(is_compatible(DataType::Int32, DataType::Float64));
     }
 
     #[test]
+    fn text_widening_allowed() {
+        assert!(is_compatible(text(10), text(20)));
+        assert!(is_compatible(text(10), TEXT));
+        assert!(is_compatible(text(36), text(36)));
+    }
+
+    #[test]
+    fn text_narrowing_rejected() {
+        assert!(!is_compatible(text(20), text(10)));
+        assert!(!is_compatible(TEXT, text(255)));
+        assert!(is_narrowing(text(20), text(10)));
+        assert!(is_narrowing(TEXT, text(255)));
+    }
+
+    #[test]
+    fn bytes_widening_allowed() {
+        assert!(is_compatible(bytes(10), bytes(20)));
+        assert!(is_compatible(bytes(10), BYTES));
+        assert!(!is_compatible(bytes(20), bytes(10)));
+        assert!(!is_compatible(BYTES, bytes(16)));
+    }
+
+    #[test]
+    fn uuid_to_text_requires_36() {
+        assert!(is_compatible(DataType::Uuid, text(36)));
+        assert!(is_compatible(DataType::Uuid, text(64)));
+        assert!(is_compatible(DataType::Uuid, TEXT));
+        assert!(!is_compatible(DataType::Uuid, text(35)));
+    }
+
+    #[test]
+    fn uuid_to_bytes_requires_16() {
+        assert!(is_compatible(DataType::Uuid, bytes(16)));
+        assert!(is_compatible(DataType::Uuid, bytes(32)));
+        assert!(is_compatible(DataType::Uuid, BYTES));
+        assert!(!is_compatible(DataType::Uuid, bytes(15)));
+    }
+
+    #[test]
+    fn text_to_uuid_requires_36() {
+        assert!(is_compatible(text(36), DataType::Uuid));
+        assert!(is_compatible(TEXT, DataType::Uuid));
+        assert!(!is_compatible(text(35), DataType::Uuid));
+    }
+
+    #[test]
+    fn bytes_to_uuid_requires_16() {
+        assert!(is_compatible(bytes(16), DataType::Uuid));
+        assert!(is_compatible(BYTES, DataType::Uuid));
+        assert!(!is_compatible(bytes(8), DataType::Uuid));
+    }
+
+    #[test]
     fn bytes_text_incompatible_both_directions() {
-        assert!(!is_compatible(DataType::Bytes, DataType::Text));
-        assert!(!is_compatible(DataType::Text, DataType::Bytes));
+        assert!(!is_compatible(BYTES, TEXT));
+        assert!(!is_compatible(TEXT, BYTES));
     }
 
     #[test]
     fn json_text_incompatible_both_directions() {
-        assert!(!is_compatible(DataType::Json, DataType::Text));
-        assert!(!is_compatible(DataType::Text, DataType::Json));
+        assert!(!is_compatible(DataType::Json, TEXT));
+        assert!(!is_compatible(TEXT, DataType::Json));
     }
 
     #[test]
     fn date_timestamp_incompatible_both_directions() {
         assert!(!is_compatible(DataType::Date, DataType::Timestamp));
         assert!(!is_compatible(DataType::Timestamp, DataType::Date));
+    }
+
+    fn bigint(w: u32) -> DataType {
+        DataType::BigInt { width: Some(w) }
+    }
+    const BIGINT_UNB: DataType = DataType::BigInt { width: None };
+
+    fn dec(p: u32, s: u32) -> DataType {
+        DataType::Decimal {
+            precision: Some(p),
+            scale: Some(s),
+        }
+    }
+    const DEC_UNB: DataType = DataType::Decimal {
+        precision: None,
+        scale: None,
+    };
+
+    #[test]
+    fn fixed_int_into_bigint_always_ok() {
+        for src in [DataType::Int16, DataType::Int32, DataType::Int64] {
+            assert!(is_compatible(src, BIGINT_UNB));
+            assert!(is_compatible(src, bigint(20)));
+        }
+    }
+
+    #[test]
+    fn bigint_widening_only() {
+        assert!(is_compatible(bigint(20), BIGINT_UNB));
+        assert!(is_compatible(bigint(20), bigint(40)));
+        assert!(is_compatible(bigint(20), bigint(20)));
+        assert!(!is_compatible(bigint(40), bigint(20)));
+        assert!(!is_compatible(BIGINT_UNB, bigint(40)));
+    }
+
+    #[test]
+    fn bigint_into_int_rejected() {
+        assert!(!is_compatible(BIGINT_UNB, DataType::Int64));
+        assert!(!is_compatible(bigint(10), DataType::Int32));
+    }
+
+    #[test]
+    fn int_into_decimal_needs_integer_digits() {
+        assert!(is_compatible(DataType::Int16, dec(5, 0)));
+        assert!(!is_compatible(DataType::Int16, dec(4, 0)));
+        assert!(is_compatible(DataType::Int32, dec(10, 0)));
+        assert!(!is_compatible(DataType::Int32, dec(9, 0)));
+        assert!(is_compatible(DataType::Int64, dec(19, 0)));
+        assert!(!is_compatible(DataType::Int64, dec(18, 0)));
+        // Widening with scale: precision − scale must still cover the int.
+        assert!(is_compatible(DataType::Int32, dec(20, 10)));
+        assert!(!is_compatible(DataType::Int32, dec(15, 10)));
+        // Unbounded decimal soaks up everything.
+        assert!(is_compatible(DataType::Int64, DEC_UNB));
+    }
+
+    #[test]
+    fn bigint_into_decimal_rules() {
+        assert!(is_compatible(bigint(20), dec(20, 0)));
+        assert!(!is_compatible(bigint(20), dec(19, 0)));
+        assert!(is_compatible(bigint(20), DEC_UNB));
+        assert!(!is_compatible(BIGINT_UNB, dec(40, 0)));
+        assert!(is_compatible(BIGINT_UNB, DEC_UNB));
+    }
+
+    #[test]
+    fn decimal_widening_rules() {
+        assert!(is_compatible(dec(10, 2), dec(12, 4))); // both grow
+        assert!(is_compatible(dec(10, 2), dec(10, 2))); // identity
+        assert!(is_compatible(dec(10, 2), DEC_UNB));
+        assert!(!is_compatible(DEC_UNB, dec(10, 2)));
+        // Scale must not shrink even if precision grows.
+        assert!(!is_compatible(dec(10, 4), dec(20, 2)));
+        // Integer-digits must not shrink even if scale grows.
+        assert!(!is_compatible(dec(10, 2), dec(11, 4)));
+    }
+
+    #[test]
+    fn decimal_into_int_or_bigint_rejected() {
+        assert!(!is_compatible(dec(10, 0), DataType::Int64));
+        assert!(!is_compatible(dec(10, 0), bigint(10)));
+        assert!(!is_compatible(DEC_UNB, BIGINT_UNB));
+    }
+
+    #[test]
+    fn unsigned_widening_within_unsigned() {
+        assert!(is_compatible(DataType::UInt8, DataType::UInt16));
+        assert!(is_compatible(DataType::UInt8, DataType::UInt64));
+        assert!(is_compatible(DataType::UInt16, DataType::UInt32));
+        assert!(is_compatible(DataType::UInt32, DataType::UInt64));
+        assert!(!is_compatible(DataType::UInt32, DataType::UInt16));
+        assert!(!is_compatible(DataType::UInt64, DataType::UInt32));
+    }
+
+    #[test]
+    fn unsigned_widening_into_signed() {
+        assert!(is_compatible(DataType::UInt8, DataType::Int16));
+        assert!(is_compatible(DataType::UInt16, DataType::Int32));
+        assert!(is_compatible(DataType::UInt32, DataType::Int64));
+        // UInt64 max > i64 max — can't widen into any signed Int*.
+        assert!(!is_compatible(DataType::UInt64, DataType::Int64));
+        // Reverse: signed → unsigned is rejected (sign loss).
+        assert!(!is_compatible(DataType::Int16, DataType::UInt16));
+        assert!(!is_compatible(DataType::Int64, DataType::UInt64));
+    }
+
+    #[test]
+    fn unsigned_into_bigint_and_decimal() {
+        assert!(is_compatible(DataType::UInt8, BIGINT_UNB));
+        assert!(is_compatible(DataType::UInt64, BIGINT_UNB));
+        assert!(is_compatible(DataType::UInt8, dec(3, 0)));
+        assert!(!is_compatible(DataType::UInt8, dec(2, 0)));
+        assert!(is_compatible(DataType::UInt32, dec(10, 0)));
+        assert!(!is_compatible(DataType::UInt32, dec(9, 0)));
+        assert!(is_compatible(DataType::UInt64, dec(20, 0)));
+        assert!(!is_compatible(DataType::UInt64, dec(19, 0)));
+    }
+
+    #[test]
+    fn unsigned_to_bool_and_back() {
+        assert!(is_compatible(DataType::UInt8, DataType::Bool));
+        assert!(is_compatible(DataType::Bool, DataType::UInt32));
+    }
+
+    #[test]
+    fn float_into_unsigned_rejected_both_directions() {
+        assert!(!is_compatible(DataType::Float32, DataType::UInt32));
+        assert!(!is_compatible(DataType::Float64, DataType::UInt64));
+        assert!(!is_compatible(DataType::UInt32, DataType::Float32));
+        assert!(!is_compatible(DataType::UInt64, DataType::Float64));
+    }
+
+    #[test]
+    fn bigint_or_decimal_into_unsigned_rejected() {
+        assert!(!is_compatible(BIGINT_UNB, DataType::UInt64));
+        assert!(!is_compatible(bigint(10), DataType::UInt32));
+        assert!(!is_compatible(dec(10, 0), DataType::UInt8));
+        assert!(!is_compatible(DEC_UNB, DataType::UInt64));
+    }
+
+    #[test]
+    fn unsigned_narrowing_full_matrix() {
+        // Every UInt → smaller-UInt pair must be rejected and flagged narrowing.
+        let pairs = [
+            (DataType::UInt16, DataType::UInt8),
+            (DataType::UInt32, DataType::UInt8),
+            (DataType::UInt32, DataType::UInt16),
+            (DataType::UInt64, DataType::UInt8),
+            (DataType::UInt64, DataType::UInt16),
+            (DataType::UInt64, DataType::UInt32),
+        ];
+        for (a, b) in pairs {
+            assert!(!is_compatible(a, b), "{a:?} → {b:?} should reject");
+            assert!(is_narrowing(a, b), "{a:?} → {b:?} should narrow");
+        }
+    }
+
+    #[test]
+    fn signed_to_unsigned_full_matrix() {
+        // Sign loss in both directions: signed → unsigned never compatible.
+        for src in [DataType::Int16, DataType::Int32, DataType::Int64] {
+            for dst in [
+                DataType::UInt8,
+                DataType::UInt16,
+                DataType::UInt32,
+                DataType::UInt64,
+            ] {
+                assert!(!is_compatible(src, dst), "{src:?} → {dst:?} should reject");
+                assert!(is_narrowing(src, dst), "{src:?} → {dst:?} should narrow");
+            }
+        }
+    }
+
+    #[test]
+    fn float_to_decimal_or_bigint_rejected_both_directions() {
+        assert!(!is_compatible(DataType::Float32, dec(10, 2)));
+        assert!(!is_compatible(DataType::Float64, dec(20, 4)));
+        assert!(!is_compatible(DataType::Float32, BIGINT_UNB));
+        assert!(!is_compatible(dec(10, 2), DataType::Float64));
+        assert!(!is_compatible(BIGINT_UNB, DataType::Float64));
     }
 }

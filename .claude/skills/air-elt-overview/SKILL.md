@@ -25,7 +25,7 @@ Air Elt is a Rust service for moving data between systems with **minimal transfo
 
 ## Tech stack
 
-Rust 1.90 stable (pinned via `rust-toolchain.toml`), tokio, async-trait, sqlx (postgres / migrate / chrono / uuid / json), tracing, clap, mimalloc, thiserror.
+Rust 1.90 stable (pinned via `rust-toolchain.toml`), tokio, async-trait, sqlx (postgres / mysql / migrate / chrono / uuid / json), tracing, clap, mimalloc, thiserror.
 
 ## Workspace layout
 
@@ -36,23 +36,28 @@ air-elt/
 ├── crates/
 │   ├── app/                         # bin air-elt (CLI, mimalloc, tracing init, registry wiring)
 │   ├── core/                        # traits, types, config, validation, flow runner
-│   ├── commons/                     # tracing-init, sql::pg (identifier, pool, schema, null_bind, pg_type), testing helpers
-│   ├── sources/postgres/            # PgSource
-│   ├── sinks/postgres/              # PgSink
-│   └── storages/postgres/           # PgStorage + migrations
-├── migrations/storage-postgres/     # raw SQL for sqlx::migrate!
-└── examples/pg-to-pg/               # usage example
+│   ├── commons/lib/                 # tracing-init, identifier, pool_timeouts (db-agnostic — no project deps)
+│   ├── commons/pg/                  # pg quote/pool/schema/pg_type/null_bind
+│   ├── commons/mysql/               # mysql quote/pool/schema/mysql_type/null_bind
+│   ├── commons/testing/             # PgTestHandle / MySqlTestHandle + shared backend probe
+│   ├── sources/{postgres,mysql}/    # connectors per backend
+│   ├── sinks/{postgres,mysql}/
+│   └── storages/{postgres,mysql}/   # storage + migrations dir per backend
+├── migrations/storage-{postgres,mysql}/  # raw SQL for sqlx::migrate!
+└── examples/{pg-to-pg,mysql-to-mysql}/   # usage examples
 ```
 
 **Cross-dependencies between `sources/*`, `sinks/*`, `storages/*` are forbidden.** Each depends only on `core` (and optionally `commons`). Connectors are wired into the app via `core::registry::Registry`.
 
+The `mysql` connector is exercised against both vanilla MySQL **and MariaDB** (10.7+ for native UUID, version-aware UPSERT for `VALUES()` legacy form). MariaDB is a *test target*, not a separate registered backend — there is no `type = "mariadb"` in config.
+
 ## Type model (canonical pivot, N+N matrix)
 
-Internal canonical `DataType`s: `Bool, Int16, Int32, Int64, Float32, Float64, Text, Bytes, Date, Timestamp (UTC), Uuid, Json`. Nullability is a property of `Field`, not a type — `Value::Null` represents "no data".
+Internal canonical `DataType`s: `Bool, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float32, Float64, BigInt { width: Option<u32> }, Decimal { precision: Option<u32>, scale: Option<u32> }, Text { size: Option<u32> }, Bytes { size: Option<u32> }, Date, Timestamp (UTC), Uuid, Json`. Unsigned variants exist solely to carry MySQL/MariaDB `UNSIGNED` integer columns lossless — Postgres has no native unsigned ints, so PG schemas never produce `UInt*`. Nullability is a property of `Field`, not a type — `Value::Null` represents "no data". `Text`/`Bytes` carry the column's declared length (`varchar(36)`, `binary(16)`); `None` means unbounded (`text`, `blob`, etc.). `BigInt` is `numeric(p, 0)` (arbitrary-precision integer, backed by `num_bigint::BigInt` to skip BigDecimal arithmetic on plain integer pipelines); `Decimal` is `numeric(p, s>0)` (backed by `bigdecimal::BigDecimal`). PG `numeric` without modifier surfaces as `Decimal { precision: None, scale: None }`.
 
 - Each source maps `native → DataType`, each sink maps `DataType → native`. This gives N+N mappings instead of N×N.
-- **No canonical↔canonical value conversion.** Compatibility is checked at validation time only (identity + safe widening + null-assignability).
-- Narrowing / bool↔int / text↔scalar auto-coercion are rejected. Users fix schemas or add explicit transforms later (out of MVP).
+- **Cross-type conversion happens in `core::types::convert`.** The runner dispatches per cell only when `source_dt != sink_dt` (identity columns are skipped). Supported pairs: `Uuid ↔ Text` (size ≥ 36, accepts canonical / hex-no-dash / `{...}` formats), `Uuid ↔ Bytes` (size ≥ 16), `Int* ↔ Bool` (`0 ↔ false`, non-zero → `true`), plus numeric widening that leaves the value unchanged. `Int* → BigInt`, `Int*/BigInt → Decimal`, and BigInt/Decimal widening (target unbounded or wider precision/scale) are also supported. **Reverse paths (`BigInt → Int*`, `Decimal → BigInt/Int*`, `Float ↔ BigInt/Decimal`) are deliberately rejected — every one is potentially lossy.**
+- **Compatibility is checked at validation time** by `types::matrix::is_compatible`. Width-narrowing and unbounded→bounded are rejected. Validation populates `FlowState::conversions` so the runner has a per-column plan ready.
 - Config format details are in the `config-format` skill.
 
 ## Config (TOML only in MVP)
@@ -114,7 +119,7 @@ Cursor columns may be nullable. NULL is treated as the minimum element: `NULL < 
 - Value transforms (`transform = "seconds"`, `timezone`).
 - Privilege-excess check and sample-conversion check.
 - Prometheus/OTel metrics.
-- Non-postgres connectors.
+- Connectors beyond postgres + mysql.
 - YAML config.
 
 ## CLI
