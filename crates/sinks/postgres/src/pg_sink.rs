@@ -179,6 +179,15 @@ impl Sink for PgSink {
                         DataType::Json => {
                             tuple.push_bind::<Option<serde_json::Value>>(None);
                         }
+                        DataType::BigInt { .. } | DataType::Decimal { .. } => {
+                            tuple.push_bind::<Option<bigdecimal::BigDecimal>>(None);
+                        }
+                        DataType::UInt8
+                        | DataType::UInt16
+                        | DataType::UInt32
+                        | DataType::UInt64 => {
+                            unreachable!("postgres has no unsigned integer column types")
+                        }
                     },
                     Value::Bool(b) => {
                         tuple.push_bind(*b);
@@ -215,6 +224,22 @@ impl Sink for PgSink {
                     }
                     Value::Json(j) => {
                         tuple.push_bind(j);
+                    }
+                    Value::BigInt(b) => {
+                        // Lift BigInt to BigDecimal with scale 0 — sqlx's PG
+                        // numeric encoding only goes through BigDecimal.
+                        tuple.push_bind(bigdecimal::BigDecimal::new(b.clone(), 0));
+                    }
+                    Value::Decimal(d) => {
+                        tuple.push_bind(d.clone());
+                    }
+                    Value::UInt8(_) | Value::UInt16(_) | Value::UInt32(_) | Value::UInt64(_) => {
+                        unreachable!(
+                            "unsigned values cannot reach a postgres sink: pg schemas never \
+                             produce UInt* (no native unsigned int columns), and the convert \
+                             dispatcher rewrites every UInt → Int*/BigInt/Decimal mapping into \
+                             the target variant before binding"
+                        )
                     }
                 }
             }

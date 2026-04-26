@@ -1,3 +1,4 @@
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::Row;
 use sqlx::mysql::MySqlRow;
@@ -22,6 +23,18 @@ pub fn decode_column(row: &MySqlRow, index: usize, data_type: DataType) -> Runti
         }
         DataType::Int64 => {
             nullable::<i64>(row, index).map(|o| o.map(Value::Int64).unwrap_or(Value::Null))
+        }
+        DataType::UInt8 => {
+            nullable::<u8>(row, index).map(|o| o.map(Value::UInt8).unwrap_or(Value::Null))
+        }
+        DataType::UInt16 => {
+            nullable::<u16>(row, index).map(|o| o.map(Value::UInt16).unwrap_or(Value::Null))
+        }
+        DataType::UInt32 => {
+            nullable::<u32>(row, index).map(|o| o.map(Value::UInt32).unwrap_or(Value::Null))
+        }
+        DataType::UInt64 => {
+            nullable::<u64>(row, index).map(|o| o.map(Value::UInt64).unwrap_or(Value::Null))
         }
         DataType::Float32 => {
             nullable::<f32>(row, index).map(|o| o.map(Value::Float32).unwrap_or(Value::Null))
@@ -51,6 +64,21 @@ pub fn decode_column(row: &MySqlRow, index: usize, data_type: DataType) -> Runti
         },
         DataType::Json => nullable::<serde_json::Value>(row, index)
             .map(|o| o.map(Value::Json).unwrap_or(Value::Null)),
+        // MySQL/MariaDB `decimal(p, 0)` arrives as `BigDecimal`. Force-
+        // rescale to 0 before extracting so a future sqlx normalisation of
+        // values like `1000` (potentially surfacing as `1e3`) doesn't trip
+        // a strict exponent check. See pg counterpart for context.
+        DataType::BigInt { .. } => match nullable::<BigDecimal>(row, index)? {
+            None => Ok(Value::Null),
+            Some(d) => {
+                let (mantissa, _) = d.with_scale(0).into_bigint_and_exponent();
+                Ok(Value::BigInt(mantissa))
+            }
+        },
+        DataType::Decimal { .. } => match nullable::<BigDecimal>(row, index)? {
+            None => Ok(Value::Null),
+            Some(d) => Ok(Value::Decimal(d)),
+        },
     }
 }
 
@@ -98,5 +126,11 @@ pub fn bind_cursor_value<'q>(
         Value::Timestamp(ts) => query.bind(*ts),
         Value::Uuid(u) => query.bind(u.to_string()),
         Value::Json(j) => query.bind(j),
+        Value::BigInt(b) => query.bind(BigDecimal::new(b.clone(), 0)),
+        Value::Decimal(d) => query.bind(d.clone()),
+        Value::UInt8(n) => query.bind(*n),
+        Value::UInt16(n) => query.bind(*n),
+        Value::UInt32(n) => query.bind(*n),
+        Value::UInt64(n) => query.bind(*n),
     }
 }

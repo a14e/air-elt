@@ -18,7 +18,9 @@ const COLUMNS_QUERY: &str = "SELECT \
         CAST(is_nullable AS CHAR)  AS is_nullable, \
         CAST(data_type AS CHAR)    AS data_type, \
         CAST(column_type AS CHAR)  AS column_type, \
-        character_maximum_length   AS character_maximum_length \
+        character_maximum_length   AS character_maximum_length, \
+        numeric_precision          AS numeric_precision, \
+        numeric_scale              AS numeric_scale \
     FROM information_schema.columns \
     WHERE table_schema = ? AND table_name = ? \
     ORDER BY ordinal_position";
@@ -55,6 +57,14 @@ pub async fn fetch_schema(pool: &MySqlPool, table: &str) -> RuntimeResult<Schema
         let cml: Option<i64> = row
             .try_get("character_maximum_length")
             .map_err(RuntimeError::backend)?;
+        // numeric_precision / numeric_scale are `BIGINT UNSIGNED` in MySQL 8
+        // (vs character_maximum_length which is signed BIGINT — see above).
+        let np: Option<u64> = row
+            .try_get("numeric_precision")
+            .map_err(RuntimeError::backend)?;
+        let ns: Option<u64> = row
+            .try_get("numeric_scale")
+            .map_err(RuntimeError::backend)?;
 
         let mysql = mysql_type::parse(&data_type, &column_type).ok_or_else(|| {
             RuntimeError::Other(format!(
@@ -63,9 +73,11 @@ pub async fn fetch_schema(pool: &MySqlPool, table: &str) -> RuntimeResult<Schema
             ))
         })?;
         let size = cml.and_then(|n| u32::try_from(n).ok());
+        let prec = np.and_then(|n| u32::try_from(n).ok());
+        let scale = ns.and_then(|n| u32::try_from(n).ok());
         fields.push(Field {
             name: col,
-            data_type: mysql_type::to_internal(mysql, size),
+            data_type: mysql_type::to_internal(mysql, size, prec, scale),
             nullable: is_null.eq_ignore_ascii_case("YES"),
         });
     }

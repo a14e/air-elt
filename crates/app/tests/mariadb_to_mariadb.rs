@@ -51,6 +51,14 @@ async fn mariadb_to_mariadb_with_native_uuid() {
     let src_db = format!("{}_src", handle.schema);
     let dst_db = format!("{}_dst", handle.schema);
 
+    // Register the cleanup guard *before* CREATE so a panic between the two
+    // CREATEs (or any later step) still drops both databases. DROP IF EXISTS
+    // is a no-op for the not-yet-created one — safe.
+    let _sibling_guard = SiblingDbGuard {
+        pool: handle.pool.clone(),
+        dbs: vec![src_db.clone(), dst_db.clone()],
+    };
+
     handle
         .pool
         .execute(format!("CREATE DATABASE `{src_db}`").as_str())
@@ -61,11 +69,6 @@ async fn mariadb_to_mariadb_with_native_uuid() {
         .execute(format!("CREATE DATABASE `{dst_db}`").as_str())
         .await
         .unwrap();
-
-    let _sibling_guard = SiblingDbGuard {
-        pool: handle.pool.clone(),
-        dbs: vec![src_db.clone(), dst_db.clone()],
-    };
 
     let ddl = |db: &str| {
         format!(

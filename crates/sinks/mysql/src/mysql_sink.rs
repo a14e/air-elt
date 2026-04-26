@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{MySqlPool, QueryBuilder};
 use tracing::{debug, info};
-use uuid::Uuid;
 
 use air_elt_commons_mysql::pool;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
@@ -157,10 +156,27 @@ impl Sink for MySqlSink {
                             tuple.push_bind::<Option<DateTime<Utc>>>(None);
                         }
                         DataType::Uuid => {
-                            tuple.push_bind::<Option<Uuid>>(None);
+                            // Match the non-null UUID path which binds as
+                            // canonical text (see Value::Uuid arm below).
+                            tuple.push_bind::<Option<String>>(None);
                         }
                         DataType::Json => {
                             tuple.push_bind::<Option<serde_json::Value>>(None);
+                        }
+                        DataType::BigInt { .. } | DataType::Decimal { .. } => {
+                            tuple.push_bind::<Option<bigdecimal::BigDecimal>>(None);
+                        }
+                        DataType::UInt8 => {
+                            tuple.push_bind::<Option<u8>>(None);
+                        }
+                        DataType::UInt16 => {
+                            tuple.push_bind::<Option<u16>>(None);
+                        }
+                        DataType::UInt32 => {
+                            tuple.push_bind::<Option<u32>>(None);
+                        }
+                        DataType::UInt64 => {
+                            tuple.push_bind::<Option<u64>>(None);
                         }
                     },
                     Value::Bool(b) => {
@@ -204,6 +220,26 @@ impl Sink for MySqlSink {
                     }
                     Value::Json(j) => {
                         tuple.push_bind(j);
+                    }
+                    Value::BigInt(b) => {
+                        // sqlx-mysql encodes `decimal` only via `BigDecimal`;
+                        // wrap the bigint with scale 0.
+                        tuple.push_bind(bigdecimal::BigDecimal::new(b.clone(), 0));
+                    }
+                    Value::Decimal(d) => {
+                        tuple.push_bind(d.clone());
+                    }
+                    Value::UInt8(n) => {
+                        tuple.push_bind(*n);
+                    }
+                    Value::UInt16(n) => {
+                        tuple.push_bind(*n);
+                    }
+                    Value::UInt32(n) => {
+                        tuple.push_bind(*n);
+                    }
+                    Value::UInt64(n) => {
+                        tuple.push_bind(*n);
                     }
                 }
             }

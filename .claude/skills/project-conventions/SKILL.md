@@ -87,9 +87,9 @@ Config-time resolution of `${VAR}` / `${VAR:default}` placeholders.
 
 Canonical types avoid direct source↔sink coupling — each connector maps to/from the shared pivot.
 
-- **`air_elt_core::types::{DataType, Value}`** — the only type enums. Never introduce parallel enums in connectors. `Text`/`Bytes` carry `size: Option<u32>`.
+- **`air_elt_core::types::{DataType, Value}`** — the only type enums. Never introduce parallel enums in connectors. `Text`/`Bytes` carry `size: Option<u32>`. `BigInt { width }` and `Decimal { precision, scale }` cover SQL `numeric`/`decimal`: scale-0 columns map to `BigInt` (carrying `num_bigint::BigInt`), scale > 0 to `Decimal` (carrying `bigdecimal::BigDecimal`). Sources read both via sqlx `BigDecimal`; the BigInt arm extracts the integer mantissa with no arithmetic.
 - Source owns `native → DataType`, sink owns `DataType → native`. Shared halves (`PgType`, `MySqlType`, `parse`, `to_internal`) in `commons-pg` / `commons-mysql`.
-- **`air_elt_core::types::matrix::is_compatible(source_dt, sink_dt)`** — validation-time width check (no narrowing, no unbounded→bounded), plus `Uuid ↔ Text/Bytes` and `Int* ↔ Bool` allowances.
+- **`air_elt_core::types::matrix::is_compatible(source_dt, sink_dt)`** — validation-time width check (no narrowing, no unbounded→bounded), plus `Uuid ↔ Text/Bytes`, `Int* ↔ Bool`, `Int*/BigInt → BigInt/Decimal` widening allowances. Reverse paths (`BigInt/Decimal → Int*`, `Float ↔ BigInt/Decimal`) are deliberately rejected — every one is potentially lossy.
 - **`air_elt_core::types::convert::{convert, ConvertError}`** — single dispatcher `convert(value, src, dst)` for runtime per-cell conversion. Identity / pure-widening pairs return the value unchanged. UUID parsing accepts canonical `8-4-4-4-12`, hex-only, MS-style `{...}` (any case). Connectors must NOT implement these conversions themselves.
 - **`FlowState::conversions: Vec<(DataType, DataType)>`** — populated by `validation::pipeline::validate` from src/sink schemas; the runner uses it to skip identity columns and dispatch through `convert` for the rest.
 
@@ -97,6 +97,7 @@ Canonical types avoid direct source↔sink coupling — each connector maps to/f
 
 - **`air_elt_commons_testing::pg::pg_pool()`** — `PgTestHandle` with sandboxed schema. Honours `AIR_ELT_TEST_PG_URL` or auto-detects podman/docker.
 - **`air_elt_commons_testing::mysql::mysql_pool()`** — `MySqlTestHandle` with sandboxed database. Honours `AIR_ELT_TEST_MYSQL_URL` or auto-detects podman/docker.
+- **`air_elt_commons_testing::mariadb::mariadb_pool()`** — `MariaDbTestHandle` for the MariaDB test target of the mysql connector (validates legacy `VALUES()` UPSERT and native UUID divergences). Honours `AIR_ELT_TEST_MARIADB_URL` or auto-detects podman/docker. Uses an extra connect-retry loop to absorb the MariaDB image's bootstrap-then-restart sequence.
 - Keep the handle alive for the whole test — dropping it tears down the schema/database.
 - **`[dev-dependencies]` only** — listing it under `[dependencies]` ships testcontainers into release builds.
 - Database mocks are forbidden.

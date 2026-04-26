@@ -4,10 +4,10 @@
 //! type that must match the column. Picking the right `None` per canonical
 //! `DataType` keeps NULL inserts/comparisons working everywhere.
 
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::mysql::{MySql, MySqlArguments};
 use sqlx::query::Query;
-use uuid::Uuid;
 
 use air_elt_core::types::DataType;
 
@@ -26,9 +26,18 @@ pub fn bind_typed_null<'q>(
         DataType::Bytes { .. } => query.bind::<Option<Vec<u8>>>(None),
         DataType::Date => query.bind::<Option<NaiveDate>>(None),
         DataType::Timestamp => query.bind::<Option<DateTime<Utc>>>(None),
-        // MySQL has no native UUID — we route uuid columns through Text or Bytes
-        // before reaching this point. If it leaks through, fall back to Bytes(16).
-        DataType::Uuid => query.bind::<Option<Uuid>>(None),
+        // MariaDB 10.7+ native UUID column accepts text input reliably
+        // (binary input triggers an internal byte-shuffle — see codec /
+        // sink). NULLs are bound as `Option<String>` to keep the wire-type
+        // OID consistent with the non-null path which sends canonical text.
+        DataType::Uuid => query.bind::<Option<String>>(None),
         DataType::Json => query.bind::<Option<serde_json::Value>>(None),
+        DataType::BigInt { .. } | DataType::Decimal { .. } => {
+            query.bind::<Option<BigDecimal>>(None)
+        }
+        DataType::UInt8 => query.bind::<Option<u8>>(None),
+        DataType::UInt16 => query.bind::<Option<u16>>(None),
+        DataType::UInt32 => query.bind::<Option<u32>>(None),
+        DataType::UInt64 => query.bind::<Option<u64>>(None),
     }
 }

@@ -25,6 +25,9 @@ pub enum PgType {
     Uuid,
     Json,
     Jsonb,
+    /// `numeric` / `decimal`. Precision and scale come from a separate
+    /// information_schema column — see `to_internal`.
+    Numeric,
 }
 
 impl PgType {
@@ -52,6 +55,7 @@ impl PgType {
             "uuid" => PgType::Uuid,
             "json" => PgType::Json,
             "jsonb" => PgType::Jsonb,
+            "numeric" | "decimal" => PgType::Numeric,
             // `timestamp` / `timestamp without time zone` intentionally omitted.
             _ => return None,
         };
@@ -64,7 +68,17 @@ impl PgType {
 /// `char_max_length` comes from `information_schema.columns` and is folded
 /// into `Text`/`Bytes` size. For unbounded `text` / `bytea` it is `None`. For
 /// non-text/bytes types the parameter is ignored.
-pub fn to_internal(pg: PgType, char_max_length: Option<u32>) -> DataType {
+///
+/// `numeric_precision` / `numeric_scale` are read for `numeric`/`decimal`
+/// columns. PG returns both as NULL when the column was declared without a
+/// modifier (`numeric`) — the column can then carry any precision and scale
+/// at runtime, so we surface it as fully-unbounded `Decimal`.
+pub fn to_internal(
+    pg: PgType,
+    char_max_length: Option<u32>,
+    numeric_precision: Option<u32>,
+    numeric_scale: Option<u32>,
+) -> DataType {
     match pg {
         PgType::Bool => DataType::Bool,
         PgType::Int2 => DataType::Int16,
@@ -82,6 +96,22 @@ pub fn to_internal(pg: PgType, char_max_length: Option<u32>) -> DataType {
         PgType::TimestampTz => DataType::Timestamp,
         PgType::Uuid => DataType::Uuid,
         PgType::Json | PgType::Jsonb => DataType::Json,
+        PgType::Numeric => match (numeric_precision, numeric_scale) {
+            // numeric(p, 0) → BigInt with declared digit-width.
+            (Some(p), Some(0)) => DataType::BigInt { width: Some(p) },
+            // numeric(p, s) with s > 0 → fractional decimal.
+            (Some(p), Some(s)) => DataType::Decimal {
+                precision: Some(p),
+                scale: Some(s),
+            },
+            // `numeric` without modifier — fully unbounded.
+            (None, _) => DataType::Decimal {
+                precision: None,
+                scale: None,
+            },
+            // Precision without scale is non-canonical in PG; treat as scale 0.
+            (Some(p), None) => DataType::BigInt { width: Some(p) },
+        },
     }
 }
 
@@ -114,23 +144,53 @@ mod tests {
     }
 
     #[test]
-    fn internal_mapping_sample() {
-        assert_eq!(to_internal(PgType::Int8, None), DataType::Int64);
-        assert_eq!(to_internal(PgType::Jsonb, None), DataType::Json);
+    fn numeric_zero_scale_is_bigint() {
         assert_eq!(
-            to_internal(PgType::Text, None),
+            to_internal(PgType::Numeric, None, Some(20), Some(0)),
+            DataType::BigInt { width: Some(20) }
+        );
+    }
+
+    #[test]
+    fn numeric_with_scale_is_decimal() {
+        assert_eq!(
+            to_internal(PgType::Numeric, None, Some(10), Some(2)),
+            DataType::Decimal {
+                precision: Some(10),
+                scale: Some(2)
+            }
+        );
+    }
+
+    #[test]
+    fn unbounded_numeric_is_unbounded_decimal() {
+        assert_eq!(
+            to_internal(PgType::Numeric, None, None, None),
+            DataType::Decimal {
+                precision: None,
+                scale: None
+            }
+        );
+    }
+
+    #[test]
+    fn internal_mapping_sample() {
+        assert_eq!(to_internal(PgType::Int8, None, None, None), DataType::Int64);
+        assert_eq!(to_internal(PgType::Jsonb, None, None, None), DataType::Json);
+        assert_eq!(
+            to_internal(PgType::Text, None, None, None),
             DataType::Text { size: None }
         );
         assert_eq!(
-            to_internal(PgType::Bpchar, Some(36)),
+            to_internal(PgType::Bpchar, Some(36), None, None),
             DataType::Text { size: Some(36) }
         );
         assert_eq!(
-            to_internal(PgType::Varchar, Some(255)),
+            to_internal(PgType::Varchar, Some(255), None, None),
             DataType::Text { size: Some(255) }
         );
         assert_eq!(
-            to_internal(PgType::Bytea, None),
+            to_internal(PgType::Bytea, None, None, None),
             DataType::Bytes { size: None }
         );
     }

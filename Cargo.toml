@@ -42,7 +42,9 @@ async-trait = "0.1.89"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 toml = "0.9.7"
-sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "macros", "migrate", "chrono", "uuid", "json"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "macros", "migrate", "chrono", "uuid", "json", "bigdecimal"] }
+num-bigint = { version = "0.4.6", features = ["serde"] }
+bigdecimal = { version = "0.4.5", features = ["serde"] }
 iso8601-duration = "0.2.0"
 thiserror = "2.0.17"
 anyhow = "1.0.100"

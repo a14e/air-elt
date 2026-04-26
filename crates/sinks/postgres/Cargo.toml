@@ -19,10 +19,12 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+bigdecimal = { workspace = true }
 
 [dev-dependencies]
 air-elt-commons-testing = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+num-bigint = { workspace = true }
 
 [lints]
 workspace = true

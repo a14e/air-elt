@@ -19,6 +19,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+num-bigint = { workspace = true }
+bigdecimal = { workspace = true }
 tokio = { workspace = true }
 regex = { workspace = true }
 once_cell = { workspace = true }

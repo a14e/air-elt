@@ -97,6 +97,19 @@ async fn cursor_roundtrip_all_value_variants() {
         ("c_bytes_empty", Value::Bytes(vec![])),
         ("c_text_empty", Value::Text(String::new())),
         ("c_json_empty_obj", Value::Json(serde_json::json!({}))),
+        // BigInt and Decimal serialize through their string-form custom serde
+        // shims (default JSON number repr would f64-truncate). Test values
+        // above f64 mantissa to lock the contract in.
+        (
+            "c_bigint",
+            Value::BigInt(
+                num_bigint::BigInt::parse_bytes(b"12345678901234567890123456", 10).unwrap(),
+            ),
+        ),
+        (
+            "c_decimal",
+            Value::Decimal("1234567890.0987654321".parse().unwrap()),
+        ),
     ];
 
     for (flow, value) in &variants {

@@ -223,15 +223,24 @@ async fn connect_with_retry(url: &str) -> MySqlPool {
                 // the *next* fresh pool can race the gap. Probe with a
                 // simple query, then verify a *second* fresh pool can also
                 // connect — that one sees the steady state.
-                if probe(&pool).await.is_ok()
-                    && MySqlPoolOptions::new()
+                if probe(&pool).await.is_ok() {
+                    let probe_pool = MySqlPoolOptions::new()
                         .max_connections(1)
                         .acquire_timeout(std::time::Duration::from_secs(3))
                         .connect(url)
-                        .await
-                        .is_ok()
-                {
-                    return pool;
+                        .await;
+                    match probe_pool {
+                        Ok(p) => {
+                            // Steady state confirmed — close the throwaway
+                            // probe pool to free its connection before
+                            // returning the long-lived one.
+                            let _ = p.close().await;
+                            return pool;
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                        }
+                    }
                 }
                 let _ = pool.close().await;
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
