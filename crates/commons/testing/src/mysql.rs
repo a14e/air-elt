@@ -10,8 +10,8 @@
 //! Note: in MySQL "schema" and "database" are synonyms — we expose the
 //! sandbox name as `schema` to mirror the pg helper API.
 
-use rand::distr::Alphanumeric;
-use rand::{Rng, rng};
+use rand::distr::{Alphanumeric, SampleString};
+use rand::rng;
 use sqlx::MySqlPool;
 use sqlx::mysql::MySqlPoolOptions;
 use testcontainers::runners::AsyncRunner;
@@ -256,11 +256,9 @@ async fn drop_stale_test_databases(pool: &MySqlPool, max_age_secs: u64) {
 }
 
 fn random_db() -> String {
-    let suffix: String = rng()
-        .sample_iter(&Alphanumeric)
-        .take(8)
-        .map(|c| (c as char).to_ascii_lowercase())
-        .collect();
+    let suffix = Alphanumeric
+        .sample_string(&mut rng(), 8)
+        .to_ascii_lowercase();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

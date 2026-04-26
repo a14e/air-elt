@@ -22,7 +22,7 @@ impl MySqlStorage {
     pub async fn connect(config: MySqlStorageConfig) -> RuntimeResult<Self> {
         let pool = air_elt_commons_mysql::pool::connect(
             &config.url,
-            air_elt_commons_mysql::pool::PoolTimeouts::from_options(
+            air_elt_commons_mysql::pool::PoolSettings::from_options(
                 config.connect_timeout,
                 config.acquire_timeout,
                 config.idle_timeout,

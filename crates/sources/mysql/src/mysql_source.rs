@@ -39,7 +39,7 @@ impl MySqlSource {
     pub async fn connect(config: MySqlSourceConfig) -> RuntimeResult<Self> {
         let pool = pool::connect(
             &config.url,
-            pool::PoolTimeouts::from_options(
+            pool::PoolSettings::from_options(
                 config.connect_timeout,
                 config.acquire_timeout,
                 config.idle_timeout,

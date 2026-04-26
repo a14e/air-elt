@@ -46,7 +46,7 @@ impl PgSource {
     pub async fn connect(config: PgSourceConfig) -> RuntimeResult<Self> {
         let pool = pool::connect(
             &config.url,
-            pool::PoolTimeouts::from_options(
+            pool::PoolSettings::from_options(
                 config.connect_timeout,
                 config.acquire_timeout,
                 config.idle_timeout,

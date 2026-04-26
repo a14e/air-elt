@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
-pub struct PoolTimeouts {
+pub struct PoolSettings {
     pub connect: Duration,
     pub acquire: Duration,
     pub idle: Duration,
@@ -14,7 +14,7 @@ pub struct PoolTimeouts {
     pub min_connections: u32,
 }
 
-impl PoolTimeouts {
+impl PoolSettings {
     /// Conservative defaults. Operators can override any of them per connector.
     ///
     /// - connect=5s: distinguishes "unreachable DB" from "slow DB" fast;

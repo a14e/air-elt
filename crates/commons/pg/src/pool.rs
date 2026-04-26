@@ -3,14 +3,14 @@
 //! All three postgres connectors (source, sink, storage) open pools through
 //! `connect()`. Centralising the option builder means timeouts, the UTC
 //! session TZ, and the statement-level timeout stay in sync. Everything
-//! configurable is piped in via `PoolTimeouts`.
+//! configurable is piped in via `PoolSettings`.
 
 use sqlx::PgPool;
 use sqlx::pool::PoolOptions;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::str::FromStr;
 
-pub use air_elt_commons::pool_timeouts::PoolTimeouts;
+pub use air_elt_commons::pool_settings::PoolSettings;
 
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 
@@ -25,7 +25,7 @@ use air_elt_core::error::{RuntimeError, RuntimeResult};
 /// Why `SET statement_timeout`: a second line of defence on top of the
 /// query timeout in the runner. Postgres kills runaway queries server-side
 /// so a wedged backend cannot hold the flow forever.
-pub async fn connect(url: &str, timeouts: PoolTimeouts) -> RuntimeResult<PgPool> {
+pub async fn connect(url: &str, timeouts: PoolSettings) -> RuntimeResult<PgPool> {
     let connect_opts = PgConnectOptions::from_str(url).map_err(RuntimeError::backend)?;
 
     let stmt_ms = i64::try_from(timeouts.statement.as_millis()).unwrap_or(i64::MAX);

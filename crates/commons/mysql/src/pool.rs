@@ -1,5 +1,5 @@
 //! Shared MySQL pool construction. Mirrors `air-elt-commons-pg::pool` —
-//! same `PoolTimeouts` (re-exported from `air-elt-commons`), different
+//! same `PoolSettings` (re-exported from `air-elt-commons`), different
 //! session-bootstrap SQL.
 
 use sqlx::MySqlPool;
@@ -7,7 +7,7 @@ use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use sqlx::pool::PoolOptions;
 use std::str::FromStr;
 
-pub use air_elt_commons::pool_timeouts::PoolTimeouts;
+pub use air_elt_commons::pool_settings::PoolSettings;
 
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 
@@ -26,7 +26,7 @@ use air_elt_core::error::{RuntimeError, RuntimeResult};
 /// diverges between vendors: MySQL exposes `max_execution_time` (ms,
 /// integer), MariaDB exposes `max_statement_time` (seconds, decimal). We
 /// probe `VERSION()` once per connection and pick the right one.
-pub async fn connect(url: &str, timeouts: PoolTimeouts) -> RuntimeResult<MySqlPool> {
+pub async fn connect(url: &str, timeouts: PoolSettings) -> RuntimeResult<MySqlPool> {
     let connect_opts = MySqlConnectOptions::from_str(url).map_err(RuntimeError::backend)?;
 
     let stmt_ms = u64::try_from(timeouts.statement.as_millis()).unwrap_or(u64::MAX);
