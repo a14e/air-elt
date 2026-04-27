@@ -320,4 +320,132 @@ mod tests {
         let d: BigDecimal = "0".parse().unwrap();
         assert_eq!(bigdecimal_to_bigint_truncating(&d), BigInt::from(0));
     }
+
+    // ---- Signed-narrowing primitives -------------------------------
+
+    #[test]
+    fn signed_narrow_saturates_at_each_width() {
+        assert_eq!(sat_i64_to_i16(7), 7);
+        assert_eq!(sat_i64_to_i16(i16::MAX as i64 + 1), i16::MAX);
+        assert_eq!(sat_i64_to_i16(i16::MIN as i64 - 1), i16::MIN);
+        assert_eq!(sat_i32_to_i16(7), 7);
+        assert_eq!(sat_i32_to_i16(40_000), i16::MAX);
+        assert_eq!(sat_i32_to_i16(-40_000), i16::MIN);
+    }
+
+    // ---- Unsigned-narrowing primitives -----------------------------
+
+    #[test]
+    fn unsigned_narrow_saturates_at_each_width() {
+        assert_eq!(sat_u64_to_u32(7), 7);
+        assert_eq!(sat_u64_to_u32(u64::MAX), u32::MAX);
+        assert_eq!(sat_u64_to_u16(70_000), u16::MAX);
+        assert_eq!(sat_u64_to_u8(1_000), u8::MAX);
+        assert_eq!(sat_u32_to_u16(70_000), u16::MAX);
+        assert_eq!(sat_u32_to_u8(1_000), u8::MAX);
+        assert_eq!(sat_u16_to_u8(1_000), u8::MAX);
+    }
+
+    // ---- Signed → Unsigned (negative → 0) --------------------------
+
+    #[test]
+    fn signed_to_unsigned_clamps_negative_and_saturates_max() {
+        assert_eq!(sat_i64_to_u64(-1), 0);
+        assert_eq!(sat_i64_to_u64(7), 7);
+        assert_eq!(sat_i64_to_u16(-1), 0);
+        assert_eq!(sat_i64_to_u16(70_000), u16::MAX);
+        assert_eq!(sat_i64_to_u8(-1), 0);
+        assert_eq!(sat_i64_to_u8(1_000), u8::MAX);
+    }
+
+    // ---- Unsigned → Signed -----------------------------------------
+
+    #[test]
+    fn unsigned_to_signed_saturates_at_signed_max() {
+        assert_eq!(sat_u64_to_i64(7), 7);
+        assert_eq!(sat_u64_to_i64(u64::MAX), i64::MAX);
+        assert_eq!(sat_u64_to_i32(u32::MAX as u64 + 1), i32::MAX);
+        assert_eq!(sat_u64_to_i16(70_000), i16::MAX);
+        assert_eq!(sat_u32_to_i32(u32::MAX), i32::MAX);
+        assert_eq!(sat_u32_to_i16(70_000), i16::MAX);
+        assert_eq!(sat_u16_to_i16(u16::MAX), i16::MAX);
+    }
+
+    // ---- Float → Int ±Infinity / subnormals ------------------------
+
+    #[test]
+    fn f64_to_int_handles_infinities() {
+        assert_eq!(sat_f64_to_i64(f64::INFINITY), Some(i64::MAX));
+        assert_eq!(sat_f64_to_i64(f64::NEG_INFINITY), Some(i64::MIN));
+        assert_eq!(sat_f64_to_i32(f64::INFINITY), Some(i32::MAX));
+        assert_eq!(sat_f64_to_i16(f64::NEG_INFINITY), Some(i16::MIN));
+    }
+
+    #[test]
+    fn f64_to_unsigned_clamps_negative_and_handles_nan() {
+        assert_eq!(sat_f64_to_u64(-1.5), Some(0));
+        assert_eq!(sat_f64_to_u32(-1.5), Some(0));
+        assert_eq!(sat_f64_to_u16(-1.5), Some(0));
+        assert_eq!(sat_f64_to_u8(-1.5), Some(0));
+        assert_eq!(sat_f64_to_u64(f64::NAN), None);
+        assert_eq!(sat_f64_to_u32(f64::NAN), None);
+        assert_eq!(sat_f64_to_u16(f64::NAN), None);
+        assert_eq!(sat_f64_to_u8(f64::NAN), None);
+    }
+
+    #[test]
+    fn f64_to_unsigned_saturates_max() {
+        assert_eq!(sat_f64_to_u32(1e30), Some(u32::MAX));
+        assert_eq!(sat_f64_to_u16(1e30), Some(u16::MAX));
+        assert_eq!(sat_f64_to_u8(1e30), Some(u8::MAX));
+    }
+
+    // ---- BigInt-saturating primitives ------------------------------
+
+    #[test]
+    fn bigint_to_signed_each_width_in_range() {
+        assert_eq!(sat_bigint_to_i64(&BigInt::from(42)), 42);
+        assert_eq!(sat_bigint_to_i32(&BigInt::from(42)), 42);
+        assert_eq!(sat_bigint_to_i16(&BigInt::from(42)), 42);
+    }
+
+    #[test]
+    fn bigint_to_signed_saturates_at_overflow_and_underflow() {
+        let huge = BigInt::from_str("99999999999999999999999").unwrap();
+        let huge_neg = BigInt::from_str("-99999999999999999999999").unwrap();
+        assert_eq!(sat_bigint_to_i64(&huge), i64::MAX);
+        assert_eq!(sat_bigint_to_i64(&huge_neg), i64::MIN);
+        assert_eq!(sat_bigint_to_i32(&huge), i32::MAX);
+        assert_eq!(sat_bigint_to_i32(&huge_neg), i32::MIN);
+        assert_eq!(sat_bigint_to_i16(&huge), i16::MAX);
+        assert_eq!(sat_bigint_to_i16(&huge_neg), i16::MIN);
+    }
+
+    #[test]
+    fn bigint_to_unsigned_clamps_negative_and_saturates_max() {
+        let neg = BigInt::from(-1);
+        assert_eq!(sat_bigint_to_u64(&neg), 0);
+        assert_eq!(sat_bigint_to_u32(&neg), 0);
+        assert_eq!(sat_bigint_to_u16(&neg), 0);
+        assert_eq!(sat_bigint_to_u8(&neg), 0);
+        let huge = BigInt::from_str("99999999999999999999999").unwrap();
+        assert_eq!(sat_bigint_to_u64(&huge), u64::MAX);
+        assert_eq!(sat_bigint_to_u32(&huge), u32::MAX);
+        assert_eq!(sat_bigint_to_u16(&huge), u16::MAX);
+        assert_eq!(sat_bigint_to_u8(&huge), u8::MAX);
+    }
+
+    #[test]
+    fn bigint_to_width_zero_saturates_everything_to_zero() {
+        // width=0 → max becomes 10^0-1 = 0; only 0 fits.
+        assert_eq!(sat_bigint_to_width(&BigInt::from(5), 0), BigInt::from(0));
+        assert_eq!(sat_bigint_to_width(&BigInt::from(-5), 0), BigInt::from(0));
+        assert_eq!(sat_bigint_to_width(&BigInt::from(0), 0), BigInt::from(0));
+    }
+
+    #[test]
+    fn bigint_to_width_one_caps_at_nine() {
+        assert_eq!(sat_bigint_to_width(&BigInt::from(99), 1), BigInt::from(9));
+        assert_eq!(sat_bigint_to_width(&BigInt::from(-99), 1), BigInt::from(-9));
+    }
 }

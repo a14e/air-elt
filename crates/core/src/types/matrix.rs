@@ -133,15 +133,21 @@ pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool
     use DataType::*;
     if is_compatible(source_t, sink_t) {
         // truncate=true on a pair that's already lossless: harmless no-op,
-        // BUT explicitly forbid Json→Json / Xml→Xml. The dispatcher will
-        // raise TruncationForbidden at runtime; we mirror that at the
-        // matrix level so validation surfaces it pre-runtime as well.
-        return !matches!((source_t, sink_t), (Json, Json) | (Xml, Xml));
+        // BUT explicitly forbid identities that have no defined truncation
+        // semantics — Json/Xml (structure corruption) and Uuid/Date/
+        // Timestamp (atomic types, "truncating" them is meaningless). The
+        // dispatcher raises TruncationForbidden at runtime; the matrix
+        // mirrors that so validation surfaces it pre-runtime as well.
+        return !matches!(
+            (source_t, sink_t),
+            (Json, Json) | (Xml, Xml) | (Uuid, Uuid) | (Date, Date) | (Timestamp, Timestamp)
+        );
     }
 
     match (source_t, sink_t) {
         // Forbidden under truncate.
         (Json, Json) | (Xml, Xml) => false,
+        (Uuid, Uuid) | (Date, Date) | (Timestamp, Timestamp) => false,
         (Date, Timestamp) => false,
         // UUID truncations don't have defined semantics — explicitly reject.
         (Uuid, Text { size: Some(n) }) if n < 36 => false,
@@ -694,10 +700,192 @@ mod tests {
     }
 
     #[test]
+    fn truncate_forbids_atomic_identities() {
+        // Atomic identity-with-truncate is meaningless — matrix rejects so
+        // a misconfigured mapping surfaces at validation.
+        assert!(!is_compatible_with_truncate(DataType::Uuid, DataType::Uuid));
+        assert!(!is_compatible_with_truncate(DataType::Date, DataType::Date));
+        assert!(!is_compatible_with_truncate(
+            DataType::Timestamp,
+            DataType::Timestamp
+        ));
+    }
+
+    #[test]
     fn truncate_does_not_unlock_date_to_timestamp() {
         assert!(!is_compatible_with_truncate(
             DataType::Date,
             DataType::Timestamp
         ));
+    }
+
+    // ---- Truncate allow-list — exhaustive walk ---------------------
+
+    /// Two-sided invariant for every "unlock" pair: rejected without
+    /// `truncate`, allowed with `truncate`. Asserting both sides catches a
+    /// regression where `is_compatible_with_truncate` returned `true`
+    /// unconditionally (which a one-sided walk would silently accept).
+    fn assert_unlocks(a: DataType, b: DataType) {
+        assert!(!is_compatible(a, b), "{a:?} → {b:?} should reject lossless");
+        assert!(
+            is_compatible_with_truncate(a, b),
+            "{a:?} → {b:?} should unlock with truncate"
+        );
+    }
+
+    #[test]
+    fn truncate_unlocks_full_signed_narrow_matrix() {
+        for (a, b) in [
+            (DataType::Int64, DataType::Int32),
+            (DataType::Int64, DataType::Int16),
+            (DataType::Int32, DataType::Int16),
+        ] {
+            assert_unlocks(a, b);
+        }
+    }
+
+    #[test]
+    fn truncate_unlocks_full_unsigned_narrow_matrix() {
+        for (a, b) in [
+            (DataType::UInt64, DataType::UInt32),
+            (DataType::UInt64, DataType::UInt16),
+            (DataType::UInt64, DataType::UInt8),
+            (DataType::UInt32, DataType::UInt16),
+            (DataType::UInt32, DataType::UInt8),
+            (DataType::UInt16, DataType::UInt8),
+        ] {
+            assert_unlocks(a, b);
+        }
+    }
+
+    #[test]
+    fn truncate_unlocks_full_signed_to_unsigned_matrix() {
+        for s in [DataType::Int16, DataType::Int32, DataType::Int64] {
+            for u in [
+                DataType::UInt8,
+                DataType::UInt16,
+                DataType::UInt32,
+                DataType::UInt64,
+            ] {
+                assert_unlocks(s, u);
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_unlocks_full_unsigned_to_signed_matrix() {
+        for (a, b) in [
+            (DataType::UInt64, DataType::Int64),
+            (DataType::UInt64, DataType::Int32),
+            (DataType::UInt64, DataType::Int16),
+            (DataType::UInt32, DataType::Int32),
+            (DataType::UInt32, DataType::Int16),
+            (DataType::UInt16, DataType::Int16),
+        ] {
+            assert_unlocks(a, b);
+        }
+    }
+
+    #[test]
+    fn truncate_unlocks_float64_to_all_int_widths() {
+        for d in [
+            DataType::Float32,
+            DataType::Int64,
+            DataType::Int32,
+            DataType::Int16,
+            DataType::UInt64,
+            DataType::UInt32,
+            DataType::UInt16,
+            DataType::UInt8,
+        ] {
+            assert_unlocks(DataType::Float64, d);
+        }
+    }
+
+    #[test]
+    fn truncate_unlocks_decimal_to_all_int_widths() {
+        for d in [
+            DataType::Int64,
+            DataType::Int32,
+            DataType::Int16,
+            DataType::UInt64,
+            DataType::UInt32,
+            DataType::UInt16,
+            DataType::UInt8,
+            BIGINT_UNB,
+        ] {
+            assert_unlocks(dec(10, 2), d);
+        }
+    }
+
+    #[test]
+    fn truncate_unlocks_bigint_to_all_int_widths() {
+        for d in [
+            DataType::Int64,
+            DataType::Int32,
+            DataType::Int16,
+            DataType::UInt64,
+            DataType::UInt32,
+            DataType::UInt16,
+            DataType::UInt8,
+        ] {
+            assert_unlocks(BIGINT_UNB, d);
+        }
+    }
+
+    #[test]
+    fn truncate_unlocks_decimal_narrow_each_dimension() {
+        // Both dimensions shrink simultaneously.
+        assert_unlocks(dec(20, 4), dec(10, 2));
+        // Precision-only shrink.
+        assert_unlocks(dec(20, 2), dec(10, 2));
+        // Scale-only shrink.
+        assert_unlocks(dec(20, 4), dec(20, 2));
+    }
+
+    #[test]
+    fn truncate_unlocks_bytes_narrow_with_unbounded_source() {
+        assert!(!is_compatible(BYTES, bytes(10)));
+        assert!(is_compatible_with_truncate(BYTES, bytes(10)));
+    }
+
+    // ---- Truncate deny-list under truncate -------------------------
+
+    #[test]
+    fn truncate_does_not_unlock_unrelated_pairs() {
+        // Unrelated pairs remain incompatible even with truncate.
+        assert!(!is_compatible_with_truncate(DataType::Bool, DataType::Date));
+        assert!(!is_compatible_with_truncate(DataType::Date, DataType::Json));
+        assert!(!is_compatible_with_truncate(
+            DataType::Uuid,
+            DataType::Timestamp
+        ));
+    }
+
+    #[test]
+    fn truncate_uuid_to_wide_text_or_bytes_still_ok() {
+        // Truncation is a no-op when the source already fits — fall through to is_compatible.
+        assert!(is_compatible_with_truncate(DataType::Uuid, text(36)));
+        assert!(is_compatible_with_truncate(DataType::Uuid, bytes(16)));
+    }
+
+    // ---- is_narrowing() coverage gaps ------------------------------
+
+    #[test]
+    fn narrowing_text_unbounded_to_bounded() {
+        assert!(is_narrowing(TEXT, text(10)));
+        assert!(is_narrowing(BYTES, bytes(10)));
+    }
+
+    #[test]
+    fn narrowing_text_widening_returns_false() {
+        assert!(!is_narrowing(text(10), text(20)));
+        assert!(!is_narrowing(text(10), TEXT));
+    }
+
+    #[test]
+    fn narrowing_distinct_unrelated_pair_returns_false() {
+        assert!(!is_narrowing(DataType::Json, DataType::Bool));
+        assert!(!is_narrowing(DataType::Date, DataType::Timestamp));
     }
 }
