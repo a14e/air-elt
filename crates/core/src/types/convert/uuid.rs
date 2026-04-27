@@ -164,6 +164,64 @@ mod tests {
     }
 
     #[test]
+    fn parse_text_braced_empty_rejected() {
+        assert!(matches!(
+            parse_text("{}"),
+            Err(ConvertError::InvalidUuid { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_text_only_dashes_rejected() {
+        let s = "-".repeat(36);
+        assert!(matches!(
+            parse_text(&s),
+            Err(ConvertError::InvalidUuid { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_text_31_hex_digits_rejected() {
+        let s = "a".repeat(31);
+        assert!(matches!(
+            parse_text(&s),
+            Err(ConvertError::InvalidUuid { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_text_with_extra_chars_after_36_hex_digits_rejected() {
+        // 36 hex chars (no dashes) → exceeds the 32 hex digits the loop accepts.
+        let s = "a".repeat(36);
+        assert!(matches!(
+            parse_text(&s),
+            Err(ConvertError::InvalidUuid { .. })
+        ));
+    }
+
+    #[test]
+    fn from_bytes_zero_length_rejected() {
+        assert!(matches!(
+            from_bytes(&[]),
+            Err(ConvertError::Length {
+                expected: 16,
+                got: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn from_bytes_17_bytes_rejected() {
+        assert!(matches!(
+            from_bytes(&[0u8; 17]),
+            Err(ConvertError::Length {
+                expected: 16,
+                got: 17
+            })
+        ));
+    }
+
+    #[test]
     fn rejects_wrong_byte_length() {
         assert!(matches!(
             from_bytes(&[0u8; 8]),

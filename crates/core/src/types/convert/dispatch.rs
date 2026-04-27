@@ -2,7 +2,7 @@
 //!
 //! Becomes a thin router: identity / pure-widening short-circuits stay
 //! here; everything narrowing-or-cross-type is delegated to a per-group
-//! submodule (`int_narrow`, `text_narrow`, `json_text`, `xml_text`, etc.).
+//! submodule (`int_narrow`, `text_narrow`, `json_text`, `xml`, etc.).
 //! Truncate-only paths require `ctx.truncate=true`; explicitly-forbidden
 //! truncate combinations return [`ConvertError::TruncationForbidden`].
 
@@ -10,7 +10,7 @@ use super::ConvertError;
 use super::context::ConversionContext;
 use super::{
     bigint_narrow, bytes_narrow, decimal_narrow, float_narrow, int_narrow, json_text, text_bool,
-    text_narrow, timestamp_date, uuid as uuid_conv, xml_text,
+    text_narrow, timestamp_date, uuid as uuid_conv, xml,
 };
 use crate::types::{DataType, Value};
 use bigdecimal::BigDecimal;
@@ -369,9 +369,9 @@ pub fn convert(
             if size.is_some() {
                 require_truncate(ctx, src, dst)?;
             }
-            xml_text::xml_to_text(value, src, *size)
+            xml::xml_to_text(value, src, *size)
         }
-        (DataType::Text { .. }, DataType::Xml) => xml_text::text_to_xml(value, src),
+        (DataType::Text { .. }, DataType::Xml) => xml::text_to_xml(value, src),
 
         // ---- Timestamp → Date ---------------------------------------
         (DataType::Timestamp, DataType::Date) => {
@@ -386,32 +386,23 @@ pub fn convert(
     }
 }
 
-/// Identity (`src == dst`) check. `Json → Json` and `Xml → Xml` with
-/// `truncate=true` are forbidden — that combination would corrupt the
-/// payload's structure and there is no sensible truncation to apply.
+/// Identity (`src == dst`) check. `Json → Json` / `Xml → Xml` with
+/// `truncate=true` are rejected at runtime — truncating structured payloads
+/// corrupts the syntax. `Uuid/Date/Timestamp` identity-with-truncate is
+/// caught earlier by the matrix at validation; if the dispatcher is invoked
+/// directly (bypassing validation) we treat the request as a harmless no-op
+/// rather than erroring on data already in transit.
 fn identity_or_forbid(
     value: Value,
     src: &DataType,
     dst: &DataType,
     ctx: &ConversionContext,
 ) -> Result<Value, ConvertError> {
-    if ctx.truncate
-        && matches!(
-            src,
-            DataType::Json | DataType::Xml | DataType::Uuid | DataType::Date | DataType::Timestamp
-        )
-        && src == dst
-    {
-        // Identity for these types is harmless without truncate; with
-        // truncate the request is meaningless but we must error for Json
-        // and Xml (corruption risk) and for Uuid/Date/Timestamp where
-        // truncation has no defined semantics.
-        if matches!(src, DataType::Json | DataType::Xml) {
-            return Err(ConvertError::TruncationForbidden {
-                src: *src,
-                dst: *dst,
-            });
-        }
+    if ctx.truncate && matches!(src, DataType::Json | DataType::Xml) {
+        return Err(ConvertError::TruncationForbidden {
+            src: *src,
+            dst: *dst,
+        });
     }
     Ok(value)
 }
@@ -627,8 +618,8 @@ mod tests {
     }
 
     #[test]
-    fn text_narrow_utf8_rounds_down() {
-        // "Привет" = 12 bytes, max=5 → "Пр" (4 bytes).
+    fn text_narrow_counts_chars_not_bytes() {
+        // "Привет" = 6 chars, max=5 chars → "Приве".
         let out = convert(
             Value::Text("Привет".into()),
             &dt_text(20),
@@ -636,12 +627,12 @@ mod tests {
             &truncate_ctx(),
         )
         .unwrap();
-        assert_eq!(out, Value::Text("Пр".into()));
+        assert_eq!(out, Value::Text("Приве".into()));
     }
 
     #[test]
-    fn text_narrow_emoji_oversize_to_empty() {
-        // emoji is 4 bytes; max=3 → ""
+    fn text_narrow_emoji_counts_as_one_char() {
+        // 1 emoji char fits a max=3 chars sink — passthrough.
         let out = convert(
             Value::Text("😀".into()),
             &dt_text(20),
@@ -649,7 +640,7 @@ mod tests {
             &truncate_ctx(),
         )
         .unwrap();
-        assert_eq!(out, Value::Text("".into()));
+        assert_eq!(out, Value::Text("😀".into()));
     }
 
     // §6.4 Bytes narrowing
@@ -965,6 +956,150 @@ mod tests {
     }
 
     // Existing UUID round-trip regression coverage.
+
+    #[test]
+    fn value_shape_mismatch_on_each_dispatcher_arm() {
+        // For each (src, dst), pass a deliberately-wrong-variant value and
+        // assert ValueShapeMismatch is surfaced by the dispatcher arm.
+        let wrong_bool = Value::Bool(true);
+        let wrong_int = Value::Int32(1);
+        let bigint_unbounded = DataType::BigInt { width: None };
+        let dec = DataType::Decimal {
+            precision: Some(20),
+            scale: Some(0),
+        };
+
+        let cases: Vec<(DataType, DataType, Value)> = vec![
+            // UUID round-trips
+            (DataType::Uuid, dt_text(36), wrong_bool.clone()),
+            (DataType::Uuid, dt_bytes(16), wrong_bool.clone()),
+            (dt_text(36), DataType::Uuid, wrong_bool.clone()),
+            (dt_bytes(16), DataType::Uuid, wrong_bool.clone()),
+            // Int → Bool (wrong variant: Bool, expected Int*)
+            (DataType::Int16, DataType::Bool, wrong_bool.clone()),
+            (DataType::Int32, DataType::Bool, wrong_bool.clone()),
+            (DataType::Int64, DataType::Bool, wrong_bool.clone()),
+            // UInt → Bool
+            (DataType::UInt8, DataType::Bool, wrong_bool.clone()),
+            (DataType::UInt16, DataType::Bool, wrong_bool.clone()),
+            (DataType::UInt32, DataType::Bool, wrong_bool.clone()),
+            (DataType::UInt64, DataType::Bool, wrong_bool.clone()),
+            // Bool → Int*/UInt*
+            (DataType::Bool, DataType::Int16, wrong_int.clone()),
+            (DataType::Bool, DataType::Int32, wrong_int.clone()),
+            (DataType::Bool, DataType::Int64, wrong_int.clone()),
+            (DataType::Bool, DataType::UInt8, wrong_int.clone()),
+            (DataType::Bool, DataType::UInt16, wrong_int.clone()),
+            (DataType::Bool, DataType::UInt32, wrong_int.clone()),
+            (DataType::Bool, DataType::UInt64, wrong_int.clone()),
+            // Int widening
+            (DataType::Int16, DataType::Int32, wrong_bool.clone()),
+            (DataType::Int16, DataType::Int64, wrong_bool.clone()),
+            (DataType::Int32, DataType::Int64, wrong_bool.clone()),
+            (DataType::Int16, DataType::Float32, wrong_bool.clone()),
+            (DataType::Int16, DataType::Float64, wrong_bool.clone()),
+            (DataType::Int32, DataType::Float64, wrong_bool.clone()),
+            (DataType::Float32, DataType::Float64, wrong_bool.clone()),
+            // UInt widening (within unsigned and to signed)
+            (DataType::UInt8, DataType::UInt16, wrong_bool.clone()),
+            (DataType::UInt8, DataType::UInt32, wrong_bool.clone()),
+            (DataType::UInt8, DataType::UInt64, wrong_bool.clone()),
+            (DataType::UInt16, DataType::UInt32, wrong_bool.clone()),
+            (DataType::UInt16, DataType::UInt64, wrong_bool.clone()),
+            (DataType::UInt32, DataType::UInt64, wrong_bool.clone()),
+            (DataType::UInt8, DataType::Int16, wrong_bool.clone()),
+            (DataType::UInt8, DataType::Int32, wrong_bool.clone()),
+            (DataType::UInt8, DataType::Int64, wrong_bool.clone()),
+            (DataType::UInt16, DataType::Int32, wrong_bool.clone()),
+            (DataType::UInt16, DataType::Int64, wrong_bool.clone()),
+            (DataType::UInt32, DataType::Int64, wrong_bool.clone()),
+            // Int → BigInt
+            (DataType::Int16, bigint_unbounded, wrong_bool.clone()),
+            (DataType::Int32, bigint_unbounded, wrong_bool.clone()),
+            (DataType::Int64, bigint_unbounded, wrong_bool.clone()),
+            // UInt → BigInt
+            (DataType::UInt8, bigint_unbounded, wrong_bool.clone()),
+            (DataType::UInt16, bigint_unbounded, wrong_bool.clone()),
+            (DataType::UInt32, bigint_unbounded, wrong_bool.clone()),
+            (DataType::UInt64, bigint_unbounded, wrong_bool.clone()),
+            // Int → Decimal
+            (DataType::Int16, dec, wrong_bool.clone()),
+            (DataType::Int32, dec, wrong_bool.clone()),
+            (DataType::Int64, dec, wrong_bool.clone()),
+            // UInt → Decimal
+            (DataType::UInt8, dec, wrong_bool.clone()),
+            (DataType::UInt16, dec, wrong_bool.clone()),
+            (DataType::UInt32, dec, wrong_bool.clone()),
+            (DataType::UInt64, dec, wrong_bool.clone()),
+            // BigInt → Decimal
+            (bigint_unbounded, dec, wrong_bool.clone()),
+        ];
+
+        for (src, dst, wrong_value) in cases {
+            let res = convert(wrong_value.clone(), &src, &dst, &passthrough());
+            assert!(
+                matches!(res, Err(ConvertError::ValueShapeMismatch { .. })),
+                "expected ValueShapeMismatch for ({src:?} -> {dst:?}) with {wrong_value:?}, got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_to_text_value_shape_mismatch() {
+        let res = convert(
+            Value::Int32(1),
+            &DataType::Json,
+            &DataType::Text { size: None },
+            &passthrough(),
+        );
+        assert!(matches!(res, Err(ConvertError::ValueShapeMismatch { .. })));
+    }
+
+    #[test]
+    fn xml_to_text_value_shape_mismatch() {
+        let res = convert(
+            Value::Int32(1),
+            &DataType::Xml,
+            &DataType::Text { size: None },
+            &passthrough(),
+        );
+        assert!(matches!(res, Err(ConvertError::ValueShapeMismatch { .. })));
+    }
+
+    #[test]
+    fn text_to_bool_value_shape_mismatch() {
+        let res = convert(
+            Value::Int32(1),
+            &dt_text(10),
+            &DataType::Bool,
+            &passthrough(),
+        );
+        assert!(matches!(res, Err(ConvertError::ValueShapeMismatch { .. })));
+    }
+
+    #[test]
+    fn json_to_json_identity_passthrough() {
+        let v = serde_json::json!({"a": 1});
+        let out = convert(
+            Value::Json(v.clone()),
+            &DataType::Json,
+            &DataType::Json,
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Json(v));
+    }
+
+    #[test]
+    fn unsupported_pair_with_no_arm() {
+        let res = convert(
+            Value::Bool(true),
+            &DataType::Bool,
+            &DataType::Float64,
+            &passthrough(),
+        );
+        assert!(matches!(res, Err(ConvertError::Unsupported { .. })));
+    }
 
     #[test]
     fn uuid_to_text_canonical() {

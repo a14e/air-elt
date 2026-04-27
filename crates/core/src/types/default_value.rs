@@ -326,7 +326,7 @@ fn parse_xml(literal: &toml::Value) -> Result<Value, DefaultParseError> {
     let s = literal
         .as_str()
         .ok_or(DefaultParseError::TypeMismatch { dst: DataType::Xml })?;
-    crate::types::convert::xml_validate::validate(s)
+    crate::types::convert::xml::validate(s)
         .map_err(|reason| DefaultParseError::InvalidXml { reason })?;
     Ok(Value::Text(s.to_string()))
 }
@@ -546,5 +546,398 @@ mod tests {
     fn xml_multiple_roots_rejected() {
         let res = parse(&lit("<a/><b/>"), &DataType::Xml);
         assert!(matches!(res, Err(DefaultParseError::InvalidXml { .. })));
+    }
+
+    // ---- Bytes prefix grammar — error / boundary --------------------
+
+    #[test]
+    fn bytes_hex_uppercase_accepted() {
+        let v = parse(&lit("hex:DEADBEEF"), &DataType::Bytes { size: Some(4) }).unwrap();
+        assert_eq!(v, Value::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+    }
+
+    #[test]
+    fn bytes_hex_non_hex_byte_rejected() {
+        let res = parse(&lit("hex:zz"), &DataType::Bytes { size: Some(1) });
+        assert!(matches!(res, Err(DefaultParseError::InvalidHex { .. })));
+    }
+
+    #[test]
+    fn bytes_base64_invalid_rejected() {
+        let res = parse(&lit("base64:!!!"), &DataType::Bytes { size: Some(8) });
+        assert!(matches!(res, Err(DefaultParseError::InvalidBase64 { .. })));
+    }
+
+    #[test]
+    fn bytes_bin_non_01_rejected() {
+        let res = parse(&lit("bin:01010102"), &DataType::Bytes { size: Some(1) });
+        assert!(matches!(res, Err(DefaultParseError::InvalidBinary { .. })));
+    }
+
+    #[test]
+    fn bytes_empty_payload_after_prefix() {
+        // hex: empty string parses as zero bytes (length 0, divisible by 2).
+        let v = parse(&lit("hex:"), &DataType::Bytes { size: Some(8) }).unwrap();
+        assert_eq!(v, Value::Bytes(Vec::<u8>::new()));
+        // utf8: empty → zero bytes.
+        let v = parse(&lit("utf8:"), &DataType::Bytes { size: Some(8) }).unwrap();
+        assert_eq!(v, Value::Bytes(Vec::<u8>::new()));
+        // bin: empty → zero bytes (0 % 8 == 0).
+        let v = parse(&lit("bin:"), &DataType::Bytes { size: Some(8) }).unwrap();
+        assert_eq!(v, Value::Bytes(Vec::<u8>::new()));
+    }
+
+    #[test]
+    fn bytes_unbounded_sink_skips_length_check() {
+        let v = parse(&lit("hex:01020304"), &DataType::Bytes { size: None }).unwrap();
+        assert_eq!(v, Value::Bytes(vec![1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn bytes_non_string_literal_rejected() {
+        let res = parse(&toml::Value::Integer(42), &DataType::Bytes { size: None });
+        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+    }
+
+    // ---- Text ------------------------------------------------------
+
+    #[test]
+    fn text_unbounded_sink_skips_length_check() {
+        let v = parse(&lit("hello"), &DataType::Text { size: None }).unwrap();
+        assert_eq!(v, Value::Text("hello".into()));
+    }
+
+    #[test]
+    fn text_uses_chars_not_bytes_for_length() {
+        // "Привет" = 6 chars, 12 bytes. Sink size=10 chars must accept.
+        let v = parse(&lit("Привет"), &DataType::Text { size: Some(10) }).unwrap();
+        assert_eq!(v, Value::Text("Привет".into()));
+    }
+
+    #[test]
+    fn text_non_string_literal_rejected() {
+        let res = parse(&toml::Value::Integer(42), &DataType::Text { size: None });
+        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+    }
+
+    // ---- Signed ints — exact boundaries ----------------------------
+
+    #[test]
+    fn signed_boundary_values_accepted() {
+        for (lit_val, dt, expected) in [
+            (i16::MAX as i64, DataType::Int16, Value::Int16(i16::MAX)),
+            (i16::MIN as i64, DataType::Int16, Value::Int16(i16::MIN)),
+            (i32::MAX as i64, DataType::Int32, Value::Int32(i32::MAX)),
+            (i32::MIN as i64, DataType::Int32, Value::Int32(i32::MIN)),
+            (i64::MAX, DataType::Int64, Value::Int64(i64::MAX)),
+            (i64::MIN, DataType::Int64, Value::Int64(i64::MIN)),
+        ] {
+            let v = parse(&toml::Value::Integer(lit_val), &dt).unwrap();
+            assert_eq!(v, expected);
+        }
+    }
+
+    #[test]
+    fn signed_non_integer_rejected() {
+        let res = parse(&lit("42"), &DataType::Int32);
+        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+    }
+
+    // ---- Unsigned ints — exact boundaries --------------------------
+
+    #[test]
+    fn unsigned_boundary_values_accepted() {
+        for (lit_val, dt, expected) in [
+            (0i64, DataType::UInt8, Value::UInt8(0)),
+            (u8::MAX as i64, DataType::UInt8, Value::UInt8(u8::MAX)),
+            (u16::MAX as i64, DataType::UInt16, Value::UInt16(u16::MAX)),
+            (u32::MAX as i64, DataType::UInt32, Value::UInt32(u32::MAX)),
+            (i64::MAX, DataType::UInt64, Value::UInt64(i64::MAX as u64)),
+        ] {
+            let v = parse(&toml::Value::Integer(lit_val), &dt).unwrap();
+            assert_eq!(v, expected);
+        }
+    }
+
+    #[test]
+    fn unsigned_overflow_rejected() {
+        let res = parse(&toml::Value::Integer(256), &DataType::UInt8);
+        assert!(matches!(res, Err(DefaultParseError::OutOfRange { .. })));
+    }
+
+    #[test]
+    fn unsigned_non_integer_rejected() {
+        let res = parse(&lit("1"), &DataType::UInt8);
+        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+    }
+
+    // ---- Floats ----------------------------------------------------
+
+    #[test]
+    fn float_from_float_literal() {
+        let v = parse(&toml::Value::Float(1.5), &DataType::Float64).unwrap();
+        assert_eq!(v, Value::Float64(1.5));
+        let v = parse(&toml::Value::Float(1.5), &DataType::Float32).unwrap();
+        assert_eq!(v, Value::Float32(1.5));
+    }
+
+    #[test]
+    fn float_from_integer_literal() {
+        let v = parse(&toml::Value::Integer(7), &DataType::Float64).unwrap();
+        assert_eq!(v, Value::Float64(7.0));
+    }
+
+    #[test]
+    fn float_non_numeric_rejected() {
+        let res = parse(&lit("3.14"), &DataType::Float64);
+        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+    }
+
+    // ---- BigInt ----------------------------------------------------
+
+    #[test]
+    fn bigint_from_string_within_width() {
+        let v = parse(
+            &lit("123456789012345678901"),
+            &DataType::BigInt { width: Some(21) },
+        )
+        .unwrap();
+        match v {
+            Value::BigInt(b) => assert_eq!(b.to_string(), "123456789012345678901"),
+            _ => panic!("expected BigInt"),
+        }
+    }
+
+    #[test]
+    fn bigint_from_integer_literal() {
+        let v = parse(&toml::Value::Integer(42), &DataType::BigInt { width: None }).unwrap();
+        match v {
+            Value::BigInt(b) => assert_eq!(b.to_string(), "42"),
+            _ => panic!("expected BigInt"),
+        }
+    }
+
+    #[test]
+    fn bigint_overflow_width() {
+        // width=10 → max 9_999_999_999. 10^10 itself is one too many.
+        let res = parse(&lit("10000000000"), &DataType::BigInt { width: Some(10) });
+        assert!(matches!(res, Err(DefaultParseError::OutOfRange { .. })));
+    }
+
+    #[test]
+    fn bigint_at_exact_width_boundary() {
+        // width=10 → max 9_999_999_999 must be accepted.
+        let v = parse(&lit("9999999999"), &DataType::BigInt { width: Some(10) }).unwrap();
+        match v {
+            Value::BigInt(b) => assert_eq!(b.to_string(), "9999999999"),
+            _ => panic!("expected BigInt"),
+        }
+        // negative boundary symmetrical.
+        let v = parse(&lit("-9999999999"), &DataType::BigInt { width: Some(10) }).unwrap();
+        match v {
+            Value::BigInt(b) => assert_eq!(b.to_string(), "-9999999999"),
+            _ => panic!("expected BigInt"),
+        }
+    }
+
+    #[test]
+    fn bigint_invalid_string_rejected() {
+        let res = parse(&lit("not-a-number"), &DataType::BigInt { width: None });
+        assert!(matches!(res, Err(DefaultParseError::OutOfRange { .. })));
+    }
+
+    #[test]
+    fn bigint_non_string_non_int_rejected() {
+        let res = parse(
+            &toml::Value::Boolean(true),
+            &DataType::BigInt { width: None },
+        );
+        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+    }
+
+    // ---- Decimal ---------------------------------------------------
+
+    #[test]
+    fn decimal_from_integer_literal() {
+        let v = parse(
+            &toml::Value::Integer(42),
+            &DataType::Decimal {
+                precision: Some(10),
+                scale: Some(2),
+            },
+        )
+        .unwrap();
+        assert!(matches!(v, Value::Decimal(_)));
+    }
+
+    #[test]
+    fn decimal_from_float_literal() {
+        let v = parse(
+            &toml::Value::Float(1.5),
+            &DataType::Decimal {
+                precision: Some(10),
+                scale: Some(2),
+            },
+        )
+        .unwrap();
+        assert!(matches!(v, Value::Decimal(_)));
+    }
+
+    #[test]
+    fn decimal_precision_overflow_rejected() {
+        // dec(5,2) → integer-digits=3 → max < 1000.
+        let res = parse(
+            &lit("1000.00"),
+            &DataType::Decimal {
+                precision: Some(5),
+                scale: Some(2),
+            },
+        );
+        assert!(matches!(res, Err(DefaultParseError::OutOfRange { .. })));
+    }
+
+    #[test]
+    fn decimal_negative_precision_overflow_rejected() {
+        let res = parse(
+            &lit("-1000.00"),
+            &DataType::Decimal {
+                precision: Some(5),
+                scale: Some(2),
+            },
+        );
+        assert!(matches!(res, Err(DefaultParseError::OutOfRange { .. })));
+    }
+
+    #[test]
+    fn decimal_unbounded_accepts_any() {
+        let v = parse(
+            &lit("99999999999.99999"),
+            &DataType::Decimal {
+                precision: None,
+                scale: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(v, Value::Decimal(_)));
+    }
+
+    #[test]
+    fn decimal_invalid_string_rejected() {
+        let res = parse(
+            &lit("not-a-decimal"),
+            &DataType::Decimal {
+                precision: Some(10),
+                scale: Some(2),
+            },
+        );
+        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn decimal_non_numeric_literal_rejected() {
+        let res = parse(
+            &toml::Value::Boolean(true),
+            &DataType::Decimal {
+                precision: Some(10),
+                scale: Some(2),
+            },
+        );
+        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+    }
+
+    // ---- Date / Timestamp ------------------------------------------
+
+    #[test]
+    fn date_non_string_rejected() {
+        let res = parse(&toml::Value::Integer(0), &DataType::Date);
+        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn timestamp_ok() {
+        let v = parse(&lit("2024-01-15T12:00:00Z"), &DataType::Timestamp).unwrap();
+        assert!(matches!(v, Value::Timestamp(_)));
+    }
+
+    #[test]
+    fn timestamp_invalid_rejected() {
+        let res = parse(&lit("not-a-timestamp"), &DataType::Timestamp);
+        assert!(matches!(
+            res,
+            Err(DefaultParseError::InvalidTimestamp { .. })
+        ));
+    }
+
+    #[test]
+    fn timestamp_non_string_rejected() {
+        let res = parse(&toml::Value::Integer(0), &DataType::Timestamp);
+        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+    }
+
+    // ---- Uuid ------------------------------------------------------
+
+    #[test]
+    fn uuid_non_string_rejected() {
+        let res = parse(&toml::Value::Integer(0), &DataType::Uuid);
+        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+    }
+
+    // ---- Xml -------------------------------------------------------
+
+    #[test]
+    fn xml_non_string_rejected() {
+        let res = parse(&toml::Value::Integer(0), &DataType::Xml);
+        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+    }
+
+    // ---- Json — toml_to_json variants ------------------------------
+
+    #[test]
+    fn json_string_literal() {
+        let v = parse(&lit("hello"), &DataType::Json).unwrap();
+        assert_eq!(v, Value::Json(serde_json::json!("hello")));
+    }
+
+    #[test]
+    fn json_integer_literal() {
+        let v = parse(&toml::Value::Integer(42), &DataType::Json).unwrap();
+        assert_eq!(v, Value::Json(serde_json::json!(42)));
+    }
+
+    #[test]
+    fn json_float_literal() {
+        let v = parse(&toml::Value::Float(1.5), &DataType::Json).unwrap();
+        assert_eq!(v, Value::Json(serde_json::json!(1.5)));
+    }
+
+    #[test]
+    fn json_boolean_literal() {
+        let v = parse(&toml::Value::Boolean(true), &DataType::Json).unwrap();
+        assert_eq!(v, Value::Json(serde_json::json!(true)));
+    }
+
+    #[test]
+    fn json_array_literal() {
+        let v = parse(
+            &toml::Value::Array(vec![toml::Value::Integer(1), toml::Value::Integer(2)]),
+            &DataType::Json,
+        )
+        .unwrap();
+        assert_eq!(v, Value::Json(serde_json::json!([1, 2])));
+    }
+
+    #[test]
+    fn json_table_literal() {
+        let mut tbl = toml::map::Map::new();
+        tbl.insert("k".to_string(), toml::Value::Integer(1));
+        let v = parse(&toml::Value::Table(tbl), &DataType::Json).unwrap();
+        assert_eq!(v, Value::Json(serde_json::json!({"k": 1})));
+    }
+
+    #[test]
+    fn json_float_nan_falls_back_to_null() {
+        // serde_json::Number::from_f64(NaN) is None → mapped to JSON null.
+        let v = parse(&toml::Value::Float(f64::NAN), &DataType::Json).unwrap();
+        assert_eq!(v, Value::Json(serde_json::Value::Null));
     }
 }

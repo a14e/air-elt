@@ -96,4 +96,22 @@ mod tests {
         assert_eq!(parse("é"), None);
         assert_eq!(parse("дa"), None);
     }
+
+    #[test]
+    fn convert_value_shape_mismatch() {
+        let res = convert(Value::Int32(1), &DataType::Text { size: None });
+        assert!(matches!(res, Err(ConvertError::ValueShapeMismatch { .. })));
+    }
+
+    #[test]
+    fn convert_returns_invalid_bool_for_unknown_token() {
+        let res = convert(Value::Text("maybe".into()), &DataType::Text { size: None });
+        assert!(matches!(res, Err(ConvertError::InvalidBool { .. })));
+    }
+
+    #[test]
+    fn convert_returns_bool_for_truthy_text() {
+        let out = convert(Value::Text("yes".into()), &DataType::Text { size: None }).unwrap();
+        assert_eq!(out, Value::Bool(true));
+    }
 }

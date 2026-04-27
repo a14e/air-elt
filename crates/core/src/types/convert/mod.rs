@@ -22,11 +22,10 @@ pub mod json_text;
 pub mod saturate;
 pub mod text_bool;
 pub mod text_narrow;
+pub mod text_truncate;
 pub mod timestamp_date;
-pub mod truncate_utf8;
 pub mod uuid;
-pub mod xml_text;
-pub mod xml_validate;
+pub mod xml;
 
 pub use context::ConversionContext;
 pub use dispatch::convert;
