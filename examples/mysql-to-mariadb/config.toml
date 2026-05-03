@@ -1,0 +1,30 @@
+[config]
+include = ["flows"]
+
+# Both ends speak the MySQL wire protocol — the connector type stays
+# `mysql` for either; only the live server diverges. MariaDB has small
+# divergences (legacy `VALUES()` UPSERT, native `UUID` from 10.7+) that
+# the runtime detects via a server-version probe at connect time.
+
+[secrets]
+MYSQL_SRC_URL = "mysql://root@localhost:3306/source"
+MARIADB_SINK_URL = "mysql://root@localhost:3307/target"
+MARIADB_STATE_URL = "mysql://root@localhost:3307/state"
+
+[[sources]]
+name = "mysql_src"
+type = "mysql"
+config = { url = "${MYSQL_SRC_URL}" }
+
+[[sinks]]
+name = "mariadb_sink"
+type = "mysql"
+config = { url = "${MARIADB_SINK_URL}" }
+
+[[storages]]
+name = "mariadb_state"
+type = "mysql"
+# Cursor table lives in the database from the URL path. MariaDB storage
+# uses the legacy `INSERT … ON DUPLICATE KEY UPDATE col = VALUES(col)`
+# UPSERT dialect (the modern `AS new ON DUPLICATE …` form is MySQL 8+).
+config = { url = "${MARIADB_STATE_URL}" }

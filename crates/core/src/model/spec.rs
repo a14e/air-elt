@@ -33,4 +33,7 @@ pub struct ReadSpec {
 pub struct WriteSpec {
     pub columns: Vec<String>,
     pub table: String,
+    /// Optional upsert directive. Absent → plain INSERT / insertMany.
+    /// Present → sink upserts on `conflict.key` using `strategy`.
+    pub conflict: Option<crate::config::conflict::ConflictConfig>,
 }

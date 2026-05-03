@@ -32,9 +32,10 @@ pub async fn fetch_schema(pool: &MySqlPool, table: &str) -> RuntimeResult<Schema
         None => current_database(pool).await?,
     };
 
-    // CHARACTER_MAXIMUM_LENGTH is `BIGINT` in MySQL 8.0+ (it was unsigned in
-    // older versions); we read it as `i64` and convert to `u32` afterwards.
-    // Negative values are not expected per the spec.
+    // CHARACTER_MAXIMUM_LENGTH surfaces with different signedness on
+    // different servers (MySQL 8 reports it signed, MariaDB unsigned).
+    // sqlx's strict type check rejects the wrong half — try unsigned
+    // first (the natural representation), then fall back to signed.
     let rows = sqlx::query(COLUMNS_QUERY)
         .bind(&db)
         .bind(&table_name)
@@ -54,17 +55,29 @@ pub async fn fetch_schema(pool: &MySqlPool, table: &str) -> RuntimeResult<Schema
         let is_null: String = row.try_get("is_nullable").map_err(RuntimeError::backend)?;
         let data_type: String = row.try_get("data_type").map_err(RuntimeError::backend)?;
         let column_type: String = row.try_get("column_type").map_err(RuntimeError::backend)?;
-        let cml: Option<i64> = row
-            .try_get("character_maximum_length")
-            .map_err(RuntimeError::backend)?;
-        // numeric_precision / numeric_scale are `BIGINT UNSIGNED` in MySQL 8
-        // (vs character_maximum_length which is signed BIGINT — see above).
-        let np: Option<u64> = row
-            .try_get("numeric_precision")
-            .map_err(RuntimeError::backend)?;
-        let ns: Option<u64> = row
-            .try_get("numeric_scale")
-            .map_err(RuntimeError::backend)?;
+        let cml: Option<u64> = match row.try_get::<Option<u64>, _>("character_maximum_length") {
+            Ok(v) => v,
+            Err(_) => row
+                .try_get::<Option<i64>, _>("character_maximum_length")
+                .map_err(RuntimeError::backend)?
+                .and_then(|n| u64::try_from(n).ok()),
+        };
+        // numeric_precision / numeric_scale also vary in signedness
+        // across MySQL / MariaDB releases — same fallback pattern.
+        let np: Option<u64> = match row.try_get::<Option<u64>, _>("numeric_precision") {
+            Ok(v) => v,
+            Err(_) => row
+                .try_get::<Option<i64>, _>("numeric_precision")
+                .map_err(RuntimeError::backend)?
+                .and_then(|n| u64::try_from(n).ok()),
+        };
+        let ns: Option<u64> = match row.try_get::<Option<u64>, _>("numeric_scale") {
+            Ok(v) => v,
+            Err(_) => row
+                .try_get::<Option<i64>, _>("numeric_scale")
+                .map_err(RuntimeError::backend)?
+                .and_then(|n| u64::try_from(n).ok()),
+        };
 
         let mysql = mysql_type::parse(&data_type, &column_type).ok_or_else(|| {
             RuntimeError::Other(format!(

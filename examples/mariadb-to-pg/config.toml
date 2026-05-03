@@ -1,0 +1,28 @@
+[config]
+include = ["flows"]
+
+[secrets]
+MARIADB_SRC_URL = "mysql://root@localhost:3307/source"
+PG_SINK_URL = "postgres://postgres:postgres@localhost:5432/target"
+PG_STATE_URL = "postgres://postgres:postgres@localhost:5432/state"
+
+[[sources]]
+name = "mariadb_src"
+# MariaDB speaks the MySQL wire protocol — the registry uses the same
+# `mysql` factory; the source connector probes the server version on
+# connect and adapts type decoding (e.g. native `UUID` columns return
+# the canonical 36-char text form, not 16 raw bytes).
+type = "mysql"
+config = { url = "${MARIADB_SRC_URL}" }
+
+[[sinks]]
+name = "pg_sink"
+type = "postgres"
+config = { url = "${PG_SINK_URL}" }
+
+[[storages]]
+name = "pg_state"
+type = "postgres"
+# If you need the cursor table in a non-default schema, append
+# `?options=-c%20search_path%3Danalytics` to the URL.
+config = { url = "${PG_STATE_URL}" }

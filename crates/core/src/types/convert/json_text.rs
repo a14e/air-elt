@@ -13,7 +13,7 @@ pub fn convert(
 ) -> Result<Value, ConvertError> {
     let v = match value {
         Value::Json(v) => v,
-        _ => return Err(ConvertError::ValueShapeMismatch { src: *src }),
+        _ => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
     };
     // serde_json::Value cannot contain non-finite f64 (Number::from_f64
     // rejects NaN/±Inf at construction time), so to_string is infallible.

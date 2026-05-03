@@ -31,10 +31,13 @@ async fn describe_and_read_with_cursor() {
     let handle = mysql_pool().await;
     seed_users(&handle.pool).await;
 
-    let source = MySqlSource::connect(MySqlSourceConfig {
-        url: handle.url_with_database(),
-        ..Default::default()
-    })
+    let source = MySqlSource::connect(
+        "test_source".to_string(),
+        MySqlSourceConfig {
+            url: handle.url_with_database(),
+            ..Default::default()
+        },
+    )
     .await
     .expect("connect source");
 
@@ -117,10 +120,13 @@ async fn read_with_nullable_cursor() {
             .expect("insert");
     }
 
-    let source = MySqlSource::connect(MySqlSourceConfig {
-        url: handle.url_with_database(),
-        ..Default::default()
-    })
+    let source = MySqlSource::connect(
+        "test_source".to_string(),
+        MySqlSourceConfig {
+            url: handle.url_with_database(),
+            ..Default::default()
+        },
+    )
     .await
     .expect("connect source");
 
@@ -190,10 +196,13 @@ async fn read_with_nullable_cursor_desc() {
             .expect("insert");
     }
 
-    let source = MySqlSource::connect(MySqlSourceConfig {
-        url: handle.url_with_database(),
-        ..Default::default()
-    })
+    let source = MySqlSource::connect(
+        "test_source".to_string(),
+        MySqlSourceConfig {
+            url: handle.url_with_database(),
+            ..Default::default()
+        },
+    )
     .await
     .expect("connect source");
 
@@ -254,10 +263,13 @@ async fn tinyint_one_round_trips_as_bool() {
             .expect("insert");
     }
 
-    let source = MySqlSource::connect(MySqlSourceConfig {
-        url: handle.url_with_database(),
-        ..Default::default()
-    })
+    let source = MySqlSource::connect(
+        "test_source".to_string(),
+        MySqlSourceConfig {
+            url: handle.url_with_database(),
+            ..Default::default()
+        },
+    )
     .await
     .expect("connect source");
 
@@ -317,10 +329,13 @@ async fn binary_columns_carry_size() {
         .await
         .expect("insert");
 
-    let source = MySqlSource::connect(MySqlSourceConfig {
-        url: handle.url_with_database(),
-        ..Default::default()
-    })
+    let source = MySqlSource::connect(
+        "test_source".to_string(),
+        MySqlSourceConfig {
+            url: handle.url_with_database(),
+            ..Default::default()
+        },
+    )
     .await
     .expect("connect source");
 

@@ -7,7 +7,7 @@ include = ["flows"]
 
 [secrets]
 PG_SRC_URL = "postgres://postgres:postgres@localhost:5432/source"
-PG_SINK_URL = "postgres://postgres:postgres@localhost:5432/target"
+MONGO_SINK_URL = "mongodb://localhost:27017"
 PG_STATE_URL = "postgres://postgres:postgres@localhost:5432/state"
 
 [[sources]]
@@ -16,14 +16,14 @@ type = "postgres"
 config = { url = "${PG_SRC_URL}" }
 
 [[sinks]]
-name = "pg_sink"
-type = "postgres"
-config = { url = "${PG_SINK_URL}" }
+name = "mongo_sink"
+type = "mongodb"
+# Schemaless sink — `Sink::schemaless()` makes validate mirror the source's
+# inferred schema instead of probing for declared columns. `[flow.<name>.conflict]`
+# (see flows/users.toml) turns the writer into `replaceOne(upsert=true)`.
+config = { url = "${MONGO_SINK_URL}", database = "target" }
 
 [[storages]]
 name = "pg_state"
 type = "postgres"
-# If you need the cursor table in a non-default schema, append
-# `?options=-c%20search_path%3Danalytics` to the URL. There is no `schema`
-# field in MVP — this keeps pool-session / migrate / runtime queries aligned.
 config = { url = "${PG_STATE_URL}" }

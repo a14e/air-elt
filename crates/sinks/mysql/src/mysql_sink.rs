@@ -18,6 +18,10 @@ use crate::sql_statements as sql;
 struct MySqlSinkCtx {
     column_types: Vec<DataType>,
     insert_statement: String,
+    /// `ON DUPLICATE KEY UPDATE ...` suffix for `Overwrite` strategy;
+    /// empty string when conflict is `Ignore` (already encoded by the
+    /// `INSERT IGNORE` prefix) or absent.
+    conflict_suffix: String,
 }
 
 impl SinkCtx for MySqlSinkCtx {
@@ -90,7 +94,7 @@ impl Sink for MySqlSink {
             .columns
             .iter()
             .map(|c| {
-                schema.find(c).map(|f| f.data_type).ok_or_else(|| {
+                schema.find(c).map(|f| f.data_type.clone()).ok_or_else(|| {
                     RuntimeError::SchemaColumnMissing {
                         table: spec.table.clone(),
                         column: c.clone(),
@@ -98,10 +102,26 @@ impl Sink for MySqlSink {
                 })
             })
             .collect::<RuntimeResult<_>>()?;
-        let insert_statement = sql::insert_statement(&spec.table, &spec.columns)?;
+        let (insert_statement, conflict_suffix) = match &spec.conflict {
+            Some(c) => match c.strategy {
+                air_elt_core::config::conflict::ConflictStrategy::Ignore => (
+                    sql::insert_ignore_statement(&spec.table, &spec.columns)?,
+                    String::new(),
+                ),
+                air_elt_core::config::conflict::ConflictStrategy::Overwrite => (
+                    sql::insert_statement(&spec.table, &spec.columns)?,
+                    sql::conflict_overwrite_suffix(c, &spec.columns)?,
+                ),
+            },
+            None => (
+                sql::insert_statement(&spec.table, &spec.columns)?,
+                String::new(),
+            ),
+        };
         Ok(Arc::new(MySqlSinkCtx {
             column_types,
             insert_statement,
+            conflict_suffix,
         }))
     }
 
@@ -124,7 +144,7 @@ impl Sink for MySqlSink {
                 match value {
                     // Keep in sync with air_elt_commons_mysql::null_bind::bind_typed_null
                     // — the Separated lifetime forces inlining here.
-                    Value::Null => match *dt {
+                    Value::Null => match dt {
                         DataType::Bool => {
                             tuple.push_bind::<Option<bool>>(None);
                         }
@@ -181,6 +201,9 @@ impl Sink for MySqlSink {
                         // MySQL has no native xml type — bind as text.
                         DataType::Xml => {
                             tuple.push_bind::<Option<String>>(None);
+                        }
+                        DataType::Union(_) => {
+                            unreachable!("mysql sinks never carry Union types")
                         }
                     },
                     Value::Bool(b) => {
@@ -248,6 +271,9 @@ impl Sink for MySqlSink {
                 }
             }
         });
+        if !my_ctx.conflict_suffix.is_empty() {
+            qb.push(&my_ctx.conflict_suffix);
+        }
         debug!(sql = %qb.sql(), rows = batch.rows.len(), "mysql insert batch sql");
         let result = qb
             .build()

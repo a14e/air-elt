@@ -131,12 +131,51 @@ pub enum ValidationError {
     )]
     DefaultOnNotNullSource { flow: String, column: String },
 
+    #[error(
+        "flow {flow:?} field {column:?}: `default` requires `validation.fields = true` so \
+         the sink type can be resolved; with `fields = false` no schema introspection runs"
+    )]
+    DefaultRequiresFields { flow: String, column: String },
+
     #[error("field {column:?}: failed to parse default literal: {source}")]
     DefaultParse {
         flow: String,
         column: String,
         #[source]
         source: crate::types::default_value::DefaultParseError,
+    },
+
+    #[error(
+        "mapping declares the same sink field {field:?} twice (entries {first_index} and {duplicate_index}){detail}"
+    )]
+    DuplicateSinkField {
+        field: String,
+        first_index: usize,
+        duplicate_index: usize,
+        /// Optional clarifier appended to the error message — used to
+        /// distinguish the plain "two entries with identical `to`" case
+        /// from the nested-path "one is a prefix of the other" case.
+        /// Empty string when no extra context is needed.
+        detail: String,
+    },
+
+    #[error("field path {path:?} in mapping is invalid: {source}")]
+    InvalidFieldPath {
+        path: String,
+        #[source]
+        source: crate::mapping::FieldPathError,
+    },
+
+    #[error(
+        "sampling validation failed for flow {flow:?}: row {row_index} column {field:?} ({source_type:?} -> {sink_type:?}): {detail}"
+    )]
+    SamplingFailed {
+        flow: String,
+        row_index: usize,
+        field: String,
+        source_type: DataType,
+        sink_type: DataType,
+        detail: String,
     },
 }
 

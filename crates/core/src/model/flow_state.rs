@@ -2,6 +2,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::config::validation::SamplingConfig;
 use crate::mapping::ColumnMapping;
 use crate::model::{ReadSpec, WriteSpec};
 use crate::traits::{Sink, Source, Storage};
@@ -23,6 +24,18 @@ pub struct AssembledFlow {
     pub write_spec: WriteSpec,
     pub interval: Duration,
     pub query_timeout: Duration,
+    /// Operator-resolved sampling-validation decision (after applying
+    /// the per-backend factory default for `Unset`).
+    pub sampling: SamplingConfig,
+    /// Whether the validation pipeline runs source / storage access
+    /// probes for this flow.
+    pub access_check: bool,
+    /// Whether the validation pipeline runs schema introspection +
+    /// matrix + duplicate-`to` checks. For Mongo this is honoured but
+    /// only partial (the schema is sampled, not authoritative).
+    pub fields_check: bool,
+    /// Whether the validation pipeline runs the sink's write probe.
+    pub inserts_check: bool,
 }
 
 /// Per-column conversion plan. Carries the resolved source/sink `DataType`
@@ -40,7 +53,7 @@ impl ConversionPlan {
     /// Build an identity plan (no truncate, no default). Test helper.
     pub fn identity(dt: DataType) -> Self {
         Self {
-            source: dt,
+            source: dt.clone(),
             sink: dt,
             ctx: ConversionContext::passthrough(),
         }

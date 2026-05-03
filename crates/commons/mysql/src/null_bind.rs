@@ -43,5 +43,9 @@ pub fn bind_typed_null<'q>(
         // XML through MySQL columns map them to text-family columns, so
         // this null-bind reaches the same wire type as Text.
         DataType::Xml => query.bind::<Option<String>>(None),
+        // Union never reaches a MySQL sink: schemaful sinks declare
+        // concrete column types, and validation rejects Union → MySQL
+        // before any bind happens.
+        DataType::Union(_) => unreachable!("mysql sinks never carry Union types"),
     }
 }

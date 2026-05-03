@@ -9,7 +9,7 @@ pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, Co
     use DataType::*;
     let b = match value {
         Value::BigInt(b) => b,
-        _ => return Err(ConvertError::ValueShapeMismatch { src: *src }),
+        _ => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
     };
     match dst {
         BigInt { width: Some(w) } => Ok(Value::BigInt(sat_bigint_to_width(&b, *w))),
@@ -22,8 +22,8 @@ pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, Co
         UInt16 => Ok(Value::UInt16(sat_bigint_to_u16(&b))),
         UInt8 => Ok(Value::UInt8(sat_bigint_to_u8(&b))),
         _ => Err(ConvertError::Unsupported {
-            src: *src,
-            dst: *dst,
+            src: src.clone(),
+            dst: dst.clone(),
         }),
     }
 }

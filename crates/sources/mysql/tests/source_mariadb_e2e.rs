@@ -38,10 +38,13 @@ async fn reads_native_uuid_column_from_mariadb() {
         .await
         .expect("insert");
 
-    let source = MySqlSource::connect(MySqlSourceConfig {
-        url: handle.url_with_database(),
-        ..Default::default()
-    })
+    let source = MySqlSource::connect(
+        "test_source".to_string(),
+        MySqlSourceConfig {
+            url: handle.url_with_database(),
+            ..Default::default()
+        },
+    )
     .await
     .expect("connect source");
 

@@ -22,7 +22,7 @@ Flat `key = "value"` map. Used by `${VAR}` expansion (env → secrets → defaul
 | Field | Type | Required | Description |
 |-------|------|:--------:|-------------|
 | `name` | string | yes | Unique identifier |
-| `type` | string | yes | Connector kind (`"postgres"` or `"mysql"`) |
+| `type` | string | yes | Connector kind (`"postgres"`, `"mysql"`, or `"mongodb"`) |
 | `config` | table | yes | Connector-specific config (see below) |
 
 ### Postgres / MySQL connector config (`config = { ... }`)
@@ -40,6 +40,29 @@ The same field set applies to both `"postgres"` and `"mysql"` types — only the
 | `max-connections` | u32 | 5 | Pool size (capped at 100) |
 | `min-connections` | u32 | 0 | Minimum idle connections |
 
+### MongoDB connector config (`config = { ... }`)
+
+The same field set covers `[[sources]]`, `[[sinks]]`, and `[[storages]]` of `type = "mongodb"`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | string | required | Connection URL (`mongodb://[user:pass@]host[:port][/db][?opts]`) |
+| `database` | string | from URL path | Override the database name. Required if the URL has no path component. |
+| `connect-timeout` | Duration | `"5s"` | TCP connect timeout |
+| `acquire-timeout` | Duration | `"10s"` | Server-selection timeout |
+| `idle-timeout` | Duration | `"5m"` | Idle connection lifetime |
+| `max-connections` | u32 | 5 | Driver pool size cap (≤100) |
+| `min-connections` | u32 | 0 | Minimum pool size |
+| `schema-sample-size` | usize | 100 | (source only) Documents pulled by `describe_schema` for type inference |
+| `operation-timeout` | Duration | `"30s"` | (source only) Per-op `maxTimeMS` applied to driver calls that support it (Find / Aggregate / FindOne). Bounds server-side work after the runner detaches a spawned future on shutdown / timeout. |
+| `collection` | string | `"air_elt_cursors"` | (storage only) Collection that holds cursor state |
+
+**Mongo-specific notes:**
+- Flow `from` / `to` are bare collection names — no database prefix; database is configured on the connector itself.
+- Mapping `from` / `to` accept dot notation for nested fields (`"addr.city"`). Dot notation is forbidden for SQL connectors.
+- Cursor field set must be a single field in MVP (multi-key Mongo cursors are not yet supported).
+- Mongo collections are schemaless. The sink takes any BSON shape; validation is driven by the source's *sampled* schema (see `[flow.<name>.validation]` below).
+
 ## `[flow.<name>]`
 
 | Field | Type | Default | Description |
@@ -53,6 +76,50 @@ The same field set applies to both `"postgres"` and `"mysql"` types — only the
 | `cursor` | table | required | Cursor config |
 | `batch-limit` | usize | 1024 | Max rows per batch. `batch-limit × mapping cols ≤ 60,000` |
 | `query-timeout` | Duration | `"30s"` | Per-operation timeout for read/write/cursor calls |
+| `validation` | table | `{}` | Optional per-flow validation knobs (see below) |
+| `conflict` | table | absent | Optional upsert directive (see below). Without this block sinks do plain `INSERT` / `insertMany`. |
+
+### `validation`
+
+Optional sub-block; controls validation steps that go beyond schema introspection.
+
+```toml
+[flow.<name>]
+validation = { sampling = true }
+# or, table form:
+[flow.<name>.validation.sampling]
+enabled = true
+size = 100
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `access` | bool | `true` | Run source / storage `validate_access` probes (ping, schema visibility). |
+| `fields` | bool | `true` | Gates schema introspection (`describe_schema` on source + sink), `check_cursor`, and `check_mapping`. With `fields = false` no introspection runs; conversions become identity passthrough (`Json → Json`), `truncate` becomes a no-op, and `default` is rejected (parsing the literal needs the real sink type). Use this to bring an empty Mongo collection online before the first writer exists. For Mongo with `fields = true` the check is honoured but partial — the inferred schema is a sample, not authoritative. |
+| `inserts` | bool | `true` | Run the sink write probe (insert + delete sentinel). |
+| `sampling` | bool / table | per-backend default | Enable sampling-validation. `true` → enabled with size 100. `false` → disabled. Table form `{ enabled, size }` overrides the default size. |
+
+**Backend defaults**: when `validation.sampling` is omitted, the source factory chooses — `mongodb` defaults **on** (size 100), `postgres` and `mysql` default **off**. Sampling pulls `size` rows from the source via the cursor query (`Source::sample`) and, for backends that support it (Mongo `$sample`), an extra random slice via `Source::sample_fresh`. Both row sets are run through every `ConversionPlan::convert`, surfacing data that violates the declared types (overflow integers, malformed UUIDs, etc.). The recommendation is to enable it on SQL flows whose data shape you don't fully trust — the cost is one extra round-trip per validate run.
+
+### `conflict`
+
+Optional upsert directive. Without this block sinks do plain `INSERT` / `insertMany`. With it, the sink upserts on `key` using the chosen `strategy`.
+
+```toml
+[flow.<name>.conflict]
+key = ["id"]            # one or more sink columns / dot-paths
+strategy = "overwrite"  # "ignore" | "overwrite"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `key` | `[string]` | required | Sink columns / dot-paths forming the conflict key. Must be a subset of `mapping.to`. |
+| `strategy` | `"ignore"` / `"overwrite"` | required | `ignore` drops the new row on key collision; `overwrite` replaces the existing row. |
+
+**Per-backend translation**:
+- **Postgres** — `ON CONFLICT (key) DO NOTHING` for `ignore`, `ON CONFLICT (key) DO UPDATE SET col = EXCLUDED.col, …` for `overwrite`. The `key` columns must form a unique index in the sink table; otherwise PG rejects the statement.
+- **MySQL / MariaDB** — `INSERT IGNORE` for `ignore` (drops any unique-violation, not just the one on `key`), `ON DUPLICATE KEY UPDATE col = VALUES(col), …` (legacy form, MariaDB-compatible) for `overwrite`. The `key` columns must form a UNIQUE/PRIMARY KEY.
+- **MongoDB** — `insertMany(ordered=false)` swallowing E11000 duplicate-key errors for `ignore`. For `overwrite` the path is server-version dependent: on **server ≥ 8.0** the sink uses `Client::bulk_write` (one round-trip per batch); on **older servers** it falls back to per-row `replaceOne(filter = key, upsert = true)` fired with bounded concurrency. The version is detected once at `connect()` via `db.runCommand({ buildInfo: 1 })`. Single-key `["_id"]` takes a fast path that skips the FieldPath round-trip on both branches.
 
 ### `mapping`
 
@@ -117,6 +184,7 @@ All Duration fields accept two formats, routed by prefix:
 - `cursor.interval > 0` (zero interval causes spin-loop)
 - `query-timeout > 0` when specified
 - Cursor fields ⊆ mapping `from` columns
+- `conflict.key` ⊆ mapping `to` columns (when `[flow.<name>.conflict]` is set)
 - File size ≤ 16 MiB
 - No absolute include paths
 - Symlink loops detected via canonical path dedup

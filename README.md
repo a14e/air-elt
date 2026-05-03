@@ -17,16 +17,16 @@ Rust **1.90** (stable) is pinned via `rust-toolchain.toml`.
 
 ```bash
 # Validate a config (connects to all declared sources/sinks/storages)
-cargo run -p air-elt-app -- validate --config examples/pg-to-pg/config.toml
+cargo run -p air-elt-app -- validate --config examples/pg-to-mongo/config.toml
 
 # Apply storage migrations
-cargo run -p air-elt-app -- migrate --config examples/pg-to-pg/config.toml
+cargo run -p air-elt-app -- migrate --config examples/pg-to-mongo/config.toml
 
 # Daemon mode — micro-batch + drain, graceful shutdown on SIGTERM
-cargo run -p air-elt-app -- run --config examples/pg-to-pg/config.toml
+cargo run -p air-elt-app -- run --config examples/pg-to-mongo/config.toml
 
 # One-shot drain
-cargo run -p air-elt-app -- run --once --config examples/pg-to-pg/config.toml
+cargo run -p air-elt-app -- run --once --config examples/pg-to-mongo/config.toml
 
 # Shorthand: no subcommand → daemon mode with ./config.toml
 cargo run -p air-elt-app
@@ -48,7 +48,7 @@ E2E tests need a PostgreSQL instance. Two options:
 
 ## Configs and secrets
 
-`${VAR}` / `${VAR:default}` placeholders are resolved before TOML parse. Lookup order: process env → config `[secrets]` map → default clause → error. See `examples/pg-to-pg/config.toml`.
+`${VAR}` / `${VAR:default}` placeholders are resolved before TOML parse. Lookup order: process env → config `[secrets]` map → default clause → error. See `examples/pg-to-mongo/config.toml`.
 
 Storage schema placement is **not** a config field in MVP — if you need the cursor table in a non-default schema, put `?options=-c%20search_path%3D<schema>` in the storage URL. libpq applies that to every new pool connection, so migrations and runtime queries agree.
 

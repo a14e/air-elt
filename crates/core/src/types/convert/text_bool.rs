@@ -17,7 +17,7 @@ const MAX_TOKEN_BYTES: usize = 5;
 pub fn convert(value: Value, src: &DataType) -> Result<Value, ConvertError> {
     let s = match value {
         Value::Text(s) => s,
-        _ => return Err(ConvertError::ValueShapeMismatch { src: *src }),
+        _ => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
     };
     match parse(&s) {
         Some(b) => Ok(Value::Bool(b)),

@@ -13,7 +13,7 @@ pub fn convert(
 ) -> Result<Value, ConvertError> {
     let s = match value {
         Value::Text(s) => s,
-        _ => return Err(ConvertError::ValueShapeMismatch { src: *src }),
+        _ => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
     };
     let out = match sink_size {
         None => s,

@@ -1,5 +1,5 @@
 use crate::error::{TypeError, ValidationError};
-use crate::mapping::ColumnMapping;
+use crate::mapping::{ColumnMapping, FieldPath};
 use crate::model::Schema;
 use crate::types::matrix;
 
@@ -14,6 +14,7 @@ pub fn check_mapping(
     sink_schema: &Schema,
     mappings: &[ColumnMapping],
 ) -> Result<(), ValidationError> {
+    check_sink_uniqueness(mappings)?;
     for m in mappings {
         let src_field =
             source_schema
@@ -33,26 +34,32 @@ pub fn check_mapping(
         // matrix (`is_compatible_with_truncate`); without it we only allow
         // the lossless set.
         let compatible = if m.truncate {
-            matrix::is_compatible_with_truncate(src_field.data_type, sink_field.data_type)
+            matrix::is_compatible_with_truncate(
+                src_field.data_type.clone(),
+                sink_field.data_type.clone(),
+            )
         } else {
-            matrix::is_compatible(src_field.data_type, sink_field.data_type)
+            matrix::is_compatible(src_field.data_type.clone(), sink_field.data_type.clone())
         };
         if !compatible {
-            let type_err = if matrix::is_narrowing(src_field.data_type, sink_field.data_type) {
+            let type_err = if matrix::is_narrowing(
+                src_field.data_type.clone(),
+                sink_field.data_type.clone(),
+            ) {
                 TypeError::NarrowingNotAllowed {
-                    from: src_field.data_type,
-                    to: sink_field.data_type,
+                    from: src_field.data_type.clone(),
+                    to: sink_field.data_type.clone(),
                 }
             } else {
                 TypeError::UnsupportedCast {
-                    from: src_field.data_type,
-                    to: sink_field.data_type,
+                    from: src_field.data_type.clone(),
+                    to: sink_field.data_type.clone(),
                 }
             };
             return Err(ValidationError::IncompatibleTypes {
                 field: format!("{} -> {}", m.from, m.to),
-                from: src_field.data_type,
-                to: sink_field.data_type,
+                from: src_field.data_type.clone(),
+                to: sink_field.data_type.clone(),
                 source: type_err,
             });
         }
@@ -65,6 +72,51 @@ pub fn check_mapping(
                 source_nullable: src_field.nullable,
                 sink_nullable: sink_field.nullable,
             });
+        }
+    }
+    Ok(())
+}
+
+/// Reject mapping configurations that would write into the same sink
+/// field more than once, or into a sink field that is a parent /
+/// ancestor of another mapped field (only meaningful for connectors
+/// that build nested documents — e.g. MongoDB — where `to = "addr"`
+/// and `to = "addr.city"` together would silently overwrite the
+/// nested writer).
+///
+/// Mappings are tiny (handful to a few dozen entries), so the O(n²)
+/// scan is fine.
+fn check_sink_uniqueness(mappings: &[ColumnMapping]) -> Result<(), ValidationError> {
+    let parsed: Vec<Option<FieldPath>> = mappings
+        .iter()
+        .map(|m| FieldPath::parse(&m.to).ok())
+        .collect();
+
+    for (i, mi) in mappings.iter().enumerate() {
+        for (j, mj) in mappings.iter().enumerate().take(i) {
+            if mi.to == mj.to {
+                return Err(ValidationError::DuplicateSinkField {
+                    field: mi.to.clone(),
+                    first_index: j,
+                    duplicate_index: i,
+                    detail: String::new(),
+                });
+            }
+            // Prefix conflict only meaningful when both `to` values
+            // parse as valid paths. If one fails to parse we let the
+            // per-column type check produce its own error.
+            if let (Some(a), Some(b)) = (&parsed[j], &parsed[i]) {
+                if a.is_nested() || b.is_nested() {
+                    if a.is_prefix_or_equal(b) || b.is_prefix_or_equal(a) {
+                        return Err(ValidationError::DuplicateSinkField {
+                            field: format!("{} / {}", mj.to, mi.to),
+                            first_index: j,
+                            duplicate_index: i,
+                            detail: " — one path is an ancestor of the other".to_string(),
+                        });
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -170,6 +222,57 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn duplicate_sink_field_rejected() {
+        let src = Schema::new(vec![
+            Field {
+                name: "a".into(),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            Field {
+                name: "b".into(),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+        ]);
+        let dst = Schema::new(vec![Field {
+            name: "out".into(),
+            data_type: DataType::Int32,
+            nullable: false,
+        }]);
+        let err =
+            check_mapping(&src, &dst, &[mapping("a", "out"), mapping("b", "out")]).unwrap_err();
+        assert!(matches!(err, ValidationError::DuplicateSinkField { .. }));
+    }
+
+    #[test]
+    fn nested_path_prefix_rejected() {
+        // The schema lookups would fail for nested paths (since SQL
+        // schemas don't have nested fields), but the prefix check
+        // runs first.
+        let src = Schema::new(vec![
+            Field {
+                name: "a".into(),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            Field {
+                name: "b".into(),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+        ]);
+        let dst = Schema::new(vec![]);
+        let err = check_mapping(
+            &src,
+            &dst,
+            &[mapping("a", "addr"), mapping("b", "addr.city")],
+        )
+        .unwrap_err();
+        assert!(matches!(err, ValidationError::DuplicateSinkField { .. }));
     }
 
     #[test]

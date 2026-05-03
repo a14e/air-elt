@@ -40,10 +40,11 @@ impl SourceCtx for PgSourceCtx {
 
 pub struct PgSource {
     pool: PgPool,
+    name: String,
 }
 
 impl PgSource {
-    pub async fn connect(config: PgSourceConfig) -> RuntimeResult<Self> {
+    pub async fn connect(name: String, config: PgSourceConfig) -> RuntimeResult<Self> {
         let pool = pool::connect(
             &config.url,
             pool::PoolSettings::from_options(
@@ -57,7 +58,7 @@ impl PgSource {
             ),
         )
         .await?;
-        Ok(Self { pool })
+        Ok(Self { pool, name })
     }
 
     async fn ensure_connection_alive(&self) -> RuntimeResult<()> {
@@ -93,6 +94,10 @@ impl PgSource {
 
 #[async_trait]
 impl Source for PgSource {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     async fn validate_access(&self, spec: &ReadSpec) -> RuntimeResult<()> {
         self.ensure_connection_alive().await?;
         self.assert_table_readable(spec).await?;
@@ -204,7 +209,7 @@ impl Source for PgSource {
                             field.name
                         ))
                     })?;
-                let dt = pg_ctx.cursor_types[cursor_field_pos];
+                let dt = pg_ctx.cursor_types[cursor_field_pos].clone();
                 query = codec::bind_cursor_value(query, &field.value, dt);
             }
         }
@@ -222,12 +227,12 @@ impl Source for PgSource {
         for row in &rows {
             let mut values = Vec::with_capacity(spec.columns.len());
             for (idx, dt) in pg_ctx.column_types.iter().enumerate() {
-                values.push(codec::decode_column(row, idx, *dt)?);
+                values.push(codec::decode_column(row, idx, dt.clone())?);
             }
 
             let mut cursor_values = Vec::with_capacity(spec.cursor_fields.len());
             for (cf_idx, cursor_field) in spec.cursor_fields.iter().enumerate() {
-                let dt = pg_ctx.cursor_types[cf_idx];
+                let dt = pg_ctx.cursor_types[cf_idx].clone();
                 let value = match pg_ctx.cursor_to_column[cf_idx] {
                     Some(i) => values[i].clone(),
                     None => {
@@ -277,11 +282,14 @@ fn resolve_types(schema: &Schema, names: &[String], table: &str) -> RuntimeResul
     names
         .iter()
         .map(|name| {
-            schema.find(name).map(|f| f.data_type).ok_or_else(|| {
-                RuntimeError::Other(format!(
-                    "column {name:?} not in source schema for {table:?}"
-                ))
-            })
+            schema
+                .find(name)
+                .map(|f| f.data_type.clone())
+                .ok_or_else(|| {
+                    RuntimeError::Other(format!(
+                        "column {name:?} not in source schema for {table:?}"
+                    ))
+                })
         })
         .collect()
 }

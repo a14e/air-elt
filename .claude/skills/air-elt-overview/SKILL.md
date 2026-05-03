@@ -8,57 +8,64 @@ user-invocable: false
 
 Air Elt is a Rust service for moving data between systems with **minimal transformation** (ELT, not ETL). Data is carried through as-is; only essential coercion happens at the edges.
 
-## Key features
+## Operating philosophy
 
-1. **GitOps flows.** Each flow is a declarative TOML file describing source, sink, storage, column mapping, and cursor.
-2. **Strict validation on startup.**
-   1. Config schema / structural checks.
-   2. Access checks — real connect + minimal probe (`SELECT 1`, `INSERT … SELECT … WHERE false`, etc.) against source/sink/storage.
-   3. Target tables exist and current user has required privileges.
-   4. *(Optional)* Excess-privilege check.
-   5. Field/type compatibility between source and sink via the canonical-type matrix.
-   6. *(Optional)* Sample-value conversion check.
-3. **Micro-batch + drain.** Flows run sub-second micro-batches with drain semantics (pull while full, sleep when empty). A classic nightly mode is also allowed via a long interval.
-4. **Monitoring is first-class.** All processes emit structured logs via `tracing`.
-5. **Minimal resources.** Run centralised, or place instances next to each data plane (nginx-style).
-6. **Static SQL.** All SQL is composed during config-init, not per-row.
+Validation prioritises **correctness**: every access probe, type check, and config constraint must pass before any data moves. Runtime prioritises **fault tolerance**: individual flow failures are logged and retried, never crashing the whole process.
+
+- Flows are **declarative TOML** (GitOps). One file per flow.
+- **Static SQL.** Statements are composed during config-init, never per-row.
+- **Micro-batch + drain.** Sub-second batches with drain semantics (pull while full, sleep when empty). A nightly mode is available via a long interval.
+- **Structured logs** via `tracing` only — no `println!`.
+- **Minimal resources.** Run centralised, or place instances next to each data plane.
 
 ## Tech stack
 
-Rust 1.90 stable (pinned via `rust-toolchain.toml`), tokio, async-trait, sqlx (postgres / mysql / migrate / chrono / uuid / json), tracing, clap, mimalloc, thiserror.
+Rust 1.90 stable (pinned via `rust-toolchain.toml`), tokio, async-trait, sqlx (postgres / mysql / migrate / chrono / uuid / json), mongodb 3.x driver, tracing, clap, mimalloc, thiserror.
 
 ## Workspace layout
 
 ```
 air-elt/
 ├── rust-toolchain.toml
-├── Cargo.toml                       # [workspace] + [workspace.package] + pinned [workspace.dependencies]
+├── Cargo.toml                       # [workspace] + pinned [workspace.dependencies]
 ├── crates/
 │   ├── app/                         # bin air-elt (CLI, mimalloc, tracing init, registry wiring)
 │   ├── core/                        # traits, types, config, validation, flow runner
-│   ├── commons/lib/                 # tracing-init, identifier, pool_timeouts (db-agnostic — no project deps)
-│   ├── commons/pg/                  # pg quote/pool/schema/pg_type/null_bind
-│   ├── commons/mysql/               # mysql quote/pool/schema/mysql_type/null_bind
-│   ├── commons/testing/             # PgTestHandle / MySqlTestHandle + shared backend probe
-│   ├── sources/{postgres,mysql}/    # connectors per backend
-│   ├── sinks/{postgres,mysql}/
-│   └── storages/{postgres,mysql}/   # storage + migrations dir per backend
-├── migrations/storage-{postgres,mysql}/  # raw SQL for sqlx::migrate!
-└── examples/{pg-to-pg,mysql-to-mysql}/   # usage examples
+│   ├── commons/lib/                 # tracing-init, identifier, pool_timeouts (db-agnostic)
+│   ├── commons/{pg,mysql,mongodb}/  # per-backend shared helpers
+│   ├── commons/testing/             # PgTestHandle / MySqlTestHandle / MongoTestHandle
+│   ├── sources/{postgres,mysql,mongodb}/    # connectors per backend
+│   ├── sinks/{postgres,mysql,mongodb}/
+│   └── storages/{postgres,mysql,mongodb}/   # storage + migrations dir per backend
+├── migrations/storage-{postgres,mysql}/  # raw SQL for sqlx::migrate! (mongo storage has no migrations)
+└── examples/{pg-to-pg,mysql-to-mysql,mongo-to-mongo}/   # usage examples
 ```
 
 **Cross-dependencies between `sources/*`, `sinks/*`, `storages/*` are forbidden.** Each depends only on `core` (and optionally `commons`). Connectors are wired into the app via `core::registry::Registry`.
 
-The `mysql` connector is exercised against both vanilla MySQL **and MariaDB** (10.7+ for native UUID, version-aware UPSERT for `VALUES()` legacy form). MariaDB is a *test target*, not a separate registered backend — there is no `type = "mariadb"` in config.
+The `mysql` connector is exercised against both vanilla MySQL **and MariaDB** (10.7+ for native UUID, version-aware UPSERT for `VALUES()` legacy form). MariaDB is a *test target*, not a separately registered backend.
 
-## Type model (canonical pivot, N+N matrix)
+## Validation pipeline
 
-Internal canonical `DataType`s: `Bool, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float32, Float64, BigInt { width: Option<u32> }, Decimal { precision: Option<u32>, scale: Option<u32> }, Text { size: Option<u32> }, Bytes { size: Option<u32> }, Date, Timestamp (UTC), Uuid, Json`. Unsigned variants exist solely to carry MySQL/MariaDB `UNSIGNED` integer columns lossless — Postgres has no native unsigned ints, so PG schemas never produce `UInt*`. Nullability is a property of `Field`, not a type — `Value::Null` represents "no data". `Text`/`Bytes` carry the column's declared length (`varchar(36)`, `binary(16)`); `None` means unbounded (`text`, `blob`, etc.). `BigInt` is `numeric(p, 0)` (arbitrary-precision integer, backed by `num_bigint::BigInt` to skip BigDecimal arithmetic on plain integer pipelines); `Decimal` is `numeric(p, s>0)` (backed by `bigdecimal::BigDecimal`). PG `numeric` without modifier surfaces as `Decimal { precision: None, scale: None }`.
+Two stages. **Assemble** (no I/O): looks up components by name, builds them through factories, derives `ReadSpec`/`WriteSpec`. **Validate** (I/O): runs access probes, schema introspection, the type matrix, and optionally sampling.
 
-- Each source maps `native → DataType`, each sink maps `DataType → native`. This gives N+N mappings instead of N×N.
-- **Cross-type conversion happens in `core::types::convert`.** The runner dispatches per cell only when `source_dt != sink_dt` (identity columns are skipped). Supported pairs: `Uuid ↔ Text` (size ≥ 36, accepts canonical / hex-no-dash / `{...}` formats), `Uuid ↔ Bytes` (size ≥ 16), `Int* ↔ Bool` (`0 ↔ false`, non-zero → `true`), plus numeric widening that leaves the value unchanged. `Int* → BigInt`, `Int*/BigInt → Decimal`, and BigInt/Decimal widening (target unbounded or wider precision/scale) are also supported. **Reverse paths (`BigInt → Int*`, `Decimal → BigInt/Int*`, `Float ↔ BigInt/Decimal`) are deliberately rejected — every one is potentially lossy.**
-- **Compatibility is checked at validation time** by `types::matrix::is_compatible`. Width-narrowing and unbounded→bounded are rejected. Validation populates `FlowState::conversions` so the runner has a per-column plan ready.
-- Config format details are in the `config-format` skill.
+The pipeline groups assembled flows by `Source::name()` and runs them through `futures::join_all` — one async worker per source, sequential within. The CLI prints `running validation in N workers` at start. Output ordering is deterministic: results are sorted back into config order.
+
+The flow-level `[flow.<name>.validation]` block exposes four toggles: `access`, `fields`, `inserts` (default `true`) and `sampling` (per-backend default — Mongo enabled at size 100, SQL disabled). Sampling-validation pulls rows via `Source::sample` (cursor-driven) and `Source::sample_fresh` (random, Mongo only) and runs every non-identity `ConversionPlan` against them.
+
+## Type model — canonical pivot, N+N matrix
+
+Each source maps `native → DataType` on read, each sink maps `DataType → native` on write. This gives N+N mappings instead of N×N. The internal type set covers integers (signed + unsigned for MySQL/MariaDB UNSIGNED columns), floats, `BigInt { width }` and `Decimal { precision, scale }` for SQL `numeric`, sized `Text`/`Bytes`, `Date`, `Timestamp` (UTC), `Uuid`, `Json`, `Xml`. Nullability is a property of `Field`, not of `DataType` — `Value::Null` carries "no data".
+
+Compatibility is checked at validation time by `core::types::matrix::is_compatible` (lossless) or `is_compatible_with_truncate` (when a mapping has `truncate=true`). Reverse paths (`BigInt/Decimal → Int*`, `Float ↔ BigInt/Decimal`) are deliberately rejected without `truncate`. Runtime per-cell conversion happens in `core::types::convert`; the runner skips identity columns.
+
+Schemaless sinks (Mongo) opt out of the matrix narrowing check — `Sink::schemaless() == true` makes the pipeline derive the sink schema from the source's declared types.
+
+For the full `DataType`/`Value` enumeration and conversion rules, read the source — `core::types`.
+
+## Conflict resolution
+
+Optional `[flow.<name>.conflict]` block with `key = […]` and `strategy = "ignore"|"overwrite"`. Without it, sinks do plain `INSERT` / `insertMany`. With it: pg uses `ON CONFLICT … DO NOTHING/UPDATE`, mysql uses `INSERT IGNORE` / `ON DUPLICATE KEY UPDATE … = VALUES(…)` (MariaDB-compatible legacy form), mongo upserts via parallel `replaceOne(upsert=true)` (single-key `["_id"]` takes a fast path).
 
 ## Config (TOML only in MVP)
 
@@ -88,46 +95,38 @@ config = { url = "postgres://…" }
 source  = "pg_src"
 sink    = "pg_sink"
 storage = "pg_state"
-from    = "public.users"          # source table (dot-qualified allowed)
-to      = "analytics.users"       # sink table
+from    = "public.users"
+to      = "analytics.users"
 mapping = [{ from = "id", to = "id" }, { from = "name", to = "name" }]
 cursor  = { fields = ["id"], order = "asc", interval = "1s" }
 batch-limit = 1024
 ```
 
-- Flow names must be unique across the root file and every `include`'d file.
-- `mapping` accepts only `from`, `to`, `truncate`, `default` — `deny_unknown_fields` rejects every other key at parse time. The previously-reserved `transform` / `timezone` / `data-type` placeholders are gone, in line with the project rule "no future-proofing config fields" (see `rust-guidelines`).
-- Architecturally we allow an unbounded number of `include` files — only the per-file 16 MiB cap applies.
+Flow names must be unique across the root file and every `include`'d file. `mapping` accepts only `from`, `to`, `truncate`, `default` (`deny_unknown_fields`). Includes are unbounded in number, but each file is capped at 16 MiB.
 
-## Operating philosophy
-
-Validation phase prioritises **correctness**: every access probe, type check, and config constraint must pass before any data moves. Runtime phase prioritises **fault tolerance**: individual flow failures are logged and retried, never crashing the whole process.
+For the full reference (every section, every field, every default, every validation rule) read the `config-format` skill.
 
 ## Fault tolerance
 
-- Flows retry independently with exponential backoff (1s → 4x → 1h cap). One flow's failure does not affect others.
-- `--once` mode propagates errors immediately.
+- Flows retry independently with exponential backoff (1s → 4× → 1h cap). One flow's failure does not affect others.
+- `--once` mode propagates errors immediately (used by e2e tests).
 - `save_cursor` failure aborts the iteration (not the process) to prevent duplicate writes.
 
 ## NULL-cursor algebra
 
-Cursor columns may be nullable. NULL is treated as the minimum element: `NULL < any_non_null` and `NULL == NULL`. ORDER BY uses `ASC NULLS FIRST` / `DESC NULLS LAST` to match. Non-null cursors use plain `(c1,c2) > ($1,$2)`; if any cursor value is NULL, SQL rewrites to a null-aware lexicographic predicate. ASC + all-NULL cursor reads all non-null rows (NULL is minimum); DESC + all-NULL cursor returns `FALSE` (nothing below minimum). Direction is per-column.
-
-## Explicit out-of-MVP list
-
-- Vault secret retrieval (only `$ENV_VAR` / literals work).
-- Privilege-excess check and sample-conversion check.
-- Prometheus/OTel metrics.
-- Connectors beyond postgres + mysql.
-- YAML config.
+Cursor columns may be nullable. NULL is treated as the minimum element: `NULL < any_non_null`, `NULL == NULL`. `ORDER BY` uses `ASC NULLS FIRST` / `DESC NULLS LAST` to match. Non-null cursors use plain `(c1,c2) > ($1,$2)`; if any cursor value is NULL, the source rewrites to a null-aware lexicographic predicate. ASC + all-NULL cursor reads all non-null rows; DESC + all-NULL cursor returns FALSE. Direction is per-column.
 
 ## CLI
 
-- `air-elt validate --config <path>` — full validation pipeline (runs real access probes).
+- `air-elt validate --config <path>` — full validation pipeline (real access probes).
 - `air-elt migrate --config <path>` — runs `Storage::migrate` for every declared storage.
-- `air-elt run --config <path>` — daemon (micro-batch + drain) with graceful shutdown on SIGTERM/Ctrl-C. Use `--once` to drain a single tick and exit (used by e2e tests).
+- `air-elt run --config <path>` — daemon. `--once` drains a single tick and exits.
 - `air-elt` (no subcommand) — shorthand for `run --config ./config.toml`.
+
+## Out of MVP
+
+Vault secret retrieval (only `$ENV_VAR` / literals work), privilege-excess check, Prometheus/OTel metrics, connectors beyond postgres + mysql + mongodb, YAML config.
 
 ## Testing
 
-Inverted pyramid: heavy e2e tests against real Postgres, focused unit tests for pure logic. No database mocks.
+Inverted pyramid: heavy e2e tests against real databases, focused unit tests for pure logic. No database mocks. See `project-conventions::Testing` for handles and rules.

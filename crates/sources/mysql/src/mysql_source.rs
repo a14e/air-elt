@@ -33,10 +33,11 @@ impl SourceCtx for MySqlSourceCtx {
 
 pub struct MySqlSource {
     pool: MySqlPool,
+    name: String,
 }
 
 impl MySqlSource {
-    pub async fn connect(config: MySqlSourceConfig) -> RuntimeResult<Self> {
+    pub async fn connect(name: String, config: MySqlSourceConfig) -> RuntimeResult<Self> {
         let pool = pool::connect(
             &config.url,
             pool::PoolSettings::from_options(
@@ -50,7 +51,7 @@ impl MySqlSource {
             ),
         )
         .await?;
-        Ok(Self { pool })
+        Ok(Self { pool, name })
     }
 
     async fn ensure_connection_alive(&self) -> RuntimeResult<()> {
@@ -78,6 +79,10 @@ impl MySqlSource {
 
 #[async_trait]
 impl Source for MySqlSource {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     async fn validate_access(&self, spec: &ReadSpec) -> RuntimeResult<()> {
         self.ensure_connection_alive().await?;
         self.assert_table_readable(spec).await?;
@@ -182,7 +187,7 @@ impl Source for MySqlSource {
                             field.name
                         ))
                     })?;
-                let dt = my_ctx.cursor_types[cursor_field_pos];
+                let dt = my_ctx.cursor_types[cursor_field_pos].clone();
                 query = codec::bind_cursor_value(query, &field.value, dt);
             }
         }
@@ -200,12 +205,12 @@ impl Source for MySqlSource {
         for row in &rows {
             let mut values = Vec::with_capacity(spec.columns.len());
             for (idx, dt) in my_ctx.column_types.iter().enumerate() {
-                values.push(codec::decode_column(row, idx, *dt)?);
+                values.push(codec::decode_column(row, idx, dt.clone())?);
             }
 
             let mut cursor_values = Vec::with_capacity(spec.cursor_fields.len());
             for (cf_idx, cursor_field) in spec.cursor_fields.iter().enumerate() {
-                let dt = my_ctx.cursor_types[cf_idx];
+                let dt = my_ctx.cursor_types[cf_idx].clone();
                 let value = match my_ctx.cursor_to_column[cf_idx] {
                     Some(i) => values[i].clone(),
                     None => {
@@ -251,11 +256,14 @@ fn resolve_types(schema: &Schema, names: &[String], table: &str) -> RuntimeResul
     names
         .iter()
         .map(|name| {
-            schema.find(name).map(|f| f.data_type).ok_or_else(|| {
-                RuntimeError::Other(format!(
-                    "column {name:?} not in source schema for {table:?}"
-                ))
-            })
+            schema
+                .find(name)
+                .map(|f| f.data_type.clone())
+                .ok_or_else(|| {
+                    RuntimeError::Other(format!(
+                        "column {name:?} not in source schema for {table:?}"
+                    ))
+                })
         })
         .collect()
 }

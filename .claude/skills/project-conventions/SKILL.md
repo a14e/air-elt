@@ -5,131 +5,105 @@ description: Mandatory shared utilities and patterns for Air Elt — load before
 
 # Project conventions — mandatory utilities
 
-Before editing Rust code, check this list. If a utility exists for your need, use it. **Do not reimplement.** If you add a new cross-crate helper, append it here.
+Before editing Rust code, check this list. If a utility exists for your need, use it — **do not reimplement**. Method signatures are not duplicated here; this is a "where to look" map. Add a line when you introduce a new cross-crate helper.
 
 ## Commons isolation
 
-`air-elt-commons` (`crates/commons/lib`) is the foundational utility crate and **MUST NOT depend on any other `air-elt-*` crate**, including `air-elt-core`. It hosts only project-internal-dep-free helpers: `tracing_init`, `identifier` (validation + `IdentifierError`), `pool_timeouts`.
+`air-elt-commons` (`crates/commons/lib`) is the foundational utility crate and **MUST NOT depend on any other `air-elt-*` crate**, including `air-elt-core`. It hosts only project-internal-dep-free helpers (`tracing_init`, `identifier`, `pool_timeouts`).
 
-Direction of dependency is the inverse: `core` (and connectors) depend on `commons`, never the other way around. If you find yourself wanting to import `air-elt-core` into commons, the type or impl belongs somewhere downstream — in `core` itself, or in `commons-pg` / `commons-mysql` (which legitimately depend on both core and commons).
-
-Example: `impl From<IdentifierError> for RuntimeError` lives in `core::error`, not in `commons::identifier`, even though it bridges the two — the `From` impl is needed for `?`-ergonomics in connector code, and core is allowed to know about commons.
+Direction of dependency is the inverse: `core` (and connectors) depend on `commons`, never the other way around. If a type wants to bridge `commons` and `core` (e.g. `impl From<IdentifierError> for RuntimeError`), the impl belongs in `core` — `core` is allowed to know about `commons`. The `commons-pg` / `commons-mysql` / `commons-mongodb` crates legitimately depend on both core and commons; `commons-lib` does not.
 
 ## Config naming
 
-TOML config keys use **kebab-case** for multi-word fields (`batch-limit`, `operation-timeout-secs`, `max-connections`). Structs with multi-word fields carry `#[serde(rename_all = "kebab-case")]`.
+TOML keys use **kebab-case** for multi-word fields (`batch-limit`, `max-connections`). Structs carry `#[serde(rename_all = "kebab-case")]`. **No future-proofing fields** — every config field must be consumed by the implementation that ships with it.
 
 ## Logging
 
-Initialise the subscriber once via `air_elt_commons::tracing_init::init()` in `app::main`. All style rules (structured fields, no instrument, no println) are in `rust-guidelines`.
+Initialise the subscriber once via `air_elt_commons::tracing_init` in `app::main`. Style rules (structured fields, no instrument, no println) live in `rust-guidelines`.
 
-## SQL — identifier escaping
+## SQL helpers
 
-All dynamic identifiers in SQL must go through these helpers. Raw `format!` quoting is forbidden.
+All dynamic SQL identifiers must go through these helpers. Raw `format!` quoting is forbidden.
 
-- Validation primitives in **`air_elt_commons::identifier`** (`IdentifierError`, `is_bare_ident_char`, `validate_segment`) — db-agnostic.
-- pg quoting (`"`): **`air_elt_commons_pg::identifier::{quote_ident, quote_qualified, quote_columns, split_qualified}`** (`split_qualified` defaults to `public`).
-- mysql quoting (backtick): **`air_elt_commons_mysql::identifier::{quote_ident, quote_qualified, quote_columns, split_qualified}`** (`split_qualified` returns `(Option<db>, table)` — bare names default to `SELECT DATABASE()`).
-- `IdentifierError → RuntimeError` via `impl From` (lives in `core::error`) — use `?` directly.
+- **`air_elt_commons::identifier`** — db-agnostic validation primitives + `IdentifierError`.
+- **`air_elt_commons_pg::identifier`** — pg quoting (`"`).
+- **`air_elt_commons_mysql::identifier`** — mysql quoting (backtick).
+- **`IdentifierError → RuntimeError`** via `impl From` in `core::error` — use `?` directly.
 
-## SQL — type tables
+Source-side type resolution lives in `commons-pg::pg_type` / `commons-mysql::mysql_type` (native ↔ canonical `DataType`). Notable quirks: pg accepts `timestamptz` only (naive `timestamp` rejected); mysql `tinyint(1)` → `Bool`, other tinyints → `Int16`, `datetime` rejected (only `timestamp` accepted, UTC).
 
-Source-side type resolution: native type → canonical `DataType`. Each table folds the column's declared length into `Text { size }` / `Bytes { size }` (or unbounded for `text`/`blob`-family).
+NULL binding goes through `commons-pg::null_bind` / `commons-mysql::null_bind` (extracted helper) on the source side; the sink side inlines because the sqlx `Separated` lifetime prevents extraction.
 
-- **`air_elt_commons_pg::pg_type::{PgType, parse, to_internal}`** — accepts `timestamptz` only; naive `timestamp` returns `None`.
-- **`air_elt_commons_mysql::mysql_type::{MySqlType, parse, to_internal}`** — `tinyint(1)` → `Bool`, other tinyints → `Int16`. `datetime` is rejected; only `timestamp` is accepted (UTC).
+Pool construction goes through `commons-pg::pool` / `commons-mysql::pool`, both consuming `air_elt_commons::pool_timeouts::PoolTimeouts`. They wire UTC time-zone + statement-timeout pragmas. Defaults: connect 5s, acquire 10s, idle 300s, max_lifetime 1800s, statement 30s, max_connections 5.
 
-## SQL — NULL binding
+Schema introspection is `commons-pg::schema::fetch_schema` / `commons-mysql::schema::fetch_schema`. Both read `character_maximum_length`; mysql additionally reads `column_type` for `tinyint(1)` discrimination.
 
-Typed NULL binding ensures the wire type matches the column.
+Each connector owns its `sql_statements.rs`. Bind values via sqlx `$N` + `query.bind()` / `QueryBuilder::push_bind` — never interpolate values into SQL.
 
-- **`air_elt_commons_pg::null_bind::bind_typed_null(query, DataType)`**
-- **`air_elt_commons_mysql::null_bind::bind_typed_null(query, DataType)`**
-- Sink-side: the NULL match is inlined inside `push_values` (the `Separated` lifetime prevents extraction).
+## MongoDB helpers
 
-## SQL — pool construction
+Mongo has no SQL surface, so `commons-mongodb` ships its own helper set:
 
-All postgres / mysql connectors open pools through a shared helper. Both reuse the same `PoolTimeouts` (db-agnostic).
+- **`commons-mongodb::client`** — `mongodb::Client` builder + project-wide pool/timeout settings, reusing `commons::pool_timeouts`. Mongo has no per-statement timeout; the runner's per-call `tokio::time::timeout` covers that.
+- **`commons-mongodb::identifier`** — gates database / collection names on the same character class as SQL identifiers.
+- **`commons-mongodb::path`** — read / write nested BSON via `core::mapping::FieldPath`. `set` creates missing intermediate documents.
+- **`commons-mongodb::bson_value`** — bidirectional codec between BSON and the canonical `Value`/`DataType`. ObjectId → `Bytes(12)`; BSON Date → `Timestamp` (UTC, sub-ms truncation documented inline); Decimal128 → `Decimal`; Document/Array → `Json`; Binary(uuid subtype) → `Uuid`. Unrepresentable BSON variants (regex, JS code, MinKey/MaxKey, …) error rather than silently dropping data.
+- **`commons-mongodb::infer`** — sample-based schema inference. Folds per-field types; widens `int32 + int64` → `Int64`, `int + float` → `Float64`.
 
-- **`air_elt_commons::pool_timeouts::PoolTimeouts`** — provider-agnostic struct (`defaults()`, `from_options(...)`).
-- **`air_elt_commons_pg::pool::connect(url, PoolTimeouts)`** — wires `SET TIME ZONE 'UTC'` + `SET statement_timeout`.
-- **`air_elt_commons_mysql::pool::connect(url, PoolTimeouts)`** — wires `SET SESSION time_zone='+00:00'` + `SET SESSION max_execution_time`.
-- **Defaults**: connect 5s, acquire 10s, idle 300s, max_lifetime 1800s, statement 30s, max_connections 5.
+## Type model and the N+N matrix
 
-## SQL — schema introspection
+Canonical types are the only pivot — connectors do NOT introduce parallel enums. Each connector maps `native → DataType` on read and `DataType → native` on write.
 
-- **`air_elt_commons_pg::schema::fetch_schema(pool, table)`** — pg `information_schema.columns` (reads `character_maximum_length` for sized text/bytes).
-- **`air_elt_commons_mysql::schema::fetch_schema(pool, table)`** — mysql `information_schema.COLUMNS` (reads `column_type` for `tinyint(1)` discrimination + `character_maximum_length`).
+- **`core::types::{DataType, Value}`** — the type enums. `Text`/`Bytes` carry `size: Option<u32>` (None = unbounded). `BigInt { width }` covers integer-only `numeric(p, 0)` (carrying `num_bigint::BigInt`); `Decimal { precision, scale }` covers fractional `numeric(p, s>0)` (carrying `bigdecimal::BigDecimal`). Unsigned variants exist solely for MySQL/MariaDB UNSIGNED columns — pg never produces them.
+- **`core::types::matrix`** — validation-time width check. `is_compatible` is the lossless matrix; `is_compatible_with_truncate` widens to admit narrowing arms when a mapping has `truncate=true`. Reverse paths (`BigInt/Decimal → Int*`, `Float ↔ BigInt/Decimal`) are deliberately rejected by the lossless matrix.
+- **`core::types::convert`** — runtime per-cell dispatcher (`convert(value, src, dst, &ctx)`). Identity / pure-widening pairs return the value unchanged. Connectors must NOT implement these conversions themselves; the runner builds a `ConversionPlan` per column and dispatches via `convert`.
+- **`core::types::default_value::parse`** — parses a TOML default literal against the sink `DataType`. Bytes columns require a typed prefix (`hex:` / `base64:` / `utf8:` / `bin:`).
+- **`FlowState::conversions`** is populated in `validation::pipeline::validate`. The runner skips identity plans and dispatches the rest via `convert`.
 
-## SQL — value binding
+## Validation pipeline
 
-- Bind values via sqlx `$N` + `query.bind()` / `QueryBuilder::push_bind`. Never interpolate values into SQL.
-- Each connector owns its `sql_statements.rs`. No ad-hoc SQL in business-logic files.
+Two stages: `assemble` (no I/O) → `validate` (probes, schema introspection, matrix, sampling). The pipeline groups assembled flows by `Source::name()` and runs them through `futures::join_all` — one async worker per source, sequential within. The CLI prints `running validation in {N} workers` at start. Output is sorted back into config order so error reporting is deterministic.
 
-## Interval parsing
+The flow-level `[flow.<name>.validation]` block exposes four toggles: `access`, `fields`, `inserts`, `sampling`. The first three default `true` and gate the access probes / matrix / sink write probe respectively. `sampling` follows the per-backend `SourceFactory::sampling_default()` — Mongo enables it (size 100), SQL keeps it disabled.
 
-- **`air_elt_core::config::interval::{parse, deserialize, serialize}`** — parses `1s`, `1h30m`, `PT1H5S`, `P1W`, `1 second`, etc. into `Duration`. ISO 8601 via `iso8601-duration` crate (routed by `P`/`p` prefix); human-time is built-in with enforced unit order (w>d>h>m>s>ms). Used in `CursorConfig::interval` via serde hooks.
+`Sink::schemaless()` is `true` for Mongo. The pipeline then derives the sink schema from the source's declared types, skipping the matrix narrowing check.
 
-## Secrets and env vars
+`Source::sample` drives `read_batch` with `limit=n` (validates the cursor SQL). `Source::sample_fresh` is an optional companion override for backends with random-access — Mongo overrides via `$sample`. Sampling-validation runs both and unions the rows before exercising the conversion plan.
 
-Config-time resolution of `${VAR}` / `${VAR:default}` placeholders.
+`core::mapping::FieldPath` — `parse(&str)` produces a validated dot-notation path. SQL connectors reject `is_nested()` paths; Mongo accepts them.
 
-- **`air_elt_core::config::env_expand::expand`** — runs on raw TOML before parsing. Lookup: env → `[secrets]` map → default → error.
-- `[secrets]` is a literal `BTreeMap<String, String>`. No recursion, no vault (tracked separately).
-- `std::env::var(...)` in connectors is forbidden — thread runtime strings through the config.
+## Conflict resolution
 
-## Config loading
+Optional `[flow.<name>.conflict]` block. `core::config::conflict::{ConflictConfig, ConflictStrategy}`. Without it, sinks do plain `INSERT` / `insertMany`. With it:
 
-- **`air_elt_core::config::loader::load(path)`** — enforces: 16 MiB file-size cap, absolute-path reject in `include`, symlink-loop dedupe, `${VAR}` expansion, structural validation (`batch_limit ≥ 1`, `batch_limit × mapping_cols ≤ 60_000`, cursor fields ⊆ mapping).
-- Config types: `air_elt_core::config::model`.
+- pg → `ON CONFLICT (key) DO NOTHING|UPDATE SET …=EXCLUDED.…`
+- mysql → `INSERT IGNORE` / `ON DUPLICATE KEY UPDATE … = VALUES(…)` (legacy form, MariaDB-compatible)
+- mongo → `insertMany(ordered=false)` swallowing E11000 duplicates / per-row `replaceOne(upsert=true)` fired in parallel via `join_all`. Single-key `["_id"]` takes a fast path that skips the FieldPath round-trip.
 
-## Types and the N+N matrix
+## Interval parsing, secrets, config
 
-Canonical types avoid direct source↔sink coupling — each connector maps to/from the shared pivot.
-
-- **`air_elt_core::types::{DataType, Value}`** — the only type enums. Never introduce parallel enums in connectors. `Text`/`Bytes` carry `size: Option<u32>`. `BigInt { width }` and `Decimal { precision, scale }` cover SQL `numeric`/`decimal`: scale-0 columns map to `BigInt` (carrying `num_bigint::BigInt`), scale > 0 to `Decimal` (carrying `bigdecimal::BigDecimal`). Sources read both via sqlx `BigDecimal`; the BigInt arm extracts the integer mantissa with no arithmetic.
-- Source owns `native → DataType`, sink owns `DataType → native`. Shared halves (`PgType`, `MySqlType`, `parse`, `to_internal`) in `commons-pg` / `commons-mysql`.
-- **`air_elt_core::types::matrix::is_compatible(source_dt, sink_dt)`** — validation-time width check (no narrowing, no unbounded→bounded), plus `Uuid ↔ Text/Bytes`, `Int* ↔ Bool`, `Int*/BigInt → BigInt/Decimal` widening allowances, `Json/Xml → Text*` (unbounded), `Text → Bool` (lexer), `Text → Xml` (well-formed). Reverse paths (`BigInt/Decimal → Int*`, `Float ↔ BigInt/Decimal`) are deliberately rejected by the lossless matrix.
-- **`air_elt_core::types::matrix::is_compatible_with_truncate(src, dst)`** — wider matrix used when a mapping has `truncate=true`. Admits text/bytes narrowing, integer/float saturating narrowing, signed↔unsigned, decimal scale drop, BigInt/Decimal → integer, `Json/Xml → Text(n)`, `Timestamp → Date`. Explicitly forbids `Json→Json`, `Xml→Xml`, UUID truncations, `Date→Timestamp`.
-- **`air_elt_core::types::convert::{convert, ConvertError, ConversionContext}`** — dispatcher `convert(value, src, dst, &ctx)` for runtime per-cell conversion. Identity / pure-widening pairs return the value unchanged. UUID parsing accepts canonical `8-4-4-4-12`, hex-only, MS-style `{...}`. `ctx.truncate=true` opts into narrowing arms; `ctx.default=Some(v)` substitutes when the source value is `Null`. Connectors must NOT implement these conversions themselves.
-- **`air_elt_core::types::convert::truncate_utf8`** — UTF-safe byte-prefix helper. Always cuts at the last complete codepoint ≤ `max_bytes`.
-- **`air_elt_core::types::convert::saturate::*`** — saturating numeric primitives (`sat_i64_to_i32`, `sat_bigint_to_width`, `sat_f64_to_i64`, `bigdecimal_to_bigint_truncating`, …). Never panic; clamp to the target's representable range.
-- **`air_elt_core::types::default_value::parse(literal, sink_dt)`** — parses a TOML default literal against the sink `DataType`. Bytes columns require a typed prefix (`hex:` / `base64:` / `utf8:` / `bin:`). Other types use the plain literal.
-- **`FlowState::conversions: Vec<ConversionPlan>`** — populated by `validation::pipeline::validate`. Each `ConversionPlan { source, sink, ctx }` carries the truncate flag and the parsed default; the runner skips identity plans and dispatches the rest through `convert` with the per-column ctx.
+- **`core::config::interval`** — parses `1s`, `1h30m`, `PT1H5S`, etc. into `Duration`. Used for `CursorConfig::interval` and `query-timeout`.
+- **`core::config::env_expand`** — runs on raw TOML before parsing. Resolves `${VAR}` via env → `[secrets]` map → default → error. `std::env::var(...)` in connectors is forbidden.
+- **`core::config::loader::load`** — entry point. Enforces 16 MiB file cap, no absolute-path includes, symlink-loop dedupe, `${VAR}` expansion, and structural validation (`batch_limit ≥ 1`, `batch_limit × mapping_cols ≤ 60_000`, cursor fields ⊆ mapping, `conflict.key` ⊆ mapping).
 
 ## Testing
 
-- **`air_elt_commons_testing::pg::pg_pool()`** — `PgTestHandle` with sandboxed schema. Honours `AIR_ELT_TEST_PG_URL` or auto-detects podman/docker.
-- **`air_elt_commons_testing::mysql::mysql_pool()`** — `MySqlTestHandle` with sandboxed database. Honours `AIR_ELT_TEST_MYSQL_URL` or auto-detects podman/docker.
-- **`air_elt_commons_testing::mariadb::mariadb_pool()`** — `MariaDbTestHandle` for the MariaDB test target of the mysql connector (validates legacy `VALUES()` UPSERT and native UUID divergences). Honours `AIR_ELT_TEST_MARIADB_URL` or auto-detects podman/docker. Uses an extra connect-retry loop to absorb the MariaDB image's bootstrap-then-restart sequence.
-- Keep the handle alive for the whole test — dropping it tears down the schema/database.
-- **`[dev-dependencies]` only** — listing it under `[dependencies]` ships testcontainers into release builds.
-- Database mocks are forbidden.
-- **`mockall` (dev-dependency)** — used for unit-testing runner logic. traits carry `#[cfg_attr(test, mockall::automock)]`.
+- **`commons-testing::pg::pg_pool`** / **`mysql::mysql_pool`** / **`mariadb::mariadb_pool`** / **`mongo::mongo_pool`** — sandboxed handles. Honour `AIR_ELT_TEST_*_URL` or auto-detect podman/docker. Drop tears down the sandbox.
+- `[dev-dependencies]` only — testcontainers must not ship in release builds.
+- Database mocks are forbidden. **`mockall`** (dev-dep) is used only for runner-logic unit tests via `#[cfg_attr(test, mockall::automock)]` on `core::traits`.
+- E2e suites: each connector owns its own. Cross-vendor flows are exercised by a *small fixed* sample, not an N×N matrix.
 
-## Traits and runtime contract
+## Traits, runtime, registration
 
-- **`air_elt_core::traits::{Source, Sink, Storage}`** — `#[async_trait]`, object-safe. Do not change signatures without updating all connectors and the runner.
-- Shared types: `Batch { rows, next_cursor }`, `Row { values }`, `ReadSpec`, `WriteSpec`, `WriteReport`, `CursorState`. Connectors must not define their own.
-
-## Connector registration
-
-Factories are `#[async_trait]` traits in `core::registry`, each with `async fn build(&self, cfg: &ComponentConfig)`. Registration stores `Arc<dyn *Factory>`.
-
-Wire connectors in `app::registry::build_registry()` via zero-sized structs (`struct PgSourceFactory;`). Do not construct connectors directly from flow code.
-
-## Engine and timeouts
-
-- **`core::flow::engine::FlowEngine`** — fan-out entry point. `FlowEngine::new(flows, mode, shutdown).run()` spawns one `FlowRunner` per flow. Each runner wraps every DB call in `tokio::time::timeout` + `tokio::select!` with shutdown watcher.
-- **`core::flow::runner::FlowRunner`** — per-flow tick loop with exponential backoff (pub(crate), used by FlowEngine).
-- `query_timeout` on `FlowConfig` overrides the 30s default.
+- **`core::traits::{Source, Sink, Storage}`** — `#[async_trait]`, object-safe. `Source::name()` is required (used by the validation pipeline to group flows by source pool).
+- **`Source/Sink/Storage::cancel_safe() -> bool`** — default `true`. The runner's `run_op` consults it to pick a strategy: `true` → `tokio::time::timeout` + `select!` (cheap, sqlx connectors); `false` → `tokio::spawn` + detach so the underlying driver future is never dropped mid-await (the `mongodb` 3.x crate is not cancellation-safe). Mongo source / sink / storage override to `false`. Add the override on any future connector whose driver doesn't tolerate `Drop` mid-flight.
+- Shared types: `Batch`, `Row`, `ReadSpec`, `WriteSpec`, `WriteReport`, `CursorState`. Connectors must not define their own.
+- Factories are `#[async_trait]` in `core::registry`, registered as zero-sized structs in `app::registry::build_registry`. Do not construct connectors directly from flow code.
+- **`core::flow::engine::FlowEngine`** — spawns one `FlowRunner` per flow. Each runner wraps every DB call via `run_op` (cancel-safe path = `tokio::time::timeout` + `select!`; cancel-unsafe path = `tokio::spawn` + detach). `query_timeout` on `FlowConfig` overrides the 30s default.
 
 ## Errors
 
-Dedicated error variants — use the right one instead of generic `RuntimeError::Other`.
-
-- Wrap third-party errors with `RuntimeError::backend(err)` to preserve the `source` chain.
-- `ValidationError::NullabilityMismatch`, `TypeError::NullSinkColumn`, `ConfigError::{UnresolvedReference, ConfigTooLarge, AbsoluteIncludeNotAllowed}`.
+Dedicated variants — use the right one instead of `RuntimeError::Other`. Wrap third-party errors with `RuntimeError::backend(err)` to preserve the `source` chain. Notable: `ValidationError::{NullabilityMismatch, DuplicateSinkField, SamplingFailed, MissingField, AccessFailed}`, `TypeError::NullSinkColumn`, `ConfigError::{UnresolvedReference, ConfigTooLarge, AbsoluteIncludeNotAllowed, Invalid}`.
 
 ## After changes
 

@@ -75,6 +75,10 @@ pub fn parse(literal: &toml::Value, sink: &DataType) -> Result<Value, DefaultPar
         DataType::Uuid => parse_uuid(literal),
         DataType::Json => Ok(Value::Json(toml_to_json(literal))),
         DataType::Xml => parse_xml(literal),
+        // Defaults are parsed against the sink's concrete type. Sinks
+        // never carry Union (only sources can — see `DataType::Union`),
+        // so this arm is unreachable in well-typed flows.
+        DataType::Union(_) => Err(DefaultParseError::TypeMismatch { dst: sink.clone() }),
     }
 }
 
@@ -190,9 +194,9 @@ fn parse_signed(
 ) -> Result<i64, DefaultParseError> {
     let n = literal
         .as_integer()
-        .ok_or(DefaultParseError::TypeMismatch { dst: *sink })?;
+        .ok_or(DefaultParseError::TypeMismatch { dst: sink.clone() })?;
     if n < min || n > max {
-        return Err(DefaultParseError::OutOfRange { dst: *sink });
+        return Err(DefaultParseError::OutOfRange { dst: sink.clone() });
     }
     Ok(n)
 }
@@ -204,12 +208,12 @@ fn parse_unsigned(
 ) -> Result<u64, DefaultParseError> {
     let n = literal
         .as_integer()
-        .ok_or(DefaultParseError::TypeMismatch { dst: *sink })?;
+        .ok_or(DefaultParseError::TypeMismatch { dst: sink.clone() })?;
     if n < 0 {
-        return Err(DefaultParseError::SignLoss { dst: *sink });
+        return Err(DefaultParseError::SignLoss { dst: sink.clone() });
     }
     if (n as u64) > max {
-        return Err(DefaultParseError::OutOfRange { dst: *sink });
+        return Err(DefaultParseError::OutOfRange { dst: sink.clone() });
     }
     Ok(n as u64)
 }
@@ -221,7 +225,7 @@ fn parse_float(literal: &toml::Value, sink: &DataType) -> Result<f64, DefaultPar
     if let Some(i) = literal.as_integer() {
         return Ok(i as f64);
     }
-    Err(DefaultParseError::TypeMismatch { dst: *sink })
+    Err(DefaultParseError::TypeMismatch { dst: sink.clone() })
 }
 
 fn parse_bigint(
@@ -230,16 +234,16 @@ fn parse_bigint(
     width: Option<u32>,
 ) -> Result<Value, DefaultParseError> {
     let b = if let Some(s) = literal.as_str() {
-        BigInt::from_str(s).map_err(|_| DefaultParseError::OutOfRange { dst: *sink })?
+        BigInt::from_str(s).map_err(|_| DefaultParseError::OutOfRange { dst: sink.clone() })?
     } else if let Some(n) = literal.as_integer() {
         BigInt::from(n)
     } else {
-        return Err(DefaultParseError::TypeMismatch { dst: *sink });
+        return Err(DefaultParseError::TypeMismatch { dst: sink.clone() });
     };
     if let Some(w) = width {
         let max = bigint_pow10(w) - BigInt::from(1);
         if b > max || b < -max.clone() {
-            return Err(DefaultParseError::OutOfRange { dst: *sink });
+            return Err(DefaultParseError::OutOfRange { dst: sink.clone() });
         }
     }
     Ok(Value::BigInt(b))
@@ -252,14 +256,15 @@ fn parse_decimal(
     scale: Option<u32>,
 ) -> Result<Value, DefaultParseError> {
     let d = if let Some(s) = literal.as_str() {
-        BigDecimal::from_str(s).map_err(|_| DefaultParseError::TypeMismatch { dst: *sink })?
+        BigDecimal::from_str(s)
+            .map_err(|_| DefaultParseError::TypeMismatch { dst: sink.clone() })?
     } else if let Some(n) = literal.as_integer() {
         BigDecimal::from(n)
     } else if let Some(f) = literal.as_float() {
         BigDecimal::from_str(&f.to_string())
-            .map_err(|_| DefaultParseError::TypeMismatch { dst: *sink })?
+            .map_err(|_| DefaultParseError::TypeMismatch { dst: sink.clone() })?
     } else {
-        return Err(DefaultParseError::TypeMismatch { dst: *sink });
+        return Err(DefaultParseError::TypeMismatch { dst: sink.clone() });
     };
     // Scale check uses the *significant* fractional digit count: trailing
     // zeros (e.g. "12.30" against decimal(p, 1)) are not a real scale
@@ -283,7 +288,7 @@ fn parse_decimal(
         let abs = d.abs();
         let one = BigDecimal::from(1);
         if abs >= one * bigdecimal_pow10(int_digits) {
-            return Err(DefaultParseError::OutOfRange { dst: *sink });
+            return Err(DefaultParseError::OutOfRange { dst: sink.clone() });
         }
     }
     Ok(Value::Decimal(d))

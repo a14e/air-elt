@@ -11,7 +11,7 @@ pub fn convert(
 ) -> Result<Value, ConvertError> {
     let mut bytes = match value {
         Value::Bytes(b) => b,
-        _ => return Err(ConvertError::ValueShapeMismatch { src: *src }),
+        _ => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
     };
     if let Some(max) = sink_size
         && bytes.len() > max as usize

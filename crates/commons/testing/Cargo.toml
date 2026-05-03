@@ -16,6 +16,8 @@ rand = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+mongodb = { workspace = true }
+bson = { workspace = true }
 
 [lints]
 workspace = true

@@ -13,7 +13,7 @@ pub struct PgSourceFactory;
 impl SourceFactory for PgSourceFactory {
     async fn build(&self, cfg: &ComponentConfig) -> Result<Box<dyn Source>, ConfigError> {
         let config = PgSourceConfig::try_from(cfg)?;
-        let source = PgSource::connect(config)
+        let source = PgSource::connect(cfg.name.clone(), config)
             .await
             .map_err(|e| ConfigError::Invalid {
                 reason: e.to_string(),

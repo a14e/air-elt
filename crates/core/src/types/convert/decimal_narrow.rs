@@ -12,7 +12,7 @@ pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, Co
     use DataType::*;
     let d = match value {
         Value::Decimal(d) => d,
-        _ => return Err(ConvertError::ValueShapeMismatch { src: *src }),
+        _ => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
     };
     match dst {
         Decimal { precision, scale } => Ok(Value::Decimal(narrow_decimal(d, *precision, *scale))),
@@ -53,8 +53,8 @@ pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, Co
             Ok(Value::UInt8(sat_bigint_to_u8(&b)))
         }
         _ => Err(ConvertError::Unsupported {
-            src: *src,
-            dst: *dst,
+            src: src.clone(),
+            dst: dst.clone(),
         }),
     }
 }

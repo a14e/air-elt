@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// The size is part of the *schema*, not the *value* — `Value::Text` stores a
 /// plain `String` regardless. Width is consulted only at validation time so
 /// the matrix can reject narrowing pairs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataType {
     Bool,
@@ -54,6 +54,18 @@ pub enum DataType {
     /// (well-formedness validation on `Text → Xml`, forbidding
     /// `Xml → Xml` truncation).
     Xml,
+    /// Heterogeneous source field — Mongo schema sampling produced
+    /// multiple non-widening types in one column. The convert dispatcher
+    /// inspects the actual `Value` variant at runtime and re-dispatches
+    /// to the concrete source type. Sinks never carry `Union` (schemaful
+    /// sinks declare a concrete column type; the schemaless Mongo sink
+    /// inherits the source's `Union` and writes BSON via `Value` match,
+    /// which doesn't consult the schema type).
+    ///
+    /// Variants are normalised by `union(...)`: deduplicated and sorted
+    /// in `Debug` order so two equal unions compare equal regardless of
+    /// observation order.
+    Union(Vec<DataType>),
 }
 
 impl DataType {
@@ -65,6 +77,30 @@ impl DataType {
     /// Convenience constructor for unbounded bytes.
     pub const fn bytes() -> Self {
         DataType::Bytes { size: None }
+    }
+
+    /// Build a normalised `Union`. Flattens any nested `Union(...)`
+    /// inputs so the result is always one level deep, then sorts and
+    /// deduplicates so equality is observation-order-independent, and
+    /// collapses a 1-element union to the bare variant.
+    pub fn union(vs: Vec<DataType>) -> Self {
+        let mut flat: Vec<DataType> = Vec::with_capacity(vs.len());
+        for v in vs {
+            match v {
+                DataType::Union(inner) => flat.extend(inner),
+                other => flat.push(other),
+            }
+        }
+        // Why: derived `Ord` is allocation-free (lexicographic on the
+        // discriminant + fields), unlike a `format!`-based sort key
+        // which would allocate two `String`s per comparison for a type
+        // that's otherwise stack-resident.
+        flat.sort();
+        flat.dedup();
+        if flat.len() == 1 {
+            return flat.into_iter().next().expect("len==1");
+        }
+        DataType::Union(flat)
     }
 }
 
@@ -104,6 +140,16 @@ impl std::fmt::Display for DataType {
             DataType::Uuid => f.write_str("uuid"),
             DataType::Json => f.write_str("json"),
             DataType::Xml => f.write_str("xml"),
+            DataType::Union(vs) => {
+                f.write_str("union<")?;
+                for (i, v) in vs.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str("|")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                f.write_str(">")
+            }
         }
     }
 }

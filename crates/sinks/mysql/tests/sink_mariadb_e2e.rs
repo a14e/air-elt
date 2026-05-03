@@ -35,6 +35,7 @@ async fn writes_native_uuid_column_to_mariadb() {
     let spec = WriteSpec {
         columns: vec!["id".into(), "ext".into()],
         table: format!("{}.accounts", handle.schema),
+        conflict: None,
     };
 
     let schema = sink.describe_schema(&spec.table).await.expect("describe");

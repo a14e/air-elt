@@ -60,6 +60,8 @@ mod tests {
             },
             batch_limit: 100,
             query_timeout: None,
+            validation: Default::default(),
+            conflict: None,
         }
     }
 

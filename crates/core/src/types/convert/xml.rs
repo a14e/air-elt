@@ -74,7 +74,7 @@ pub fn xml_to_text(
 ) -> Result<Value, ConvertError> {
     let s = match value {
         Value::Text(s) => s,
-        _ => return Err(ConvertError::ValueShapeMismatch { src: *src }),
+        _ => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
     };
     let out = match sink_size {
         None => s,
@@ -86,7 +86,7 @@ pub fn xml_to_text(
 pub fn text_to_xml(value: Value, src: &DataType) -> Result<Value, ConvertError> {
     let s = match value {
         Value::Text(s) => s,
-        _ => return Err(ConvertError::ValueShapeMismatch { src: *src }),
+        _ => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
     };
     validate(&s).map_err(|reason| ConvertError::InvalidXml { reason })?;
     Ok(Value::Text(s))
