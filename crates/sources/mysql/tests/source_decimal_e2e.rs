@@ -40,10 +40,13 @@ async fn decimal_zero_scale_decoded_as_bigint_and_decimal() {
         .await
         .unwrap();
 
-    let source = MySqlSource::connect(MySqlSourceConfig {
-        url: handle.url_with_database(),
-        ..Default::default()
-    })
+    let source = MySqlSource::connect(
+        "test_source".to_string(),
+        MySqlSourceConfig {
+            url: handle.url_with_database(),
+            ..Default::default()
+        },
+    )
     .await
     .unwrap();
 
@@ -136,10 +139,13 @@ async fn unsigned_int_columns_round_trip() {
     .await
     .unwrap();
 
-    let source = MySqlSource::connect(MySqlSourceConfig {
-        url: handle.url_with_database(),
-        ..Default::default()
-    })
+    let source = MySqlSource::connect(
+        "test_source".to_string(),
+        MySqlSourceConfig {
+            url: handle.url_with_database(),
+            ..Default::default()
+        },
+    )
     .await
     .unwrap();
 

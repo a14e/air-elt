@@ -7,12 +7,16 @@ members = [
     "crates/commons/pg",
     "crates/commons/mysql",
     "crates/commons/testing",
+    "crates/commons/mongodb",
     "crates/sources/postgres",
     "crates/sources/mysql",
+    "crates/sources/mongodb",
     "crates/sinks/postgres",
     "crates/sinks/mysql",
+    "crates/sinks/mongodb",
     "crates/storages/postgres",
     "crates/storages/mysql",
+    "crates/storages/mongodb",
 ]
 
 [workspace.package]
@@ -35,6 +39,10 @@ air-elt-sink-postgres = { path = "crates/sinks/postgres", version = "0.1.0" }
 air-elt-sink-mysql = { path = "crates/sinks/mysql", version = "0.1.0" }
 air-elt-storage-postgres = { path = "crates/storages/postgres", version = "0.1.0" }
 air-elt-storage-mysql = { path = "crates/storages/mysql", version = "0.1.0" }
+air-elt-commons-mongodb = { path = "crates/commons/mongodb", version = "0.1.0" }
+air-elt-source-mongodb = { path = "crates/sources/mongodb", version = "0.1.0" }
+air-elt-sink-mongodb = { path = "crates/sinks/mongodb", version = "0.1.0" }
+air-elt-storage-mongodb = { path = "crates/storages/mongodb", version = "0.1.0" }
 
 ahash = "0.8.12"
 tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "test-util"] }
@@ -56,7 +64,9 @@ chrono = { version = "0.4.44", features = ["serde"] }
 uuid = { version = "1.23.1", features = ["v4", "serde"] }
 futures = "0.3.32"
 testcontainers = "0.27.3"
-testcontainers-modules = { version = "0.15.0", features = ["postgres", "mysql", "mariadb"] }
+testcontainers-modules = { version = "0.15.0", features = ["postgres", "mysql", "mariadb", "mongo"] }
+mongodb = { version = "3.6.0", default-features = false, features = ["rustls-tls", "bson-2", "compat-3-3-0"] }
+bson = "2.15.0"
 rand = "0.10.1"
 tempfile = "3.27.0"
 regex = "1.12.3"
@@ -83,3 +93,7 @@ collapsible_if = "allow"
 collapsible_else_if = "allow"
 collapsible_match = "allow"
 unwrap_used = "deny"
+# `ValidationError` carries `DataType` (now Vec-bearing via `Union`),
+# nudging it past the 128-byte threshold. Errors are not hot-path —
+# the rare allocation cost is preferable to boxing every variant.
+result_large_err = "allow"

@@ -18,13 +18,31 @@ The codebase favours clarity over cleverness. Code is read far more often than w
 - **No `unwrap()` in production code.** Enforced via `clippy::unwrap_used = "deny"`. Use `expect("reason")` for infallible cases (static regex, const parsing). Tests are exempt via `#[allow(clippy::unwrap_used)]`.
 - Avoid magic numbers — prefer configs.
 - Prefer small code duplication over coupling.
-- Avoid "nano functions" that perform a single command or a routine operation. Small methods are allowed if they comply with OOP.
+- Avoid "nano functions" that perform a single command or a routine operation. Small methods are allowed if they comply
+  with OOP.
 - use ahash instead of std::collections::HashMap
-- **No future-proofing config or struct fields.** Do not introduce TOML keys, struct fields, or enum variants for hypothetical future features. Add the field together with the feature that consumes it. The previous "object form mapping" with reserved `transform` / `timezone` / `data-type` was a concrete example of this anti-pattern — reserved fields rot and create misleading parser surface. If a feature is on the near horizon, file an `agent_tasks/` ticket; don't pre-wire the surface.
+- **No future-proofing config or struct fields.** Do not introduce TOML keys, struct fields, or enum variants for
+  hypothetical future features. Add the field together with the feature that consumes it.
+- Do not use complex multi-level nested constructs like Ok( match ...). Try to split such constructs into multiple
+  variables. (except for pattern matching extraction — that is acceptable)
+- do not make lines and blocks oversaturated — separate into variables and try to follow the one line per expression
+  approach
 
 ## Timeouts and cancellation safety
 
-- When wrapping a future in `tokio::time::timeout` or `tokio::select!`, verify the underlying driver/protocol supports cancellation without leaving inconsistent state. sqlx postgres queries are cancellation-safe (drop sends a cancel message to the server). If a driver is not cancellation-safe, document the risk and consider `spawn` + `abort` instead of `select!`.
+- When wrapping a future in `tokio::time::timeout` or `tokio::select!`, verify the underlying driver/protocol supports
+  cancellation without leaving inconsistent state. sqlx postgres / sqlx mysql queries are cancellation-safe (drop sends
+  a cancel message to the server). If a driver is not cancellation-safe, document the risk and consider `spawn` +
+  `abort` instead of `select!`.
+- The `mongodb` 3.x Rust driver is **not** cancellation-safe — dropping its futures mid-await can leave driver internals
+  inconsistent. The flow runner enforces this via `Source/Sink/Storage::cancel_safe()` (default `true`); Mongo
+  connectors override it to `false`. The `cancel_safe == false` branch in `core::flow::runner::run_op` (and the same
+  logic in `core::validation::sampling`) uses `tokio::spawn` + detach instead of `tokio::time::timeout`: dropping a
+  `JoinHandle` in tokio does NOT abort the task, so the driver future always runs to completion. Connection-level / pool
+  timeouts on the underlying `mongodb::Client` (configured in `commons-mongodb::client::connect`) bound runaway work;
+  `ClientOptions::default_timeout` does NOT exist in the pinned `mongodb 3.6` crate, so per-operation
+  `*Options::max_time` is the only client-side per-op cap available — apply it where the operation's options struct
+  supports it (Find, Aggregate, FindOne, …).
 
 ## Logging and errors
 

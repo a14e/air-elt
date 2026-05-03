@@ -38,10 +38,13 @@ async fn numeric_zero_scale_decoded_as_bigint() {
     .await
     .unwrap();
 
-    let source = PgSource::connect(PgSourceConfig {
-        url: handle.url_with_search_path(),
-        ..Default::default()
-    })
+    let source = PgSource::connect(
+        "test_source".to_string(),
+        PgSourceConfig {
+            url: handle.url_with_search_path(),
+            ..Default::default()
+        },
+    )
     .await
     .unwrap();
 

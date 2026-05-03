@@ -86,6 +86,10 @@ pub fn decode_column(row: &MySqlRow, index: usize, data_type: DataType) -> Runti
         DataType::Xml => {
             nullable::<String>(row, index).map(|o| o.map(Value::Text).unwrap_or(Value::Null))
         }
+        // SQL sources never produce Union — only Mongo's sample-based
+        // inference does. Mirrors the mysql sink's `unreachable!` for
+        // the same structural invariant.
+        DataType::Union(_) => unreachable!("mysql sources never produce Union types"),
     }
 }
 

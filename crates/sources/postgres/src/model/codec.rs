@@ -79,6 +79,13 @@ pub fn decode_column(row: &PgRow, index: usize, data_type: DataType) -> RuntimeR
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
             unreachable!("postgres has no unsigned integer types")
         }
+        // SQL sources never produce Union — only Mongo's sample-based
+        // inference does. The validation matrix already rejects Union
+        // sinks/sources mismatches pre-runtime, so reaching this arm
+        // means the schema introspector itself emitted Union (impossible
+        // for pg `information_schema`). Mirrors the pg sink's
+        // `unreachable!` for the same invariant.
+        DataType::Union(_) => unreachable!("postgres sources never produce Union types"),
     }
 }
 

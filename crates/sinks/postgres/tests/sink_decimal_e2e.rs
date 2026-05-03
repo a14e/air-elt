@@ -41,6 +41,7 @@ async fn writes_numeric_bigint_and_decimal() {
     let spec = WriteSpec {
         columns: vec!["id".into(), "big".into(), "rate".into()],
         table: format!("{}.t", handle.schema),
+        conflict: None,
     };
 
     let big_str = "9876543210987654321098765";

@@ -259,6 +259,24 @@ fn validate_post_merge(root: &RootConfig) -> Result<(), ConfigError> {
                 });
             }
         }
+        if let Some(conflict) = &flow.conflict {
+            conflict.validate().map_err(|reason| ConfigError::Invalid {
+                reason: format!("flow {flow_name:?}: {reason}"),
+            })?;
+            // Every conflict.key entry must appear in mapping.to —
+            // otherwise the upsert filter would reference a sink column
+            // we never write.
+            let mapped_tos: AHashSet<&str> = flow.mapping.iter().map(|m| m.to.as_str()).collect();
+            for k in &conflict.key {
+                if !mapped_tos.contains(k.as_str()) {
+                    return Err(ConfigError::Invalid {
+                        reason: format!(
+                            "flow {flow_name:?}: conflict.key entry {k:?} must be listed in mapping.to"
+                        ),
+                    });
+                }
+            }
+        }
     }
     Ok(())
 }

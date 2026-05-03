@@ -20,8 +20,25 @@ use crate::types::data_type::DataType;
 pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
     use DataType::*;
 
+    // Identity short-circuit covers `Union(vs) → Union(vs)` (Mongo →
+    // Mongo schemaless: `dst_schema` is rebuilt from `src_schema` so a
+    // heterogeneous source field surfaces with the same Union on both
+    // sides).
     if source_t == sink_t {
         return true;
+    }
+
+    // Union on the source side: every variant must independently be
+    // compatible with the (concrete) sink.
+    if let Union(vs) = &source_t {
+        return vs.iter().all(|v| is_compatible(v.clone(), sink_t.clone()));
+    }
+    // Sinks never carry Union — schemaful sinks have concrete columns;
+    // the schemaless Mongo sink also takes its types from the source
+    // (which may itself be a Union, handled by the identity arm
+    // above). A non-identity Union sink is a misconfiguration.
+    if matches!(sink_t, Union(_)) {
+        return false;
     }
 
     match (source_t, sink_t) {
@@ -131,7 +148,15 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
 /// can rescue them.
 pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool {
     use DataType::*;
-    if is_compatible(source_t, sink_t) {
+    if let Union(vs) = &source_t {
+        return vs
+            .iter()
+            .all(|v| is_compatible_with_truncate(v.clone(), sink_t.clone()));
+    }
+    if matches!(sink_t, Union(_)) {
+        return false;
+    }
+    if is_compatible(source_t.clone(), sink_t.clone()) {
         // truncate=true on a pair that's already lossless: harmless no-op,
         // BUT explicitly forbid identities that have no defined truncation
         // semantics — Json/Xml (structure corruption) and Uuid/Date/
@@ -241,16 +266,23 @@ fn fits_size(source: Option<u32>, sink: Option<u32>) -> bool {
 
 pub fn is_narrowing(source_t: DataType, sink_t: DataType) -> bool {
     use DataType::*;
-    if let (Text { size: Some(a) }, Text { size: Some(b) }) = (source_t, sink_t) {
+    // Union: narrowing iff every variant is narrowing into the sink.
+    if let Union(vs) = &source_t {
+        return vs.iter().all(|v| is_narrowing(v.clone(), sink_t.clone()));
+    }
+    if matches!(sink_t, Union(_)) {
+        return false;
+    }
+    if let (Text { size: Some(a) }, Text { size: Some(b) }) = (&source_t, &sink_t) {
         return a > b;
     }
-    if let (Bytes { size: Some(a) }, Bytes { size: Some(b) }) = (source_t, sink_t) {
+    if let (Bytes { size: Some(a) }, Bytes { size: Some(b) }) = (&source_t, &sink_t) {
         return a > b;
     }
-    if let (Text { size: None }, Text { size: Some(_) }) = (source_t, sink_t) {
+    if let (Text { size: None }, Text { size: Some(_) }) = (&source_t, &sink_t) {
         return true;
     }
-    if let (Bytes { size: None }, Bytes { size: Some(_) }) = (source_t, sink_t) {
+    if let (Bytes { size: None }, Bytes { size: Some(_) }) = (&source_t, &sink_t) {
         return true;
     }
     matches!(
@@ -443,7 +475,7 @@ mod tests {
     #[test]
     fn fixed_int_into_bigint_always_ok() {
         for src in [DataType::Int16, DataType::Int32, DataType::Int64] {
-            assert!(is_compatible(src, BIGINT_UNB));
+            assert!(is_compatible(src.clone(), BIGINT_UNB));
             assert!(is_compatible(src, bigint(20)));
         }
     }
@@ -574,8 +606,11 @@ mod tests {
             (DataType::UInt64, DataType::UInt32),
         ];
         for (a, b) in pairs {
-            assert!(!is_compatible(a, b), "{a:?} → {b:?} should reject");
-            assert!(is_narrowing(a, b), "{a:?} → {b:?} should narrow");
+            assert!(
+                !is_compatible(a.clone(), b.clone()),
+                "{a:?} → {b:?} should reject"
+            );
+            assert!(is_narrowing(a, b), "should narrow");
         }
     }
 
@@ -589,8 +624,11 @@ mod tests {
                 DataType::UInt32,
                 DataType::UInt64,
             ] {
-                assert!(!is_compatible(src, dst), "{src:?} → {dst:?} should reject");
-                assert!(is_narrowing(src, dst), "{src:?} → {dst:?} should narrow");
+                assert!(
+                    !is_compatible(src.clone(), dst.clone()),
+                    "{src:?} → {dst:?} should reject"
+                );
+                assert!(is_narrowing(src.clone(), dst), "should narrow");
             }
         }
     }
@@ -726,10 +764,13 @@ mod tests {
     /// regression where `is_compatible_with_truncate` returned `true`
     /// unconditionally (which a one-sided walk would silently accept).
     fn assert_unlocks(a: DataType, b: DataType) {
-        assert!(!is_compatible(a, b), "{a:?} → {b:?} should reject lossless");
+        assert!(
+            !is_compatible(a.clone(), b.clone()),
+            "{a:?} → {b:?} should reject lossless"
+        );
         assert!(
             is_compatible_with_truncate(a, b),
-            "{a:?} → {b:?} should unlock with truncate"
+            "should unlock with truncate"
         );
     }
 
@@ -767,7 +808,7 @@ mod tests {
                 DataType::UInt32,
                 DataType::UInt64,
             ] {
-                assert_unlocks(s, u);
+                assert_unlocks(s.clone(), u);
             }
         }
     }
@@ -887,5 +928,93 @@ mod tests {
     fn narrowing_distinct_unrelated_pair_returns_false() {
         assert!(!is_narrowing(DataType::Json, DataType::Bool));
         assert!(!is_narrowing(DataType::Date, DataType::Timestamp));
+    }
+
+    // ---- Union (Mongo heterogeneous source field) ------------------
+
+    #[test]
+    fn union_src_compatible_when_every_variant_is() {
+        // Both Int16 and Int32 widen losslessly into Int64.
+        let src = DataType::union(vec![DataType::Int16, DataType::Int32]);
+        assert!(is_compatible(src, DataType::Int64));
+    }
+
+    #[test]
+    fn union_src_rejected_when_any_variant_incompatible() {
+        // Int32 is compatible with Int64; Text is not. The union as a
+        // whole must be rejected against an Int64 sink.
+        let src = DataType::union(vec![DataType::Int32, DataType::Text { size: None }]);
+        assert!(!is_compatible(src, DataType::Int64));
+    }
+
+    #[test]
+    fn union_sink_always_rejected() {
+        // Sinks never carry Union — the matrix must reject it
+        // unconditionally so a misconfigured pipeline surfaces at
+        // validate time.
+        let sink = DataType::union(vec![DataType::Int32, DataType::Text { size: None }]);
+        assert!(!is_compatible(DataType::Int32, sink.clone()));
+        assert!(!is_compatible_with_truncate(DataType::Int32, sink));
+    }
+
+    #[test]
+    fn union_src_with_truncate_rejected_when_any_arm_lacks_truncate_path() {
+        // `Int32 → Text(10)` is not in the truncate matrix, so a union
+        // containing Int32 cannot land in a Text sink even with
+        // truncate=true.
+        let src = DataType::union(vec![DataType::Int32, DataType::Text { size: None }]);
+        assert!(!is_compatible(src.clone(), text(10)));
+        assert!(!is_compatible_with_truncate(src, text(10)));
+    }
+
+    #[test]
+    fn union_src_with_truncate_unlocks_when_every_arm_unlocks() {
+        // Both `Text(unbounded) → Text(10)` and `Text(20) → Text(10)`
+        // are unlocked by truncate. Combined as a union they unlock
+        // together — the matrix walks every member.
+        let src = DataType::union(vec![DataType::Text { size: None }, text(20)]);
+        assert!(!is_compatible(src.clone(), text(10)));
+        assert!(is_compatible_with_truncate(src, text(10)));
+    }
+
+    #[test]
+    fn union_singleton_collapses_to_concrete() {
+        // `union([T])` is normalised to bare `T` by the constructor —
+        // matrix sees a concrete type, not a Union wrapper.
+        let dt = DataType::union(vec![DataType::Int32]);
+        assert_eq!(dt, DataType::Int32);
+    }
+
+    #[test]
+    fn union_flattens_nested_inputs() {
+        // Union members that are themselves Union must be flattened —
+        // the matrix and dispatcher rely on a one-level-deep invariant.
+        let inner = DataType::union(vec![DataType::Int32, DataType::Text { size: None }]);
+        let outer = DataType::union(vec![inner, DataType::Int64]);
+        match &outer {
+            DataType::Union(vs) => {
+                assert_eq!(vs.len(), 3, "expected 3 flat variants, got {vs:?}");
+                assert!(vs.contains(&DataType::Int32));
+                assert!(vs.contains(&DataType::Int64));
+                assert!(vs.contains(&DataType::Text { size: None }));
+                assert!(
+                    !vs.iter().any(|v| matches!(v, DataType::Union(_))),
+                    "nested Union must be flattened"
+                );
+            }
+            other => panic!("expected Union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn union_dedup_and_sort_normalises() {
+        // Equality must be observation-order-independent so two flows
+        // that saw `int+text` vs `text+int` produce identical schemas.
+        let a = DataType::union(vec![DataType::Int32, DataType::Text { size: None }]);
+        let b = DataType::union(vec![DataType::Text { size: None }, DataType::Int32]);
+        assert_eq!(a, b);
+        // Duplicates are collapsed.
+        let c = DataType::union(vec![DataType::Int32, DataType::Int32]);
+        assert_eq!(c, DataType::Int32);
     }
 }

@@ -72,10 +72,30 @@ jobs:
           --health-interval=5s
           --health-timeout=5s
           --health-retries=20
+      mongo:
+        image: mongo:8.0
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd="mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' | grep 1"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+      mongo-legacy:
+        image: mongo:7.0
+        ports:
+          - 27018:27017
+        options: >-
+          --health-cmd="mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' | grep 1"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
     env:
       AIR_ELT_TEST_PG_URL: "postgres://postgres:postgres@localhost:5432/postgres"
       AIR_ELT_TEST_MYSQL_URL: "mysql://root@localhost:3306/airelt"
       AIR_ELT_TEST_MARIADB_URL: "mysql://root@localhost:3307/airelt"
+      AIR_ELT_TEST_MONGO_URL: "mongodb://localhost:27017"
+      AIR_ELT_TEST_MONGO_LEGACY_URL: "mongodb://localhost:27018"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain

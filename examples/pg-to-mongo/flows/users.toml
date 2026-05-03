@@ -1,0 +1,28 @@
+[flow.users]
+source = "pg_src"
+sink = "mongo_sink"
+storage = "pg_state"
+
+from = "public.users"
+to = "users"
+
+batch-limit = 500
+
+# Dot-notation on the *target* path materialises a nested BSON document
+# from a flat SQL column. `addr_city` lives as `varchar` in PG; the sink
+# writes it to `addr.city` inside each Mongo doc.
+mapping = [
+    { from = "id", to = "_id" },
+    { from = "name", to = "name" },
+    { from = "addr_city", to = "addr.city" },
+    { from = "created_at", to = "created_at" },
+]
+
+cursor = { fields = ["id"], order = "asc", interval = "1s" }
+
+# Idempotent re-runs: upsert on `_id`. The sink takes the `_id` fast
+# path here (single-key, exact `_id`) — replaceOne(upsert=true) per
+# row, futures fired in parallel via join_all.
+[flow.users.conflict]
+key = ["_id"]
+strategy = "overwrite"

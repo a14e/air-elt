@@ -19,6 +19,10 @@ use crate::sql_statements as sql;
 struct PgSinkCtx {
     column_types: Vec<DataType>,
     insert_statement: String,
+    /// `ON CONFLICT (...) DO ...` suffix derived from the flow's
+    /// `[flow.<name>.conflict]` block; empty string when no conflict
+    /// directive is set.
+    conflict_suffix: String,
 }
 
 impl SinkCtx for PgSinkCtx {
@@ -109,7 +113,7 @@ impl Sink for PgSink {
             .columns
             .iter()
             .map(|c| {
-                schema.find(c).map(|f| f.data_type).ok_or_else(|| {
+                schema.find(c).map(|f| f.data_type.clone()).ok_or_else(|| {
                     RuntimeError::SchemaColumnMissing {
                         table: spec.table.clone(),
                         column: c.clone(),
@@ -118,9 +122,14 @@ impl Sink for PgSink {
             })
             .collect::<RuntimeResult<_>>()?;
         let insert_statement = sql::insert_statement(&spec.table, &spec.columns)?;
+        let conflict_suffix = match &spec.conflict {
+            Some(c) => sql::conflict_suffix(c, &spec.columns)?,
+            None => String::new(),
+        };
         Ok(Arc::new(PgSinkCtx {
             column_types,
             insert_statement,
+            conflict_suffix,
         }))
     }
 
@@ -142,7 +151,7 @@ impl Sink for PgSink {
             for (value, dt) in row.values.iter().zip(column_types_ref.iter()) {
                 match value {
                     // Keep in sync with air_elt_commons_pg::null_bind::bind_typed_null — the Separated lifetime forces inlining here.
-                    Value::Null => match *dt {
+                    Value::Null => match dt {
                         DataType::Int64 => {
                             tuple.push_bind::<Option<i64>>(None);
                         }
@@ -192,6 +201,9 @@ impl Sink for PgSink {
                         // NULL. PG accepts text NULLs into xml columns.
                         DataType::Xml => {
                             tuple.push_bind::<Option<String>>(None);
+                        }
+                        DataType::Union(_) => {
+                            unreachable!("postgres sinks never carry Union types")
                         }
                     },
                     Value::Bool(b) => {
@@ -249,6 +261,9 @@ impl Sink for PgSink {
                 }
             }
         });
+        if !pg_ctx.conflict_suffix.is_empty() {
+            qb.push(&pg_ctx.conflict_suffix);
+        }
         debug!(sql = %qb.sql(), rows = batch.rows.len(), "insert batch sql");
         let result = qb
             .build()

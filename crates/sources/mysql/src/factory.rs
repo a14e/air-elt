@@ -13,7 +13,7 @@ pub struct MySqlSourceFactory;
 impl SourceFactory for MySqlSourceFactory {
     async fn build(&self, cfg: &ComponentConfig) -> Result<Box<dyn Source>, ConfigError> {
         let config = MySqlSourceConfig::try_from(cfg)?;
-        let source = MySqlSource::connect(config)
+        let source = MySqlSource::connect(cfg.name.clone(), config)
             .await
             .map_err(|e| ConfigError::Invalid {
                 reason: e.to_string(),

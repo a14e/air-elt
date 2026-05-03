@@ -84,10 +84,15 @@ impl FlowRunner {
 
     async fn tick(&mut self) -> Result<bool, RuntimeError> {
         if self.cursor.is_none() {
-            self.cursor = with_timeout(
+            let storage = self.flow.storage.clone();
+            let flow_name = self.flow.name.clone();
+            let cancel_safe = storage.cancel_safe();
+            let fut = async move { storage.load_cursor(&flow_name).await };
+            self.cursor = run_op(
                 &self.flow,
                 "load_cursor",
-                self.flow.storage.load_cursor(&self.flow.name),
+                fut,
+                cancel_safe,
                 &mut self.shutdown,
             )
             .await?;
@@ -110,12 +115,20 @@ impl FlowRunner {
             .as_ref()
             .expect("ensured by ensure_contexts")
             .clone();
-        let batch = with_timeout(
+        let source = self.flow.source.clone();
+        let read_spec = self.flow.read_spec.clone();
+        let cursor = self.cursor.clone();
+        let cancel_safe = source.cancel_safe();
+        let fut = async move {
+            source
+                .read_batch(&read_spec, src_ctx, cursor.as_ref())
+                .await
+        };
+        let batch = run_op(
             &self.flow,
             "read_batch",
-            self.flow
-                .source
-                .read_batch(&self.flow.read_spec, src_ctx, self.cursor.as_ref()),
+            fut,
+            cancel_safe,
             &mut self.shutdown,
         )
         .await?;
@@ -151,12 +164,16 @@ impl FlowRunner {
             .as_ref()
             .expect("ensured by ensure_contexts")
             .clone();
-        let report = match with_timeout(
+        let sink = self.flow.sink.clone();
+        let write_spec = self.flow.write_spec.clone();
+        let owned_batch = batch.clone();
+        let cancel_safe = sink.cancel_safe();
+        let fut = async move { sink.write_batch(&write_spec, sink_ctx, &owned_batch).await };
+        let report = match run_op(
             &self.flow,
             "write_batch",
-            self.flow
-                .sink
-                .write_batch(&self.flow.write_spec, sink_ctx, batch),
+            fut,
+            cancel_safe,
             &mut self.shutdown,
         )
         .await
@@ -175,10 +192,16 @@ impl FlowRunner {
         );
 
         if let Some(next) = &batch.next_cursor {
-            if let Err(e) = with_timeout(
+            let storage = self.flow.storage.clone();
+            let flow_name = self.flow.name.clone();
+            let next_owned = next.clone();
+            let cancel_safe = storage.cancel_safe();
+            let fut = async move { storage.save_cursor(&flow_name, &next_owned).await };
+            if let Err(e) = run_op(
                 &self.flow,
                 "save_cursor",
-                self.flow.storage.save_cursor(&self.flow.name, next),
+                fut,
+                cancel_safe,
                 &mut self.shutdown,
             )
             .await
@@ -228,6 +251,9 @@ fn apply_conversions(
     Ok(batch)
 }
 
+/// Cancellation-safe path: rely on `tokio::time::timeout` + `select!` —
+/// dropping `fut` mid-await is safe for the underlying driver. Used for
+/// sqlx-backed connectors.
 async fn with_timeout<F, T>(
     flow: &FlowState,
     op: &'static str,
@@ -251,6 +277,71 @@ where
             flow: flow.name.clone(),
             op,
         }),
+    }
+}
+
+/// Cancellation-unsafe path: spawn the future on the runtime and detach
+/// the `JoinHandle` on shutdown / timeout. In tokio, dropping a
+/// `JoinHandle` does NOT abort the task — the task runs to completion
+/// independently, so the underlying driver future never gets dropped
+/// mid-await. Used for the `mongodb` 3.x driver, which is not
+/// cancellation-safe.
+async fn with_spawn_detach<F, T>(
+    flow: &FlowState,
+    op: &'static str,
+    fut: F,
+    shutdown: &mut watch::Receiver<bool>,
+) -> RuntimeResult<T>
+where
+    F: std::future::Future<Output = RuntimeResult<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut handle = tokio::spawn(fut);
+    tokio::select! {
+        res = &mut handle => match res {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(e),
+            Err(join_err) => Err(RuntimeError::Other(format!(
+                "spawned op {op} panicked: {join_err}"
+            ))),
+        },
+        _ = tokio::time::sleep(flow.query_timeout) => {
+            // Detach: the task keeps running; the driver future
+            // completes naturally. The connection-level / pool
+            // timeouts on the underlying client bound runaway work.
+            drop(handle);
+            Err(RuntimeError::Timeout {
+                flow: flow.name.clone(),
+                op,
+                after: flow.query_timeout,
+            })
+        }
+        _ = shutdown.changed() => {
+            drop(handle);
+            Err(RuntimeError::Cancelled {
+                flow: flow.name.clone(),
+                op,
+            })
+        }
+    }
+}
+
+/// Dispatch by connector cancellation safety.
+async fn run_op<F, T>(
+    flow: &FlowState,
+    op: &'static str,
+    fut: F,
+    cancel_safe: bool,
+    shutdown: &mut watch::Receiver<bool>,
+) -> RuntimeResult<T>
+where
+    F: std::future::Future<Output = RuntimeResult<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    if cancel_safe {
+        with_timeout(flow, op, fut, shutdown).await
+    } else {
+        with_spawn_detach(flow, op, fut, shutdown).await
     }
 }
 
@@ -309,6 +400,7 @@ mod tests {
         // that read_batch was actually called (and failed) before shutdown
         // interrupted the subsequent backoff sleep.
         let mut source = crate::traits::MockSource::new();
+        source.expect_cancel_safe().return_const(true);
         source
             .expect_build_context()
             .returning(|_| Ok(Arc::new(UnitSourceCtx)));
@@ -395,6 +487,30 @@ mod tests {
         ];
         let res = apply_conversions(batch, &convs);
         assert!(res.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spawn_detach_path_completes_when_source_is_not_cancel_safe() {
+        // A source that opts out of cancellation safety must still
+        // produce correct results in the happy path — exercises the
+        // `with_spawn_detach` branch end-to-end.
+        let mut source = crate::traits::MockSource::new();
+        source.expect_cancel_safe().return_const(false);
+        source
+            .expect_build_context()
+            .returning(|_| Ok(Arc::new(UnitSourceCtx)));
+        let call = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        source.expect_read_batch().returning(move |_, _, _| {
+            let n = call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Ok(one_row_batch())
+            } else {
+                Ok(crate::model::Batch::default())
+            }
+        });
+        let flow = test_flow(source, mock_sink_ok(), mock_storage_ok());
+        let (_tx, rx) = watch::channel(false);
+        assert!(run(flow, RunMode::Once, rx).run().await.is_ok());
     }
 
     #[tokio::test(start_paused = true)]

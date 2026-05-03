@@ -31,10 +31,13 @@ async fn describe_and_read_with_cursor() {
     let handle = pg_pool().await;
     seed_users(&handle.pool).await;
 
-    let source = PgSource::connect(PgSourceConfig {
-        url: handle.url_with_search_path(),
-        ..Default::default()
-    })
+    let source = PgSource::connect(
+        "test_source".to_string(),
+        PgSourceConfig {
+            url: handle.url_with_search_path(),
+            ..Default::default()
+        },
+    )
     .await
     .expect("connect source");
 
@@ -116,10 +119,13 @@ async fn read_with_nullable_cursor() {
             .expect("insert");
     }
 
-    let source = PgSource::connect(PgSourceConfig {
-        url: handle.url_with_search_path(),
-        ..Default::default()
-    })
+    let source = PgSource::connect(
+        "test_source".to_string(),
+        PgSourceConfig {
+            url: handle.url_with_search_path(),
+            ..Default::default()
+        },
+    )
     .await
     .expect("connect source");
 

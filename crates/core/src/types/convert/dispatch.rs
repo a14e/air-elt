@@ -31,6 +31,16 @@ pub fn convert(
         return Ok(Value::Null);
     }
 
+    // Union source: pick the concrete source type from the actual value
+    // variant and re-dispatch. The matrix has already approved every
+    // member of the union against the sink, so this is just runtime
+    // routing.
+    if matches!(src, DataType::Union(_)) {
+        let concrete = concrete_type_of(&value)
+            .ok_or_else(|| ConvertError::ValueShapeMismatch { src: src.clone() })?;
+        return convert(value, &concrete, dst, ctx);
+    }
+
     if src == dst {
         return identity_or_forbid(value, src, dst, ctx);
     }
@@ -47,8 +57,8 @@ pub fn convert(
             return text_narrow::convert(value, src, *b);
         }
         return Err(ConvertError::Unsupported {
-            src: *src,
-            dst: *dst,
+            src: src.clone(),
+            dst: dst.clone(),
         });
     }
     if let (DataType::Bytes { size: a }, DataType::Bytes { size: b }) = (src, dst) {
@@ -59,8 +69,8 @@ pub fn convert(
             return bytes_narrow::convert(value, src, *b);
         }
         return Err(ConvertError::Unsupported {
-            src: *src,
-            dst: *dst,
+            src: src.clone(),
+            dst: dst.clone(),
         });
     }
 
@@ -74,19 +84,19 @@ pub fn convert(
         // ---- UUID round-trips (existing semantics) ---------------------
         (DataType::Uuid, DataType::Text { .. }) => match value {
             Value::Uuid(u) => Ok(Value::Text(uuid_conv::to_text(u))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Uuid, DataType::Bytes { .. }) => match value {
             Value::Uuid(u) => Ok(Value::Bytes(uuid_conv::to_bytes(u).to_vec())),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Text { .. }, DataType::Uuid) => match value {
             Value::Text(s) => Ok(Value::Uuid(uuid_conv::parse_text(&s)?)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Bytes { .. }, DataType::Uuid) => match value {
             Value::Bytes(b) => Ok(Value::Uuid(uuid_conv::from_bytes(&b)?)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
         // ---- Int / UInt ↔ Bool (existing) -----------------------------
@@ -95,7 +105,7 @@ pub fn convert(
                 Value::Int16(n) => n as i64,
                 Value::Int32(n) => n as i64,
                 Value::Int64(n) => n,
-                _ => return Err(ConvertError::ValueShapeMismatch { src: *src }),
+                _ => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
             };
             Ok(Value::Bool(n != 0))
         }
@@ -108,37 +118,37 @@ pub fn convert(
                 Value::UInt16(n) => n as u64,
                 Value::UInt32(n) => n as u64,
                 Value::UInt64(n) => n,
-                _ => return Err(ConvertError::ValueShapeMismatch { src: *src }),
+                _ => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
             };
             Ok(Value::Bool(n != 0))
         }
         (DataType::Bool, DataType::UInt8) => match value {
             Value::Bool(b) => Ok(Value::UInt8(b as u8)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Bool, DataType::UInt16) => match value {
             Value::Bool(b) => Ok(Value::UInt16(b as u16)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Bool, DataType::UInt32) => match value {
             Value::Bool(b) => Ok(Value::UInt32(b as u32)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Bool, DataType::UInt64) => match value {
             Value::Bool(b) => Ok(Value::UInt64(b as u64)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Bool, DataType::Int16) => match value {
             Value::Bool(b) => Ok(Value::Int16(b as i16)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Bool, DataType::Int32) => match value {
             Value::Bool(b) => Ok(Value::Int32(b as i32)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Bool, DataType::Int64) => match value {
             Value::Bool(b) => Ok(Value::Int64(b as i64)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
         // ---- Text → Bool lexer (always allowed, no truncate gate) ------
@@ -147,31 +157,31 @@ pub fn convert(
         // ---- Numeric widening (existing) ------------------------------
         (DataType::Int16, DataType::Int32) => match value {
             Value::Int16(n) => Ok(Value::Int32(n as i32)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Int16, DataType::Int64) => match value {
             Value::Int16(n) => Ok(Value::Int64(n as i64)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Int32, DataType::Int64) => match value {
             Value::Int32(n) => Ok(Value::Int64(n as i64)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Int16, DataType::Float32) => match value {
             Value::Int16(n) => Ok(Value::Float32(n as f32)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Int16, DataType::Float64) => match value {
             Value::Int16(n) => Ok(Value::Float64(n as f64)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Int32, DataType::Float64) => match value {
             Value::Int32(n) => Ok(Value::Float64(n as f64)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Float32, DataType::Float64) => match value {
             Value::Float32(n) => Ok(Value::Float64(n as f64)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
         // Float narrowing — only with truncate.
@@ -190,121 +200,121 @@ pub fn convert(
         // Fixed-width int → BigInt.
         (DataType::Int16, DataType::BigInt { .. }) => match value {
             Value::Int16(n) => Ok(Value::BigInt(BigInt::from(n))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Int32, DataType::BigInt { .. }) => match value {
             Value::Int32(n) => Ok(Value::BigInt(BigInt::from(n))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Int64, DataType::BigInt { .. }) => match value {
             Value::Int64(n) => Ok(Value::BigInt(BigInt::from(n))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
         // Fixed-width int → Decimal.
         (DataType::Int16, DataType::Decimal { .. }) => match value {
             Value::Int16(n) => Ok(Value::Decimal(BigDecimal::from(n as i64))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Int32, DataType::Decimal { .. }) => match value {
             Value::Int32(n) => Ok(Value::Decimal(BigDecimal::from(n as i64))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Int64, DataType::Decimal { .. }) => match value {
             Value::Int64(n) => Ok(Value::Decimal(BigDecimal::from(n))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::BigInt { .. }, DataType::Decimal { .. }) => match value {
             Value::BigInt(b) => Ok(Value::Decimal(BigDecimal::new(b, 0))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
         // Unsigned widening within unsigned.
         (DataType::UInt8, DataType::UInt16) => match value {
             Value::UInt8(n) => Ok(Value::UInt16(n as u16)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt8, DataType::UInt32) => match value {
             Value::UInt8(n) => Ok(Value::UInt32(n as u32)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt8, DataType::UInt64) => match value {
             Value::UInt8(n) => Ok(Value::UInt64(n as u64)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt16, DataType::UInt32) => match value {
             Value::UInt16(n) => Ok(Value::UInt32(n as u32)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt16, DataType::UInt64) => match value {
             Value::UInt16(n) => Ok(Value::UInt64(n as u64)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt32, DataType::UInt64) => match value {
             Value::UInt32(n) => Ok(Value::UInt64(n as u64)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
         // Unsigned → signed (matrix already enforces width fits).
         (DataType::UInt8, DataType::Int16) => match value {
             Value::UInt8(n) => Ok(Value::Int16(n as i16)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt8, DataType::Int32) => match value {
             Value::UInt8(n) => Ok(Value::Int32(n as i32)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt8, DataType::Int64) => match value {
             Value::UInt8(n) => Ok(Value::Int64(n as i64)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt16, DataType::Int32) => match value {
             Value::UInt16(n) => Ok(Value::Int32(n as i32)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt16, DataType::Int64) => match value {
             Value::UInt16(n) => Ok(Value::Int64(n as i64)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt32, DataType::Int64) => match value {
             Value::UInt32(n) => Ok(Value::Int64(n as i64)),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
         // Unsigned → BigInt.
         (DataType::UInt8, DataType::BigInt { .. }) => match value {
             Value::UInt8(n) => Ok(Value::BigInt(BigInt::from(n))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt16, DataType::BigInt { .. }) => match value {
             Value::UInt16(n) => Ok(Value::BigInt(BigInt::from(n))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt32, DataType::BigInt { .. }) => match value {
             Value::UInt32(n) => Ok(Value::BigInt(BigInt::from(n))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt64, DataType::BigInt { .. }) => match value {
             Value::UInt64(n) => Ok(Value::BigInt(BigInt::from(n))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
         // Unsigned → Decimal.
         (DataType::UInt8, DataType::Decimal { .. }) => match value {
             Value::UInt8(n) => Ok(Value::Decimal(BigDecimal::from(n as u64))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt16, DataType::Decimal { .. }) => match value {
             Value::UInt16(n) => Ok(Value::Decimal(BigDecimal::from(n as u64))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt32, DataType::Decimal { .. }) => match value {
             Value::UInt32(n) => Ok(Value::Decimal(BigDecimal::from(n as u64))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::UInt64, DataType::Decimal { .. }) => match value {
             Value::UInt64(n) => Ok(Value::Decimal(BigDecimal::from(n))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: *src }),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
         // ---- Integer narrowing (signed/unsigned/cross-sign) ------------
@@ -380,8 +390,8 @@ pub fn convert(
         }
 
         _ => Err(ConvertError::Unsupported {
-            src: *src,
-            dst: *dst,
+            src: src.clone(),
+            dst: dst.clone(),
         }),
     }
 }
@@ -400,8 +410,8 @@ fn identity_or_forbid(
 ) -> Result<Value, ConvertError> {
     if ctx.truncate && matches!(src, DataType::Json | DataType::Xml) {
         return Err(ConvertError::TruncationForbidden {
-            src: *src,
-            dst: *dst,
+            src: src.clone(),
+            dst: dst.clone(),
         });
     }
     Ok(value)
@@ -433,17 +443,51 @@ fn identity_or_narrow_numeric(
     }
     if !ctx.truncate {
         return Err(ConvertError::Unsupported {
-            src: *src,
-            dst: *dst,
+            src: src.clone(),
+            dst: dst.clone(),
         });
     }
     match (src, dst) {
         (BigInt { .. }, BigInt { .. }) => bigint_narrow::convert(value, src, dst),
         (Decimal { .. }, Decimal { .. }) => decimal_narrow::convert(value, src, dst),
         _ => Err(ConvertError::Unsupported {
-            src: *src,
-            dst: *dst,
+            src: src.clone(),
+            dst: dst.clone(),
         }),
+    }
+}
+
+/// Map a runtime `Value` variant to its concrete `DataType`. Used when
+/// the source type is `DataType::Union(_)` — we inspect the actual value
+/// at hand and re-dispatch through the normal matrix arms. Width-bearing
+/// variants (`Text`, `Bytes`, `BigInt`, `Decimal`) report unbounded
+/// because the value carries no width information; the matrix has
+/// already approved every union member against the sink, so unbounded
+/// is the safe upper bound.
+fn concrete_type_of(value: &Value) -> Option<DataType> {
+    match value {
+        Value::Null => None,
+        Value::Bool(_) => Some(DataType::Bool),
+        Value::Int16(_) => Some(DataType::Int16),
+        Value::Int32(_) => Some(DataType::Int32),
+        Value::Int64(_) => Some(DataType::Int64),
+        Value::UInt8(_) => Some(DataType::UInt8),
+        Value::UInt16(_) => Some(DataType::UInt16),
+        Value::UInt32(_) => Some(DataType::UInt32),
+        Value::UInt64(_) => Some(DataType::UInt64),
+        Value::Float32(_) => Some(DataType::Float32),
+        Value::Float64(_) => Some(DataType::Float64),
+        Value::BigInt(_) => Some(DataType::BigInt { width: None }),
+        Value::Decimal(_) => Some(DataType::Decimal {
+            precision: None,
+            scale: None,
+        }),
+        Value::Text(_) => Some(DataType::Text { size: None }),
+        Value::Bytes(_) => Some(DataType::Bytes { size: None }),
+        Value::Date(_) => Some(DataType::Date),
+        Value::Timestamp(_) => Some(DataType::Timestamp),
+        Value::Uuid(_) => Some(DataType::Uuid),
+        Value::Json(_) => Some(DataType::Json),
     }
 }
 
@@ -481,8 +525,8 @@ fn require_truncate(
         Ok(())
     } else {
         Err(ConvertError::Unsupported {
-            src: *src,
-            dst: *dst,
+            src: src.clone(),
+            dst: dst.clone(),
         })
     }
 }
@@ -1014,25 +1058,53 @@ mod tests {
             (DataType::UInt16, DataType::Int64, wrong_bool.clone()),
             (DataType::UInt32, DataType::Int64, wrong_bool.clone()),
             // Int → BigInt
-            (DataType::Int16, bigint_unbounded, wrong_bool.clone()),
-            (DataType::Int32, bigint_unbounded, wrong_bool.clone()),
-            (DataType::Int64, bigint_unbounded, wrong_bool.clone()),
+            (
+                DataType::Int16,
+                bigint_unbounded.clone(),
+                wrong_bool.clone(),
+            ),
+            (
+                DataType::Int32,
+                bigint_unbounded.clone(),
+                wrong_bool.clone(),
+            ),
+            (
+                DataType::Int64,
+                bigint_unbounded.clone(),
+                wrong_bool.clone(),
+            ),
             // UInt → BigInt
-            (DataType::UInt8, bigint_unbounded, wrong_bool.clone()),
-            (DataType::UInt16, bigint_unbounded, wrong_bool.clone()),
-            (DataType::UInt32, bigint_unbounded, wrong_bool.clone()),
-            (DataType::UInt64, bigint_unbounded, wrong_bool.clone()),
+            (
+                DataType::UInt8,
+                bigint_unbounded.clone(),
+                wrong_bool.clone(),
+            ),
+            (
+                DataType::UInt16,
+                bigint_unbounded.clone(),
+                wrong_bool.clone(),
+            ),
+            (
+                DataType::UInt32,
+                bigint_unbounded.clone(),
+                wrong_bool.clone(),
+            ),
+            (
+                DataType::UInt64,
+                bigint_unbounded.clone(),
+                wrong_bool.clone(),
+            ),
             // Int → Decimal
-            (DataType::Int16, dec, wrong_bool.clone()),
-            (DataType::Int32, dec, wrong_bool.clone()),
-            (DataType::Int64, dec, wrong_bool.clone()),
+            (DataType::Int16, dec.clone(), wrong_bool.clone()),
+            (DataType::Int32, dec.clone(), wrong_bool.clone()),
+            (DataType::Int64, dec.clone(), wrong_bool.clone()),
             // UInt → Decimal
-            (DataType::UInt8, dec, wrong_bool.clone()),
-            (DataType::UInt16, dec, wrong_bool.clone()),
-            (DataType::UInt32, dec, wrong_bool.clone()),
-            (DataType::UInt64, dec, wrong_bool.clone()),
+            (DataType::UInt8, dec.clone(), wrong_bool.clone()),
+            (DataType::UInt16, dec.clone(), wrong_bool.clone()),
+            (DataType::UInt32, dec.clone(), wrong_bool.clone()),
+            (DataType::UInt64, dec.clone(), wrong_bool.clone()),
             // BigInt → Decimal
-            (bigint_unbounded, dec, wrong_bool.clone()),
+            (bigint_unbounded, dec.clone(), wrong_bool.clone()),
         ];
 
         for (src, dst, wrong_value) in cases {
@@ -1115,5 +1187,40 @@ mod tests {
             out,
             Value::Text("550e8400-e29b-41d4-a716-446655440000".into())
         );
+    }
+
+    // ---- Union source — runtime per-value re-dispatch -------------
+
+    #[test]
+    fn union_src_picks_int32_arm_at_runtime() {
+        // Source `Union(Int32 | Text)` against a Text sink: a runtime
+        // Int32 value should be re-dispatched as `Int32 → Text`. We
+        // pick an unbounded Text sink so widening goes through the
+        // Int → Bool / Int → … standard arms; here we use Bool because
+        // Int → Text isn't in the lossless matrix. So instead use
+        // sink = Int64: `Union(Int32 | Int64) → Int64` should yield
+        // an Int64.
+        let src = DataType::union(vec![DataType::Int32, DataType::Int64]);
+        let out = convert(Value::Int32(42), &src, &DataType::Int64, &passthrough()).unwrap();
+        assert_eq!(out, Value::Int64(42));
+    }
+
+    #[test]
+    fn union_src_picks_int64_arm_at_runtime() {
+        // Same union, but the runtime value is Int64 — must pass
+        // through unchanged via the identity short-circuit after the
+        // re-dispatch maps Int64 → DataType::Int64.
+        let src = DataType::union(vec![DataType::Int32, DataType::Int64]);
+        let out = convert(Value::Int64(99), &src, &DataType::Int64, &passthrough()).unwrap();
+        assert_eq!(out, Value::Int64(99));
+    }
+
+    #[test]
+    fn union_src_null_returns_null() {
+        // Null short-circuits before the union-dispatch arm; no default
+        // means we propagate Value::Null untouched.
+        let src = DataType::union(vec![DataType::Int32, DataType::Int64]);
+        let out = convert(Value::Null, &src, &DataType::Int64, &passthrough()).unwrap();
+        assert_eq!(out, Value::Null);
     }
 }

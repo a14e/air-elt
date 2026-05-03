@@ -36,6 +36,7 @@ async fn write_batch_and_validate_access() {
     let spec = WriteSpec {
         columns: vec!["id".into(), "label".into(), "at".into(), "payload".into()],
         table: format!("{}.events", handle.schema),
+        conflict: None,
     };
 
     sink.validate_access(&spec).await.expect("validate_access");
@@ -142,6 +143,7 @@ async fn all_nulls_across_data_types() {
     let spec = WriteSpec {
         columns: columns.clone(),
         table: format!("{}.null_matrix", handle.schema),
+        conflict: None,
     };
     sink.validate_access(&spec).await.expect("validate_access");
 
@@ -249,6 +251,7 @@ async fn all_types_non_null_round_trip() {
     let spec = WriteSpec {
         columns: columns.clone(),
         table: format!("{}.all_vals", handle.schema),
+        conflict: None,
     };
 
     let ts = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();

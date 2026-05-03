@@ -13,12 +13,21 @@ use ahash::AHashMap;
 use async_trait::async_trait;
 
 use crate::config::model::ComponentConfig;
+use crate::config::validation::SamplingConfig;
 use crate::error::{ConfigError, RuntimeError, RuntimeResult};
 use crate::traits::{Sink, Source, Storage};
 
 #[async_trait]
 pub trait SourceFactory: Send + Sync {
     async fn build(&self, cfg: &ComponentConfig) -> Result<Box<dyn Source>, ConfigError>;
+
+    /// Per-backend default for the sampling-validation step.
+    /// Off for SQL connectors (the schema is authoritative); on for
+    /// MongoDB (no fixed schema). Operators can override either way
+    /// via `[flow.<name>.validation.sampling]` in TOML.
+    fn sampling_default(&self) -> SamplingConfig {
+        SamplingConfig::Disabled
+    }
 }
 
 #[async_trait]
@@ -73,6 +82,18 @@ impl Registry {
                 component: format!("sink:{}", cfg.kind),
             })?;
         f.build(cfg).await.map_err(RuntimeError::Config)
+    }
+
+    /// Look up the per-backend sampling-validation default, given a
+    /// source `kind` (e.g. `"postgres"`, `"mongodb"`). Returns
+    /// `SamplingConfig::Disabled` if the kind is not registered —
+    /// that case will surface as a clearer error elsewhere when the
+    /// flow tries to build the source.
+    pub fn sampling_default(&self, kind: &str) -> SamplingConfig {
+        self.sources
+            .get(kind)
+            .map(|f| f.sampling_default())
+            .unwrap_or(SamplingConfig::Disabled)
     }
 
     pub async fn build_storage(&self, cfg: &ComponentConfig) -> RuntimeResult<Box<dyn Storage>> {

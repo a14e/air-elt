@@ -65,6 +65,15 @@ pub struct FlowConfig {
         serialize_with = "crate::config::interval::serialize_opt"
     )]
     pub query_timeout: Option<Duration>,
+
+    #[serde(default)]
+    pub validation: crate::config::validation::ValidationConfig,
+
+    /// Optional conflict resolution. When absent the sink performs
+    /// plain inserts; when set, the sink upserts on `conflict.key`
+    /// using the chosen `strategy`.
+    #[serde(default)]
+    pub conflict: Option<crate::config::conflict::ConflictConfig>,
 }
 
 fn default_batch_limit() -> usize {

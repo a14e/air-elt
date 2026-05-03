@@ -10,11 +10,11 @@ pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, Co
     use DataType::*;
     let n = match (src, &value) {
         (Float64, Value::Float64(n)) => *n,
-        (Float64, _) => return Err(ConvertError::ValueShapeMismatch { src: *src }),
+        (Float64, _) => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         _ => {
             return Err(ConvertError::Unsupported {
-                src: *src,
-                dst: *dst,
+                src: src.clone(),
+                dst: dst.clone(),
             });
         }
     };
@@ -23,28 +23,28 @@ pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, Co
         Float32 => Ok(Value::Float32(sat_f64_to_f32(n))),
         Int64 => sat_f64_to_i64(n)
             .map(Value::Int64)
-            .ok_or(ConvertError::Overflow { dst: *dst }),
+            .ok_or(ConvertError::Overflow { dst: dst.clone() }),
         Int32 => sat_f64_to_i32(n)
             .map(Value::Int32)
-            .ok_or(ConvertError::Overflow { dst: *dst }),
+            .ok_or(ConvertError::Overflow { dst: dst.clone() }),
         Int16 => sat_f64_to_i16(n)
             .map(Value::Int16)
-            .ok_or(ConvertError::Overflow { dst: *dst }),
+            .ok_or(ConvertError::Overflow { dst: dst.clone() }),
         UInt64 => sat_f64_to_u64(n)
             .map(Value::UInt64)
-            .ok_or(ConvertError::Overflow { dst: *dst }),
+            .ok_or(ConvertError::Overflow { dst: dst.clone() }),
         UInt32 => sat_f64_to_u32(n)
             .map(Value::UInt32)
-            .ok_or(ConvertError::Overflow { dst: *dst }),
+            .ok_or(ConvertError::Overflow { dst: dst.clone() }),
         UInt16 => sat_f64_to_u16(n)
             .map(Value::UInt16)
-            .ok_or(ConvertError::Overflow { dst: *dst }),
+            .ok_or(ConvertError::Overflow { dst: dst.clone() }),
         UInt8 => sat_f64_to_u8(n)
             .map(Value::UInt8)
-            .ok_or(ConvertError::Overflow { dst: *dst }),
+            .ok_or(ConvertError::Overflow { dst: dst.clone() }),
         _ => Err(ConvertError::Unsupported {
-            src: *src,
-            dst: *dst,
+            src: src.clone(),
+            dst: dst.clone(),
         }),
     }
 }

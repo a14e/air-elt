@@ -53,5 +53,9 @@ pub fn bind_typed_null<'q>(
         // native `xml` type — bind as text; Postgres accepts text-typed
         // NULLs into `xml` columns.
         DataType::Xml => query.bind::<Option<String>>(None),
+        // Union never reaches a PG sink: schemaful sinks declare concrete
+        // column types, and the validation pipeline rejects Union → PG
+        // before any bind happens.
+        DataType::Union(_) => unreachable!("postgres sinks never carry Union types"),
     }
 }
