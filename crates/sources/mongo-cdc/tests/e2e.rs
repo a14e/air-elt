@@ -563,7 +563,12 @@ async fn cdc_to_mongo_sink_round_trip_with_inserts_and_deletes() {
     enable_pre_post_images(&mongo, coll_name).await;
 
     let source = cdc_source(&mongo).await.unwrap();
-    let read_spec = cdc_spec(coll_name, 4, "post-image");
+    // limit MUST equal the number of events we generate below — the
+    // change-stream loop in `read_batch` is `while events.len() <
+    // spec.limit { stream.try_next().await }`, and `try_next` on an
+    // awaitData cursor blocks indefinitely waiting for the next event.
+    // A higher limit hangs the test until CI job-timeout.
+    let read_spec = cdc_spec(coll_name, 3, "post-image");
     let src_ctx = source.build_context(&read_spec).await.expect("ctx");
 
     let sink = MongoSink::connect(MongoSinkConfig {
