@@ -180,6 +180,41 @@ async fn external_with_sandbox(url: &str) -> MongoTestHandle {
     }
 }
 
+/// Sandbox handle backed by a Mongo deployment with change-streams
+/// enabled (i.e. a replica set). Required by every e2e test for the
+/// `mongo-cdc` source, since Change Streams cannot run on a
+/// standalone mongod.
+///
+/// Operator must set `AIR_ELT_TEST_MONGO_RS_URL` to a URL pointing
+/// at a running RS-mongo. CI does this in the workflow (a
+/// `mongo:8 --replSet rs0` service initiated to a one-node RS).
+/// Local devs can replicate via:
+///
+/// ```text
+/// docker run -d --rm -p 27017:27017 mongo:8 --replSet rs0 --bind_ip_all
+/// docker exec <id> mongosh --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
+/// export AIR_ELT_TEST_MONGO_RS_URL="mongodb://localhost:27017/?replicaSet=rs0&directConnection=true"
+/// ```
+///
+/// Tests that call this without the env var set are expected to
+/// `#[ignore]`-skip themselves at runtime via
+/// `mongo_rs_url_or_skip()`.
+pub fn mongo_rs_url_or_skip() -> Option<String> {
+    std::env::var(RS_URL_VAR).ok()
+}
+
+pub async fn mongo_rs_pool() -> MongoTestHandle {
+    let url = std::env::var(RS_URL_VAR).unwrap_or_else(|_| {
+        panic!(
+            "{RS_URL_VAR} not set — mongo-cdc e2e tests need a replica-set mongo. \
+             See `mongo_rs_url_or_skip` docstring for setup."
+        )
+    });
+    external_with_sandbox(&url).await
+}
+
+const RS_URL_VAR: &str = "AIR_ELT_TEST_MONGO_RS_URL";
+
 async fn spawn_container(tag: &str) -> MongoTestHandle {
     info!(tag, "starting ephemeral mongo container");
     let container = MongoImage::default()

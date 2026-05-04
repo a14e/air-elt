@@ -96,6 +96,7 @@ jobs:
       AIR_ELT_TEST_MARIADB_URL: "mysql://root@localhost:3307/airelt"
       AIR_ELT_TEST_MONGO_URL: "mongodb://localhost:27017"
       AIR_ELT_TEST_MONGO_LEGACY_URL: "mongodb://localhost:27018"
+      AIR_ELT_TEST_MONGO_RS_URL: "mongodb://localhost:27019/?replicaSet=rs0&directConnection=true"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -107,5 +108,34 @@ jobs:
         with:
           shared-key: air-elt-test
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Start replica-set Mongo for mongo-cdc
+        # GHA `services:` runs the image's default CMD and offers no
+        # way to append `--replSet`, so we boot the RS node as a
+        # plain `docker run`. mongo:8 with `--replSet rs0
+        # --bind_ip_all` is the same shape used by `mongo_rs_pool`
+        # locally. We also run `replSetInitiate` and wait for primary;
+        # AlreadyInitialized is treated as a no-op so re-runs of this
+        # step (e.g. cached job replays) stay idempotent.
+        run: |
+          set -euo pipefail
+          docker run -d --name mongo-rs -p 27019:27017 \
+            mongo:8.0 mongod --replSet rs0 --bind_ip_all
+          for i in $(seq 1 30); do
+            if docker exec mongo-rs mongosh --quiet --eval 'db.runCommand({ping:1}).ok' \
+                | grep -q '^1$'; then break; fi
+            sleep 1
+          done
+          docker exec mongo-rs mongosh --quiet --eval '
+            try {
+              rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27017"}]});
+            } catch (e) {
+              if (e.codeName !== "AlreadyInitialized") { throw e; }
+            }
+            for (let i = 0; i < 30; i++) {
+              if (db.hello().isWritablePrimary) { quit(0); }
+              sleep(1000);
+            }
+            throw new Error("rs primary did not come up in 30s");
+          '
       - name: cargo test
         run: cargo test --workspace --all-targets

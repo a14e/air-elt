@@ -209,11 +209,10 @@ fn merge_file(
 /// Structural checks after all files are merged.
 fn validate_post_merge(root: &RootConfig) -> Result<(), ConfigError> {
     for (flow_name, flow) in &root.flow {
-        if flow.cursor.fields.is_empty() {
-            return Err(ConfigError::Invalid {
-                reason: format!("flow {flow_name:?} has empty cursor.fields"),
-            });
-        }
+        // Per-source-kind cursor.fields shape (non-empty for pull-based,
+        // empty for cdc) is checked in `validation::pipeline::assemble`
+        // where the source kind is known. The loader only ensures
+        // structural sanity (mapping subset, interval > 0, …).
         if flow.batch_limit == 0 {
             return Err(ConfigError::Invalid {
                 reason: format!("flow {flow_name:?} has batch-limit = 0"),

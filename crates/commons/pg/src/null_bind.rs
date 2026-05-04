@@ -8,8 +8,10 @@
 //! on *any* column.
 //!
 //! Source-side uses `bind_typed_null` on a `sqlx::query::Query` for cursor
-//! comparisons. Sink-side inlines the same match inside `push_values` because
-//! the `Separated` lifetime prevents extracting it into a helper.
+//! comparisons. Sink-side has its own helper at `commons-pg::sink_bind`
+//! (`bind_value_separated`) which handles both NULL and non-NULL values
+//! inside a `QueryBuilder::Separated` chain — shared between insert
+//! (`push_values`) and delete (`push_tuples`) paths.
 
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, Utc};

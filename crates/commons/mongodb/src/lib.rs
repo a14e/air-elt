@@ -14,4 +14,5 @@ pub mod client;
 pub mod identifier;
 pub mod infer;
 pub mod path;
+pub mod sampling;
 pub mod version;

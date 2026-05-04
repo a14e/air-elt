@@ -32,7 +32,7 @@ All dynamic SQL identifiers must go through these helpers. Raw `format!` quoting
 
 Source-side type resolution lives in `commons-pg::pg_type` / `commons-mysql::mysql_type` (native ↔ canonical `DataType`). Notable quirks: pg accepts `timestamptz` only (naive `timestamp` rejected); mysql `tinyint(1)` → `Bool`, other tinyints → `Int16`, `datetime` rejected (only `timestamp` accepted, UTC).
 
-NULL binding goes through `commons-pg::null_bind` / `commons-mysql::null_bind` (extracted helper) on the source side; the sink side inlines because the sqlx `Separated` lifetime prevents extraction.
+NULL binding goes through `commons-pg::null_bind` / `commons-mysql::null_bind` (extracted helper) on the source side. On the sink side use **`commons-pg::sink_bind::bind_value_separated`** / **`commons-mysql::sink_bind::bind_value_separated`** for binding a `Value` inside a sqlx `Separated` chain. They are shared between the insert (`push_values`) and delete (`push_tuples` for the `(c1,c2) IN ((...))` predicate) paths — do not reimplement per-Value-variant binding inline.
 
 Pool construction goes through `commons-pg::pool` / `commons-mysql::pool`, both consuming `air_elt_commons::pool_timeouts::PoolTimeouts`. They wire UTC time-zone + statement-timeout pragmas. Defaults: connect 5s, acquire 10s, idle 300s, max_lifetime 1800s, statement 30s, max_connections 5.
 
@@ -49,6 +49,7 @@ Mongo has no SQL surface, so `commons-mongodb` ships its own helper set:
 - **`commons-mongodb::path`** — read / write nested BSON via `core::mapping::FieldPath`. `set` creates missing intermediate documents.
 - **`commons-mongodb::bson_value`** — bidirectional codec between BSON and the canonical `Value`/`DataType`. ObjectId → `Bytes(12)`; BSON Date → `Timestamp` (UTC, sub-ms truncation documented inline); Decimal128 → `Decimal`; Document/Array → `Json`; Binary(uuid subtype) → `Uuid`. Unrepresentable BSON variants (regex, JS code, MinKey/MaxKey, …) error rather than silently dropping data.
 - **`commons-mongodb::infer`** — sample-based schema inference. Folds per-field types; widens `int32 + int64` → `Int64`, `int + float` → `Float64`.
+- **`commons-mongodb::sampling`** — `sample_documents` / `describe_collection_schema` / `rows_from_documents`. Shared between the `mongodb` and `mongo-cdc` sources. New mongo-shaped sources should call these instead of duplicating `$sample` aggregation pipelines.
 
 ## Type model and the N+N matrix
 
@@ -100,6 +101,9 @@ Optional `[flow.<name>.conflict]` block. `core::config::conflict::{ConflictConfi
 - Shared types: `Batch`, `Row`, `ReadSpec`, `WriteSpec`, `WriteReport`, `CursorState`. Connectors must not define their own.
 - Factories are `#[async_trait]` in `core::registry`, registered as zero-sized structs in `app::registry::build_registry`. Do not construct connectors directly from flow code.
 - **`core::flow::engine::FlowEngine`** — spawns one `FlowRunner` per flow. Each runner wraps every DB call via `run_op` (cancel-safe path = `tokio::time::timeout` + `select!`; cancel-unsafe path = `tokio::spawn` + detach). `query_timeout` on `FlowConfig` overrides the 30s default.
+- **`Row.op: RowOp { Upsert, Delete }`** lives on every row. Pull-based sources always emit `Upsert` (the constructor `Row::upsert` handles that). CDC sources emit a mix of `Upsert` and `Delete`. All three sinks split the batch and apply **upsert → delete** order so `insert(k) → delete(k)` within one batch lands as "absent" in the sink.
+- **`Storage::{load,save}_resume_token`** — the persistence path for CDC sources. Distinct from `{load,save}_cursor`: column cursors live in `air_elt_cursors`, resume tokens live in `air_elt_resume_tokens`. The runner picks between the two via `AssembledFlow.cursor_persistence: CursorPersistence::{ColumnCursor, ResumeToken}`, populated in `validation::pipeline::assemble` from the source's `kind`.
+- **`core::flow::runner::dedup_cdc_batch`** — CDC-only batch compaction. Reverse-walks the rows and keeps only the last op per `conflict.key` fingerprint. Built on `write_value_key` (a direct binary encoder per `Value` variant — sidesteps Hash/Eq problems with floats and Json). Short-circuits if no `Delete` is present (the common upsert-only path stays allocation-free).
 
 ## Errors
 

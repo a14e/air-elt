@@ -28,8 +28,8 @@ fn batch(rows: &[(i64, &str)]) -> Batch {
     Batch {
         rows: rows
             .iter()
-            .map(|(id, label)| CoreRow {
-                values: vec![Value::Int64(*id), Value::Text((*label).into())],
+            .map(|(id, label)| {
+                CoreRow::upsert(vec![Value::Int64(*id), Value::Text((*label).into())])
             })
             .collect(),
         next_cursor: None,

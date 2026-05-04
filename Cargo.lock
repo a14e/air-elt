@@ -34,6 +34,7 @@ dependencies = [
  "air-elt-sink-mongodb",
  "air-elt-sink-mysql",
  "air-elt-sink-postgres",
+ "air-elt-source-mongo-cdc",
  "air-elt-source-mongodb",
  "air-elt-source-mysql",
  "air-elt-source-postgres",
@@ -75,6 +76,7 @@ dependencies = [
  "bigdecimal",
  "bson",
  "chrono",
+ "futures",
  "mongodb",
  "num-bigint",
  "serde_json",
@@ -212,6 +214,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "air-elt-source-mongo-cdc"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "air-elt-commons",
+ "air-elt-commons-mongodb",
+ "air-elt-commons-testing",
+ "air-elt-core",
+ "air-elt-sink-mongodb",
+ "air-elt-sink-mysql",
+ "air-elt-sink-postgres",
+ "air-elt-source-mongodb",
+ "air-elt-storage-postgres",
+ "async-trait",
+ "bson",
+ "futures",
+ "mongodb",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "air-elt-source-mongodb"
 version = "0.1.0"
 dependencies = [
@@ -226,6 +254,7 @@ dependencies = [
  "mongodb",
  "serde",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -245,6 +274,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]
@@ -265,6 +295,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]

@@ -2,6 +2,7 @@ pub mod convert;
 pub mod data_type;
 pub mod default_value;
 pub mod matrix;
+pub(crate) mod raw_key;
 pub mod value;
 
 pub use convert::{ConversionContext, ConvertError, convert};

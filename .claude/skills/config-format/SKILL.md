@@ -63,6 +63,50 @@ The same field set covers `[[sources]]`, `[[sinks]]`, and `[[storages]]` of `typ
 - Cursor field set must be a single field in MVP (multi-key Mongo cursors are not yet supported).
 - Mongo collections are schemaless. The sink takes any BSON shape; validation is driven by the source's *sampled* schema (see `[flow.<name>.validation]` below).
 
+### `mongo-cdc` source config (`[[sources]] type = "mongo-cdc"`)
+
+CDC source driven by `collection.watch()` change streams. Requires a **replica-set** Mongo deployment — change streams cannot run on standalone mongod.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | string | required | Connection URL (must point at a replica set, e.g. `mongodb://host:27017/?replicaSet=rs0`) |
+| `database` | string | from URL path | Override the database name |
+| `connect-timeout` / `acquire-timeout` / `idle-timeout` / `max-connections` / `min-connections` | — | — | Same shape as the `mongodb` connector |
+| `operation-timeout` | Duration | `"30s"` | Per-op `maxTimeMS` for find / aggregate calls (sampling, lookup find) |
+| `max-await-time` | Duration | `"1s"` | Long-poll cap on a single `change_stream.next()` await. Tune up for fewer wake-ups, down for lower per-tick latency. |
+| `schema-sample-size` | usize | 100 | Documents pulled by `describe_schema`. Capped at 10 000. |
+
+**Per-flow options** — the `mongo-cdc` source requires the developed `source = { name = "...", mode = "..." }` form on each referencing flow:
+
+| Field | Type | Required | Description |
+|-------|------|:--------:|-------------|
+| `mode` | `"post-image"` / `"lookup-on-update"` | yes | How update events get a post-image. **PostImage** uses `fullDocument: "required"` on the watch options — needs `changeStreamPreAndPostImages` enabled on the collection (Mongo 6+). **LookupOnUpdate** opens the stream without `fullDocument` and issues one `find({_id: {$in: ids}})` per batch to attach the current state. |
+
+```toml
+[flow.users]
+source = { name = "mongo_cdc", mode = "lookup-on-update" }
+sink = "pg_sink"
+storage = "pg_state"
+from = "users"
+to = "public.users"
+mapping = [
+    { from = "_id", to = "id" },
+    { from = "name", to = "name" },
+]
+batch-limit = 500
+
+# Required: cdc emits Upsert/Delete; the sink needs a key.
+[flow.users.conflict]
+key = ["id"]
+strategy = "overwrite"
+```
+
+**Constraints:**
+- `cursor.fields` is **forbidden** — pagination is the resume token, persisted via `Storage::save_resume_token` in a dedicated `air_elt_resume_tokens` table / collection (separate from `air_elt_cursors`).
+- `[flow.<name>.conflict]` is **mandatory** — change events emit `Upsert` and `Delete`, both of which need a key.
+- Drop / rename / dropDatabase / invalidate events fail the iteration; the runner retries with the saved resume token. If the token has aged out of the oplog the operator must intervene.
+- **Bootstrap recipe**: pair `[[sources]] type = "mongo-cdc"` with a parallel `[[sources]] type = "mongodb"` snapshot flow on the same collection. After the snapshot catches up, disable it; the cdc flow keeps the table fresh — including DELETEs the snapshot source cannot observe.
+
 ## `[flow.<name>]`
 
 | Field | Type | Default | Description |

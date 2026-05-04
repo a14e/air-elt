@@ -8,3 +8,4 @@ pub mod mysql_type;
 pub mod null_bind;
 pub mod pool;
 pub mod schema;
+pub mod sink_bind;

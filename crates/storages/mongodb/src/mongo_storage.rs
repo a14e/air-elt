@@ -1,14 +1,18 @@
-//! MongoDB storage backend for cursor state.
+//! MongoDB storage backend for cursor state and CDC resume tokens.
 //!
-//! State is stored in a single collection (default
-//! `"air_elt_cursors"`), one document per flow, keyed on `_id =
-//! flow_name`. The cursor payload is the JSON serialisation of
-//! `CursorState`, parked under field `cursor`. Why JSON instead of
-//! pure BSON: `CursorState` already has a stable JSON serde impl
-//! that round-trips every `Value` variant losslessly via the
-//! tagged-enum form (`{"type": "int64", "value": 7}`), and we can
-//! re-use it as-is here. Storing native BSON would require a
-//! parallel codec for every type variant.
+//! Two collections, both keyed on `_id = flow_name`:
+//! * `"air_elt_cursors"` — column-cursor state for pull-based
+//!   sources (`Storage::{load,save}_cursor`). Payload is the JSON
+//!   serialisation of `CursorState`, parked under field `cursor`.
+//!   Why JSON instead of pure BSON: `CursorState` already has a
+//!   stable JSON serde impl that round-trips every `Value` variant
+//!   losslessly via the tagged-enum form
+//!   (`{"type": "int64", "value": 7}`), and we re-use it here.
+//!   Storing native BSON would require a parallel codec for every
+//!   type variant.
+//! * `"air_elt_resume_tokens"` — opaque CDC resume tokens
+//!   (`Storage::{load,save}_resume_token`). Same JSON-as-string
+//!   approach for the same reason.
 
 use async_trait::async_trait;
 use bson::{Document, doc};
@@ -25,11 +29,17 @@ use air_elt_core::traits::Storage;
 use crate::config::MongoStorageConfig;
 
 const DEFAULT_COLLECTION: &str = "air_elt_cursors";
+/// Resume tokens live in their own collection — see the
+/// `Storage::save_resume_token` rationale: the token is a distinct
+/// concept (opaque BSON keyed by flow), kept apart from
+/// column-cursor state.
+const DEFAULT_RESUME_TOKENS_COLLECTION: &str = "air_elt_resume_tokens";
 
 pub struct MongoStorage {
     client: Client,
     database: String,
     collection: String,
+    resume_tokens_collection: String,
 }
 
 impl MongoStorage {
@@ -64,6 +74,7 @@ impl MongoStorage {
             client,
             database,
             collection,
+            resume_tokens_collection: DEFAULT_RESUME_TOKENS_COLLECTION.to_string(),
         })
     }
 
@@ -71,6 +82,12 @@ impl MongoStorage {
         self.client
             .database(&self.database)
             .collection(&self.collection)
+    }
+
+    fn resume_tokens(&self) -> mongodb::Collection<Document> {
+        self.client
+            .database(&self.database)
+            .collection(&self.resume_tokens_collection)
     }
 }
 
@@ -140,6 +157,44 @@ impl Storage for MongoStorage {
         .with_options(opts)
         .await
         .map_err(RuntimeError::backend)?;
+        Ok(())
+    }
+
+    async fn load_resume_token(&self, flow: &str) -> RuntimeResult<Option<serde_json::Value>> {
+        let opt = self
+            .resume_tokens()
+            .find_one(doc! { "_id": flow })
+            .await
+            .map_err(RuntimeError::backend)?;
+        let Some(doc_) = opt else { return Ok(None) };
+        // `token` is stored as the JSON-string form (round-trips
+        // through serde_json without a parallel BSON codec — same
+        // rationale as `cursor` above).
+        let token_json = doc_.get_str("token").map_err(|_| {
+            RuntimeError::Other(format!(
+                "mongodb storage: resume-token row for flow {flow:?} is missing field `token`"
+            ))
+        })?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(token_json).map_err(RuntimeError::from)?;
+        Ok(Some(parsed))
+    }
+
+    async fn save_resume_token(&self, flow: &str, token: &serde_json::Value) -> RuntimeResult<()> {
+        let token_json = serde_json::to_string(token).map_err(RuntimeError::from)?;
+        let opts = ReplaceOptions::builder().upsert(Some(true)).build();
+        self.resume_tokens()
+            .replace_one(
+                doc! { "_id": flow },
+                doc! {
+                    "_id": flow,
+                    "token": token_json,
+                    "updated_at": bson::DateTime::now(),
+                },
+            )
+            .with_options(opts)
+            .await
+            .map_err(RuntimeError::backend)?;
         Ok(())
     }
 }

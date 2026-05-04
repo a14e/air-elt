@@ -55,22 +55,18 @@ async fn write_batch_and_validate_access() {
     let now = Utc.with_ymd_and_hms(2026, 4, 22, 10, 0, 0).unwrap();
     let batch = Batch {
         rows: vec![
-            CoreRow {
-                values: vec![
-                    Value::Int64(1),
-                    Value::Text("one".into()),
-                    Value::Timestamp(now),
-                    Value::Json(serde_json::json!({"k": 1})),
-                ],
-            },
-            CoreRow {
-                values: vec![
-                    Value::Int64(2),
-                    Value::Text("two".into()),
-                    Value::Timestamp(now),
-                    Value::Null,
-                ],
-            },
+            CoreRow::upsert(vec![
+                Value::Int64(1),
+                Value::Text("one".into()),
+                Value::Timestamp(now),
+                Value::Json(serde_json::json!({"k": 1})),
+            ]),
+            CoreRow::upsert(vec![
+                Value::Int64(2),
+                Value::Text("two".into()),
+                Value::Timestamp(now),
+                Value::Null,
+            ]),
         ],
         next_cursor: None,
     };
@@ -150,7 +146,7 @@ async fn all_nulls_across_data_types() {
     let mut row = vec![Value::Int64(1)];
     row.extend(std::iter::repeat_n(Value::Null, columns.len() - 1));
     let batch = Batch {
-        rows: vec![CoreRow { values: row }],
+        rows: vec![CoreRow::upsert(row)],
         next_cursor: None,
     };
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -259,23 +255,21 @@ async fn all_types_non_null_round_trip() {
     let uid = Uuid::parse_str("a1a2a3a4-b1b2-c1c2-d1d2-e1e2e3e4e5e6").unwrap();
 
     let batch = Batch {
-        rows: vec![CoreRow {
-            values: vec![
-                Value::Int64(1),
-                Value::Bool(true),
-                Value::Int16(i16::MAX),
-                Value::Int32(i32::MIN),
-                Value::Int64(i64::MAX),
-                Value::Float32(std::f32::consts::PI),
-                Value::Float64(std::f64::consts::E),
-                Value::Text("test-text".into()),
-                Value::Bytes(vec![0xCA, 0xFE]),
-                Value::Date(date),
-                Value::Timestamp(ts),
-                Value::Uuid(uid),
-                Value::Json(serde_json::json!({"k": [1, 2]})),
-            ],
-        }],
+        rows: vec![CoreRow::upsert(vec![
+            Value::Int64(1),
+            Value::Bool(true),
+            Value::Int16(i16::MAX),
+            Value::Int32(i32::MIN),
+            Value::Int64(i64::MAX),
+            Value::Float32(std::f32::consts::PI),
+            Value::Float64(std::f64::consts::E),
+            Value::Text("test-text".into()),
+            Value::Bytes(vec![0xCA, 0xFE]),
+            Value::Date(date),
+            Value::Timestamp(ts),
+            Value::Uuid(uid),
+            Value::Json(serde_json::json!({"k": [1, 2]})),
+        ])],
         next_cursor: None,
     };
 

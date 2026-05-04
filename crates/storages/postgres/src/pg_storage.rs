@@ -140,4 +140,23 @@ impl Storage for PgStorage {
             .map_err(RuntimeError::backend)?;
         Ok(())
     }
+
+    async fn load_resume_token(&self, flow: &str) -> RuntimeResult<Option<serde_json::Value>> {
+        let row: Option<(serde_json::Value,)> = sqlx::query_as(sql::SELECT_RESUME_TOKEN)
+            .bind(flow)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(RuntimeError::backend)?;
+        Ok(row.map(|(j,)| j))
+    }
+
+    async fn save_resume_token(&self, flow: &str, token: &serde_json::Value) -> RuntimeResult<()> {
+        sqlx::query(sql::UPSERT_RESUME_TOKEN)
+            .bind(flow)
+            .bind(token)
+            .execute(&self.pool)
+            .await
+            .map_err(RuntimeError::backend)?;
+        Ok(())
+    }
 }

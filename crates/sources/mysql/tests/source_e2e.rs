@@ -47,6 +47,7 @@ async fn describe_and_read_with_cursor() {
         cursor_fields: vec!["id".into()],
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 3,
+        source_options: toml::Table::new(),
     };
 
     source
@@ -136,6 +137,7 @@ async fn read_with_nullable_cursor() {
         cursor_fields: vec!["rank".into(), "id".into()],
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 2,
+        source_options: toml::Table::new(),
     };
 
     let ctx = source.build_context(&spec).await.expect("build_context");
@@ -212,6 +214,7 @@ async fn read_with_nullable_cursor_desc() {
         cursor_fields: vec!["rank".into(), "id".into()],
         cursor_order: air_elt_core::config::model::CursorOrder::Desc,
         limit: 2,
+        source_options: toml::Table::new(),
     };
 
     let ctx = source.build_context(&spec).await.expect("build_context");
@@ -279,6 +282,7 @@ async fn tinyint_one_round_trips_as_bool() {
         cursor_fields: vec!["id".into()],
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 10,
+        source_options: toml::Table::new(),
     };
 
     let schema = source
@@ -356,6 +360,7 @@ async fn binary_columns_carry_size() {
         cursor_fields: vec!["id".into()],
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 10,
+        source_options: toml::Table::new(),
     };
     let ctx = source.build_context(&spec).await.expect("build_context");
     let batch = source

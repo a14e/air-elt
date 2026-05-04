@@ -1,0 +1,29 @@
+[flow.users]
+# Developed source ref carries the per-flow `mode`. `cursor.fields`
+# must be omitted — cdc paginates via the resume token.
+source = { name = "mongo_cdc", mode = "lookup-on-update" }
+sink = "pg_sink"
+storage = "pg_state"
+
+from = "users"
+to = "public.users"
+
+batch-limit = 500
+
+mapping = [
+    { from = "_id", to = "id" },
+    { from = "name", to = "name" },
+    { from = "email", to = "email" },
+]
+
+# Required for cdc — change events emit Upsert/Delete and the sink
+# needs a key to target. `id` (sink-side) is mapped from `_id` above.
+[flow.users.conflict]
+key = ["id"]
+strategy = "overwrite"
+
+# Bootstrap recipe: run a parallel `[flow.users_snapshot]` driven by
+# the regular `mongodb` source (cursor on `_id`) until it catches up,
+# then disable it. The `mongo-cdc` flow above keeps the table fresh
+# from oplog events — including DELETEs, which the snapshot source
+# cannot observe.

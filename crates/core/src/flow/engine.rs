@@ -65,7 +65,7 @@ impl FlowEngine {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::flow::test_support::*;
+    use crate::flow::test_utils::*;
 
     #[tokio::test(start_paused = true)]
     async fn engine_collects_first_error() {

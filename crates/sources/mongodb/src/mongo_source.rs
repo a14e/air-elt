@@ -18,11 +18,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bson::{Bson, Document, doc};
 use futures::stream::TryStreamExt;
-use mongodb::{Client, Collection, options::AggregateOptions, options::FindOptions};
+use mongodb::{Client, Collection, options::FindOptions};
 use tracing::{debug, info};
 
 use air_elt_commons_mongodb::client::{PoolSettings, connect, database_from_url};
-use air_elt_commons_mongodb::{bson_value, identifier, infer, path};
+use air_elt_commons_mongodb::{bson_value, identifier, path, sampling};
 use air_elt_core::config::model::CursorOrder;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::mapping::FieldPath;
@@ -94,28 +94,6 @@ impl MongoSource {
         identifier::validate_name(name).map_err(RuntimeError::from)?;
         Ok(self.client.database(&self.database).collection(name))
     }
-
-    async fn sample_documents(
-        &self,
-        collection: &Collection<Document>,
-        n: usize,
-    ) -> RuntimeResult<Vec<Document>> {
-        use mongodb::bson::doc as bdoc;
-        let pipeline = vec![bdoc! { "$sample": { "size": n as i64 } }];
-        let opts = AggregateOptions::builder()
-            .max_time(self.operation_timeout)
-            .build();
-        let mut cursor = collection
-            .aggregate(pipeline)
-            .with_options(opts)
-            .await
-            .map_err(RuntimeError::backend)?;
-        let mut out = Vec::with_capacity(n);
-        while let Some(d) = cursor.try_next().await.map_err(RuntimeError::backend)? {
-            out.push(d);
-        }
-        Ok(out)
-    }
 }
 
 struct MongoSourceCtx {
@@ -169,20 +147,8 @@ impl Source for MongoSource {
 
     async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema> {
         let coll = self.collection(table)?;
-        let docs = self.sample_documents(&coll, self.schema_sample).await?;
-        if docs.is_empty() {
-            return Err(RuntimeError::Other(format!(
-                "mongodb source: collection {table:?} returned no documents \
-                 — cannot infer schema"
-            )));
-        }
-        // We don't know the operator's mapping `from` set here (the
-        // schema is consulted before flow assembly is finalised in the
-        // pipeline), so emit a flat schema with every leaf path we
-        // observed in the sample. Nested fields are reachable via
-        // mapping `from = "addr.city"` — `Schema::find` matches by
-        // dotted name.
-        infer::infer_schema_from_sample(&docs).map_err(|e| RuntimeError::Other(e.to_string()))
+        sampling::describe_collection_schema(&coll, self.schema_sample, self.operation_timeout)
+            .await
     }
 
     async fn build_context(&self, spec: &ReadSpec) -> RuntimeResult<Arc<dyn SourceCtx>> {
@@ -275,7 +241,7 @@ impl Source for MongoSource {
                 cursor_values.push(value);
             }
             last_cursor_values = Some(cursor_values);
-            out_rows.push(Row { values });
+            out_rows.push(Row::upsert(values));
         }
 
         let next_cursor = last_cursor_values.map(|values| {
@@ -302,24 +268,13 @@ impl Source for MongoSource {
         // `sample` impl. Sampling-validation unions both before running
         // the conversion plan.
         let coll = self.collection(&spec.table)?;
-        let docs = self.sample_documents(&coll, n).await?;
+        let docs = sampling::sample_documents(&coll, n, self.operation_timeout).await?;
         let column_paths: Vec<FieldPath> = spec
             .columns
             .iter()
             .map(|s| FieldPath::parse(s).map_err(|e| RuntimeError::Other(e.to_string())))
             .collect::<RuntimeResult<_>>()?;
-        let mut rows = Vec::with_capacity(docs.len());
-        for d in docs {
-            let mut values = Vec::with_capacity(column_paths.len());
-            for p in &column_paths {
-                let v = match path::get(&d, p) {
-                    Some(b) => bson_value::from_bson(b)?,
-                    None => Value::Null,
-                };
-                values.push(v);
-            }
-            rows.push(Row { values });
-        }
+        let rows = sampling::rows_from_documents(&docs, &column_paths)?;
         Ok(rows)
     }
 }

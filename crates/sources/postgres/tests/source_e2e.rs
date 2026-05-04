@@ -47,6 +47,7 @@ async fn describe_and_read_with_cursor() {
         cursor_fields: vec!["id".into()],
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 3,
+        source_options: toml::Table::new(),
     };
 
     source
@@ -135,6 +136,7 @@ async fn read_with_nullable_cursor() {
         cursor_fields: vec!["rank".into(), "id".into()],
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 2,
+        source_options: toml::Table::new(),
     };
 
     let ctx = source.build_context(&spec).await.expect("build_context");

@@ -46,7 +46,7 @@ use air_elt_commons_mongodb::{bson_value, identifier, path};
 use air_elt_core::config::conflict::{ConflictConfig, ConflictStrategy};
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::mapping::FieldPath;
-use air_elt_core::model::{Batch, Schema, SinkCtx, WriteReport, WriteSpec};
+use air_elt_core::model::{Batch, RowOp, Schema, SinkCtx, WriteReport, WriteSpec};
 use air_elt_core::traits::Sink;
 
 use crate::config::MongoSinkConfig;
@@ -188,6 +188,25 @@ impl Sink for MongoSink {
         Ok(())
     }
 
+    async fn validate_delete_access(&self, spec: &WriteSpec) -> RuntimeResult<()> {
+        // Index-backed: every Mongo collection has a mandatory unique
+        // `_id` index, so a filter on `_id` resolves via that index even
+        // when nothing matches — no COLLSCAN. We use `$in: []` which the
+        // server short-circuits to "match nothing" without touching any
+        // documents, while still exercising the delete privilege /
+        // collection visibility path. `validate_access` above already
+        // round-trips an insert + delete sentinel; this method exists
+        // for parity with the SQL backends and to log the explicit
+        // DELETE-path check.
+        let coll = self.collection(&spec.table)?;
+        let empty: Vec<Bson> = Vec::new();
+        coll.delete_many(doc! { "_id": { "$in": empty } })
+            .await
+            .map_err(RuntimeError::backend)?;
+        info!(collection = %spec.table, "mongodb sink delete access validated");
+        Ok(())
+    }
+
     async fn describe_schema(&self, _table: &str) -> RuntimeResult<Schema> {
         // Mongo collections have no authoritative schema. The runner
         // builds a permissive sink schema from the source's declared
@@ -248,8 +267,58 @@ impl Sink for MongoSink {
             return Ok(WriteReport::default());
         }
         let coll = self.collection(&spec.table)?;
-        let mut docs: Vec<Document> = Vec::with_capacity(batch.rows.len());
-        for (row_idx, row) in batch.rows.iter().enumerate() {
+
+        // Order matters within a CDC batch: insert(_id=42) followed
+        // by delete(_id=42) must apply upsert first; delete-first
+        // would let the upsert recreate the row we just removed.
+        let mut total_written: u64 = 0;
+        let upsert_rows: Vec<&air_elt_core::model::Row> = batch
+            .rows
+            .iter()
+            .filter(|r| r.op == RowOp::Upsert)
+            .collect();
+        if !upsert_rows.is_empty() {
+            total_written += self
+                .write_upsert_rows(my_ctx, &coll, spec, &upsert_rows)
+                .await?;
+        }
+
+        let delete_rows: Vec<&air_elt_core::model::Row> = batch
+            .rows
+            .iter()
+            .filter(|r| r.op == RowOp::Delete)
+            .collect();
+        if !delete_rows.is_empty() {
+            let keys = match &my_ctx.plan {
+                UpsertPlan::Overwrite { keys } => keys.as_slice(),
+                _ => {
+                    return Err(RuntimeError::Other(
+                        "mongodb sink received Delete row but flow has no \
+                         [flow.<x>.conflict] block (or strategy=ignore) — \
+                         Delete needs an overwrite key to target documents"
+                            .into(),
+                    ));
+                }
+            };
+            total_written +=
+                write_delete_many(&coll, &delete_rows, keys, my_ctx.id_fast_path).await?;
+        }
+        Ok(WriteReport {
+            rows_written: total_written,
+        })
+    }
+}
+
+impl MongoSink {
+    async fn write_upsert_rows(
+        &self,
+        my_ctx: &MongoSinkCtx,
+        coll: &Collection<Document>,
+        spec: &WriteSpec,
+        rows: &[&air_elt_core::model::Row],
+    ) -> RuntimeResult<u64> {
+        let mut docs: Vec<Document> = Vec::with_capacity(rows.len());
+        for (row_idx, row) in rows.iter().enumerate() {
             let mut d = Document::new();
             for (i, p) in my_ctx.column_paths.iter().enumerate() {
                 let v = row.values.get(i).ok_or_else(|| {
@@ -290,7 +359,7 @@ impl Sink for MongoSink {
                     .map_err(RuntimeError::backend)?;
                 len as u64
             }
-            UpsertPlan::Ignore => write_insert_ignore(&coll, docs).await?,
+            UpsertPlan::Ignore => write_insert_ignore(coll, docs).await?,
             UpsertPlan::Overwrite { keys } => {
                 if my_ctx.server_version.supports_bulk_write() {
                     write_upsert_bulk(
@@ -303,14 +372,68 @@ impl Sink for MongoSink {
                     )
                     .await?
                 } else {
-                    write_upsert_parallel(&coll, docs, keys, my_ctx.id_fast_path).await?
+                    write_upsert_parallel(coll, docs, keys, my_ctx.id_fast_path).await?
                 }
             }
         };
-        Ok(WriteReport {
-            rows_written: written,
-        })
+        Ok(written)
     }
+}
+
+async fn write_delete_many(
+    coll: &Collection<Document>,
+    rows: &[&air_elt_core::model::Row],
+    keys: &[UpsertKey],
+    id_fast_path: bool,
+) -> RuntimeResult<u64> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let filter = if id_fast_path {
+        // keys.len() == 1 && keys[0].path == "_id"
+        let id_idx = keys[0].column_idx;
+        let mut ids: Vec<Bson> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let v = row
+                .values
+                .get(id_idx)
+                .ok_or_else(|| RuntimeError::Other("delete row has no _id slot".into()))?;
+            if v.is_null() {
+                return Err(RuntimeError::Other(
+                    "mongodb delete: _id cannot be NULL".into(),
+                ));
+            }
+            ids.push(bson_value::to_bson(v)?);
+        }
+        doc! { "_id": { "$in": ids } }
+    } else {
+        // Compound key — emit `$or` of per-row equality filters.
+        let mut clauses: Vec<Document> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut clause = Document::new();
+            for k in keys {
+                let v = row
+                    .values
+                    .get(k.column_idx)
+                    .ok_or_else(|| RuntimeError::Other("delete row missing key slot".into()))?;
+                if v.is_null() {
+                    return Err(RuntimeError::Other(format!(
+                        "mongodb delete: key {:?} cannot be NULL",
+                        k.path.to_string()
+                    )));
+                }
+                clause.insert(k.path.to_string(), bson_value::to_bson(v)?);
+            }
+            clauses.push(clause);
+        }
+        doc! { "$or": clauses }
+    };
+    debug!(rows = rows.len(), "mongodb deleteMany");
+    let res = coll
+        .delete_many(filter)
+        .await
+        .map_err(RuntimeError::backend)?;
+    Ok(res.deleted_count)
 }
 
 fn resolve_keys(

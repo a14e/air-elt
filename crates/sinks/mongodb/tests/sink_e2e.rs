@@ -35,20 +35,16 @@ async fn insert_and_upsert_with_dot_notation() {
 
     let batch = Batch {
         rows: vec![
-            Row {
-                values: vec![
-                    Value::Int64(1),
-                    Value::Text("alice".into()),
-                    Value::Text("Berlin".into()),
-                ],
-            },
-            Row {
-                values: vec![
-                    Value::Int64(2),
-                    Value::Text("bob".into()),
-                    Value::Text("Munich".into()),
-                ],
-            },
+            Row::upsert(vec![
+                Value::Int64(1),
+                Value::Text("alice".into()),
+                Value::Text("Berlin".into()),
+            ]),
+            Row::upsert(vec![
+                Value::Int64(2),
+                Value::Text("bob".into()),
+                Value::Text("Munich".into()),
+            ]),
         ],
         next_cursor: None,
     };
@@ -57,13 +53,11 @@ async fn insert_and_upsert_with_dot_notation() {
 
     // Re-write same id 1 with new city — upsert path replaces it.
     let batch2 = Batch {
-        rows: vec![Row {
-            values: vec![
-                Value::Int64(1),
-                Value::Text("alice".into()),
-                Value::Text("Hamburg".into()),
-            ],
-        }],
+        rows: vec![Row::upsert(vec![
+            Value::Int64(1),
+            Value::Text("alice".into()),
+            Value::Text("Hamburg".into()),
+        ])],
         next_cursor: None,
     };
     sink.write_batch(&spec, ctx, &batch2).await.unwrap();

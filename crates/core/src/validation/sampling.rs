@@ -158,7 +158,7 @@ pub async fn run(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::flow::test_support;
+    use crate::flow::test_utils;
     use crate::traits::{MockSink, MockSource, MockStorage};
     use crate::types::{ConversionContext, DataType, Value};
 
@@ -177,7 +177,7 @@ mod tests {
         // suffice for these tests.
         let sink = MockSink::new();
         let storage = MockStorage::new();
-        test_support::test_flow(source, sink, storage)
+        test_utils::test_flow(source, sink, storage)
     }
 
     #[tokio::test]
@@ -196,11 +196,8 @@ mod tests {
     async fn identity_plan_skipped() {
         let mut src = MockSource::new();
         src.expect_cancel_safe().return_const(true);
-        src.expect_sample().returning(|_, _| {
-            Ok(vec![crate::model::Row {
-                values: vec![Value::Int32(7)],
-            }])
-        });
+        src.expect_sample()
+            .returning(|_, _| Ok(vec![crate::model::Row::upsert(vec![Value::Int32(7)])]));
         src.expect_sample_fresh().returning(|_, _| Ok(Vec::new()));
         let flow = build_flow_with(src);
         // Identity plan should be skipped — no convert call, no error
@@ -219,9 +216,9 @@ mod tests {
         let mut src = MockSource::new();
         src.expect_cancel_safe().return_const(true);
         src.expect_sample().returning(|_, _| {
-            Ok(vec![crate::model::Row {
-                values: vec![Value::Text("not-a-uuid".into())],
-            }])
+            Ok(vec![crate::model::Row::upsert(vec![Value::Text(
+                "not-a-uuid".into(),
+            )])])
         });
         src.expect_sample_fresh().returning(|_, _| Ok(Vec::new()));
         let flow = build_flow_with(src);

@@ -70,12 +70,32 @@ pub trait Source: Send + Sync {
     fn cancel_safe(&self) -> bool {
         true
     }
+
+    /// `true` when this source can emit `Row { op: Delete }`. Pull-based
+    /// connectors (postgres / mysql / mongodb cursor) only ever emit
+    /// `Upsert`, so they keep the default `false`. CDC connectors
+    /// (`mongo-cdc`) override to `true`. The validation pipeline uses
+    /// this flag to decide whether to also pre-flight `Sink::validate_delete_access`
+    /// — without it, a missing DELETE privilege on the sink only
+    /// surfaces at runtime on the first delete batch.
+    fn emits_deletes(&self) -> bool {
+        false
+    }
 }
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait Sink: Send + Sync {
     async fn validate_access(&self, spec: &WriteSpec) -> RuntimeResult<()>;
+    /// Pre-flight the DELETE path. Default returns `Ok(())` so backends
+    /// with no DELETE distinction (or that already cover it inside
+    /// `validate_access`) opt out for free. Called by the validation
+    /// pipeline only when the source `emits_deletes()` *and* the flow
+    /// declares a `[flow.x.conflict]` block — both are required for
+    /// the runner to ever invoke the DELETE path.
+    async fn validate_delete_access(&self, _spec: &WriteSpec) -> RuntimeResult<()> {
+        Ok(())
+    }
     async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema>;
     async fn build_context(&self, spec: &WriteSpec) -> RuntimeResult<Arc<dyn SinkCtx>>;
     async fn write_batch(
@@ -109,6 +129,29 @@ pub trait Storage: Send + Sync {
     async fn migrate(&self) -> RuntimeResult<()>;
     async fn load_cursor(&self, flow: &str) -> RuntimeResult<Option<CursorState>>;
     async fn save_cursor(&self, flow: &str, state: &CursorState) -> RuntimeResult<()>;
+
+    /// CDC resume tokens are conceptually distinct from column-based
+    /// cursors — they are opaque per-stream blobs (BSON for Mongo)
+    /// keyed by flow name. Stored in their own table / collection.
+    /// Default impls error so a misrouted call surfaces clearly.
+    async fn load_resume_token(&self, _flow: &str) -> RuntimeResult<Option<serde_json::Value>> {
+        Err(crate::error::RuntimeError::Other(
+            "this storage backend does not implement CDC resume-token \
+             persistence — switch to a backend that does (postgres / mysql / mongodb)"
+                .into(),
+        ))
+    }
+    async fn save_resume_token(
+        &self,
+        _flow: &str,
+        _token: &serde_json::Value,
+    ) -> RuntimeResult<()> {
+        Err(crate::error::RuntimeError::Other(
+            "this storage backend does not implement CDC resume-token \
+             persistence — switch to a backend that does (postgres / mysql / mongodb)"
+                .into(),
+        ))
+    }
 
     /// See `Source::cancel_safe`. Same contract — Mongo storages
     /// return `false`; sqlx-backed storages keep the default `true`.

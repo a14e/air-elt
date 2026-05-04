@@ -70,6 +70,7 @@ async fn numeric_zero_scale_decoded_as_bigint() {
         cursor_fields: vec!["id".into()],
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 10,
+        source_options: toml::Table::new(),
     };
     let ctx = source.build_context(&spec).await.unwrap();
     let batch = source.read_batch(&spec, ctx, None).await.unwrap();

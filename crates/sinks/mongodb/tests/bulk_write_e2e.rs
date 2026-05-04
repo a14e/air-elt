@@ -36,9 +36,7 @@ async fn round_trip_overwrite(sink: MongoSink, db: &str, client: &mongodb::Clien
     // First batch — pure inserts via upsert.
     let batch_a = Batch {
         rows: (1_i64..=3)
-            .map(|i| Row {
-                values: vec![Value::Int64(i), Value::Text(format!("v1-{i}"))],
-            })
+            .map(|i| Row::upsert(vec![Value::Int64(i), Value::Text(format!("v1-{i}"))]))
             .collect(),
         next_cursor: None,
     };
@@ -52,9 +50,7 @@ async fn round_trip_overwrite(sink: MongoSink, db: &str, client: &mongodb::Clien
     // half of the upsert path.
     let batch_b = Batch {
         rows: (1_i64..=3)
-            .map(|i| Row {
-                values: vec![Value::Int64(i), Value::Text(format!("v2-{i}"))],
-            })
+            .map(|i| Row::upsert(vec![Value::Int64(i), Value::Text(format!("v2-{i}"))]))
             .collect(),
         next_cursor: None,
     };

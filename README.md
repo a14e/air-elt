@@ -46,6 +46,19 @@ E2E tests need a PostgreSQL instance. Two options:
 - `AIR_ELT_LOG` / `RUST_LOG` — logging level (`info` by default). **`debug` is only safe for short diagnostic sessions** — it logs full SQL per batch, which is tens of KB per line at default `batch_limit = 1024`. Do not leave `debug` on in production. `trace` is an even firmer don't-for-prod.
 - Any `${VAR}` reference inside the config file is expanded from process env at load time; defaults are spelled `${VAR:default}`. Avoid embedding secrets in command-line arguments — they appear in `ps` output. Use the config's `[secrets]` section or a dedicated `${VAR}` with a restricted env.
 
+## Bootstrap a CDC pipeline
+
+The `mongo-cdc` source streams MongoDB change events (insert / update / replace / delete) and emits `Upsert` / `Delete` rows to any sink. It needs a **replica-set** Mongo deployment — change streams cannot run on standalone mongod.
+
+A from-scratch bootstrap pairs two flows over the same collection:
+
+1. A **snapshot** flow with `[[sources]] type = "mongodb"` (cursor-driven, full collection scan).
+2. A **cdc** flow with `[[sources]] type = "mongo-cdc"` (change-stream driven, picks up new mutations including DELETEs).
+
+Run them in parallel until the snapshot finishes, then disable the snapshot flow — the cdc flow keeps the table fresh from the oplog. Choose `mode = "post-image"` (requires `changeStreamPreAndPostImages` enabled on the collection) or `mode = "lookup-on-update"` (one extra `find` per batch, no server-side flag) per flow.
+
+A working example sits at `examples/mongo-cdc-to-pg/`. See the `config-format` skill for the full field reference.
+
 ## Configs and secrets
 
 `${VAR}` / `${VAR:default}` placeholders are resolved before TOML parse. Lookup order: process env → config `[secrets]` map → default clause → error. See `examples/pg-to-mongo/config.toml`.
