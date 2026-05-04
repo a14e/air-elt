@@ -228,18 +228,50 @@ impl Source for MongoCdcSource {
 
         let mut events: Vec<ChangeStreamEvent<Document>> = Vec::with_capacity(spec.limit);
         let mut last_token: Option<ResumeToken> = None;
+        // Whole-batch deadline. Without it, an awaitData change-stream
+        // cursor blocks `try_next` indefinitely when the workload is
+        // quiet — `read_batch` would hang until the runner's outer
+        // `query_timeout` fires (or, in tests that bypass the runner,
+        // forever). Bounding here means an idle drain returns whatever
+        // we have so the runner can persist forward progress.
+        //
+        // Why we track `hit_deadline`: the post-loop PBRT fallback
+        // below is unsafe when we time out mid-batch. The driver may
+        // have buffered events that `try_next` hasn't returned yet;
+        // their post-batch resume token is already cached in
+        // `stream.resume_token()`. If we use that token as the saved
+        // cursor, those buffered events are skipped on the next
+        // `read_batch` (cursor advances past them). Only fall back to
+        // PBRT when the loop drained cleanly (stream end or limit
+        // reached). On timeout we keep `last_token` at the last
+        // *delivered* event's token, so the server replays anything
+        // that didn't make it across the API boundary.
+        let deadline = tokio::time::Instant::now() + self.operation_timeout;
+        let mut hit_deadline = false;
         while events.len() < spec.limit {
-            match stream.try_next().await.map_err(RuntimeError::backend)? {
-                Some(event) => {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                hit_deadline = true;
+                break;
+            }
+            match tokio::time::timeout(remaining, stream.try_next()).await {
+                Ok(Ok(Some(event))) => {
                     last_token = stream.resume_token();
                     events.push(event);
                 }
-                None => break,
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => return Err(RuntimeError::backend(e)),
+                Err(_) => {
+                    hit_deadline = true;
+                    break;
+                }
             }
         }
-        // After draining, also pick up the post-batch-resume-token so a
-        // long quiescent window still advances the cursor.
-        if last_token.is_none() {
+        // After a clean drain (stream end or limit reached) pick up
+        // the post-batch resume token so a long quiescent window
+        // still advances the cursor. Skipped on timeout — see the
+        // `hit_deadline` rationale above.
+        if !hit_deadline && last_token.is_none() {
             last_token = stream.resume_token();
         }
 
