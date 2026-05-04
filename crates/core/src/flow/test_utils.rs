@@ -27,9 +27,7 @@ impl SinkCtx for UnitSinkCtx {
 
 pub fn one_row_batch() -> Batch {
     Batch {
-        rows: vec![Row {
-            values: vec![Value::Int64(1)],
-        }],
+        rows: vec![Row::upsert(vec![Value::Int64(1)])],
         next_cursor: Some(CursorState::new(vec![CursorFieldValue {
             name: "id".into(),
             value: Value::Int64(1),
@@ -74,9 +72,7 @@ pub fn mock_source_no_cursor() -> MockSource {
         let n = call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if n == 0 {
             Ok(Batch {
-                rows: vec![Row {
-                    values: vec![Value::Int64(1)],
-                }],
+                rows: vec![Row::upsert(vec![Value::Int64(1)])],
                 next_cursor: None,
             })
         } else {
@@ -166,6 +162,7 @@ pub fn test_flow_named(
             cursor_fields: vec!["id".into()],
             cursor_order: CursorOrder::Asc,
             limit: 1,
+            source_options: toml::Table::new(),
         },
         write_spec: WriteSpec {
             columns: vec!["id".into()],
@@ -178,6 +175,7 @@ pub fn test_flow_named(
         access_check: true,
         fields_check: true,
         inserts_check: true,
+        cursor_persistence: crate::model::CursorPersistence::ColumnCursor,
     };
     FlowState::new_unchecked(assembled, Vec::new())
 }

@@ -1,0 +1,36 @@
+[package]
+name = "air-elt-source-mongo-cdc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+air-elt-core = { workspace = true }
+air-elt-commons = { workspace = true }
+air-elt-commons-mongodb = { workspace = true }
+mongodb = { workspace = true }
+bson = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+ahash = { workspace = true }
+
+[dev-dependencies]
+air-elt-commons-testing = { workspace = true }
+air-elt-source-mongodb = { workspace = true }
+air-elt-sink-postgres = { workspace = true }
+air-elt-sink-mysql = { workspace = true }
+air-elt-sink-mongodb = { workspace = true }
+air-elt-storage-postgres = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+sqlx = { workspace = true }
+
+[lints]
+workspace = true

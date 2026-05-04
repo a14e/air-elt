@@ -1,0 +1,35 @@
+[config]
+include = ["flows"]
+
+# `mongo-cdc` requires a replica-set deployment — change streams are
+# unavailable on standalone mongod. The URL below is fine for a local
+# RS launched via:
+#
+#   docker run -d --rm -p 27017:27017 mongo:8 --replSet rs0 --bind_ip_all
+#   docker exec <id> mongosh --eval \
+#     'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
+
+[secrets]
+MONGO_SRC_URL = "mongodb://localhost:27017/?replicaSet=rs0&directConnection=true"
+PG_SINK_URL = "postgres://postgres:postgres@localhost:5432/target"
+PG_STATE_URL = "postgres://postgres:postgres@localhost:5432/state"
+
+[[sources]]
+name = "mongo_cdc"
+type = "mongo-cdc"
+# `database` lives at the source level — change-stream cursors are
+# attached at the collection level (see flow.from). `max-await-time`
+# bounds a single quiescent watch poll; tune up for fewer wake-ups.
+config = { url = "${MONGO_SRC_URL}", database = "appdb", max-await-time = "1s" }
+
+[[sinks]]
+name = "pg_sink"
+type = "postgres"
+config = { url = "${PG_SINK_URL}" }
+
+[[storages]]
+name = "pg_state"
+type = "postgres"
+# Resume tokens land in `air_elt_resume_tokens` (created by migration
+# 0002); column cursors keep using `air_elt_cursors`.
+config = { url = "${PG_STATE_URL}" }

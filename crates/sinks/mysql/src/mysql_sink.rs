@@ -2,13 +2,13 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{MySqlPool, QueryBuilder};
 use tracing::{debug, info};
 
 use air_elt_commons_mysql::pool;
+use air_elt_commons_mysql::sink_bind::bind_value_separated;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
-use air_elt_core::model::{Batch, Schema, SinkCtx, WriteReport, WriteSpec};
+use air_elt_core::model::{Batch, Row as CoreRow, RowOp, Schema, SinkCtx, WriteReport, WriteSpec};
 use air_elt_core::traits::Sink;
 use air_elt_core::types::{DataType, Value};
 
@@ -22,6 +22,14 @@ struct MySqlSinkCtx {
     /// empty string when conflict is `Ignore` (already encoded by the
     /// `INSERT IGNORE` prefix) or absent.
     conflict_suffix: String,
+    /// See `pg_sink::DeletePlan` for why we keep prefix + indices
+    /// instead of a fully-formed query.
+    delete: Option<DeletePlan>,
+}
+
+struct DeletePlan {
+    prefix: String,
+    key_indices: Vec<usize>,
 }
 
 impl SinkCtx for MySqlSinkCtx {
@@ -83,6 +91,19 @@ impl Sink for MySqlSink {
         Ok(())
     }
 
+    async fn validate_delete_access(&self, spec: &WriteSpec) -> RuntimeResult<()> {
+        // Zero-row `DELETE FROM t WHERE FALSE` inside a rolled-back tx —
+        // surfaces "no DELETE privilege" / "no such table" without
+        // touching any rows.
+        let stmt = sql::probe_delete_where_false(&spec.table)?;
+        let mut tx = self.pool.begin().await.map_err(RuntimeError::backend)?;
+        let exec_result = sqlx::query(&stmt).execute(&mut *tx).await;
+        tx.rollback().await.map_err(RuntimeError::backend)?;
+        exec_result.map_err(RuntimeError::backend)?;
+        info!(table = %spec.table, "mysql sink delete access validated");
+        Ok(())
+    }
+
     async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema> {
         let schema = air_elt_commons_mysql::schema::fetch_schema(&self.pool, table).await?;
         Ok(schema)
@@ -118,10 +139,28 @@ impl Sink for MySqlSink {
                 String::new(),
             ),
         };
+        let delete = match &spec.conflict {
+            Some(c) => Some(DeletePlan {
+                prefix: sql::delete_in_prefix(&spec.table, &c.key)?,
+                key_indices: c
+                    .key
+                    .iter()
+                    .map(|k| {
+                        spec.columns.iter().position(|c| c == k).ok_or_else(|| {
+                            RuntimeError::Other(format!(
+                                "conflict.key column {k:?} missing from mapping (loader should reject this)"
+                            ))
+                        })
+                    })
+                    .collect::<RuntimeResult<_>>()?,
+            }),
+            None => None,
+        };
         Ok(Arc::new(MySqlSinkCtx {
             column_types,
             insert_statement,
             conflict_suffix,
+            delete,
         }))
     }
 
@@ -134,155 +173,93 @@ impl Sink for MySqlSink {
         if batch.rows.is_empty() {
             return Ok(WriteReport { rows_written: 0 });
         }
-
         let my_ctx = ctx.downcast_ref_to::<MySqlSinkCtx>()?;
+        let upserted = self.write_upsert_batch(my_ctx, &batch.rows).await?;
+        let deleted = self.write_delete_batch(my_ctx, &batch.rows).await?;
+        Ok(WriteReport {
+            rows_written: upserted + deleted,
+        })
+    }
+}
 
+impl MySqlSink {
+    async fn write_upsert_batch(
+        &self,
+        my_ctx: &MySqlSinkCtx,
+        rows: &[CoreRow],
+    ) -> RuntimeResult<u64> {
+        if !rows.iter().any(is_upsert) {
+            return Ok(0);
+        }
         let mut qb: QueryBuilder<'_, sqlx::MySql> = QueryBuilder::new(&my_ctx.insert_statement);
         let column_types_ref = &my_ctx.column_types;
-        qb.push_values(batch.rows.iter(), |mut tuple, row| {
+        qb.push_values(rows.iter().filter(|r| is_upsert(r)), |mut tuple, row| {
             for (value, dt) in row.values.iter().zip(column_types_ref.iter()) {
-                match value {
-                    // Keep in sync with air_elt_commons_mysql::null_bind::bind_typed_null
-                    // — the Separated lifetime forces inlining here.
-                    Value::Null => match dt {
-                        DataType::Bool => {
-                            tuple.push_bind::<Option<bool>>(None);
-                        }
-                        DataType::Int16 => {
-                            tuple.push_bind::<Option<i16>>(None);
-                        }
-                        DataType::Int32 => {
-                            tuple.push_bind::<Option<i32>>(None);
-                        }
-                        DataType::Int64 => {
-                            tuple.push_bind::<Option<i64>>(None);
-                        }
-                        DataType::Float32 => {
-                            tuple.push_bind::<Option<f32>>(None);
-                        }
-                        DataType::Float64 => {
-                            tuple.push_bind::<Option<f64>>(None);
-                        }
-                        DataType::Text { .. } => {
-                            tuple.push_bind::<Option<String>>(None);
-                        }
-                        DataType::Bytes { .. } => {
-                            tuple.push_bind::<Option<Vec<u8>>>(None);
-                        }
-                        DataType::Date => {
-                            tuple.push_bind::<Option<NaiveDate>>(None);
-                        }
-                        DataType::Timestamp => {
-                            tuple.push_bind::<Option<DateTime<Utc>>>(None);
-                        }
-                        DataType::Uuid => {
-                            // Match the non-null UUID path which binds as
-                            // canonical text (see Value::Uuid arm below).
-                            tuple.push_bind::<Option<String>>(None);
-                        }
-                        DataType::Json => {
-                            tuple.push_bind::<Option<serde_json::Value>>(None);
-                        }
-                        DataType::BigInt { .. } | DataType::Decimal { .. } => {
-                            tuple.push_bind::<Option<bigdecimal::BigDecimal>>(None);
-                        }
-                        DataType::UInt8 => {
-                            tuple.push_bind::<Option<u8>>(None);
-                        }
-                        DataType::UInt16 => {
-                            tuple.push_bind::<Option<u16>>(None);
-                        }
-                        DataType::UInt32 => {
-                            tuple.push_bind::<Option<u32>>(None);
-                        }
-                        DataType::UInt64 => {
-                            tuple.push_bind::<Option<u64>>(None);
-                        }
-                        // MySQL has no native xml type — bind as text.
-                        DataType::Xml => {
-                            tuple.push_bind::<Option<String>>(None);
-                        }
-                        DataType::Union(_) => {
-                            unreachable!("mysql sinks never carry Union types")
-                        }
-                    },
-                    Value::Bool(b) => {
-                        tuple.push_bind(*b);
-                    }
-                    Value::Int16(n) => {
-                        tuple.push_bind(*n);
-                    }
-                    Value::Int32(n) => {
-                        tuple.push_bind(*n);
-                    }
-                    Value::Int64(n) => {
-                        tuple.push_bind(*n);
-                    }
-                    Value::Float32(n) => {
-                        tuple.push_bind(*n);
-                    }
-                    Value::Float64(n) => {
-                        tuple.push_bind(*n);
-                    }
-                    Value::Text(s) => {
-                        tuple.push_bind(s.as_str());
-                    }
-                    Value::Bytes(b) => {
-                        tuple.push_bind(b.as_slice());
-                    }
-                    Value::Date(d) => {
-                        tuple.push_bind(*d);
-                    }
-                    Value::Timestamp(ts) => {
-                        tuple.push_bind(*ts);
-                    }
-                    Value::Uuid(u) => {
-                        // MariaDB's native UUID column applies an internal
-                        // byte-shuffle to indexable v1 timestamps when the
-                        // input is binary; binding as canonical text bypasses
-                        // that and round-trips correctly. Stock MySQL has no
-                        // UUID type, so this branch only fires when the sink
-                        // schema declared `DataType::Uuid` (i.e. MariaDB).
-                        tuple.push_bind(u.to_string());
-                    }
-                    Value::Json(j) => {
-                        tuple.push_bind(j);
-                    }
-                    Value::BigInt(b) => {
-                        // sqlx-mysql encodes `decimal` only via `BigDecimal`;
-                        // wrap the bigint with scale 0.
-                        tuple.push_bind(bigdecimal::BigDecimal::new(b.clone(), 0));
-                    }
-                    Value::Decimal(d) => {
-                        tuple.push_bind(d.clone());
-                    }
-                    Value::UInt8(n) => {
-                        tuple.push_bind(*n);
-                    }
-                    Value::UInt16(n) => {
-                        tuple.push_bind(*n);
-                    }
-                    Value::UInt32(n) => {
-                        tuple.push_bind(*n);
-                    }
-                    Value::UInt64(n) => {
-                        tuple.push_bind(*n);
-                    }
-                }
+                bind_value_separated(&mut tuple, value, dt);
             }
         });
         if !my_ctx.conflict_suffix.is_empty() {
             qb.push(&my_ctx.conflict_suffix);
         }
-        debug!(sql = %qb.sql(), rows = batch.rows.len(), "mysql insert batch sql");
+        debug!(sql = %qb.sql(), "mysql insert batch");
         let result = qb
             .build()
             .execute(&self.pool)
             .await
             .map_err(RuntimeError::backend)?;
-
-        let rows_written = result.rows_affected();
-        debug!(rows_written, "mysql sink batch inserted");
-        Ok(WriteReport { rows_written })
+        Ok(result.rows_affected())
     }
+
+    async fn write_delete_batch(
+        &self,
+        my_ctx: &MySqlSinkCtx,
+        rows: &[CoreRow],
+    ) -> RuntimeResult<u64> {
+        if !rows.iter().any(is_delete) {
+            return Ok(0);
+        }
+        let plan = my_ctx.delete.as_ref().ok_or_else(|| {
+            RuntimeError::Other(
+                "mysql sink received Delete row but no [flow.<x>.conflict] block \
+                 configured — Delete requires a key"
+                    .into(),
+            )
+        })?;
+        let mut qb: QueryBuilder<'_, sqlx::MySql> = QueryBuilder::new(&plan.prefix);
+        let key_indices = &plan.key_indices;
+        let column_types_ref = &my_ctx.column_types;
+        if key_indices.len() == 1 {
+            let mut sep = qb.separated(", ");
+            let i = key_indices[0];
+            let dt = &column_types_ref[i];
+            for row in rows.iter().filter(|r| is_delete(r)) {
+                let v = row.values.get(i).unwrap_or(&Value::Null);
+                bind_value_separated(&mut sep, v, dt);
+            }
+        } else {
+            qb.push_tuples(rows.iter().filter(|r| is_delete(r)), |mut tuple, row| {
+                for &i in key_indices {
+                    let dt = &column_types_ref[i];
+                    let v = row.values.get(i).unwrap_or(&Value::Null);
+                    bind_value_separated(&mut tuple, v, dt);
+                }
+            });
+        }
+        qb.push(")");
+        debug!(sql = %qb.sql(), "mysql delete batch");
+        let result = qb
+            .build()
+            .execute(&self.pool)
+            .await
+            .map_err(RuntimeError::backend)?;
+        Ok(result.rows_affected())
+    }
+}
+
+fn is_upsert(r: &CoreRow) -> bool {
+    r.op == RowOp::Upsert
+}
+
+fn is_delete(r: &CoreRow) -> bool {
+    r.op == RowOp::Delete
 }

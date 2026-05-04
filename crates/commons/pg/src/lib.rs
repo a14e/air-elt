@@ -9,3 +9,4 @@ pub mod null_bind;
 pub mod pg_type;
 pub mod pool;
 pub mod schema;
+pub mod sink_bind;

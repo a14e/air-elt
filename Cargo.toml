@@ -11,6 +11,7 @@ members = [
     "crates/sources/postgres",
     "crates/sources/mysql",
     "crates/sources/mongodb",
+    "crates/sources/mongo-cdc",
     "crates/sinks/postgres",
     "crates/sinks/mysql",
     "crates/sinks/mongodb",
@@ -41,6 +42,7 @@ air-elt-storage-postgres = { path = "crates/storages/postgres", version = "0.1.0
 air-elt-storage-mysql = { path = "crates/storages/mysql", version = "0.1.0" }
 air-elt-commons-mongodb = { path = "crates/commons/mongodb", version = "0.1.0" }
 air-elt-source-mongodb = { path = "crates/sources/mongodb", version = "0.1.0" }
+air-elt-source-mongo-cdc = { path = "crates/sources/mongo-cdc", version = "0.1.0" }
 air-elt-sink-mongodb = { path = "crates/sinks/mongodb", version = "0.1.0" }
 air-elt-storage-mongodb = { path = "crates/storages/mongodb", version = "0.1.0" }
 

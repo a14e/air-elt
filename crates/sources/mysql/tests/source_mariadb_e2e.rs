@@ -54,6 +54,7 @@ async fn reads_native_uuid_column_from_mariadb() {
         cursor_fields: vec!["id".into()],
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 10,
+        source_options: toml::Table::new(),
     };
 
     let schema = source.describe_schema(&spec.table).await.expect("describe");

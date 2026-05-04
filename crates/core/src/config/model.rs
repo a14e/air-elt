@@ -46,16 +46,61 @@ pub struct ComponentConfig {
     pub config: toml::Table,
 }
 
+/// Reference to a configured `[[sources]]` instance from a flow block.
+///
+/// Two surface forms (deserialised via `#[serde(untagged)]`):
+///
+/// 1. Bare name: `source = "mymongo"` — equivalent to no per-flow
+///    options. Backwards-compatible with every existing flow.
+/// 2. Developed form: `source = { name = "mymongo", mode = "lookup-on-update" }`
+///    — extra keys flow into a free-form `toml::Table` that is
+///    pushed into `ReadSpec::source_options` so source connectors
+///    can deserialise their own typed shape (mongo-cdc uses this
+///    for `mode`). Unknown keys are NOT rejected here because each
+///    source validates its own option schema.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum FlowSourceRef {
+    Bare(String),
+    Detailed {
+        name: String,
+        #[serde(flatten)]
+        options: toml::Table,
+    },
+}
+
+impl FlowSourceRef {
+    pub fn name(&self) -> &str {
+        match self {
+            FlowSourceRef::Bare(s) => s.as_str(),
+            FlowSourceRef::Detailed { name, .. } => name.as_str(),
+        }
+    }
+
+    pub fn options(&self) -> toml::Table {
+        match self {
+            FlowSourceRef::Bare(_) => toml::Table::new(),
+            FlowSourceRef::Detailed { options, .. } => options.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct FlowConfig {
-    pub source: String,
+    pub source: FlowSourceRef,
     pub sink: String,
     pub storage: String,
     pub from: String,
     pub to: String,
     #[serde(default)]
     pub mapping: Vec<MappingEntry>,
+    /// Cursor config. Pull-based sources (postgres, mysql, mongodb)
+    /// require non-empty `fields`. CDC sources (mongo-cdc) require
+    /// empty `fields` — pagination is driven by the resume token.
+    /// `interval` is meaningful for both: it caps poll cadence /
+    /// `maxAwaitTime`. The kind-aware check lives in
+    /// `validation::pipeline::assemble`.
     pub cursor: CursorConfig,
     #[serde(default = "default_batch_limit")]
     pub batch_limit: usize,
@@ -106,6 +151,10 @@ pub struct MappingEntry {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CursorConfig {
+    /// Cursor field names. Pull-based sources (postgres/mysql/mongodb)
+    /// require this non-empty (validated in `pipeline::assemble`).
+    /// CDC sources (mongo-cdc) require it empty.
+    #[serde(default)]
     pub fields: Vec<String>,
     #[serde(default = "default_order")]
     pub order: CursorOrder,

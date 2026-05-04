@@ -46,6 +46,7 @@ async fn read_with_cursor_and_dot_notation() {
         cursor_fields: vec!["_id".into()],
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 3,
+        source_options: toml::Table::new(),
     };
 
     source
@@ -101,6 +102,7 @@ async fn sample_returns_documents() {
         cursor_fields: vec!["_id".into()],
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 1024,
+        source_options: toml::Table::new(),
     };
 
     let rows = source.sample(&spec, 5).await.expect("sample");
@@ -149,6 +151,7 @@ async fn compound_cursor_updated_at_id() {
         cursor_fields: vec!["updated_at".into(), "_id".into()],
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 2,
+        source_options: toml::Table::new(),
     };
 
     let ctx = source.build_context(&spec).await.expect("build_context");

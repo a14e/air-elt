@@ -112,3 +112,43 @@ async fn cursor_roundtrip_all_value_variants() {
         assert_eq!(loaded, state, "{flow}: variant did not round-trip");
     }
 }
+
+#[tokio::test]
+async fn resume_token_round_trip_and_reopen() {
+    let handle = mysql_pool().await;
+    let storage = make_storage(&handle).await;
+    storage.migrate().await.expect("migrate");
+
+    assert!(storage.load_resume_token("flow_a").await.unwrap().is_none());
+
+    let token = serde_json::json!({ "_data": "82AABB" });
+    storage
+        .save_resume_token("flow_a", &token)
+        .await
+        .expect("save");
+    assert_eq!(
+        storage.load_resume_token("flow_a").await.unwrap().unwrap(),
+        token
+    );
+
+    let token2 = serde_json::json!({ "_data": "82CCDD" });
+    storage.save_resume_token("flow_a", &token2).await.unwrap();
+    assert_eq!(
+        storage.load_resume_token("flow_a").await.unwrap().unwrap(),
+        token2
+    );
+
+    drop(storage);
+    let storage2 = make_storage(&handle).await;
+    assert_eq!(
+        storage2.load_resume_token("flow_a").await.unwrap().unwrap(),
+        token2
+    );
+    assert!(
+        storage2
+            .load_resume_token("flow_b")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

@@ -36,6 +36,19 @@ pub struct AssembledFlow {
     pub fields_check: bool,
     /// Whether the validation pipeline runs the sink's write probe.
     pub inserts_check: bool,
+    /// Persistence strategy for the source's cursor state.
+    /// `ColumnCursor` (default) → `Storage::{load,save}_cursor`.
+    /// `ResumeToken` → `Storage::{load,save}_resume_token` (used by
+    /// CDC sources whose pagination is an opaque BSON blob, not
+    /// per-column values).
+    pub cursor_persistence: CursorPersistence,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CursorPersistence {
+    #[default]
+    ColumnCursor,
+    ResumeToken,
 }
 
 /// Per-column conversion plan. Carries the resolved source/sink `DataType`
@@ -68,27 +81,65 @@ impl ConversionPlan {
 /// introspected, and per-column conversions are precomputed. Constructed
 /// only by `validation::pipeline::validate` — there is no public
 /// constructor that lets you build one with a stale or empty `conversions`
-/// slice. Tests reach `for_test` via the `flow::test_support` module.
+/// slice. Tests reach `for_test` via the `flow::test_utils` module.
 pub struct FlowState {
     inner: AssembledFlow,
     /// Per-column conversion plan. Identity columns get an identity plan;
     /// the runner skips per-cell `convert` calls for them.
     pub conversions: Vec<ConversionPlan>,
+    /// Pre-computed positions in `WriteSpec.columns` of the columns
+    /// listed in `conflict.key`. Filled at construction time so the
+    /// CDC dedup hot path does not redo the column-name → index lookup
+    /// for every batch. `None` when there is no `conflict` block or
+    /// when any key column is missing from the mapping (the latter is
+    /// rejected at validate-time, but we keep the option-shape so the
+    /// cache stays robust against future config rewrites). Read via
+    /// the `dedup_key_indices()` accessor; intentionally private to
+    /// stop callers from manufacturing inconsistent values.
+    dedup_key_indices: Option<Vec<usize>>,
 }
 
 impl FlowState {
     /// Internal constructor — called from `validation::pipeline::validate`
     /// after schema introspection produces the conversions vector.
     pub(crate) fn new(inner: AssembledFlow, conversions: Vec<ConversionPlan>) -> Self {
-        Self { inner, conversions }
+        let dedup_key_indices = compute_dedup_key_indices(&inner.write_spec);
+        Self {
+            inner,
+            conversions,
+            dedup_key_indices,
+        }
     }
 
     /// Bypasses validation. Test-only — lives behind `cfg(test)` to keep
     /// the type discipline for production callers.
     #[cfg(test)]
     pub fn new_unchecked(inner: AssembledFlow, conversions: Vec<ConversionPlan>) -> Self {
-        Self { inner, conversions }
+        let dedup_key_indices = compute_dedup_key_indices(&inner.write_spec);
+        Self {
+            inner,
+            conversions,
+            dedup_key_indices,
+        }
     }
+
+    /// Indices into the row's `values` slice that select the
+    /// `conflict.key` columns. Used by the CDC dedup path to feed
+    /// `Row::raw_key` without re-deriving the lookup per row. `None`
+    /// when the flow has no conflict block — dedup short-circuits in
+    /// that case anyway.
+    pub fn dedup_key_indices(&self) -> Option<&[usize]> {
+        self.dedup_key_indices.as_deref()
+    }
+}
+
+fn compute_dedup_key_indices(write_spec: &WriteSpec) -> Option<Vec<usize>> {
+    let conflict = write_spec.conflict.as_ref()?;
+    conflict
+        .key
+        .iter()
+        .map(|k| write_spec.columns.iter().position(|c| c == k))
+        .collect::<Option<Vec<_>>>()
 }
 
 /// Field access on `FlowState` reads through to the assembled flow — the

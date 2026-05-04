@@ -229,7 +229,7 @@ impl Source for MySqlSource {
                 cursor_values.push(value);
             }
             last_cursor_values = Some(cursor_values);
-            out_rows.push(CoreRow { values });
+            out_rows.push(CoreRow::upsert(values));
         }
 
         let next_cursor = last_cursor_values.map(|values| {

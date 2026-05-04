@@ -6,7 +6,9 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::model::{Batch, CursorState, FlowState, SinkCtx, SourceCtx};
+use crate::model::{
+    Batch, CursorFieldValue, CursorPersistence, CursorState, FlowState, SinkCtx, SourceCtx,
+};
 use crate::types::{Value, convert};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,15 +89,36 @@ impl FlowRunner {
             let storage = self.flow.storage.clone();
             let flow_name = self.flow.name.clone();
             let cancel_safe = storage.cancel_safe();
-            let fut = async move { storage.load_cursor(&flow_name).await };
-            self.cursor = run_op(
-                &self.flow,
-                "load_cursor",
-                fut,
-                cancel_safe,
-                &mut self.shutdown,
-            )
-            .await?;
+            self.cursor = match self.flow.cursor_persistence {
+                CursorPersistence::ColumnCursor => {
+                    let fut = async move { storage.load_cursor(&flow_name).await };
+                    run_op(
+                        &self.flow,
+                        "load_cursor",
+                        fut,
+                        cancel_safe,
+                        &mut self.shutdown,
+                    )
+                    .await?
+                }
+                CursorPersistence::ResumeToken => {
+                    let fut = async move { storage.load_resume_token(&flow_name).await };
+                    let token = run_op(
+                        &self.flow,
+                        "load_resume_token",
+                        fut,
+                        cancel_safe,
+                        &mut self.shutdown,
+                    )
+                    .await?;
+                    token.map(|json| {
+                        CursorState::new(vec![CursorFieldValue {
+                            name: RESUME_TOKEN_FIELD.into(),
+                            value: crate::types::Value::Json(json),
+                        }])
+                    })
+                }
+            };
             info!(flow = %self.flow.name, has_cursor = self.cursor.is_some(), "flow started");
         }
 
@@ -134,6 +157,7 @@ impl FlowRunner {
         .await?;
 
         let batch = apply_conversions(batch, &self.flow.conversions)?;
+        let batch = dedup_cdc_batch(batch, &self.flow);
         let batch_size = batch.rows.len();
 
         if batch_size == 0 {
@@ -194,19 +218,36 @@ impl FlowRunner {
         if let Some(next) = &batch.next_cursor {
             let storage = self.flow.storage.clone();
             let flow_name = self.flow.name.clone();
-            let next_owned = next.clone();
             let cancel_safe = storage.cancel_safe();
-            let fut = async move { storage.save_cursor(&flow_name, &next_owned).await };
-            if let Err(e) = run_op(
-                &self.flow,
-                "save_cursor",
-                fut,
-                cancel_safe,
-                &mut self.shutdown,
-            )
-            .await
-            {
-                error!(flow = %self.flow.name, error = %e, "save_cursor failed; flow will abort to avoid drift");
+            let save_result = match self.flow.cursor_persistence {
+                CursorPersistence::ColumnCursor => {
+                    let next_owned = next.clone();
+                    let fut = async move { storage.save_cursor(&flow_name, &next_owned).await };
+                    run_op(
+                        &self.flow,
+                        "save_cursor",
+                        fut,
+                        cancel_safe,
+                        &mut self.shutdown,
+                    )
+                    .await
+                }
+                CursorPersistence::ResumeToken => {
+                    let token_json = extract_resume_token(next)?;
+                    let fut =
+                        async move { storage.save_resume_token(&flow_name, &token_json).await };
+                    run_op(
+                        &self.flow,
+                        "save_resume_token",
+                        fut,
+                        cancel_safe,
+                        &mut self.shutdown,
+                    )
+                    .await
+                }
+            };
+            if let Err(e) = save_result {
+                error!(flow = %self.flow.name, error = %e, "cursor save failed; flow will abort to avoid drift");
                 return Err(e);
             }
             self.cursor = Some(next.clone());
@@ -225,6 +266,95 @@ impl FlowRunner {
 /// untouched. Empty `conversions` (e.g. tests that skip validation) and
 /// all-identity column lists short-circuit — no per-row allocation happens
 /// in either case.
+/// CDC compaction: a single change-stream batch may carry several
+/// events for the same document key. The dangerous case is
+/// `delete(k) → insert(k)`: our sink applies upserts before deletes
+/// to keep `insert(k) → delete(k)` ordering correct, which inverts
+/// the intent here. Compact by keeping only the latest event per
+/// `conflict.key` tuple, walking in reverse so the survivor is the
+/// chronologically-last event for that key.
+///
+/// Hot-path shortcuts:
+/// * non-CDC flows skip entirely (`ColumnCursor` never produces mixed-op batches);
+/// * batches without a single `Delete` skip — duplicate Upserts on
+///   the same key are idempotent (overwrite = same result; ignore =
+///   "first wins" is acceptable);
+/// * single-row batches skip.
+///
+/// When dedup does run: walk `batch.rows.into_iter().rev()`, build a
+/// per-row fingerprint via `Row::raw_key` (per-`Value`-variant byte
+/// encoder, see `core::types::raw_key`) into a reused buffer, and
+/// insert into an `AHashSet<Vec<u8>>`. First-seen wins per key; row
+/// is pushed into `kept` and `kept.reverse()`s once at the end so
+/// survivors retain their relative arrival order (matters for
+/// upsert-then-delete sink semantics on distinct keys). The key
+/// indices come from `FlowState::dedup_key_indices` — pre-computed
+/// once at assemble-time, not per row.
+fn dedup_cdc_batch(batch: Batch, flow: &FlowState) -> Batch {
+    if flow.cursor_persistence != CursorPersistence::ResumeToken || batch.rows.len() <= 1 {
+        return batch;
+    }
+    if !batch
+        .rows
+        .iter()
+        .any(|r| r.op == crate::model::RowOp::Delete)
+    {
+        return batch;
+    }
+    let Some(key_indices) = flow.dedup_key_indices() else {
+        return batch;
+    };
+
+    // Walk from the end, keep first-seen-key only. `seen` holds raw
+    // fingerprint bytes produced by `Row::raw_key` (per-variant byte
+    // encoder, see `core::types::raw_key`). Reverse iteration makes
+    // the survivor the chronologically-last event per key, matching
+    // CDC compaction. Each iteration allocates a fresh `buf` and
+    // moves it into `seen` directly — no clone-copy step. On a
+    // duplicate the move drops the buf; the alloc cost is the same
+    // either way (`HashSet::insert` always owns the key it stores).
+    let n = batch.rows.len();
+    let mut seen: ahash::AHashSet<Vec<u8>> = ahash::AHashSet::with_capacity(n);
+    let mut kept: Vec<crate::model::Row> = Vec::with_capacity(n);
+    for row in batch.rows.into_iter().rev() {
+        let mut buf: Vec<u8> = Vec::with_capacity(32);
+        row.raw_key(key_indices, &mut buf);
+        if seen.insert(buf) {
+            kept.push(row);
+        }
+    }
+    kept.reverse();
+    Batch {
+        rows: kept,
+        next_cursor: batch.next_cursor,
+    }
+}
+
+/// Synthetic cursor field name carrying a serialised resume token.
+/// Mirrors `air_elt_source_mongo_cdc::source::RESUME_TOKEN_FIELD`;
+/// the runner duplicates the constant to avoid pulling the cdc crate
+/// into core. If you change one, change the other.
+pub const RESUME_TOKEN_FIELD: &str = "__resume_token";
+
+fn extract_resume_token(state: &CursorState) -> RuntimeResult<serde_json::Value> {
+    let field = state
+        .fields
+        .first()
+        .ok_or_else(|| RuntimeError::Other("cdc flow produced an empty cursor state".into()))?;
+    if field.name != RESUME_TOKEN_FIELD {
+        return Err(RuntimeError::Other(format!(
+            "cdc flow produced cursor with unexpected field {:?} (expected {RESUME_TOKEN_FIELD:?})",
+            field.name
+        )));
+    }
+    match &field.value {
+        crate::types::Value::Json(j) => Ok(j.clone()),
+        other => Err(RuntimeError::Other(format!(
+            "cdc resume token must be Value::Json, got {other:?}"
+        ))),
+    }
+}
+
 fn apply_conversions(
     mut batch: Batch,
     conversions: &[crate::model::ConversionPlan],
@@ -349,10 +479,166 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::flow::test_support::*;
+    use crate::flow::test_utils::*;
 
     fn run(flow: FlowState, mode: RunMode, rx: watch::Receiver<bool>) -> FlowRunner {
         FlowRunner::new(flow, mode, rx)
+    }
+
+    mod dedup {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use super::super::dedup_cdc_batch;
+        use crate::config::conflict::{ConflictConfig, ConflictStrategy};
+        use crate::config::model::CursorOrder;
+        use crate::config::validation::SamplingConfig;
+        use crate::model::{
+            AssembledFlow, Batch, CursorPersistence, FlowState, ReadSpec, Row, RowOp, WriteSpec,
+        };
+        use crate::traits::{MockSink, MockSource, MockStorage};
+        use crate::types::Value;
+
+        fn flow_with(persistence: CursorPersistence, conflict_key: Option<Vec<&str>>) -> FlowState {
+            let conflict = conflict_key.map(|k| ConflictConfig {
+                key: k.into_iter().map(String::from).collect(),
+                strategy: ConflictStrategy::Overwrite,
+            });
+            let assembled = AssembledFlow {
+                name: "dedup_test".into(),
+                source: Arc::new(MockSource::new()),
+                sink: Arc::new(MockSink::new()),
+                storage: Arc::new(MockStorage::new()),
+                mappings: Vec::new(),
+                read_spec: ReadSpec {
+                    columns: vec!["id".into(), "name".into()],
+                    table: "t".into(),
+                    cursor_fields: Vec::new(),
+                    cursor_order: CursorOrder::Asc,
+                    limit: 1,
+                    source_options: toml::Table::new(),
+                },
+                write_spec: WriteSpec {
+                    columns: vec!["id".into(), "name".into()],
+                    table: "t".into(),
+                    conflict,
+                },
+                interval: Duration::from_millis(10),
+                query_timeout: Duration::from_secs(5),
+                sampling: SamplingConfig::Disabled,
+                access_check: false,
+                fields_check: false,
+                inserts_check: false,
+                cursor_persistence: persistence,
+            };
+            FlowState::new_unchecked(assembled, Vec::new())
+        }
+
+        fn cdc_flow_with_conflict(key: Vec<&str>) -> FlowState {
+            flow_with(CursorPersistence::ResumeToken, Some(key))
+        }
+
+        fn row(op: RowOp, id: i64, name: &str) -> Row {
+            Row {
+                op,
+                values: vec![Value::Int64(id), Value::Text(name.into())],
+            }
+        }
+
+        #[test]
+        fn keeps_only_last_op_per_key() {
+            // delete(1) → insert(1) — the insert is the survivor.
+            // Without dedup, the sink would upsert(1) then delete(1)
+            // and the row would disappear.
+            let flow = cdc_flow_with_conflict(vec!["id"]);
+            let batch = Batch {
+                rows: vec![row(RowOp::Delete, 1, ""), row(RowOp::Upsert, 1, "alice")],
+                next_cursor: None,
+            };
+            let out = dedup_cdc_batch(batch, &flow);
+            assert_eq!(out.rows.len(), 1);
+            assert_eq!(out.rows[0].op, RowOp::Upsert);
+            assert_eq!(out.rows[0].values[1], Value::Text("alice".into()));
+        }
+
+        #[test]
+        fn delete_after_insert_survives_as_delete() {
+            let flow = cdc_flow_with_conflict(vec!["id"]);
+            let batch = Batch {
+                rows: vec![row(RowOp::Upsert, 1, "alice"), row(RowOp::Delete, 1, "")],
+                next_cursor: None,
+            };
+            let out = dedup_cdc_batch(batch, &flow);
+            assert_eq!(out.rows.len(), 1);
+            assert_eq!(out.rows[0].op, RowOp::Delete);
+        }
+
+        #[test]
+        fn distinct_keys_kept_in_order() {
+            let flow = cdc_flow_with_conflict(vec!["id"]);
+            let batch = Batch {
+                rows: vec![
+                    row(RowOp::Upsert, 1, "a"),
+                    row(RowOp::Upsert, 2, "b"),
+                    row(RowOp::Delete, 3, ""),
+                ],
+                next_cursor: None,
+            };
+            let out = dedup_cdc_batch(batch, &flow);
+            assert_eq!(out.rows.len(), 3);
+            assert_eq!(out.rows[0].values[0], Value::Int64(1));
+            assert_eq!(out.rows[1].values[0], Value::Int64(2));
+            assert_eq!(out.rows[2].values[0], Value::Int64(3));
+        }
+
+        #[test]
+        fn no_deletes_short_circuits() {
+            // All-upsert batches should bypass dedup to keep the hot
+            // path free of allocations. We assert the function
+            // returns the batch unchanged (length-preserved).
+            let flow = cdc_flow_with_conflict(vec!["id"]);
+            let batch = Batch {
+                rows: vec![row(RowOp::Upsert, 1, "a"), row(RowOp::Upsert, 1, "b")],
+                next_cursor: None,
+            };
+            let out = dedup_cdc_batch(batch, &flow);
+            // Both rows kept — second upsert overwrites the first via
+            // sink upsert semantics, no need to dedup pre-write.
+            assert_eq!(out.rows.len(), 2);
+        }
+
+        #[test]
+        fn non_cdc_flow_skips() {
+            // ColumnCursor persistence: dedup must be a no-op even
+            // if the batch happens to contain a Delete.
+            let flow = flow_with(CursorPersistence::ColumnCursor, Some(vec!["id"]));
+            let batch = Batch {
+                rows: vec![row(RowOp::Delete, 1, ""), row(RowOp::Upsert, 1, "x")],
+                next_cursor: None,
+            };
+            let out = dedup_cdc_batch(batch, &flow);
+            assert_eq!(out.rows.len(), 2);
+        }
+
+        #[test]
+        fn compound_key_distinguishes_rows() {
+            let flow = cdc_flow_with_conflict(vec!["id", "name"]);
+            // Same id, different name → different keys, both kept
+            // (last op for each key is the survivor).
+            let batch = Batch {
+                rows: vec![
+                    row(RowOp::Upsert, 1, "a"),
+                    row(RowOp::Delete, 1, "b"),
+                    row(RowOp::Delete, 1, "a"),
+                ],
+                next_cursor: None,
+            };
+            let out = dedup_cdc_batch(batch, &flow);
+            // Two distinct keys (1,"a") and (1,"b"). For (1,"a") the
+            // last op is Delete; for (1,"b") it's Delete.
+            assert_eq!(out.rows.len(), 2);
+            assert!(out.rows.iter().all(|r| r.op == RowOp::Delete));
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -425,9 +711,7 @@ mod tests {
         use crate::model::{Batch, Row};
         use crate::types::DataType;
         let batch = Batch {
-            rows: vec![Row {
-                values: vec![Value::Int32(1), Value::Text("x".into())],
-            }],
+            rows: vec![Row::upsert(vec![Value::Int32(1), Value::Text("x".into())])],
             next_cursor: None,
         };
         let convs = vec![
@@ -446,9 +730,7 @@ mod tests {
         use crate::model::{Batch, Row};
         use crate::types::DataType;
         let batch = Batch {
-            rows: vec![Row {
-                values: vec![Value::Int16(7), Value::Int32(3)],
-            }],
+            rows: vec![Row::upsert(vec![Value::Int16(7), Value::Int32(3)])],
             next_cursor: None,
         };
         let convs = vec![
@@ -468,9 +750,7 @@ mod tests {
         use crate::model::{Batch, Row};
         use crate::types::DataType;
         let batch = Batch {
-            rows: vec![Row {
-                values: vec![Value::Int32(1)],
-            }],
+            rows: vec![Row::upsert(vec![Value::Int32(1)])],
             next_cursor: None,
         };
         let convs = vec![

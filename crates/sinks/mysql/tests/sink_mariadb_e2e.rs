@@ -43,9 +43,7 @@ async fn writes_native_uuid_column_to_mariadb() {
 
     let known = Uuid::from_u128(0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00);
     let batch = Batch {
-        rows: vec![CoreRow {
-            values: vec![Value::Int64(1), Value::Uuid(known)],
-        }],
+        rows: vec![CoreRow::upsert(vec![Value::Int64(1), Value::Uuid(known)])],
         next_cursor: None,
     };
     let ctx = sink.build_context(&spec).await.expect("ctx");

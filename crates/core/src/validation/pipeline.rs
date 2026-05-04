@@ -49,8 +49,9 @@ pub async fn assemble(
     let mut sink_names: BTreeSet<&str> = BTreeSet::new();
     let mut storage_names: BTreeSet<&str> = BTreeSet::new();
     for flow in root.flow.values() {
-        if !source_index.contains_key(flow.source.as_str()) {
-            return Err(ValidationError::UnknownSource(flow.source.clone()));
+        let source_name = flow.source.name();
+        if !source_index.contains_key(source_name) {
+            return Err(ValidationError::UnknownSource(source_name.to_string()));
         }
         if !sink_index.contains_key(flow.sink.as_str()) {
             return Err(ValidationError::UnknownSink(flow.sink.clone()));
@@ -58,7 +59,7 @@ pub async fn assemble(
         if !storage_index.contains_key(flow.storage.as_str()) {
             return Err(ValidationError::UnknownStorage(flow.storage.clone()));
         }
-        source_names.insert(flow.source.as_str());
+        source_names.insert(source_name);
         sink_names.insert(flow.sink.as_str());
         storage_names.insert(flow.storage.as_str());
     }
@@ -109,10 +110,51 @@ pub async fn assemble(
     for (flow_name, flow) in &root.flow {
         info!(flow = %flow_name, "assembling flow");
 
-        let source_cfg = source_index[flow.source.as_str()];
-        let source = sources[flow.source.as_str()].clone();
+        let source_name = flow.source.name();
+        let source_cfg = source_index[source_name];
+        let source = sources[source_name].clone();
         let sink = sinks[flow.sink.as_str()].clone();
         let storage = storages[flow.storage.as_str()].clone();
+
+        // Per-source-kind cursor.fields shape. Pull-based connectors
+        // (postgres/mysql/mongodb) require non-empty cursor.fields so
+        // each batch has a deterministic high-water mark; CDC
+        // connectors (mongo-cdc) refuse cursor.fields because
+        // pagination is driven by the resume token they manage
+        // themselves. Doing this here instead of in the loader because
+        // only assemble has access to the source's `kind`.
+        let kind = source_cfg.kind.as_str();
+        let is_cdc = matches!(kind, "mongo-cdc");
+        if is_cdc {
+            if !flow.cursor.fields.is_empty() {
+                return Err(ValidationError::AccessFailed {
+                    component: "flow",
+                    name: flow_name.clone(),
+                    source: Box::new(RuntimeError::Other(format!(
+                        "flow {flow_name:?}: source kind {kind:?} does not accept user cursors \
+                         — remove `cursor.fields` (the resume token replaces it)"
+                    ))),
+                });
+            }
+            if flow.conflict.is_none() {
+                return Err(ValidationError::AccessFailed {
+                    component: "flow",
+                    name: flow_name.clone(),
+                    source: Box::new(RuntimeError::Other(format!(
+                        "flow {flow_name:?}: source kind {kind:?} requires a `[flow.{flow_name}.conflict]` \
+                         block — cdc emits Upsert/Delete which need a key"
+                    ))),
+                });
+            }
+        } else if flow.cursor.fields.is_empty() {
+            return Err(ValidationError::AccessFailed {
+                component: "flow",
+                name: flow_name.clone(),
+                source: Box::new(RuntimeError::Other(format!(
+                    "flow {flow_name:?}: source kind {kind:?} requires non-empty `cursor.fields`"
+                ))),
+            });
+        }
 
         let mappings = mapping::build(flow).map_err(|e| ValidationError::AccessFailed {
             component: "mapping",
@@ -126,6 +168,7 @@ pub async fn assemble(
             cursor_fields: flow.cursor.fields.clone(),
             cursor_order: flow.cursor.order,
             limit: flow.batch_limit,
+            source_options: flow.source.options(),
         };
         let write_spec = WriteSpec {
             columns: mappings.iter().map(|m| m.to.clone()).collect(),
@@ -153,6 +196,11 @@ pub async fn assemble(
             access_check: flow.validation.access,
             fields_check: flow.validation.fields,
             inserts_check: flow.validation.inserts,
+            cursor_persistence: if is_cdc {
+                crate::model::CursorPersistence::ResumeToken
+            } else {
+                crate::model::CursorPersistence::ColumnCursor
+            },
         });
     }
 
@@ -287,6 +335,22 @@ async fn validate_one(flow: AssembledFlow) -> Result<FlowState, ValidationError>
                 name: flow.name.clone(),
                 source: Box::new(e),
             })?;
+        // Why: insert-only `validate_access` does not exercise the DELETE
+        // SQL/operation a CDC flow will eventually issue. Pre-flight it
+        // here so a missing DELETE privilege surfaces at validate-time
+        // instead of on the first delete batch. Gated on `conflict.is_some()`
+        // because the sink's delete path is keyed on conflict.key — without
+        // it the runner would refuse the Delete row anyway.
+        if flow.source.emits_deletes() && flow.write_spec.conflict.is_some() {
+            flow.sink
+                .validate_delete_access(&flow.write_spec)
+                .await
+                .map_err(|e| ValidationError::AccessFailed {
+                    component: "sink:delete",
+                    name: flow.name.clone(),
+                    source: Box::new(e),
+                })?;
+        }
     } else {
         info!(flow = %flow.name, "validation.inserts disabled — skipping sink write probe");
     }
@@ -431,6 +495,7 @@ mod tests {
                 cursor_fields: vec!["a".into()],
                 cursor_order: CursorOrder::Asc,
                 limit: 1,
+                source_options: toml::Table::new(),
             },
             write_spec: WriteSpec {
                 columns: vec!["a".into()],
@@ -443,6 +508,7 @@ mod tests {
             access_check: false,
             fields_check,
             inserts_check: false,
+            cursor_persistence: crate::model::CursorPersistence::ColumnCursor,
         }
     }
 
@@ -479,6 +545,84 @@ mod tests {
         assert_eq!(plan.source, DataType::Json);
         assert_eq!(plan.sink, DataType::Json);
         assert!(plan.is_identity());
+    }
+
+    fn flow_with_inserts_and_conflict(
+        source: MockSource,
+        sink: MockSink,
+        storage: MockStorage,
+        conflict: Option<crate::config::conflict::ConflictConfig>,
+    ) -> AssembledFlow {
+        let mappings = vec![ColumnMapping {
+            from: "a".into(),
+            to: "a".into(),
+            truncate: false,
+            default_literal: None,
+        }];
+        let mut flow = flow_with(source, sink, storage, mappings, false);
+        flow.inserts_check = true;
+        flow.write_spec.conflict = conflict;
+        flow
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_probe_invoked_when_source_emits_deletes_and_conflict_set() {
+        let mut source = MockSource::new();
+        source.expect_name().return_const("src".to_string());
+        source.expect_emits_deletes().return_const(true);
+        let mut sink = MockSink::new();
+        sink.expect_validate_access().times(1).returning(|_| Ok(()));
+        sink.expect_validate_delete_access()
+            .times(1)
+            .returning(|_| Ok(()));
+        let storage = MockStorage::new();
+        let flow = flow_with_inserts_and_conflict(
+            source,
+            sink,
+            storage,
+            Some(crate::config::conflict::ConflictConfig {
+                key: vec!["a".into()],
+                strategy: crate::config::conflict::ConflictStrategy::Overwrite,
+            }),
+        );
+        validate_one(flow).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_probe_skipped_when_source_does_not_emit_deletes() {
+        let mut source = MockSource::new();
+        source.expect_name().return_const("src".to_string());
+        source.expect_emits_deletes().return_const(false);
+        let mut sink = MockSink::new();
+        sink.expect_validate_access().times(1).returning(|_| Ok(()));
+        sink.expect_validate_delete_access().times(0);
+        let storage = MockStorage::new();
+        let flow = flow_with_inserts_and_conflict(
+            source,
+            sink,
+            storage,
+            Some(crate::config::conflict::ConflictConfig {
+                key: vec!["a".into()],
+                strategy: crate::config::conflict::ConflictStrategy::Overwrite,
+            }),
+        );
+        validate_one(flow).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_probe_skipped_without_conflict_block() {
+        let mut source = MockSource::new();
+        source.expect_name().return_const("src".to_string());
+        // emits_deletes may or may not be queried — sink-side gating
+        // is the conflict.is_some() check. We only assert
+        // validate_delete_access is not called.
+        source.expect_emits_deletes().return_const(true);
+        let mut sink = MockSink::new();
+        sink.expect_validate_access().times(1).returning(|_| Ok(()));
+        sink.expect_validate_delete_access().times(0);
+        let storage = MockStorage::new();
+        let flow = flow_with_inserts_and_conflict(source, sink, storage, None);
+        validate_one(flow).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

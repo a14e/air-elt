@@ -1,6 +1,9 @@
-//! SQL emitted by the MySQL storage crate.
+//! SQL emitted by the MySQL storage crate. Two state tables live
+//! here: `air_elt_cursors` for column-cursor state (pull-based
+//! sources) and `air_elt_resume_tokens` for opaque CDC resume tokens
+//! (mongo-cdc) — see `Storage::{load,save}_resume_token`. Both live
+//! in the same database.
 //!
-//! The cursor table lives in the database selected by the connection URL.
 //! No schema plumbing — operators encode the database name in the URL.
 
 pub const CURSORS_TABLE: &str = "air_elt_cursors";
@@ -33,6 +36,25 @@ pub const UPSERT_CURSOR_LEGACY: &str = "INSERT INTO air_elt_cursors (flow, state
 pub const UPSERT_CURSOR_ROW_ALIAS: &str = "INSERT INTO air_elt_cursors (flow, state) \
     VALUES (?, ?) AS new \
     ON DUPLICATE KEY UPDATE state = new.state";
+
+pub const SELECT_RESUME_TOKEN: &str = "SELECT token FROM air_elt_resume_tokens WHERE flow = ?";
+
+pub const UPSERT_RESUME_TOKEN_LEGACY: &str = "INSERT INTO air_elt_resume_tokens (flow, token) VALUES (?, ?) \
+     ON DUPLICATE KEY UPDATE token = VALUES(token)";
+
+pub const UPSERT_RESUME_TOKEN_ROW_ALIAS: &str = "INSERT INTO air_elt_resume_tokens (flow, token) VALUES (?, ?) AS new \
+     ON DUPLICATE KEY UPDATE token = new.token";
+
+pub fn pick_upsert_resume_token(version: &str) -> &'static str {
+    if version.to_ascii_lowercase().contains("mariadb") {
+        return UPSERT_RESUME_TOKEN_LEGACY;
+    }
+    if mysql_version_at_least(version, (8, 0, 19)) {
+        UPSERT_RESUME_TOKEN_ROW_ALIAS
+    } else {
+        UPSERT_RESUME_TOKEN_LEGACY
+    }
+}
 
 /// Pick the upsert dialect based on a `SELECT VERSION()` string.
 ///

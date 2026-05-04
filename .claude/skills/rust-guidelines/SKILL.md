@@ -96,6 +96,7 @@ The test strategy is inverted pyramid: heavy e2e against real services, focused 
 - **Mocking with `mockall`.** Use `#[cfg_attr(test, mockall::automock)]` on traits in `core::traits`. For methods with `Option<&T>` parameters, add an explicit lifetime — mockall cannot handle elided lifetimes inside `Option`.
 - **Deterministic time in tests.** Use `#[tokio::test(start_paused = true)]` instead of real `sleep`/wall-clock waits. This makes tests instant and non-flaky. Ensure mocked sources drain (return empty batch after data) so Once-mode tests terminate.
 - **No N×N matrices for connector pairs.** Each source / sink / storage owns its own e2e suite covering its typical cases (types, NULLs, cursors, schema quirks). Cross-vendor pipelines are exercised by a *small, fixed* sample of combinations — enough to prove the runner glues things together — not by every pair. Adding a new connector means adding its own suite plus one or two sample cross-vendor flows, not 2N new combination tests.
+- try to avoid "sleep" in tests
 
 ## After every change
 

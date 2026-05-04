@@ -47,13 +47,11 @@ async fn writes_numeric_bigint_and_decimal() {
     let big_str = "9876543210987654321098765";
     let rate_str = "1.2345";
     let batch = Batch {
-        rows: vec![CoreRow {
-            values: vec![
-                Value::Int32(1),
-                Value::BigInt(BigInt::from_str(big_str).unwrap()),
-                Value::Decimal(BigDecimal::from_str(rate_str).unwrap()),
-            ],
-        }],
+        rows: vec![CoreRow::upsert(vec![
+            Value::Int32(1),
+            Value::BigInt(BigInt::from_str(big_str).unwrap()),
+            Value::Decimal(BigDecimal::from_str(rate_str).unwrap()),
+        ])],
         next_cursor: None,
     };
     let ctx = sink.build_context(&spec).await.unwrap();

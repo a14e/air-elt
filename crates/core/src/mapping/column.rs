@@ -43,11 +43,11 @@ pub fn build(flow: &FlowConfig) -> Result<Vec<ColumnMapping>, ConfigError> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::config::model::{CursorConfig, CursorOrder, FlowConfig};
+    use crate::config::model::{CursorConfig, CursorOrder, FlowConfig, FlowSourceRef};
 
     fn flow_with_mappings(entries: Vec<MappingEntry>) -> FlowConfig {
         FlowConfig {
-            source: "s".into(),
+            source: FlowSourceRef::Bare("s".into()),
             sink: "k".into(),
             storage: "st".into(),
             from: "t".into(),

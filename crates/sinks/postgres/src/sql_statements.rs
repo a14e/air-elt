@@ -8,6 +8,15 @@ pub const PING: &str = "SELECT 1";
 
 pub const HAS_TABLE_INSERT: &str = "SELECT has_table_privilege(current_user, $1, 'INSERT') AS ok";
 
+pub const HAS_TABLE_DELETE: &str = "SELECT has_table_privilege(current_user, $1, 'DELETE') AS ok";
+
+/// `DELETE FROM "schema"."t" WHERE false` — used by the validate-time
+/// DELETE probe. Identifier-only; no values bound.
+pub fn probe_delete_where_false(table: &str) -> RuntimeResult<String> {
+    let quoted_table = quote_qualified(table)?;
+    Ok(format!("DELETE FROM {quoted_table} WHERE false"))
+}
+
 /// `INSERT INTO "schema"."t" ("c1","c2") SELECT "c1","c2" FROM "schema"."t" WHERE false`
 pub fn probe_insert_where_false(table: &str, columns: &[String]) -> RuntimeResult<String> {
     let quoted_table = quote_qualified(table)?;
@@ -23,6 +32,22 @@ pub fn insert_statement(table: &str, columns: &[String]) -> RuntimeResult<String
     let quoted_table = quote_qualified(table)?;
     let cols = quote_columns(columns)?;
     Ok(format!("INSERT INTO {quoted_table} ({cols}) "))
+}
+
+/// `DELETE FROM "schema"."t" WHERE ("k1","k2") IN (` — caller appends a
+/// `push_values` loop that pushes the tuple values, then `)`.
+pub fn delete_in_prefix(table: &str, key_columns: &[String]) -> RuntimeResult<String> {
+    let quoted_table = quote_qualified(table)?;
+    let key_quoted = quote_columns(key_columns)?;
+    if key_columns.len() == 1 {
+        Ok(format!(
+            "DELETE FROM {quoted_table} WHERE {key_quoted} IN ("
+        ))
+    } else {
+        Ok(format!(
+            "DELETE FROM {quoted_table} WHERE ({key_quoted}) IN ("
+        ))
+    }
 }
 
 /// Suffix appended after `VALUES (...)` to translate the operator's

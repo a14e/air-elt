@@ -17,12 +17,36 @@ pub fn probe_insert_where_false(table: &str, columns: &[String]) -> RuntimeResul
     ))
 }
 
+/// Zero-row probe of the DELETE path. MySQL/MariaDB has no
+/// `has_table_privilege()` analogue, so we lean on the rolled-back
+/// transaction to surface privilege / table-visibility errors.
+pub fn probe_delete_where_false(table: &str) -> RuntimeResult<String> {
+    let quoted_table = quote_qualified(table)?;
+    Ok(format!("DELETE FROM {quoted_table} WHERE FALSE"))
+}
+
 /// INSERT statement consumed by `QueryBuilder::push_values`; caller appends
 /// `VALUES ...`. MySQL syntax is identical to pg here.
 pub fn insert_statement(table: &str, columns: &[String]) -> RuntimeResult<String> {
     let quoted_table = quote_qualified(table)?;
     let cols = quote_columns(columns)?;
     Ok(format!("INSERT INTO {quoted_table} ({cols}) "))
+}
+
+/// `DELETE FROM `db`.`t` WHERE (`k1`,`k2`) IN (` — caller appends a
+/// `push_tuples` loop that pushes the tuple values, then `)`.
+pub fn delete_in_prefix(table: &str, key_columns: &[String]) -> RuntimeResult<String> {
+    let quoted_table = quote_qualified(table)?;
+    let key_quoted = quote_columns(key_columns)?;
+    if key_columns.len() == 1 {
+        Ok(format!(
+            "DELETE FROM {quoted_table} WHERE {key_quoted} IN ("
+        ))
+    } else {
+        Ok(format!(
+            "DELETE FROM {quoted_table} WHERE ({key_quoted}) IN ("
+        ))
+    }
 }
 
 /// Like `insert_statement` but for `ConflictStrategy::Ignore` — uses

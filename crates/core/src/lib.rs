@@ -9,6 +9,6 @@ pub mod types;
 pub mod validation;
 
 pub use model::{
-    Batch, CursorFieldValue, CursorState, Field, FlowState, ReadSpec, Row, Schema, WriteReport,
-    WriteSpec,
+    Batch, CursorFieldValue, CursorState, Field, FlowState, ReadSpec, Row, RowOp, Schema,
+    WriteReport, WriteSpec,
 };
