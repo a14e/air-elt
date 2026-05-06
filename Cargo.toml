@@ -82,6 +82,16 @@ base64 = "0.22.1"
 lto = "thin"
 codegen-units = 1
 
+# Explicit `incremental = true` for dev/test even though it's the cargo
+# default — guards against `CARGO_INCREMENTAL=0` leaking from the
+# environment (some CI templates set it). We also keep `codegen-units`
+# at the default 256 here for maximum parallelism on rebuild.
+[profile.dev]
+incremental = true
+
+[profile.test]
+incremental = true
+
 [workspace.lints.rust]
 # `deny` (not `forbid`) so narrow `#[allow(unsafe_code)]` can be applied at a
 # single block — currently only in test helpers around `std::env::set_var`

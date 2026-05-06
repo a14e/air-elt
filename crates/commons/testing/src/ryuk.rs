@@ -104,27 +104,78 @@ pub async fn ensure_session(socket: &str) {
     let socket = socket.to_string();
     SESSION_HANDLE
         .get_or_init(|| async move {
-            // Retry the full handshake: a previous test process may have
-            // disconnected, the reconnection-timeout fired, and ryuk is
-            // mid-shutdown — accepting TCP but closing on filter write.
-            // We back off, force a fresh start (testcontainers will
-            // reuse-or-restart by name), and try again. Three attempts
-            // with growing pauses cover typical races without dragging
-            // a real failure out for long.
+            // Retry the full handshake. If first attempt fails, the
+            // existing ryuk container is in a bad state (mid-shutdown,
+            // socket disconnect race, etc.) — testcontainers reuse-mode
+            // would just keep grabbing the same broken instance. Before
+            // each retry we explicitly force-remove the ryuk container
+            // by name so the next `start()` actually creates a fresh
+            // one. Three attempts is plenty in practice.
+            let sid = session_id();
+            let container_name =
+                format!("air-elt-ryuk-{}", sanitize_for_container_name(sid));
             let mut last_err = String::new();
             for attempt in 0..3 {
+                if attempt > 0 {
+                    if let Err(e) = remove_ryuk_container(&socket, &container_name) {
+                        warn!(error = %e, "could not force-remove ryuk before retry");
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
                 match start_session(&socket).await {
                     Ok(handle) => return handle,
                     Err(e) => {
                         warn!(attempt, error = %e, "ryuk session handshake failed; retrying");
                         last_err = e;
-                        tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
                     }
                 }
             }
             panic!("failed to bring up ryuk session after 3 attempts: {last_err}");
         })
         .await;
+}
+
+/// Best-effort `DELETE /containers/<name>?force=true` against the docker
+/// daemon. Used to evict a broken ryuk between handshake retries —
+/// testcontainers reuse-mode otherwise hands us back the same dud.
+fn remove_ryuk_container(socket: &str, name: &str) -> std::io::Result<()> {
+    let request = format!(
+        "DELETE /containers/{name}?force=true HTTP/1.0\r\n\
+         Host: localhost\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    let timeout = Duration::from_secs(3);
+    docker_http_drain(socket, request.as_bytes(), timeout)
+}
+
+#[cfg(unix)]
+fn docker_http_drain(endpoint: &str, request: &[u8], timeout: Duration) -> std::io::Result<()> {
+    use std::os::unix::net::UnixStream;
+    if let Some(path) = endpoint.strip_prefix("unix://") {
+        let mut stream = UnixStream::connect(path)?;
+        stream.set_write_timeout(Some(timeout))?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.write_all(request)?;
+        let mut sink = Vec::with_capacity(256);
+        let _ = stream.read_to_end(&mut sink);
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("unsupported endpoint scheme: {endpoint}"),
+    ))
+}
+
+#[cfg(not(unix))]
+fn docker_http_drain(_endpoint: &str, _request: &[u8], _timeout: Duration) -> std::io::Result<()> {
+    // Windows named-pipe DELETE is omitted here — the retry path will
+    // simply re-attempt the testcontainers `start()` and rely on its
+    // reuse semantics.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "force-remove is unix-only",
+    ))
 }
 
 async fn start_session(socket: &str) -> Result<SessionHandle, String> {
