@@ -112,8 +112,7 @@ pub async fn ensure_session(socket: &str) {
             // by name so the next `start()` actually creates a fresh
             // one. Three attempts is plenty in practice.
             let sid = session_id();
-            let container_name =
-                format!("air-elt-ryuk-{}", sanitize_for_container_name(sid));
+            let container_name = format!("air-elt-ryuk-{}", sanitize_for_container_name(sid));
             let mut last_err = String::new();
             for attempt in 0..3 {
                 if attempt > 0 {
