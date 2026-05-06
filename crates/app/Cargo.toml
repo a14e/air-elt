@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+name = "air_elt_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "air-elt"
 path = "src/main.rs"

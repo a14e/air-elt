@@ -63,7 +63,9 @@ const RYUK_PORT: u16 = 8080;
 const SESSION_FILE_TTL_SECS: u64 = 6 * 3600;
 
 /// How long we wait for ryuk to start listening before giving up.
-const RYUK_TCP_DEADLINE: Duration = Duration::from_secs(30);
+/// Local container start is bounded by ~3-5 s on healthy systems; 10 s
+/// is plenty without dragging real failures out.
+const RYUK_TCP_DEADLINE: Duration = Duration::from_secs(10);
 
 static SESSION_ID: OnceLock<String> = OnceLock::new();
 static SESSION_HANDLE: OnceCell<SessionHandle> = OnceCell::const_new();
@@ -116,10 +118,14 @@ pub async fn ensure_session(socket: &str) {
             let mut last_err = String::new();
             for attempt in 0..3 {
                 if attempt > 0 {
-                    if let Err(e) = remove_ryuk_container(&socket, &container_name) {
+                    if let Err(e) = remove_ryuk_container(&container_name).await {
                         warn!(error = %e, "could not force-remove ryuk before retry");
                     }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    // Brief settle so docker has time to actually evict
+                    // the container before testcontainers re-lists by
+                    // name. 150 ms is plenty for the daemon's internal
+                    // bookkeeping; longer waits just inflate retry cost.
+                    tokio::time::sleep(Duration::from_millis(150)).await;
                 }
                 match start_session(&socket).await {
                     Ok(handle) => return handle,
@@ -134,47 +140,17 @@ pub async fn ensure_session(socket: &str) {
         .await;
 }
 
-/// Best-effort `DELETE /containers/<name>?force=true` against the docker
-/// daemon. Used to evict a broken ryuk between handshake retries —
-/// testcontainers reuse-mode otherwise hands us back the same dud.
-fn remove_ryuk_container(socket: &str, name: &str) -> std::io::Result<()> {
-    let request = format!(
-        "DELETE /containers/{name}?force=true HTTP/1.0\r\n\
-         Host: localhost\r\n\
-         Connection: close\r\n\
-         \r\n"
-    );
-    let timeout = Duration::from_secs(3);
-    docker_http_drain(socket, request.as_bytes(), timeout)
-}
-
-#[cfg(unix)]
-fn docker_http_drain(endpoint: &str, request: &[u8], timeout: Duration) -> std::io::Result<()> {
-    use std::os::unix::net::UnixStream;
-    if let Some(path) = endpoint.strip_prefix("unix://") {
-        let mut stream = UnixStream::connect(path)?;
-        stream.set_write_timeout(Some(timeout))?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.write_all(request)?;
-        let mut sink = Vec::with_capacity(256);
-        let _ = stream.read_to_end(&mut sink);
-        return Ok(());
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        format!("unsupported endpoint scheme: {endpoint}"),
-    ))
-}
-
-#[cfg(not(unix))]
-fn docker_http_drain(_endpoint: &str, _request: &[u8], _timeout: Duration) -> std::io::Result<()> {
-    // Windows named-pipe DELETE is omitted here — the retry path will
-    // simply re-attempt the testcontainers `start()` and rely on its
-    // reuse semantics.
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "force-remove is unix-only",
-    ))
+/// Best-effort `DELETE /containers/<name>?force=true` via bollard. Used
+/// to evict a broken ryuk between handshake retries — testcontainers'
+/// reuse-mode would otherwise hand us back the same dud. Operates on
+/// the same `DOCKER_HOST` we exported from `backend.rs`, so behaviour
+/// matches what testcontainers itself sees.
+async fn remove_ryuk_container(name: &str) -> Result<(), bollard::errors::Error> {
+    let docker = bollard::Docker::connect_with_local_defaults()?;
+    let opts = bollard::query_parameters::RemoveContainerOptionsBuilder::default()
+        .force(true)
+        .build();
+    docker.remove_container(name, Some(opts)).await
 }
 
 async fn start_session(socket: &str) -> Result<SessionHandle, String> {
@@ -244,8 +220,11 @@ async fn start_session(socket: &str) -> Result<SessionHandle, String> {
         .map_err(|e| format!("write ryuk filter: {e}"))?;
     // Ryuk replies with "ACK\n" per match; we sent one filter so one ACK.
     let mut buf = [0u8; 4];
+    // Local ACK comes back inside a single TCP RTT — give it 1 s and
+    // let the retry path handle anything slower (typically means ryuk
+    // is in shutdown).
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_secs(1)))
         .map_err(|e| format!("set ryuk read timeout: {e}"))?;
     stream
         .read_exact(&mut buf)
@@ -275,16 +254,17 @@ async fn wait_for_ryuk_listener(host: &str, port: u16) -> Result<TcpStream, Stri
         .parse()
         .or_else(|_| addr.to_socket_first())
         .map_err(|e| format!("parse ryuk addr {addr}: {e}"))?;
-    // Container just started; ryuk needs ~tens of ms to bind. A short
-    // pre-sleep avoids burning the first attempt on a guaranteed miss.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Locally ryuk binds within ~tens of ms once the container reports
+    // running. We poll fast (100 ms cadence, 200 ms connect timeout)
+    // because even on a cold machine the listener is up well within a
+    // second; longer waits just inflate test latency.
     let mut last_err: Option<std::io::Error> = None;
     while Instant::now() < deadline {
-        match TcpStream::connect_timeout(&resolved, Duration::from_millis(500)) {
+        match TcpStream::connect_timeout(&resolved, Duration::from_millis(200)) {
             Ok(stream) => return Ok(stream),
             Err(e) => {
                 last_err = Some(e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }

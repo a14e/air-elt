@@ -96,6 +96,27 @@ impl Registry {
             .unwrap_or(SamplingConfig::Disabled)
     }
 
+    /// Sorted list of registered source `kind`s.
+    pub fn source_kinds(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.sources.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// Sorted list of registered sink `kind`s.
+    pub fn sink_kinds(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.sinks.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// Sorted list of registered storage `kind`s.
+    pub fn storage_kinds(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.storages.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     pub async fn build_storage(&self, cfg: &ComponentConfig) -> RuntimeResult<Box<dyn Storage>> {
         let f = self
             .storages
