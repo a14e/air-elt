@@ -1,0 +1,52 @@
+# Per-target linker overrides. Plain `cargo build` honours this; CI does
+# the same provided the chosen linker is installed.
+#
+# Why: the default macOS `ld` and most Linux `ld.bfd` linkers spend a
+# noticeable share of incremental rebuild time linking. `lld` (Linux,
+# Windows) and `ld64.lld` (macOS, the mach-o backend of `lld`) are
+# drop-in compatible and significantly faster on this workspace's binary
+# graph (sqlx + bollard + async-trait pull a lot of monomorphisation).
+#
+# `mold` is even faster on Linux but requires explicit install
+# (`apt install mold` / `pacman -S mold` / etc.) — left as opt-in via the
+# commented block below.
+
+[target.aarch64-apple-darwin]
+linker = "clang"
+rustflags = [
+    # `-fuse-ld=lld` instructs clang to invoke `ld64.lld`; clang must find
+    # it on `PATH`. With Homebrew LLVM that's `/opt/homebrew/bin/`.
+    "-C", "link-arg=-fuse-ld=lld",
+]
+
+[target.x86_64-apple-darwin]
+linker = "clang"
+rustflags = [
+    "-C", "link-arg=-fuse-ld=lld",
+]
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = [
+    "-C", "link-arg=-fuse-ld=lld",
+    # Uncomment to use mold instead (faster than lld; install via OS pkg):
+    # "-C", "link-arg=-fuse-ld=mold",
+]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = [
+    "-C", "link-arg=-fuse-ld=lld",
+]
+
+# Windows MSVC: bundled `link.exe` is already fast enough — keep the
+# default. Switching to `lld-link.exe` works as a drop-in but adds a
+# toolchain install step that's not worth the marginal speedup.
+#
+# Windows MinGW: clang routes the link through `lld` the same way as on
+# Linux. Requires `mingw-w64` + `llvm` (MSYS2 / Chocolatey).
+[target.x86_64-pc-windows-gnu]
+linker = "clang"
+rustflags = [
+    "-C", "link-arg=-fuse-ld=lld",
+]

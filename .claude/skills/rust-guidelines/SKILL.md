@@ -31,18 +31,10 @@ The codebase favours clarity over cleverness. Code is read far more often than w
 ## Timeouts and cancellation safety
 
 - When wrapping a future in `tokio::time::timeout` or `tokio::select!`, verify the underlying driver/protocol supports
-  cancellation without leaving inconsistent state. sqlx postgres / sqlx mysql queries are cancellation-safe (drop sends
-  a cancel message to the server). If a driver is not cancellation-safe, document the risk and consider `spawn` +
+  cancellation without leaving inconsistent state. If a driver is not cancellation-safe, document the risk and consider `spawn` +
   `abort` instead of `select!`.
 - The `mongodb` 3.x Rust driver is **not** cancellation-safe — dropping its futures mid-await can leave driver internals
-  inconsistent. The flow runner enforces this via `Source/Sink/Storage::cancel_safe()` (default `true`); Mongo
-  connectors override it to `false`. The `cancel_safe == false` branch in `core::flow::runner::run_op` (and the same
-  logic in `core::validation::sampling`) uses `tokio::spawn` + detach instead of `tokio::time::timeout`: dropping a
-  `JoinHandle` in tokio does NOT abort the task, so the driver future always runs to completion. Connection-level / pool
-  timeouts on the underlying `mongodb::Client` (configured in `commons-mongodb::client::connect`) bound runaway work;
-  `ClientOptions::default_timeout` does NOT exist in the pinned `mongodb 3.6` crate, so per-operation
-  `*Options::max_time` is the only client-side per-op cap available — apply it where the operation's options struct
-  supports it (Find, Aggregate, FindOne, …).
+  inconsistent. The flow runner enforces this via `Source/Sink/Storage::cancel_safe()` (default `true`);
 
 ## Logging and errors
 

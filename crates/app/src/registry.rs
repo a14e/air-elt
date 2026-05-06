@@ -16,9 +16,16 @@ use air_elt_storage_postgres::PgStorageFactory;
 
 pub fn build_registry() -> Registry {
     let mut registry = Registry::new();
-    registry.register_source("postgres", Arc::new(PgSourceFactory));
-    registry.register_sink("postgres", Arc::new(PgSinkFactory));
-    registry.register_storage("postgres", Arc::new(PgStorageFactory));
+    registry.register_source("postgres", Arc::new(PgSourceFactory::postgres()));
+    registry.register_sink("postgres", Arc::new(PgSinkFactory::postgres()));
+    registry.register_storage("postgres", Arc::new(PgStorageFactory::postgres()));
+    // CockroachDB is a Postgres-wire-compatible engine; the same connector
+    // crates serve it under a separate `type = "cockroachdb"` registry key
+    // with `Dialect::Cockroach` selecting the few divergent code paths
+    // (UPSERT for 1-key conflicts, 40001 retry, XML-type rejection).
+    registry.register_source("cockroachdb", Arc::new(PgSourceFactory::cockroach()));
+    registry.register_sink("cockroachdb", Arc::new(PgSinkFactory::cockroach()));
+    registry.register_storage("cockroachdb", Arc::new(PgStorageFactory::cockroach()));
     registry.register_source("mysql", Arc::new(MySqlSourceFactory));
     registry.register_sink("mysql", Arc::new(MySqlSinkFactory));
     registry.register_storage("mysql", Arc::new(MySqlStorageFactory));

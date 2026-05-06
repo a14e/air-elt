@@ -17,7 +17,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.90.0"
+          toolchain: "1.95.0"
           components: rustfmt, clippy
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -97,12 +97,13 @@ jobs:
       AIR_ELT_TEST_MONGO_URL: "mongodb://localhost:27017"
       AIR_ELT_TEST_MONGO_LEGACY_URL: "mongodb://localhost:27018"
       AIR_ELT_TEST_MONGO_RS_URL: "mongodb://localhost:27019/?replicaSet=rs0&directConnection=true"
+      AIR_ELT_TEST_COCKROACHDB_URL: "postgres://root@localhost:26257/defaultdb?sslmode=disable"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.90.0"
+          toolchain: "1.95.0"
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -137,5 +138,27 @@ jobs:
             }
             throw new Error("rs primary did not come up in 30s");
           '
+      - name: Start CockroachDB single-node
+        # GHA `services:` cannot append a custom CMD (cockroach's image
+        # ENTRYPOINT needs `start-single-node --insecure` as args, not env),
+        # so we boot it via plain `docker run` — same pattern as the
+        # mongo-rs step above. We then poll the SQL listener until ready;
+        # `cockroach sql -e 'SELECT 1'` exits non-zero until the node has
+        # finished startup.
+        run: |
+          set -euo pipefail
+          docker run -d --name cockroach -p 26257:26257 \
+            cockroachdb/cockroach:v25.1.0 start-single-node --insecure
+          for i in $(seq 1 30); do
+            if docker exec cockroach \
+                /cockroach/cockroach sql --insecure --host=localhost:26257 \
+                -e 'SELECT 1' >/dev/null 2>&1; then
+              echo "cockroach ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "cockroach did not become ready in 30s"
+          docker logs cockroach || true
+          exit 1
       - name: cargo test
         run: cargo test --workspace --all-targets

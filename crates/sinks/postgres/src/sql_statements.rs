@@ -28,6 +28,12 @@ pub fn probe_insert_where_false(table: &str, columns: &[String]) -> RuntimeResul
 }
 
 /// INSERT statement consumed by `QueryBuilder::push_values`; caller appends `VALUES ...`.
+///
+/// The same SQL is emitted for both Postgres and CockroachDB. Cockroach's
+/// native `UPSERT` is *not* used because it silently uses the primary key
+/// as the conflict arbiter regardless of any user-declared `conflict.key`,
+/// which can mask misconfiguration. Standard `INSERT … ON CONFLICT (key)`
+/// works on both engines and respects the user-declared key honestly.
 pub fn insert_statement(table: &str, columns: &[String]) -> RuntimeResult<String> {
     let quoted_table = quote_qualified(table)?;
     let cols = quote_columns(columns)?;

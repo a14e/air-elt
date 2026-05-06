@@ -1,4 +1,6 @@
 #![allow(clippy::unwrap_used)]
+use air_elt_commons_pg::Dialect;
+use air_elt_commons_testing::cockroach::cockroach_pool;
 use air_elt_commons_testing::pg::pg_pool;
 use air_elt_core::model::{Batch, Row as CoreRow, WriteSpec};
 use air_elt_core::traits::Sink;
@@ -304,4 +306,51 @@ async fn all_types_non_null_round_trip() {
             .unwrap();
     assert_eq!(c_date, date);
     assert_eq!(c_ts, ts);
+}
+
+/// Smoke test against CockroachDB: create a table, insert several rows, read
+/// them back. Asserts that the Postgres-compatible insert path works against
+/// the cockroach wire protocol (plain INSERT, no conflict block).
+#[tokio::test]
+async fn cockroach_smoke_insert_and_read_back() {
+    let handle = cockroach_pool().await;
+    handle
+        .pool
+        .execute("CREATE TABLE smoke (id INT PRIMARY KEY, label TEXT NOT NULL)")
+        .await
+        .expect("create smoke");
+
+    let sink = PgSink::connect(PgSinkConfig {
+        url: handle.url_with_database(),
+        dialect: Dialect::Cockroach,
+        ..Default::default()
+    })
+    .await
+    .expect("connect cockroach sink");
+
+    let spec = WriteSpec {
+        columns: vec!["id".into(), "label".into()],
+        table: "smoke".into(),
+        conflict: None,
+    };
+    sink.validate_access(&spec).await.expect("validate_access");
+
+    let rows: Vec<CoreRow> = (1..=5_i64)
+        .map(|i| CoreRow::upsert(vec![Value::Int64(i), Value::Text(format!("row-{i}"))]))
+        .collect();
+    let batch = Batch {
+        rows,
+        next_cursor: None,
+    };
+    let ctx = sink.build_context(&spec).await.expect("build_context");
+    let report = sink.write_batch(&spec, ctx, &batch).await.expect("write");
+    assert_eq!(report.rows_written, 5);
+
+    let back: Vec<(i64, String)> = sqlx::query_as("SELECT id, label FROM smoke ORDER BY id")
+        .fetch_all(&handle.pool)
+        .await
+        .expect("read back");
+    assert_eq!(back.len(), 5);
+    assert_eq!(back[0], (1, "row-1".into()));
+    assert_eq!(back[4], (5, "row-5".into()));
 }

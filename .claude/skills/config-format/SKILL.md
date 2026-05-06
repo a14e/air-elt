@@ -22,12 +22,12 @@ Flat `key = "value"` map. Used by `${VAR}` expansion (env → secrets → defaul
 | Field | Type | Required | Description |
 |-------|------|:--------:|-------------|
 | `name` | string | yes | Unique identifier |
-| `type` | string | yes | Connector kind (`"postgres"`, `"mysql"`, or `"mongodb"`) |
+| `type` | string | yes | Connector kind (`"postgres"`, `"cockroachdb"`, `"mysql"`, or `"mongodb"`) |
 | `config` | table | yes | Connector-specific config (see below) |
 
-### Postgres / MySQL connector config (`config = { ... }`)
+### Postgres / CockroachDB / MySQL connector config (`config = { ... }`)
 
-The same field set applies to both `"postgres"` and `"mysql"` types — only the URL scheme differs (`postgres://...` vs `mysql://...`). For MySQL, the database name is taken from the URL path (`mysql://user@host:3306/dbname`); table identifiers may also be schema-qualified (`appdb.users`).
+The same field set applies to `"postgres"`, `"cockroachdb"`, and `"mysql"` — only the URL scheme/port differs (`postgres://...:5432`, `postgres://root@...:26257/...?sslmode=disable` for Cockroach, `mysql://...:3306`). `cockroachdb` reuses the Postgres connector crates with `Dialect::Cockroach` selecting the divergent paths (automatic retry on `40001 RETRY_SERIALIZABLE`, upfront `XML`-type rejection, advisory-lock-free migrations). The standard `INSERT … ON CONFLICT` path is used for upserts on both engines. For MySQL, the database name is taken from the URL path (`mysql://user@host:3306/dbname`); table identifiers may also be schema-qualified (`appdb.users`).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

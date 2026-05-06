@@ -73,6 +73,30 @@ impl Drop for PgSchemaGuard {
     }
 }
 
+pub struct CockroachDbGuard {
+    pool: PgPool,
+    dbs: Vec<String>,
+}
+
+impl CockroachDbGuard {
+    pub fn new(pool: PgPool, dbs: Vec<String>) -> Self {
+        Self { pool, dbs }
+    }
+}
+
+impl Drop for CockroachDbGuard {
+    fn drop(&mut self) {
+        let pool = self.pool.clone();
+        let dbs = std::mem::take(&mut self.dbs);
+        run_cleanup(move || async move {
+            for db in dbs {
+                let stmt = format!("DROP DATABASE IF EXISTS \"{db}\" CASCADE");
+                let _ = tokio::time::timeout(DROP_TIMEOUT, pool.execute(stmt.as_str())).await;
+            }
+        });
+    }
+}
+
 pub struct MongoDbGuard {
     client: MongoClient,
     dbs: Vec<String>,

@@ -111,6 +111,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -122,6 +123,7 @@ dependencies = [
  "bson",
  "mongodb",
  "rand 0.10.1",
+ "sha2",
  "sqlx",
  "testcontainers",
  "testcontainers-modules",
