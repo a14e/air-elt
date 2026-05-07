@@ -78,47 +78,55 @@ async fn pg_to_cockroachdb_with_upsert_overwrite() {
     let pg_url = pg.url_with_search_path();
     let cockroach_url = cockroach.url_with_database();
 
-    let config_toml = format!(
+    let config_yaml = format!(
         r#"
-[[sources]]
-name = "src"
-type = "postgres"
-config = {{ url = "{pg_url}" }}
+sources:
+  - name: src
+    type: postgres
+    config:
+      url: "{pg_url}"
 
-[[sinks]]
-name = "snk"
-type = "cockroachdb"
-config = {{ url = "{cockroach_url}" }}
+sinks:
+  - name: snk
+    type: cockroachdb
+    config:
+      url: "{cockroach_url}"
 
-[[storages]]
-name = "st"
-type = "cockroachdb"
-config = {{ url = "{cockroach_url}" }}
+storages:
+  - name: st
+    type: cockroachdb
+    config:
+      url: "{cockroach_url}"
 
-[flow.users]
-source = "src"
-sink = "snk"
-storage = "st"
-from = "{src_schema}.users"
-to = "public.users"
-batch-limit = 2
+flow:
+  users:
+    source: src
+    sink: snk
+    storage: st
+    from: "{src_schema}.users"
+    to: "public.users"
+    batch-limit: 2
 
-mapping = [
-    {{ from = "id", to = "id" }},
-    {{ from = "email", to = "email" }},
-    {{ from = "display_name", to = "display_name" }},
-]
+    mapping:
+      - {{ from: id, to: id }}
+      - {{ from: email, to: email }}
+      - {{ from: display_name, to: display_name }}
 
-cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
+    cursor:
+      fields: [id]
+      order: asc
+      interval: "100ms"
 
-# Single-key Overwrite — drives the sink down the UPSERT path on Cockroach.
-conflict = {{ key = ["id"], strategy = "overwrite" }}
+    # Single-key Overwrite -- drives the sink down the UPSERT path on Cockroach.
+    conflict:
+      key: [id]
+      strategy: overwrite
 "#,
     );
 
     let tmp = tempfile::tempdir().unwrap();
-    let config_path = tmp.path().join("config.toml");
-    std::fs::write(&config_path, &config_toml).unwrap();
+    let config_path = tmp.path().join("config.yml");
+    std::fs::write(&config_path, &config_yaml).unwrap();
     let app = App::from_path(&config_path).expect("App::from_path");
     app.run_once().await.expect("run_once");
 

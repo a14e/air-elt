@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn from_path_loads_example_config() {
-        let cfg_path = workspace_root().join("examples/pg-to-cockroachdb/config.toml");
+        let cfg_path = workspace_root().join("examples/pg-to-cockroachdb/config.yml");
         let app = App::from_path(&cfg_path).expect("from_path");
         assert!(!app.config.sources.is_empty());
         assert!(!app.config.sinks.is_empty());
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn from_config_uses_default_registry() {
-        let cfg_path = workspace_root().join("examples/pg-to-cockroachdb/config.toml");
+        let cfg_path = workspace_root().join("examples/pg-to-cockroachdb/config.yml");
         let raw = loader::load(&cfg_path).expect("load");
         let app = App::from_config(raw);
         let kinds = app.list_kinds();
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn list_kinds_contains_all_registered_kinds() {
-        let cfg_path = workspace_root().join("examples/pg-to-cockroachdb/config.toml");
+        let cfg_path = workspace_root().join("examples/pg-to-cockroachdb/config.yml");
         let app = App::from_path(&cfg_path).expect("from_path");
         let kinds = app.list_kinds();
 

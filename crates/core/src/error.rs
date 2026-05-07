@@ -23,6 +23,28 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
 
+    #[error("failed to parse yaml in {path:?}: {source}")]
+    YamlParse {
+        path: PathBuf,
+        #[source]
+        source: serde_yaml::Error,
+    },
+
+    #[error(
+        "config file {path:?} has unsupported extension {ext:?} — expected .toml, .yml, or .yaml"
+    )]
+    UnknownConfigExtension { path: PathBuf, ext: String },
+
+    #[error(
+        "duplicate secret key {key:?} declared in {first:?} and {second:?} — \
+         each secret must be defined exactly once across all included files"
+    )]
+    DuplicateSecret {
+        key: String,
+        first: PathBuf,
+        second: PathBuf,
+    },
+
     #[error("failed to resolve env var {var}: {source}")]
     EnvVar {
         var: String,

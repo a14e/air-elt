@@ -32,6 +32,8 @@ cargo run -p air-elt-app -- run --once --config examples/pg-to-mongo/config.toml
 cargo run -p air-elt-app
 ```
 
+Both TOML (`.toml`) and YAML (`.yml` / `.yaml`) are supported equally — pick whichever you prefer. The format is detected per file by extension, and mixing files of different formats inside the same `include` graph is allowed (a TOML root may include a YAML flow file and vice versa). When invoked without `--config`, the CLI probes `./config.toml`, then `./config.yml`, then `./config.yaml`, and uses the first one it finds.
+
 ## Tests
 
 E2E tests need a PostgreSQL instance. Two options:

@@ -118,49 +118,55 @@ async fn mariadb_to_pg_with_uuid_and_mixed_nullability() {
     let src_url = mariadb.url_with_database();
     let pg_url = pg.url_with_search_path();
 
-    let config_toml = format!(
+    let config_yaml = format!(
         r#"
-[[sources]]
-name = "src"
-type = "mysql"
-config = {{ url = "{src_url}" }}
+sources:
+  - name: src
+    type: mysql
+    config:
+      url: "{src_url}"
 
-[[sinks]]
-name = "snk"
-type = "postgres"
-config = {{ url = "{pg_url}" }}
+sinks:
+  - name: snk
+    type: postgres
+    config:
+      url: "{pg_url}"
 
-[[storages]]
-name = "st"
-type = "postgres"
-config = {{ url = "{pg_url}" }}
+storages:
+  - name: st
+    type: postgres
+    config:
+      url: "{pg_url}"
 
-[flow.accounts]
-source = "src"
-sink = "snk"
-storage = "st"
-from = "{src_db}.accounts"
-to = "{dst_schema}.accounts"
-batch-limit = 2
+flow:
+  accounts:
+    source: src
+    sink: snk
+    storage: st
+    from: "{src_db}.accounts"
+    to: "{dst_schema}.accounts"
+    batch-limit: 2
 
-mapping = [
-    {{ from = "id", to = "id" }},
-    {{ from = "ext", to = "ext" }},
-    {{ from = "label", to = "label" }},
-    {{ from = "payload_bytes", to = "payload_bytes" }},
-    # Nullable source → NOT NULL sink, bridged by `default`.
-    {{ from = "nickname", to = "nickname_safe", default = "anonymous" }},
-    {{ from = "visits", to = "visits" }},
-    {{ from = "last_seen", to = "last_seen" }},
-]
+    mapping:
+      - {{ from: id, to: id }}
+      - {{ from: ext, to: ext }}
+      - {{ from: label, to: label }}
+      - {{ from: payload_bytes, to: payload_bytes }}
+      # Nullable source -> NOT NULL sink, bridged by `default`.
+      - {{ from: nickname, to: nickname_safe, default: anonymous }}
+      - {{ from: visits, to: visits }}
+      - {{ from: last_seen, to: last_seen }}
 
-cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
+    cursor:
+      fields: [id]
+      order: asc
+      interval: "100ms"
 "#,
     );
 
     let tmp = tempfile::tempdir().unwrap();
-    let config_path = tmp.path().join("config.toml");
-    std::fs::write(&config_path, &config_toml).unwrap();
+    let config_path = tmp.path().join("config.yml");
+    std::fs::write(&config_path, &config_yaml).unwrap();
     let app = App::from_path(&config_path).expect("App::from_path");
     app.run_once().await.expect("run_once");
 
