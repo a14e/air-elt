@@ -1,0 +1,28 @@
+flow:
+  users:
+    source: pg_src
+    sink: cockroach_sink
+    storage: cockroach_state
+
+    from: public.users
+    to: public.users
+
+    batch-limit: 500
+
+    mapping:
+      - { from: id, to: id }
+      - { from: email, to: email }
+      - { from: display_name, to: display_name }
+
+    cursor:
+      fields: ["id"]
+      order: asc
+      interval: "1s"
+
+    # `INSERT … ON CONFLICT (id) DO UPDATE SET …` — same syntax on both
+    # engines. CockroachDB's native `UPSERT` is intentionally not used: it
+    # silently uses the table's primary key as the conflict arbiter rather
+    # than the user-declared `conflict.key`, which can mask misconfiguration.
+    conflict:
+      key: ["id"]
+      strategy: overwrite

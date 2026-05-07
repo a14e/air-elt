@@ -25,7 +25,18 @@ struct Cli {
     command: Option<Command>,
 }
 
+/// CLI default when `--config` is omitted: probe the working directory for
+/// `config.toml`, then `config.yml`, then `config.yaml`. Returns the first
+/// existing file. If none exist, falls back to `./config.toml` so the
+/// downstream loader emits a clear "file not found" diagnostic against the
+/// canonical name.
 fn default_config_path() -> PathBuf {
+    for candidate in ["./config.toml", "./config.yml", "./config.yaml"] {
+        let p = PathBuf::from(candidate);
+        if p.is_file() {
+            return p;
+        }
+    }
     PathBuf::from("./config.toml")
 }
 

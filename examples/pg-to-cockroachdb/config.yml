@@ -1,0 +1,35 @@
+config:
+  include: ["flows"]
+
+secrets:
+  PG_SRC_URL: "postgres://postgres:postgres@localhost:5432/source"
+  COCKROACH_SINK_URL: "postgres://root@localhost:26257/target?sslmode=disable"
+  COCKROACH_STATE_URL: "postgres://root@localhost:26257/state?sslmode=disable"
+
+sources:
+  - name: pg_src
+    type: postgres
+    config:
+      url: "${PG_SRC_URL}"
+
+sinks:
+  - name: cockroach_sink
+    # CockroachDB speaks the Postgres wire protocol — the same connector crate
+    # serves it under a separate registry key. The `cockroachdb` factory binds
+    # `Dialect::Cockroach`, which selects the few divergent code paths:
+    #   * automatic retry on `40001 RETRY_SERIALIZABLE` (CockroachDB defaults
+    #     to SERIALIZABLE isolation),
+    #   * upfront rejection of `XML` columns (CockroachDB has no XML type),
+    #   * storage migrations skip `pg_advisory_lock` (unimplemented in CRDB).
+    # The standard `INSERT … ON CONFLICT` path is used for upserts on both
+    # engines — Cockroach's native `UPSERT` is intentionally avoided because
+    # it ignores the user-declared `conflict.key` and silently uses the PK.
+    type: cockroachdb
+    config:
+      url: "${COCKROACH_SINK_URL}"
+
+storages:
+  - name: cockroach_state
+    type: cockroachdb
+    config:
+      url: "${COCKROACH_STATE_URL}"

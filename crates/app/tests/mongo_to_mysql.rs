@@ -119,69 +119,77 @@ async fn mongo_to_mysql_with_many_types_and_nulls() {
     let mongo_url = mongo.url.clone();
     let mysql_url = mysql.url_with_database();
 
-    let config_toml = format!(
+    let config_yaml = format!(
         r#"
-[[sources]]
-name = "mongo_src"
-type = "mongodb"
-config = {{ url = "{mongo_url}", database = "{src_db_mongo}" }}
+sources:
+  - name: mongo_src
+    type: mongodb
+    config:
+      url: "{mongo_url}"
+      database: "{src_db_mongo}"
 
-[[sinks]]
-name = "mysql_sink"
-type = "mysql"
-config = {{ url = "{mysql_url}" }}
+sinks:
+  - name: mysql_sink
+    type: mysql
+    config:
+      url: "{mysql_url}"
 
-[[storages]]
-name = "mongo_state"
-type = "mongodb"
-config = {{ url = "{mongo_url}", database = "{state_db_mongo}" }}
+storages:
+  - name: mongo_state
+    type: mongodb
+    config:
+      url: "{mongo_url}"
+      database: "{state_db_mongo}"
 
-[flow.users]
-source = "mongo_src"
-sink = "mysql_sink"
-storage = "mongo_state"
-from = "users"
-to = "{dst_db_sql}.users"
-batch-limit = 2
+flow:
+  users:
+    source: mongo_src
+    sink: mysql_sink
+    storage: mongo_state
+    from: users
+    to: "{dst_db_sql}.users"
+    batch-limit: 2
 
-mapping = [
-    # `_id` is invariably present in Mongo; on the SQL side `id BIGINT
-    # NOT NULL PRIMARY KEY` requires a default to placate the
-    # nullable-source check. `0` is a sentinel that should never fire
-    # in practice — a missing `_id` would be a malformed document.
-    {{ from = "_id", to = "id", default = 0 }},
-    # NOT NULL columns with `default = "..."` — `check_mapping` admits
-    # `nullable_src → not_null_sink` only when a default literal is
-    # present. The runtime `convert` arm substitutes the default when
-    # the source value is `Null`, so the seed below intentionally drops
-    # `name` / `city` / `score` to NULL on selected rows to verify the
-    # substitution actually fires.
-    #
-    # `truncate = true` is also needed for the text columns: Mongo
-    # strings are unbounded text; MySQL `VARCHAR(64)` carries a width.
-    # The lossless matrix forbids unbounded -> bounded narrowing — opt
-    # into the wider matrix (`is_compatible_with_truncate`).
-    {{ from = "name", to = "name", truncate = true, default = "anonymous" }},
-    {{ from = "addr.city", to = "city", truncate = true, default = "unknown" }},
-    {{ from = "score", to = "score", default = -1 }},
-    # Genuinely nullable columns — NULL passes through as SQL NULL.
-    {{ from = "rating", to = "rating" }},
-    {{ from = "is_active", to = "is_active" }},
-    {{ from = "created_at", to = "created_at" }},
-    {{ from = "payload", to = "payload" }},
-]
+    mapping:
+      # `_id` is invariably present in Mongo; on the SQL side `id BIGINT
+      # NOT NULL PRIMARY KEY` requires a default to placate the
+      # nullable-source check. `0` is a sentinel that should never fire
+      # in practice -- a missing `_id` would be a malformed document.
+      - {{ from: _id, to: id, default: 0 }}
+      # NOT NULL columns with `default: ...` -- `check_mapping` admits
+      # `nullable_src -> not_null_sink` only when a default literal is
+      # present. The runtime `convert` arm substitutes the default when
+      # the source value is `Null`, so the seed below intentionally drops
+      # `name` / `city` / `score` to NULL on selected rows to verify the
+      # substitution actually fires.
+      #
+      # `truncate: true` is also needed for the text columns: Mongo
+      # strings are unbounded text; MySQL `VARCHAR(64)` carries a width.
+      # The lossless matrix forbids unbounded -> bounded narrowing -- opt
+      # into the wider matrix (`is_compatible_with_truncate`).
+      - {{ from: name, to: name, truncate: true, default: anonymous }}
+      - {{ from: "addr.city", to: city, truncate: true, default: unknown }}
+      - {{ from: score, to: score, default: -1 }}
+      # Genuinely nullable columns -- NULL passes through as SQL NULL.
+      - {{ from: rating, to: rating }}
+      - {{ from: is_active, to: is_active }}
+      - {{ from: created_at, to: created_at }}
+      - {{ from: payload, to: payload }}
 
-cursor = {{ fields = ["_id"], order = "asc", interval = "100ms" }}
+    cursor:
+      fields: [_id]
+      order: asc
+      interval: "100ms"
 
-[flow.users.conflict]
-key = ["id"]
-strategy = "overwrite"
+    conflict:
+      key: [id]
+      strategy: overwrite
 "#,
     );
 
     let tmp = tempfile::tempdir().unwrap();
-    let config_path = tmp.path().join("config.toml");
-    std::fs::write(&config_path, &config_toml).unwrap();
+    let config_path = tmp.path().join("config.yml");
+    std::fs::write(&config_path, &config_yaml).unwrap();
     let app = App::from_path(&config_path).expect("App::from_path");
     app.run_once().await.expect("run_once");
 

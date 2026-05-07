@@ -12,7 +12,7 @@ Air Elt is a Rust service for moving data between systems with **minimal transfo
 
 Validation prioritises **correctness**: every access probe, type check, and config constraint must pass before any data moves. Runtime prioritises **fault tolerance**: individual flow failures are logged and retried, never crashing the whole process.
 
-- Flows are **declarative TOML** (GitOps). One file per flow.
+- Flows are **declarative TOML or YAML** (GitOps). One file per flow.
 - **Static SQL.** Statements are composed during config-init, never per-row.
 - **Micro-batch + drain.** Sub-second batches with drain semantics (pull while full, sleep when empty). A nightly mode is available via a long interval.
 - **Structured logs** via `tracing` only — no `println!`.
@@ -69,7 +69,7 @@ For the full `DataType`/`Value` enumeration and conversion rules, read the sourc
 
 Optional `[flow.<name>.conflict]` block with `key = […]` and `strategy = "ignore"|"overwrite"`. Without it, sinks do plain `INSERT` / `insertMany`. With it: pg uses `ON CONFLICT … DO NOTHING/UPDATE`, mysql uses `INSERT IGNORE` / `ON DUPLICATE KEY UPDATE … = VALUES(…)` (MariaDB-compatible legacy form), mongo upserts via parallel `replaceOne(upsert=true)` (single-key `["_id"]` takes a fast path).
 
-## Config (TOML only in MVP)
+## Config (TOML or YAML)
 
 ```toml
 [config]
@@ -127,7 +127,7 @@ Cursor columns may be nullable. NULL is treated as the minimum element: `NULL < 
 
 ## Out of MVP
 
-Vault secret retrieval (only `$ENV_VAR` / literals work), privilege-excess check, Prometheus/OTel metrics, connectors beyond postgres + mysql + mongodb + cockroachdb, YAML config.
+Vault secret retrieval (only `$ENV_VAR` / literals work), privilege-excess check, Prometheus/OTel metrics, connectors beyond postgres + mysql + mongodb + cockroachdb.
 
 ## Testing
 

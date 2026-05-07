@@ -2,11 +2,11 @@
 
 ## Mandatory skills
 
-(Mandatory) For any non-trivial task, load `task-flow` **before planning starts and before any execution begins**. Re-load it after compaction.
+(Mandatory) For any non-trivial task, load `task-flow` and follow rules from it **before planning starts and before any execution begins**. Re-load it after compaction.
 (Mandatory) When exploring the project, read `air-elt-overview`.
 (Mandatory) When writing code or planning, also use `rust-guidelines` and `project-conventions`.
 If you need to work with configs, use `config-format`.
-Save context using `context-saving`.
+Save context using `context-saving` (load it before complex tasks and project research).
 Use the skill tools rather than reading skill files directly.
 
 If you add a new shared utility — document it in `project-conventions`.

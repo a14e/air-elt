@@ -1,17 +1,24 @@
 ---
 name: config-format
-description: Complete reference for the Air Elt TOML config format — all sections, fields, defaults, and validation rules. Load before editing config files, config structs, or the loader.
+description: Complete reference for the Air Elt TOML/YAML config format — all sections, fields, defaults, and validation rules. Load before editing config files, config structs, or the loader.
 ---
 
 # Config format
 
-Air Elt uses TOML. Multi-word keys use **kebab-case** (`batch-limit`, `operation-timeout-secs`).
+Air Elt accepts both TOML (`.toml`) and YAML (`.yml`/`.yaml`). Format is detected per file by extension; mixing formats inside one include graph is allowed. The shape is identical — a TOML `[[sources]]`/`[flow.<name>]`/inline-table maps mechanically to a YAML list / nested map / nested mapping under the same keys. All examples below are TOML; translate to YAML by that mapping when needed. Multi-word keys use **kebab-case** (`batch-limit`, `operation-timeout-secs`) in both formats.
+
+## Include & duplicate rules
+
+- Each `[[sources]]`, `[[sinks]]`, `[[storages]]` entry and each `[flow.<name>]` must be defined in exactly one file across the root and all included files. Duplicate names across files are an error (`DuplicateName` / `DuplicateFlow`).
+- Each `[secrets]` key must also be defined exactly once across the include graph. Duplicates are a `DuplicateSecret` error (was silently first-wins before).
+- 16 MiB per-file size cap and absolute-path-include rejection apply to both formats.
+- When invoked without `--config`, the CLI probes `./config.toml`, then `./config.yml`, then `./config.yaml`, and uses the first one found.
 
 ## `[config]`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `include` | `[string]` | `[]` | Relative paths to files or directories. Directories are scanned non-recursively for `*.toml`. Absolute paths rejected. |
+| `include` | `[string]` | `[]` | Relative paths to files or directories. Directories are scanned non-recursively for `*.toml`, `*.yml`, and `*.yaml`. Absolute paths rejected. |
 
 ## `[secrets]`
 

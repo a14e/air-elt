@@ -26,7 +26,7 @@ For trivial stages that don't need the full context, also launch separate agents
 Tests are slow, so first narrow down to the specific tests tied to the current task,
 then the full test set.
 If you have local tests, start with them. E2E tests come last.
-And the full test set is the very last call.
+And the FULL test set is the very last call (Mandatory).
 In other words, we have a testing funnel to optimise test time.
 
 
