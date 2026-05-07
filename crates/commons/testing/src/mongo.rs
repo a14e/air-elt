@@ -18,13 +18,15 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
-use mongodb::Client;
+use mongodb::bson::doc;
+use mongodb::{Client, options::ClientOptions};
 use rand::distr::{Alphanumeric, SampleString};
 use rand::rng;
-use testcontainers::core::Mount;
+use testcontainers::core::{ContainerPort, Mount};
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ImageExt, ReuseDirective};
+use testcontainers::{GenericImage, ImageExt, ReuseDirective};
 use testcontainers_modules::mongo::Mongo as MongoImage;
 use tokio::sync::OnceCell;
 use tracing::info;
@@ -53,6 +55,7 @@ struct MongoInfra {
 
 static MONGO_INFRA: OnceCell<MongoInfra> = OnceCell::const_new();
 static MONGO_LEGACY_INFRA: OnceCell<MongoInfra> = OnceCell::const_new();
+static MONGO_RS_INFRA: OnceCell<MongoInfra> = OnceCell::const_new();
 
 pub struct MongoTestHandle {
     pub client: Client,
@@ -194,43 +197,103 @@ fn strip_db_from_path(head: &str) -> (String, Option<String>) {
 /// `mongo-cdc` source, since Change Streams cannot run on a
 /// standalone mongod.
 ///
-/// Operator must set `AIR_ELT_TEST_MONGO_RS_URL` to a URL pointing
-/// at a running RS-mongo. CI does this in the workflow (a
-/// `mongo:8 --replSet rs0` service initiated to a one-node RS).
-/// Local devs can replicate via:
+/// Two modes, mirroring `mongo_pool`:
 ///
-/// ```text
-/// docker run -d --rm -p 27017:27017 mongo:8 --replSet rs0 --bind_ip_all
-/// docker exec <id> mongosh --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
-/// export AIR_ELT_TEST_MONGO_RS_URL="mongodb://localhost:27017/?replicaSet=rs0&directConnection=true"
-/// ```
+/// 1. If `AIR_ELT_TEST_MONGO_RS_URL` is set (CI workflow does this),
+///    connect there.
+/// 2. Otherwise launch a `mongo:8 --replSet rs0` container via
+///    testcontainers, run `replSetInitiate` once, and reuse it across
+///    every test process of the cargo invocation (ryuk-managed).
 ///
-/// Tests that call this without the env var set are expected to
-/// `#[ignore]`-skip themselves at runtime via
-/// `mongo_rs_url_or_skip()`.
-pub fn mongo_rs_url_or_skip() -> Option<String> {
-    std::env::var(RS_URL_VAR).ok()
+/// Clients always connect with `directConnection=true` so the driver
+/// doesn't try to follow the in-container topology entry to a host:port
+/// it can't reach.
+async fn mongo_rs_infra() -> &'static MongoInfra {
+    MONGO_RS_INFRA
+        .get_or_init(|| async move {
+            if let Ok(external) = std::env::var(RS_URL_VAR) {
+                let (base_url, _existing_db) = strip_db(&external);
+                return MongoInfra { base_url };
+            }
+            let backend = detect_with_timeout(RS_URL_VAR)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let socket = match backend {
+                TestBackend::ExternalUrl => unreachable!("handled above"),
+                TestBackend::Container { socket } => socket,
+            };
+            prepare_container_env(&socket);
+            ryuk::ensure_session(&socket).await;
+            let (sk, sv) = ryuk::session_label();
+            let start_lock = crate::filelock::acquire_lock("mongo-rs");
+            info!("ensuring shared mongo-rs container (reuse=Always, ryuk-managed)");
+            // GenericImage rather than testcontainers_modules::Mongo —
+            // we need to override the entrypoint command with
+            // `--replSet rs0 --bind_ip_all`. tmpfs on /data/db: container
+            // is reaped at session end, so on-disk state has no value.
+            let image = GenericImage::new("mongo", "8")
+                .with_exposed_port(ContainerPort::Tcp(27017))
+                .with_cmd(["--replSet", "rs0", "--bind_ip_all"])
+                .with_container_name(format!("air-elt-mongo-rs-{sv}"))
+                .with_label(sk, sv)
+                .with_label(KIND_LABEL_KEY, "mongo-rs")
+                .with_mount(Mount::tmpfs_mount("/data/db"))
+                .with_reuse(ReuseDirective::Always);
+            let container = image.start().await.expect("start mongo-rs container");
+            drop(start_lock);
+            let host = container.get_host().await.expect("container host");
+            let port = container
+                .get_host_port_ipv4(27017)
+                .await
+                .expect("container port");
+            let base_url = format!("mongodb://{host}:{port}/?replicaSet=rs0&directConnection=true");
+            init_replica_set(&host.to_string(), port).await;
+            drop(container);
+            MongoInfra { base_url }
+        })
+        .await
+}
+
+/// Idempotent one-node `rs.initiate` + wait-for-primary. Tolerates a
+/// reused container that's already initialised (replSetInitiate returns
+/// `AlreadyInitialized` — we ignore the error and fall through to the
+/// readiness probe).
+async fn init_replica_set(host: &str, port: u16) {
+    let admin_url = format!("mongodb://{host}:{port}/?directConnection=true");
+    // Short server-selection timeout — pre-rs.initiate the server has
+    // no primary yet, so the default 30s wait makes the bootstrap slow.
+    let mut opts = ClientOptions::parse(&admin_url)
+        .await
+        .expect("parse admin mongo url");
+    opts.server_selection_timeout = Some(Duration::from_secs(2));
+    opts.direct_connection = Some(true);
+    let client = Client::with_options(opts).expect("admin mongo client");
+    let admin = client.database("admin");
+
+    let _ = admin
+        .run_command(doc! {
+            "replSetInitiate": {
+                "_id": "rs0",
+                "members": [{ "_id": 0i32, "host": "localhost:27017" }],
+            }
+        })
+        .await;
+
+    for _ in 0..120 {
+        if let Ok(resp) = admin.run_command(doc! { "hello": 1 }).await
+            && resp.get_bool("isWritablePrimary").unwrap_or(false)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("mongo replica set did not become primary within 60s");
 }
 
 pub fn mongo_rs_pool() -> Pin<Box<dyn Future<Output = MongoTestHandle> + Send + 'static>> {
     Box::pin(async move {
-        let url = std::env::var(RS_URL_VAR).unwrap_or_else(|_| {
-            panic!(
-                "{RS_URL_VAR} not set — mongo-cdc e2e tests need a replica-set mongo. \
-                 See `mongo_rs_url_or_skip` docstring for setup."
-            )
-        });
-        let (base_url, _existing_db) = strip_db(&url);
-        let client = Client::with_uri_str(&base_url)
-            .await
-            .expect("connect to RS mongo failed");
-
-        let database = random_db();
-        MongoTestHandle {
-            client,
-            url: base_url,
-            database,
-        }
+        let infra = mongo_rs_infra().await;
+        handle_for(infra).await
     })
 }
 

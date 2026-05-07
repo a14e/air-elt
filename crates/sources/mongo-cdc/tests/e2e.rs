@@ -1,8 +1,10 @@
 //! End-to-end tests for the `mongo-cdc` source.
 //!
 //! Requires a replica-set Mongo deployment — change streams cannot run
-//! on a standalone mongod. Operator must export
-//! `AIR_ELT_TEST_MONGO_RS_URL`. Tests skip cleanly when it is not set.
+//! on a standalone mongod. `mongo_rs_pool` honours
+//! `AIR_ELT_TEST_MONGO_RS_URL` if set (CI uses this) and otherwise spins
+//! up a `mongo:8 --replSet rs0` container via testcontainers and runs
+//! `replSetInitiate` once.
 //!
 //! ## Determinism: probe-watch + post-batch resume token (PBRT)
 //!
@@ -23,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use air_elt_commons_mongodb::bson_value;
-use air_elt_commons_testing::mongo::{MongoTestHandle, mongo_rs_pool, mongo_rs_url_or_skip};
+use air_elt_commons_testing::mongo::{MongoTestHandle, mongo_rs_pool};
 use air_elt_commons_testing::pg::pg_pool;
 use air_elt_core::config::conflict::{ConflictConfig, ConflictStrategy};
 use air_elt_core::config::model::CursorOrder;
@@ -40,8 +42,7 @@ use sqlx::Executor;
 
 const RESUME_TOKEN_FIELD: &str = "__resume_token";
 
-async fn cdc_source(handle: &MongoTestHandle) -> Option<Arc<MongoCdcSource>> {
-    mongo_rs_url_or_skip()?;
+async fn cdc_source(handle: &MongoTestHandle) -> Arc<MongoCdcSource> {
     let cfg = MongoCdcSourceConfig {
         url: handle.url.clone(),
         database: Some(handle.database.clone()),
@@ -51,7 +52,7 @@ async fn cdc_source(handle: &MongoTestHandle) -> Option<Arc<MongoCdcSource>> {
     let s = MongoCdcSource::connect("mongo_cdc".into(), cfg)
         .await
         .expect("connect mongo-cdc");
-    Some(Arc::new(s))
+    Arc::new(s)
 }
 
 fn cdc_spec(table: &str, limit: usize, mode: &str) -> ReadSpec {
@@ -97,16 +98,9 @@ async fn capture_pbrt(coll: &Collection<Document>) -> CursorState {
     }])
 }
 
-async fn mongo_rs_pool_or_return() -> Option<MongoTestHandle> {
-    mongo_rs_url_or_skip()?;
-    Some(mongo_rs_pool().await)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cdc_emits_upsert_for_inserts_replace_and_delete() {
-    let Some(mongo) = mongo_rs_pool_or_return().await else {
-        return;
-    };
+    let mongo = mongo_rs_pool().await;
     let coll_name = "users";
     let coll = mongo
         .client
@@ -117,7 +111,7 @@ async fn cdc_emits_upsert_for_inserts_replace_and_delete() {
         .expect("seed");
     enable_pre_post_images(&mongo, coll_name).await;
 
-    let source = cdc_source(&mongo).await.unwrap();
+    let source = cdc_source(&mongo).await;
     let spec = cdc_spec(coll_name, 4, "post-image");
     source.validate_access(&spec).await.expect("validate");
     let ctx = source.build_context(&spec).await.expect("ctx");
@@ -143,28 +137,28 @@ async fn cdc_emits_upsert_for_inserts_replace_and_delete() {
     // BSON int literals (`doc!{"_id": 1}`) encode as Int32, not Int64.
     // `bson_value::from_bson` round-trips that to `Value::Int32`. Sinks
     // widen on the write path; source-side assertions stay honest.
-    assert_eq!(batch.rows.len(), 4);
+    //
+    // Dedup-by-`_id` collapses the four events to two: for _id=1 the
+    // insert is shadowed by the later delete; for _id=2 the insert is
+    // shadowed by the later replace. Survivors keep their relative
+    // chronological order.
+    assert_eq!(batch.rows.len(), 2);
     assert_eq!(batch.rows[0].op, RowOp::Upsert);
-    assert_eq!(batch.rows[0].values[0], Value::Int32(1));
-    assert_eq!(batch.rows[0].values[1], Value::Text("alice".into()));
-    assert_eq!(batch.rows[1].op, RowOp::Upsert);
-    assert_eq!(batch.rows[2].op, RowOp::Upsert);
-    assert_eq!(batch.rows[2].values[1], Value::Text("bob2".into()));
-    assert_eq!(batch.rows[3].op, RowOp::Delete);
-    assert_eq!(batch.rows[3].values[0], Value::Int32(1));
+    assert_eq!(batch.rows[0].values[0], Value::Int32(2));
+    assert_eq!(batch.rows[0].values[1], Value::Text("bob2".into()));
+    assert_eq!(batch.rows[1].op, RowOp::Delete);
+    assert_eq!(batch.rows[1].values[0], Value::Int32(1));
     // Delete event carries documentKey only — non-key columns must be
     // Null and the row must have full column arity.
-    assert_eq!(batch.rows[3].values.len(), spec.columns.len());
-    assert_eq!(batch.rows[3].values[1], Value::Null);
+    assert_eq!(batch.rows[1].values.len(), spec.columns.len());
+    assert_eq!(batch.rows[1].values[1], Value::Null);
     assert!(batch.next_cursor.is_some());
     mongo.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cdc_lookup_on_update_attaches_post_image_via_find() {
-    let Some(mongo) = mongo_rs_pool_or_return().await else {
-        return;
-    };
+    let mongo = mongo_rs_pool().await;
     let coll_name = "items";
     let coll = mongo
         .client
@@ -174,7 +168,7 @@ async fn cdc_lookup_on_update_attaches_post_image_via_find() {
         .await
         .expect("seed");
 
-    let source = cdc_source(&mongo).await.unwrap();
+    let source = cdc_source(&mongo).await;
     let spec = cdc_spec(coll_name, 1, "lookup-on-update");
     let ctx = source.build_context(&spec).await.expect("ctx");
 
@@ -201,9 +195,7 @@ async fn cdc_lookup_on_update_skips_when_doc_deleted_between_event_and_find() {
     // deleted between the change event and our batch-find, the source
     // must warn-and-skip instead of erroring. The follow-up `delete`
     // event surfaces in the next batch.
-    let Some(mongo) = mongo_rs_pool_or_return().await else {
-        return;
-    };
+    let mongo = mongo_rs_pool().await;
     let coll_name = "items_deleted";
     let coll = mongo
         .client
@@ -213,7 +205,7 @@ async fn cdc_lookup_on_update_skips_when_doc_deleted_between_event_and_find() {
         .await
         .expect("seed");
 
-    let source = cdc_source(&mongo).await.unwrap();
+    let source = cdc_source(&mongo).await;
     let spec = cdc_spec(coll_name, 2, "lookup-on-update");
     let ctx = source.build_context(&spec).await.expect("ctx");
 
@@ -240,9 +232,7 @@ async fn cdc_lookup_on_update_skips_when_doc_deleted_between_event_and_find() {
 async fn cdc_post_image_collapses_multiple_updates_per_id() {
     // Multiple updates of the same `_id` in one batch collapse to a
     // single Upsert row carrying the chronologically-last post-image.
-    let Some(mongo) = mongo_rs_pool_or_return().await else {
-        return;
-    };
+    let mongo = mongo_rs_pool().await;
     let coll_name = "multi_updates";
     let coll = mongo
         .client
@@ -253,7 +243,7 @@ async fn cdc_post_image_collapses_multiple_updates_per_id() {
         .expect("seed");
     enable_pre_post_images(&mongo, coll_name).await;
 
-    let source = cdc_source(&mongo).await.unwrap();
+    let source = cdc_source(&mongo).await;
     let spec = cdc_spec(coll_name, 4, "post-image");
     let ctx = source.build_context(&spec).await.expect("ctx");
 
@@ -283,17 +273,20 @@ async fn cdc_post_image_insert_then_delete_emits_only_delete() {
     // insert(_id) + delete(_id) in one batch must collapse to a
     // single Delete — not Upsert + Delete (which would otherwise
     // require strict insert-before-delete ordering at the sink).
-    let Some(mongo) = mongo_rs_pool_or_return().await else {
-        return;
-    };
+    let mongo = mongo_rs_pool().await;
     let coll_name = "insert_then_delete";
     let coll = mongo
         .client
         .database(&mongo.database)
         .collection::<Document>(coll_name);
+    // `collMod` requires the collection to exist; seed an unrelated
+    // doc first so `enable_pre_post_images` doesn't hit NamespaceNotFound.
+    coll.insert_one(doc! { "_id": 0, "name": "seed" })
+        .await
+        .expect("seed");
     enable_pre_post_images(&mongo, coll_name).await;
 
-    let source = cdc_source(&mongo).await.unwrap();
+    let source = cdc_source(&mongo).await;
     let spec = cdc_spec(coll_name, 4, "post-image");
     let ctx = source.build_context(&spec).await.expect("ctx");
 
@@ -318,9 +311,7 @@ async fn cdc_lookup_on_update_collapses_multiple_updates_to_single_row() {
     // Same as the post-image case but exercising the LookupOnUpdate
     // path: dedup happens before `find`, so we end up with one row
     // carrying the final post-image fetched by lookup.
-    let Some(mongo) = mongo_rs_pool_or_return().await else {
-        return;
-    };
+    let mongo = mongo_rs_pool().await;
     let coll_name = "lookup_multi_updates";
     let coll = mongo
         .client
@@ -330,7 +321,7 @@ async fn cdc_lookup_on_update_collapses_multiple_updates_to_single_row() {
         .await
         .expect("seed");
 
-    let source = cdc_source(&mongo).await.unwrap();
+    let source = cdc_source(&mongo).await;
     let spec = cdc_spec(coll_name, 4, "lookup-on-update");
     let ctx = source.build_context(&spec).await.expect("ctx");
 
@@ -354,9 +345,7 @@ async fn cdc_lookup_on_update_collapses_multiple_updates_to_single_row() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cdc_drop_collection_surfaces_runtime_error() {
-    let Some(mongo) = mongo_rs_pool_or_return().await else {
-        return;
-    };
+    let mongo = mongo_rs_pool().await;
     let coll_name = "to_drop";
     let coll = mongo
         .client
@@ -364,7 +353,7 @@ async fn cdc_drop_collection_surfaces_runtime_error() {
         .collection::<Document>(coll_name);
     coll.insert_one(doc! { "_id": 1 }).await.expect("seed");
 
-    let source = cdc_source(&mongo).await.unwrap();
+    let source = cdc_source(&mongo).await;
     let spec = cdc_spec(coll_name, 1, "post-image");
     let ctx = source.build_context(&spec).await.expect("ctx");
 
@@ -385,9 +374,7 @@ async fn cdc_drop_collection_surfaces_runtime_error() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cdc_to_pg_sink_round_trip_with_inserts_and_deletes() {
-    let Some(mongo) = mongo_rs_pool_or_return().await else {
-        return;
-    };
+    let mongo = mongo_rs_pool().await;
     let pg = pg_pool().await;
     pg.pool
         .execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)")
@@ -404,7 +391,7 @@ async fn cdc_to_pg_sink_round_trip_with_inserts_and_deletes() {
         .expect("seed");
     enable_pre_post_images(&mongo, coll_name).await;
 
-    let source = cdc_source(&mongo).await.unwrap();
+    let source = cdc_source(&mongo).await;
     let read_spec = cdc_spec(coll_name, 4, "post-image");
     let src_ctx = source.build_context(&read_spec).await.expect("ctx");
 
@@ -466,9 +453,7 @@ async fn cdc_describe_schema_unifies_heterogeneous_bson() {
     // widens to Float64. Confirms the cdc source delegates to
     // `commons-mongodb::sampling::describe_collection_schema` rather than
     // diverging.
-    let Some(mongo) = mongo_rs_pool_or_return().await else {
-        return;
-    };
+    let mongo = mongo_rs_pool().await;
     let coll_name = "het";
     let coll = mongo
         .client
@@ -481,7 +466,7 @@ async fn cdc_describe_schema_unifies_heterogeneous_bson() {
         .await
         .unwrap();
 
-    let source = cdc_source(&mongo).await.unwrap();
+    let source = cdc_source(&mongo).await;
     let schema = source
         .describe_schema(coll_name)
         .await
@@ -496,9 +481,7 @@ async fn cdc_describe_schema_unifies_heterogeneous_bson() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_token_round_trips_through_pg_storage_with_reopen() {
-    let Some(mongo) = mongo_rs_pool_or_return().await else {
-        return;
-    };
+    let mongo = mongo_rs_pool().await;
     let coll_name = "tokens";
     let coll = mongo
         .client
@@ -506,7 +489,7 @@ async fn resume_token_round_trips_through_pg_storage_with_reopen() {
         .collection::<Document>(coll_name);
     coll.insert_one(doc! { "_id": 0 }).await.expect("seed");
 
-    let source = cdc_source(&mongo).await.unwrap();
+    let source = cdc_source(&mongo).await;
     let spec = cdc_spec(coll_name, 1, "post-image");
     let ctx = source.build_context(&spec).await.expect("ctx");
     let cursor_before_writes = capture_pbrt(&coll).await;
@@ -609,9 +592,7 @@ async fn cdc_to_mysql_sink_round_trip_with_inserts_and_deletes() {
     use air_elt_commons_testing::mysql::mysql_pool;
     use air_elt_sink_mysql::{MySqlSink, MySqlSinkConfig};
 
-    let Some(mongo) = mongo_rs_pool_or_return().await else {
-        return;
-    };
+    let mongo = mongo_rs_pool().await;
     let mysql = mysql_pool().await;
     sqlx::query("CREATE TABLE users_mc (id BIGINT PRIMARY KEY, name VARCHAR(64))")
         .execute(&mysql.pool)
@@ -628,7 +609,7 @@ async fn cdc_to_mysql_sink_round_trip_with_inserts_and_deletes() {
         .expect("seed");
     enable_pre_post_images(&mongo, coll_name).await;
 
-    let source = cdc_source(&mongo).await.unwrap();
+    let source = cdc_source(&mongo).await;
     let read_spec = cdc_spec(coll_name, 4, "post-image");
     let src_ctx = source.build_context(&read_spec).await.expect("ctx");
 
@@ -679,9 +660,7 @@ async fn cdc_to_mongo_sink_round_trip_with_inserts_and_deletes() {
     use air_elt_commons_testing::mongo::mongo_pool;
     use air_elt_sink_mongodb::{MongoSink, MongoSinkConfig};
 
-    let Some(mongo) = mongo_rs_pool_or_return().await else {
-        return;
-    };
+    let mongo = mongo_rs_pool().await;
     let sink_handle = mongo_pool().await;
 
     let coll_name = "users_mongo_cdc";
@@ -695,7 +674,7 @@ async fn cdc_to_mongo_sink_round_trip_with_inserts_and_deletes() {
         .expect("seed");
     enable_pre_post_images(&mongo, coll_name).await;
 
-    let source = cdc_source(&mongo).await.unwrap();
+    let source = cdc_source(&mongo).await;
     let read_spec = cdc_spec(coll_name, 3, "post-image");
     let src_ctx = source.build_context(&read_spec).await.expect("ctx");
 
@@ -916,10 +895,8 @@ async fn cdc_validate_access_succeeds_on_not_yet_existing_collection() {
     // namespace that has no documents yet — operators should be able
     // to point a CDC flow at a future-collection without bootstrapping
     // a placeholder document first.
-    let Some(mongo) = mongo_rs_pool_or_return().await else {
-        return;
-    };
-    let source = cdc_source(&mongo).await.unwrap();
+    let mongo = mongo_rs_pool().await;
+    let source = cdc_source(&mongo).await;
     let spec = cdc_spec("not_yet_existing", 1, "post-image");
     source
         .validate_access(&spec)

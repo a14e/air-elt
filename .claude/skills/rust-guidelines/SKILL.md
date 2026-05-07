@@ -94,6 +94,8 @@ The test strategy is inverted pyramid: heavy e2e against real services, focused 
 - **File-lock test infra at the narrowest window.** Cross-process locks (`crate::filelock::acquire_lock`) around container `start()` are required so nextest doesn't race on `reuse=Always`. Hold the lock only across the create-or-reuse call — release before any `wait_for_*`, TCP handshake, or other slow probe so siblings can proceed in parallel.
 - **Doctests are disabled workspace-wide.** Every lib crate's `Cargo.toml` must declare `[lib]` with `doctest = false` so `cargo test --workspace` skips doc-tests automatically. Add the section when creating a new crate.
 - **Consolidate test files into one binary per crate.** Use `autotests = false` in `Cargo.toml` and a single `tests/all.rs` that does `mod foo; mod bar;` for each test file. Cuts cargo's per-binary serialization overhead.
+- **No hidden tests.** `cargo test` must run ALL tests. Temporarily disabled flag/env-gated tests and silent skips are not
+  allowed.
 
 ## After every change
 
