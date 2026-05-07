@@ -111,6 +111,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -119,9 +120,11 @@ name = "air-elt-commons-testing"
 version = "0.1.0"
 dependencies = [
  "air-elt-commons",
+ "bollard",
  "bson",
  "mongodb",
  "rand 0.10.1",
+ "sha2",
  "sqlx",
  "testcontainers",
  "testcontainers-modules",

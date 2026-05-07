@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use sqlx::{Column, PgPool, Row};
 use tracing::{debug, info};
 
+use air_elt_commons_pg::Dialect;
 use air_elt_commons_pg::pool;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::model::{Batch, ReadSpec, Row as CoreRow, Schema, SourceCtx};
@@ -41,10 +42,12 @@ impl SourceCtx for PgSourceCtx {
 pub struct PgSource {
     pool: PgPool,
     name: String,
+    dialect: Dialect,
 }
 
 impl PgSource {
     pub async fn connect(name: String, config: PgSourceConfig) -> RuntimeResult<Self> {
+        let dialect = config.dialect;
         let pool = pool::connect(
             &config.url,
             pool::PoolSettings::from_options(
@@ -58,7 +61,11 @@ impl PgSource {
             ),
         )
         .await?;
-        Ok(Self { pool, name })
+        Ok(Self {
+            pool,
+            name,
+            dialect,
+        })
     }
 
     async fn ensure_connection_alive(&self) -> RuntimeResult<()> {
@@ -101,6 +108,8 @@ impl Source for PgSource {
     async fn validate_access(&self, spec: &ReadSpec) -> RuntimeResult<()> {
         self.ensure_connection_alive().await?;
         self.assert_table_readable(spec).await?;
+        let schema = air_elt_commons_pg::schema::fetch_schema(&self.pool, &spec.table).await?;
+        reject_excluded_types(self.dialect, &schema, &spec.columns)?;
         info!(table = %spec.table, "source access validated");
         Ok(())
     }
@@ -192,35 +201,44 @@ impl Source for PgSource {
 
         debug!(sql = %query_plan.sql, "read_batch sql");
 
-        let mut query = sqlx::query(&query_plan.sql);
-        if let Some(state) = cursor {
-            for idx in &query_plan.bind_order {
-                let field = state
-                    .fields
-                    .get(*idx)
-                    .ok_or_else(|| RuntimeError::Other("cursor bind index out of range".into()))?;
-                let cursor_field_pos = spec
-                    .cursor_fields
-                    .iter()
-                    .position(|n| n == &field.name)
-                    .ok_or_else(|| {
-                        RuntimeError::Other(format!(
-                            "cursor field {:?} not present in spec.cursor_fields",
-                            field.name
-                        ))
-                    })?;
-                let dt = pg_ctx.cursor_types[cursor_field_pos].clone();
-                query = codec::bind_cursor_value(query, &field.value, dt);
-            }
-        }
-        query = query.bind(i64::try_from(spec.limit).map_err(|_| {
+        let limit = i64::try_from(spec.limit).map_err(|_| {
             RuntimeError::Other(format!("batch_limit {} does not fit in i64", spec.limit))
-        })?);
+        })?;
 
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(RuntimeError::backend)?;
+        // Bind + execute is wrapped in `with_serialization_retry`. On the
+        // Postgres dialect the retry helper is a pure pass-through (single
+        // execution), so behaviour is unchanged. On Cockroach a `40001`
+        // serialization failure under contention is retried with backoff.
+        // The closure rebuilds the `sqlx::query` each attempt because
+        // `fetch_all` consumes it.
+        let rows = air_elt_commons_pg::retry::with_serialization_retry(self.dialect, || async {
+            let mut query = sqlx::query(&query_plan.sql);
+            if let Some(state) = cursor {
+                for idx in &query_plan.bind_order {
+                    let field = state.fields.get(*idx).ok_or_else(|| {
+                        RuntimeError::Other("cursor bind index out of range".into())
+                    })?;
+                    let cursor_field_pos = spec
+                        .cursor_fields
+                        .iter()
+                        .position(|n| n == &field.name)
+                        .ok_or_else(|| {
+                            RuntimeError::Other(format!(
+                                "cursor field {:?} not present in spec.cursor_fields",
+                                field.name
+                            ))
+                        })?;
+                    let dt = pg_ctx.cursor_types[cursor_field_pos].clone();
+                    query = codec::bind_cursor_value(query, &field.value, dt);
+                }
+            }
+            query = query.bind(limit);
+            query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(RuntimeError::backend)
+        })
+        .await?;
 
         let mut out_rows = Vec::with_capacity(rows.len());
         let mut last_cursor_values: Option<Vec<Value>> = None;
@@ -278,6 +296,31 @@ impl Source for PgSource {
     }
 }
 
+/// Reject columns whose declared type the dialect refuses to serve.
+///
+/// Currently used for CockroachDB, which has no `XML` type. Centralised in a
+/// free function so it can be unit-tested without spinning up a database;
+/// `validate_access` is the only production caller.
+fn reject_excluded_types(
+    dialect: Dialect,
+    schema: &Schema,
+    columns: &[String],
+) -> RuntimeResult<()> {
+    for col in columns {
+        let Some(field) = schema.find(col) else {
+            // Missing-column reporting is the matrix's job, not ours.
+            continue;
+        };
+        if let Some(reason) = dialect.excludes_type(&field.data_type) {
+            return Err(RuntimeError::Other(format!(
+                "source column {col:?} has type {dt:?} unsupported on this dialect: {reason}",
+                dt = field.data_type
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn resolve_types(schema: &Schema, names: &[String], table: &str) -> RuntimeResult<Vec<DataType>> {
     names
         .iter()
@@ -292,4 +335,66 @@ fn resolve_types(schema: &Schema, names: &[String], table: &str) -> RuntimeResul
                 })
         })
         .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use air_elt_core::model::Field;
+
+    fn schema_with_xml() -> Schema {
+        Schema::new(vec![
+            Field {
+                name: "id".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            Field {
+                name: "doc".into(),
+                data_type: DataType::Xml,
+                nullable: true,
+            },
+        ])
+    }
+
+    #[test]
+    fn cockroach_rejects_xml_column() {
+        let schema = schema_with_xml();
+        let err = reject_excluded_types(
+            Dialect::Cockroach,
+            &schema,
+            &["id".to_string(), "doc".to_string()],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("doc"), "msg: {msg}");
+        assert!(msg.contains("Xml"), "msg: {msg}");
+        assert!(msg.contains("CockroachDB has no XML type"), "msg: {msg}");
+    }
+
+    #[test]
+    fn cockroach_accepts_non_xml_columns() {
+        let schema = schema_with_xml();
+        reject_excluded_types(Dialect::Cockroach, &schema, &["id".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn postgres_accepts_xml_column() {
+        let schema = schema_with_xml();
+        reject_excluded_types(
+            Dialect::Postgres,
+            &schema,
+            &["id".to_string(), "doc".to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn missing_column_is_silently_skipped_here() {
+        // Reporting "column not in schema" is the matrix's job — this helper
+        // only enforces the dialect type allow-list.
+        let schema = schema_with_xml();
+        reject_excluded_types(Dialect::Cockroach, &schema, &["nonexistent".to_string()]).unwrap();
+    }
 }

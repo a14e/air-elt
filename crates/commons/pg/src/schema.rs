@@ -15,14 +15,18 @@ struct ColumnRow {
     is_nullable: String,
     udt_name: String,
     data_type: String,
-    character_maximum_length: Option<i32>,
-    numeric_precision: Option<i32>,
-    numeric_scale: Option<i32>,
+    // CockroachDB returns these as INT8 (i64) where stock Postgres uses INT4
+    // (i32). Casting to bigint in the SELECT normalises the wire type so the
+    // same `Option<i64>` decode works against both engines.
+    character_maximum_length: Option<i64>,
+    numeric_precision: Option<i64>,
+    numeric_scale: Option<i64>,
 }
 
 const INFORMATION_SCHEMA: &str = "SELECT column_name, is_nullable, udt_name, data_type, \
-                                  character_maximum_length, \
-                                  numeric_precision, numeric_scale \
+                                  character_maximum_length::bigint AS character_maximum_length, \
+                                  numeric_precision::bigint AS numeric_precision, \
+                                  numeric_scale::bigint AS numeric_scale \
     FROM information_schema.columns \
     WHERE table_schema = $1 AND table_name = $2 \
     ORDER BY ordinal_position";
@@ -56,13 +60,9 @@ pub async fn fetch_schema(pool: &PgPool, table: &str) -> RuntimeResult<Schema> {
             })?;
         let size = row
             .character_maximum_length
-            .and_then(|n| if n > 0 { Some(n as u32) } else { None });
-        let prec = row
-            .numeric_precision
-            .and_then(|n| if n >= 0 { Some(n as u32) } else { None });
-        let scale = row
-            .numeric_scale
-            .and_then(|n| if n >= 0 { Some(n as u32) } else { None });
+            .and_then(|n| u32::try_from(n).ok().filter(|v| *v > 0));
+        let prec = row.numeric_precision.and_then(|n| u32::try_from(n).ok());
+        let scale = row.numeric_scale.and_then(|n| u32::try_from(n).ok());
         fields.push(Field {
             name: row.column_name,
             data_type: pg_type::to_internal(pg, size, prec, scale),

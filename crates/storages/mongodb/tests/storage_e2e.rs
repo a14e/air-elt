@@ -46,6 +46,8 @@ async fn save_and_load_cursor_roundtrip() {
         .unwrap()
         .expect("present");
     assert_eq!(loaded2.fields[0].value, Value::Int64(99));
+
+    handle.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -94,4 +96,6 @@ async fn resume_token_round_trip_and_reopen() {
             .unwrap()
             .is_none()
     );
+
+    handle.client.clone().shutdown().await;
 }

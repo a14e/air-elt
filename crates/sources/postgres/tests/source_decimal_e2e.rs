@@ -3,6 +3,8 @@
 //! decoder paths for both.
 #![allow(clippy::unwrap_used)]
 
+use air_elt_commons_pg::Dialect;
+use air_elt_commons_testing::cockroach::cockroach_pool;
 use air_elt_commons_testing::pg::pg_pool;
 use air_elt_core::model::ReadSpec;
 use air_elt_core::traits::Source;
@@ -84,4 +86,68 @@ async fn numeric_zero_scale_decoded_as_bigint() {
         batch.rows[0].values[2],
         Value::Decimal(BigDecimal::from_str(dec_str).unwrap())
     );
+    handle.pool.close().await;
+}
+
+/// Cockroach mirror: a `DECIMAL(10, 2)` column round-trips as
+/// `DataType::Decimal { precision: 10, scale: 2 }` and the bound value
+/// preserves precision.
+#[tokio::test]
+async fn cockroach_decimal_round_trip() {
+    let handle = cockroach_pool().await;
+    handle
+        .pool
+        .execute(
+            "CREATE TABLE prices (
+                id INT PRIMARY KEY,
+                amount DECIMAL(10, 2) NOT NULL
+            )",
+        )
+        .await
+        .unwrap();
+
+    let amount_str = "12345.67";
+    sqlx::query("INSERT INTO prices (id, amount) VALUES (1, $1::DECIMAL(10, 2))")
+        .bind(BigDecimal::from_str(amount_str).unwrap())
+        .execute(&handle.pool)
+        .await
+        .unwrap();
+
+    let source = PgSource::connect(
+        "test_source".to_string(),
+        PgSourceConfig {
+            url: handle.url_with_database(),
+            dialect: Dialect::Cockroach,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let table = "public.prices".to_string();
+    let schema = source.describe_schema(&table).await.unwrap();
+    assert_eq!(
+        schema.find("amount").unwrap().data_type,
+        DataType::Decimal {
+            precision: Some(10),
+            scale: Some(2),
+        }
+    );
+
+    let spec = ReadSpec {
+        columns: vec!["id".into(), "amount".into()],
+        table,
+        cursor_fields: vec!["id".into()],
+        cursor_order: air_elt_core::config::model::CursorOrder::Asc,
+        limit: 10,
+        source_options: toml::Table::new(),
+    };
+    let ctx = source.build_context(&spec).await.unwrap();
+    let batch = source.read_batch(&spec, ctx, None).await.unwrap();
+    assert_eq!(batch.rows.len(), 1);
+    assert_eq!(
+        batch.rows[0].values[1],
+        Value::Decimal(BigDecimal::from_str(amount_str).unwrap())
+    );
+    handle.pool.close().await;
 }

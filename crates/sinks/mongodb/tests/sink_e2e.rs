@@ -73,4 +73,5 @@ async fn insert_and_upsert_with_dot_notation() {
         .expect("doc");
     let inner = doc_alice.get_document("addr").unwrap();
     assert_eq!(inner.get_str("city").unwrap(), "Hamburg");
+    handle.client.clone().shutdown().await;
 }

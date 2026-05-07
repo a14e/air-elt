@@ -5,6 +5,8 @@
 //! up storage just to assert SQL behaviour.
 #![allow(clippy::unwrap_used)]
 
+use air_elt_commons_pg::Dialect;
+use air_elt_commons_testing::cockroach::{CockroachTestHandle, cockroach_pool};
 use air_elt_commons_testing::pg::pg_pool;
 use air_elt_core::config::conflict::{ConflictConfig, ConflictStrategy};
 use air_elt_core::model::{Batch, Row as CoreRow, WriteSpec};
@@ -92,6 +94,7 @@ async fn overwrite_replaces_existing_rows() {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0], (1, "fresh-1".into()));
     assert_eq!(rows[2], (3, "fresh-3".into()));
+    handle.pool.close().await;
 }
 
 #[tokio::test]
@@ -119,6 +122,201 @@ async fn ignore_preserves_existing_rows() {
     // ignore: the pre-existing rows survive untouched.
     assert_eq!(rows[0], (1, "kept-1".into()));
     assert_eq!(rows[2], (3, "kept-3".into()));
+    handle.pool.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// CockroachDB variants
+// ---------------------------------------------------------------------------
+
+async fn connect_cockroach(handle: &CockroachTestHandle) -> PgSink {
+    PgSink::connect(PgSinkConfig {
+        url: handle.url_with_database(),
+        dialect: Dialect::Cockroach,
+        ..Default::default()
+    })
+    .await
+    .expect("connect cockroach sink")
+}
+
+#[tokio::test]
+async fn cockroach_overwrite_single_key_via_on_conflict_do_update() {
+    let handle = cockroach_pool().await;
+    handle
+        .pool
+        .execute("CREATE TABLE items (id INT PRIMARY KEY, name TEXT NOT NULL)")
+        .await
+        .unwrap();
+
+    let sink = connect_cockroach(&handle).await;
+    let s = WriteSpec {
+        columns: vec!["id".into(), "name".into()],
+        table: "items".into(),
+        conflict: Some(ConflictConfig {
+            key: vec!["id".into()],
+            strategy: ConflictStrategy::Overwrite,
+        }),
+    };
+    let ctx = sink.build_context(&s).await.expect("build_context");
+
+    let first = Batch {
+        rows: vec![CoreRow::upsert(vec![
+            Value::Int64(1),
+            Value::Text("a".into()),
+        ])],
+        next_cursor: None,
+    };
+    sink.write_batch(&s, ctx.clone(), &first).await.unwrap();
+
+    let second = Batch {
+        rows: vec![CoreRow::upsert(vec![
+            Value::Int64(1),
+            Value::Text("b".into()),
+        ])],
+        next_cursor: None,
+    };
+    sink.write_batch(&s, ctx, &second).await.unwrap();
+
+    let row: (i64, String) = sqlx::query_as("SELECT id, name FROM items WHERE id = 1")
+        .fetch_one(&handle.pool)
+        .await
+        .unwrap();
+    assert_eq!(row, (1, "b".into()));
+    handle.pool.close().await;
+}
+
+#[tokio::test]
+async fn cockroach_overwrite_two_key_uses_on_conflict() {
+    let handle = cockroach_pool().await;
+    handle
+        .pool
+        .execute("CREATE TABLE pairs (a INT, b INT, name TEXT NOT NULL, PRIMARY KEY (a, b))")
+        .await
+        .unwrap();
+
+    let sink = connect_cockroach(&handle).await;
+    let s = WriteSpec {
+        columns: vec!["a".into(), "b".into(), "name".into()],
+        table: "pairs".into(),
+        conflict: Some(ConflictConfig {
+            key: vec!["a".into(), "b".into()],
+            strategy: ConflictStrategy::Overwrite,
+        }),
+    };
+    let ctx = sink.build_context(&s).await.unwrap();
+
+    let first = Batch {
+        rows: vec![CoreRow::upsert(vec![
+            Value::Int64(1),
+            Value::Int64(1),
+            Value::Text("x".into()),
+        ])],
+        next_cursor: None,
+    };
+    sink.write_batch(&s, ctx.clone(), &first).await.unwrap();
+
+    let second = Batch {
+        rows: vec![CoreRow::upsert(vec![
+            Value::Int64(1),
+            Value::Int64(1),
+            Value::Text("y".into()),
+        ])],
+        next_cursor: None,
+    };
+    sink.write_batch(&s, ctx, &second).await.unwrap();
+
+    let row: (i64, i64, String) =
+        sqlx::query_as("SELECT a, b, name FROM pairs WHERE a = 1 AND b = 1")
+            .fetch_one(&handle.pool)
+            .await
+            .unwrap();
+    assert_eq!(row, (1, 1, "y".into()));
+    handle.pool.close().await;
+}
+
+#[tokio::test]
+async fn cockroach_ignore_does_nothing() {
+    let handle = cockroach_pool().await;
+    handle
+        .pool
+        .execute("CREATE TABLE keepers (id INT PRIMARY KEY, name TEXT NOT NULL)")
+        .await
+        .unwrap();
+
+    let sink = connect_cockroach(&handle).await;
+    let s = WriteSpec {
+        columns: vec!["id".into(), "name".into()],
+        table: "keepers".into(),
+        conflict: Some(ConflictConfig {
+            key: vec!["id".into()],
+            strategy: ConflictStrategy::Ignore,
+        }),
+    };
+    let ctx = sink.build_context(&s).await.unwrap();
+
+    let first = Batch {
+        rows: vec![CoreRow::upsert(vec![
+            Value::Int64(1),
+            Value::Text("a".into()),
+        ])],
+        next_cursor: None,
+    };
+    sink.write_batch(&s, ctx.clone(), &first).await.unwrap();
+
+    let second = Batch {
+        rows: vec![CoreRow::upsert(vec![
+            Value::Int64(1),
+            Value::Text("b".into()),
+        ])],
+        next_cursor: None,
+    };
+    sink.write_batch(&s, ctx, &second).await.unwrap();
+
+    let row: (i64, String) = sqlx::query_as("SELECT id, name FROM keepers WHERE id = 1")
+        .fetch_one(&handle.pool)
+        .await
+        .unwrap();
+    assert_eq!(row, (1, "a".into()));
+    handle.pool.close().await;
+}
+
+#[tokio::test]
+async fn cockroach_pk_only_table_overwrite_falls_back_to_do_nothing() {
+    // Single-column key + Overwrite, but every column is part of the key,
+    // so `conflict_suffix` collapses to `ON CONFLICT … DO NOTHING`. Same
+    // semantics on Cockroach and Postgres — re-inserting the same row is
+    // idempotent.
+    let handle = cockroach_pool().await;
+    handle
+        .pool
+        .execute("CREATE TABLE pk_only (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    let sink = connect_cockroach(&handle).await;
+    let s = WriteSpec {
+        columns: vec!["id".into()],
+        table: "pk_only".into(),
+        conflict: Some(ConflictConfig {
+            key: vec!["id".into()],
+            strategy: ConflictStrategy::Overwrite,
+        }),
+    };
+    let ctx = sink.build_context(&s).await.unwrap();
+
+    let row = Batch {
+        rows: vec![CoreRow::upsert(vec![Value::Int64(1)])],
+        next_cursor: None,
+    };
+    sink.write_batch(&s, ctx.clone(), &row).await.unwrap();
+    sink.write_batch(&s, ctx, &row).await.unwrap();
+
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pk_only")
+        .fetch_one(&handle.pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 1);
+    handle.pool.close().await;
 }
 
 #[tokio::test]
@@ -139,4 +337,5 @@ async fn overwrite_is_idempotent_on_rerun() {
     let rows = fetch_labels(&handle.pool).await;
     assert_eq!(rows.len(), 2, "re-run must not duplicate");
     assert_eq!(rows[0], (1, "v1".into()));
+    handle.pool.close().await;
 }

@@ -11,7 +11,7 @@ cargo build --release
 cargo test --workspace
 ```
 
-Rust **1.90** (stable) is pinned via `rust-toolchain.toml`.
+Rust **1.95** (stable) is pinned via `rust-toolchain.toml`.
 
 ## Running
 
@@ -42,9 +42,21 @@ E2E tests need a PostgreSQL instance. Two options:
 ## Environment variables
 
 - `AIR_ELT_TEST_PG_URL` — external postgres for e2e tests. CI uses this; local dev almost never needs it.
+- `AIR_ELT_TEST_COCKROACHDB_URL` — external CockroachDB instance (`postgres://root@host:26257/defaultdb?sslmode=disable` shape). Optional locally — `cockroach_pool()` falls back to a `cockroachdb/cockroach:v25.1.0 start-single-node --insecure` testcontainer when unset. CI sets it.
 - `DOCKER_HOST` — override socket auto-detection for testcontainers. Usually unset.
 - `AIR_ELT_LOG` / `RUST_LOG` — logging level (`info` by default). **`debug` is only safe for short diagnostic sessions** — it logs full SQL per batch, which is tens of KB per line at default `batch_limit = 1024`. Do not leave `debug` on in production. `trace` is an even firmer don't-for-prod.
 - Any `${VAR}` reference inside the config file is expanded from process env at load time; defaults are spelled `${VAR:default}`. Avoid embedding secrets in command-line arguments — they appear in `ps` output. Use the config's `[secrets]` section or a dedicated `${VAR}` with a restricted env.
+
+## CockroachDB
+
+CockroachDB is supported as `type = "cockroachdb"` for sources, sinks, and storages. Under the hood it reuses the Postgres connector crates with a `Dialect::Cockroach` flag selecting the divergent code paths:
+
+- write paths automatically retry on `40001 RETRY_SERIALIZABLE` (Cockroach defaults to SERIALIZABLE isolation),
+- `XML` columns are rejected upfront at validation time (Cockroach has no XML type),
+- migrations live in `migrations/storage-cockroachdb/` (byte-identical to the Postgres ones — `TEXT`/`JSONB`/`TIMESTAMPTZ` are all supported); the migrator skips `pg_advisory_lock` since CockroachDB doesn't implement it,
+- conflict resolution stays on the standard `INSERT … ON CONFLICT (key) DO …` path on both engines. CockroachDB's native `UPSERT` is intentionally not used — it silently treats the primary key as the conflict arbiter regardless of the user-declared `conflict.key`, which can mask misconfiguration.
+
+Connection string is the standard Postgres URL pointing at port 26257, e.g. `postgres://root@host:26257/mydb?sslmode=disable`. See `examples/pg-to-cockroachdb/` for a working flow.
 
 ## Bootstrap a CDC pipeline
 

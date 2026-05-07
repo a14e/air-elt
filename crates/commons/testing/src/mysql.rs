@@ -9,19 +9,36 @@
 //!
 //! Note: in MySQL "schema" and "database" are synonyms — we expose the
 //! sandbox name as `schema` to mirror the pg helper API.
+//!
+//! Across both modes the container (when used) and the resolved base URL
+//! are cached in a process-wide `OnceCell`; subsequent tests reuse them
+//! and only pay the cost of `CREATE DATABASE` + a fresh per-test pool.
+//! Per-test pools are intentionally not cached — sqlx connection workers
+//! are tied to the `#[tokio::test]` runtime that spawned them, and that
+//! runtime is rebuilt for every test.
+
+use std::future::Future;
+use std::pin::Pin;
 
 use rand::distr::{Alphanumeric, SampleString};
 use rand::rng;
 use sqlx::MySqlPool;
 use sqlx::mysql::MySqlPoolOptions;
+use testcontainers::core::Mount;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ImageExt};
+use testcontainers::{ImageExt, ReuseDirective};
 use testcontainers_modules::mysql::Mysql as MySqlImage;
-use tracing::{info, warn};
+use tokio::sync::OnceCell;
+use tracing::info;
 
 use crate::backend::{TestBackend, detect_with_timeout, prepare_container_env};
+use crate::ryuk;
 
 const URL_VAR: &str = "AIR_ELT_TEST_MYSQL_URL";
+const KIND_LABEL_KEY: &str = "air-elt.kind";
+const KIND_LABEL_VALUE: &str = "mysql";
+
+static MYSQL_BASE_URL: OnceCell<String> = OnceCell::const_new();
 
 pub struct MySqlTestHandle {
     pub pool: MySqlPool,
@@ -31,7 +48,6 @@ pub struct MySqlTestHandle {
     /// (e.g. `format!("{}.users", handle.schema)`) when issuing DDL via the
     /// pool — the pool itself is already pinned to this database.
     pub schema: String,
-    _cleanup: CleanupGuard,
 }
 
 impl MySqlTestHandle {
@@ -42,73 +58,89 @@ impl MySqlTestHandle {
     }
 }
 
-enum CleanupGuard {
-    ExternalDb {
-        pool: MySqlPool,
-        db: String,
-    },
-    Container {
-        _container: Box<ContainerAsync<MySqlImage>>,
-    },
-}
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        match self {
-            CleanupGuard::ExternalDb { pool, db } => {
-                let pool = pool.clone();
-                let db = db.clone();
-                let join = std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("build cleanup runtime");
-                    rt.block_on(async move {
-                        // Bound the cleanup so a hung server can't wedge the
-                        // test process forever. Stale dbs are reaped on the
-                        // next run via `drop_stale_test_databases`.
-                        let stmt = format!("DROP DATABASE IF EXISTS `{db}`");
-                        let drop_fut = sqlx::query(&stmt).execute(&pool);
-                        match tokio::time::timeout(std::time::Duration::from_secs(5), drop_fut)
-                            .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(e)) => {
-                                warn!(error = %e, db, "failed to drop test database");
-                            }
-                            Err(_) => {
-                                warn!(db, "drop database timed out — relying on self-heal");
-                            }
-                        }
-                        // Best-effort graceful close of the bootstrap pool.
-                        let _ =
-                            tokio::time::timeout(std::time::Duration::from_secs(2), pool.close())
-                                .await;
-                    });
-                });
-                if let Err(e) = join.join() {
-                    warn!(?e, "cleanup thread panicked");
-                }
+async fn mysql_base_url() -> &'static String {
+    MYSQL_BASE_URL
+        .get_or_init(|| async {
+            if let Ok(external) = std::env::var(URL_VAR) {
+                let (base_url, _existing_db) = strip_db(&external);
+                return base_url;
             }
-            CleanupGuard::Container { .. } => {}
-        }
-    }
+            let backend = detect_with_timeout(URL_VAR)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let socket = match backend {
+                TestBackend::ExternalUrl => unreachable!("handled above"),
+                TestBackend::Container { socket } => socket,
+            };
+            prepare_container_env(&socket);
+            ryuk::ensure_session(&socket).await;
+            let (sk, sv) = ryuk::session_label();
+            info!("ensuring shared mysql container (reuse=Always, ryuk-managed)");
+            let start_lock = crate::filelock::acquire_lock("mysql");
+            // tmpfs on the data dir + relaxed durability flags trade
+            // crash-safety for raw throughput. Acceptable in tests: the
+            // container is reaped at session end, so on-disk state has no
+            // value.
+            let container = MySqlImage::default()
+                .with_tag("8.4")
+                .with_container_name(format!("air-elt-mysql-{sv}"))
+                .with_label(sk, sv)
+                .with_label(KIND_LABEL_KEY, KIND_LABEL_VALUE)
+                .with_mount(Mount::tmpfs_mount("/var/lib/mysql"))
+                .with_cmd([
+                    "mysqld",
+                    "--innodb-flush-log-at-trx-commit=0",
+                    "--innodb-doublewrite=0",
+                    "--sync-binlog=0",
+                    "--skip-log-bin",
+                ])
+                .with_reuse(ReuseDirective::Always)
+                .start()
+                .await
+                .expect("start mysql container failed");
+            drop(start_lock);
+            let host = container.get_host().await.expect("container host");
+            let port = container
+                .get_host_port_ipv4(3306)
+                .await
+                .expect("container port");
+            drop(container);
+            format!("mysql://root@{host}:{port}")
+        })
+        .await
 }
 
-pub async fn mysql_pool() -> MySqlTestHandle {
-    if let Ok(external) = std::env::var(URL_VAR) {
-        return external_with_sandbox(&external).await;
-    }
-    let backend = detect_with_timeout(URL_VAR)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
-    match backend {
-        TestBackend::ExternalUrl => unreachable!("handled above"),
-        TestBackend::Container { socket } => {
-            prepare_container_env(&socket);
-            spawn_container().await
+pub fn mysql_pool() -> Pin<Box<dyn Future<Output = MySqlTestHandle> + Send + 'static>> {
+    Box::pin(async move {
+        let base_url = mysql_base_url().await;
+        let db = random_db();
+        info!(db = %db, "creating sandbox database");
+
+        let bootstrap_pool = MySqlPoolOptions::new()
+            .max_connections(2)
+            .connect(base_url)
+            .await
+            .expect("connect to mysql failed");
+
+        let create = format!("CREATE DATABASE `{db}`");
+        sqlx::query(&create)
+            .execute(&bootstrap_pool)
+            .await
+            .expect("create sandbox database failed");
+
+        let scoped_url = format!("{}/{}", base_url, db);
+        let pool = MySqlPoolOptions::new()
+            .max_connections(5)
+            .connect(&scoped_url)
+            .await
+            .expect("connect to sandbox database failed");
+
+        MySqlTestHandle {
+            pool,
+            url: base_url.clone(),
+            schema: db,
         }
-    }
+    })
 }
 
 /// Strip the `/<dbname>` path component from a mysql URL — we connect to the
@@ -138,120 +170,6 @@ fn strip_db_from_path(head: &str) -> (String, Option<String>) {
         (format!("{scheme}{auth_host}"), db)
     } else {
         (head.to_string(), None)
-    }
-}
-
-async fn external_with_sandbox(url: &str) -> MySqlTestHandle {
-    let (base_url, _existing_db) = strip_db(url);
-    let db = random_db();
-    info!(db = %db, "creating sandbox database on external mysql");
-
-    let bootstrap_pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(&base_url)
-        .await
-        .expect("connect to AIR_ELT_TEST_MYSQL_URL failed");
-
-    drop_stale_test_databases(&bootstrap_pool, 24 * 3600).await;
-
-    let create = format!("CREATE DATABASE `{db}`");
-    sqlx::query(&create)
-        .execute(&bootstrap_pool)
-        .await
-        .expect("create sandbox database failed");
-
-    let cleanup = CleanupGuard::ExternalDb {
-        pool: bootstrap_pool.clone(),
-        db: db.clone(),
-    };
-
-    let scoped_url = format!("{base_url}/{db}");
-    let pool = MySqlPoolOptions::new()
-        .max_connections(5)
-        .connect(&scoped_url)
-        .await
-        .expect("connect to sandbox database failed");
-
-    MySqlTestHandle {
-        pool,
-        url: base_url,
-        schema: db,
-        _cleanup: cleanup,
-    }
-}
-
-async fn spawn_container() -> MySqlTestHandle {
-    info!("starting ephemeral mysql container (AIR_ELT_TEST_MYSQL_URL not set)");
-    let container = MySqlImage::default()
-        .with_tag("8.4")
-        .start()
-        .await
-        .expect("start mysql container failed");
-
-    let host = container.get_host().await.expect("container host");
-    let port = container
-        .get_host_port_ipv4(3306)
-        .await
-        .expect("container port");
-
-    // testcontainers-modules' Mysql image creates an empty `test` database
-    // and a `root` superuser without a password.
-    let base_url = format!("mysql://root@{host}:{port}");
-    let url = format!("{base_url}/test");
-    let pool = MySqlPoolOptions::new()
-        .max_connections(5)
-        .connect(&url)
-        .await
-        .expect("connect to containerised mysql failed");
-
-    MySqlTestHandle {
-        pool,
-        url: base_url,
-        schema: "test".to_string(),
-        _cleanup: CleanupGuard::Container {
-            _container: Box::new(container),
-        },
-    }
-}
-
-async fn drop_stale_test_databases(pool: &MySqlPool, max_age_secs: u64) {
-    let cutoff = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-        .saturating_sub(max_age_secs);
-
-    let rows: Vec<(String,)> = match sqlx::query_as(
-        "SELECT schema_name FROM information_schema.schemata \
-         WHERE schema_name LIKE 'test\\_%' ESCAPE '\\\\'",
-    )
-    .fetch_all(pool)
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not enumerate test_* databases for self-heal");
-            return;
-        }
-    };
-
-    for (db,) in rows {
-        let ts = db
-            .strip_prefix("test_")
-            .and_then(|s| s.split_once('_'))
-            .and_then(|(ts_str, _)| ts_str.parse::<u64>().ok());
-        let Some(ts) = ts else {
-            continue;
-        };
-        if ts >= cutoff {
-            continue;
-        }
-        let stmt = format!("DROP DATABASE IF EXISTS `{db}`");
-        if let Err(e) = sqlx::query(&stmt).execute(pool).await {
-            tracing::warn!(error = %e, db = %db, "failed to drop stale database");
-        } else {
-            tracing::debug!(db = %db, "self-healed stale test database");
-        }
     }
 }
 

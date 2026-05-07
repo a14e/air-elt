@@ -20,7 +20,7 @@ Validation prioritises **correctness**: every access probe, type check, and conf
 
 ## Tech stack
 
-Rust 1.90 stable (pinned via `rust-toolchain.toml`), tokio, async-trait, sqlx (postgres / mysql / migrate / chrono / uuid / json), mongodb 3.x driver, tracing, clap, mimalloc, thiserror.
+Rust 1.95 stable (pinned via `rust-toolchain.toml`), tokio, async-trait, sqlx (postgres / mysql / migrate / chrono / uuid / json), mongodb 3.x driver, tracing, clap, mimalloc, thiserror.
 
 ## Workspace layout
 
@@ -44,6 +44,8 @@ air-elt/
 **Cross-dependencies between `sources/*`, `sinks/*`, `storages/*` are forbidden.** Each depends only on `core` (and optionally `commons`). Connectors are wired into the app via `core::registry::Registry`.
 
 The `mysql` connector is exercised against both vanilla MySQL **and MariaDB** (10.7+ for native UUID, version-aware UPSERT for `VALUES()` legacy form). MariaDB is a *test target*, not a separately registered backend.
+
+The `postgres` connector crates are also reused as the **CockroachDB** backend, registered under a separate factory key `cockroachdb` with `Dialect::Cockroach` (in `air-elt-commons-pg`) selecting the divergent code paths: automatic `40001` (`RETRY_SERIALIZABLE`) retry on writes via `air_elt_commons_pg::retry::with_serialization_retry`, upfront `XML`-type rejection at `validate_access`, and `set_locking(false)` on the migrator (Cockroach has no `pg_advisory_lock`). Conflict resolution stays on the standard `INSERT … ON CONFLICT` path on both engines — Cockroach's native `UPSERT` is deliberately not used because it ignores the user-declared `conflict.key` and silently uses the primary key as arbiter. Migrations for the cockroach storage live in `migrations/storage-cockroachdb/` (byte-identical to the postgres ones; `TEXT`/`JSONB`/`TIMESTAMPTZ` are all supported). For the Postgres dialect the new code paths are pure pass-throughs — behaviour is unchanged.
 
 ## Validation pipeline
 
@@ -125,7 +127,7 @@ Cursor columns may be nullable. NULL is treated as the minimum element: `NULL < 
 
 ## Out of MVP
 
-Vault secret retrieval (only `$ENV_VAR` / literals work), privilege-excess check, Prometheus/OTel metrics, connectors beyond postgres + mysql + mongodb, YAML config.
+Vault secret retrieval (only `$ENV_VAR` / literals work), privilege-excess check, Prometheus/OTel metrics, connectors beyond postgres + mysql + mongodb + cockroachdb, YAML config.
 
 ## Testing
 

@@ -1,4 +1,6 @@
 #![allow(clippy::unwrap_used)]
+use air_elt_commons_pg::Dialect;
+use air_elt_commons_testing::cockroach::cockroach_pool;
 use air_elt_commons_testing::pg::pg_pool;
 use air_elt_core::model::ReadSpec;
 use air_elt_core::traits::Source;
@@ -91,6 +93,7 @@ async fn describe_and_read_with_cursor() {
         .expect("read_batch drained");
     assert!(empty.rows.is_empty());
     assert!(empty.next_cursor.is_none());
+    handle.pool.close().await;
 }
 
 /// Nullable cursor with mixed NULL/non-null data. With `NULL < everything`
@@ -177,4 +180,154 @@ async fn read_with_nullable_cursor() {
         .await
         .expect("drain");
     assert!(empty.rows.is_empty());
+    handle.pool.close().await;
+}
+
+/// Cockroach mirror of `describe_and_read_with_cursor`: smoke-tests the full
+/// validate → build_context → read_batch path against CockroachDB. Cockroach
+/// speaks pgwire, so the existing source must work unchanged.
+#[tokio::test]
+async fn cockroach_read_batch_smoke() {
+    let handle = cockroach_pool().await;
+    handle
+        .pool
+        .execute(
+            "CREATE TABLE users (
+                id INT PRIMARY KEY,
+                name STRING NOT NULL
+            )",
+        )
+        .await
+        .expect("create users");
+    for i in 1..=5i64 {
+        sqlx::query("INSERT INTO users (id, name) VALUES ($1, $2)")
+            .bind(i)
+            .bind(format!("user-{i}"))
+            .execute(&handle.pool)
+            .await
+            .expect("insert");
+    }
+
+    let source = PgSource::connect(
+        "test_source".to_string(),
+        PgSourceConfig {
+            url: handle.url_with_database(),
+            dialect: Dialect::Cockroach,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect cockroach source");
+
+    let spec = ReadSpec {
+        columns: vec!["id".into(), "name".into()],
+        table: "public.users".to_string(),
+        cursor_fields: vec!["id".into()],
+        cursor_order: air_elt_core::config::model::CursorOrder::Asc,
+        limit: 10,
+        source_options: toml::Table::new(),
+    };
+
+    source
+        .validate_access(&spec)
+        .await
+        .expect("validate_access");
+    let ctx = source.build_context(&spec).await.expect("build_context");
+    let batch = source
+        .read_batch(&spec, ctx, None)
+        .await
+        .expect("read_batch initial");
+    assert_eq!(batch.rows.len(), 5);
+    assert_eq!(batch.rows[0].values[0], Value::Int64(1));
+    assert_eq!(batch.rows[4].values[0], Value::Int64(5));
+    let cursor = batch.next_cursor.expect("cursor");
+    assert_eq!(cursor.fields[0].name, "id");
+    assert_eq!(cursor.fields[0].value, Value::Int64(5));
+    handle.pool.close().await;
+}
+
+/// Cockroach mirror of `read_with_nullable_cursor`: NULL-cursor lexicographic
+/// algebra with two cursor columns (one nullable). NULLs come first in ASC
+/// order, then non-null rows.
+#[tokio::test]
+async fn cockroach_null_cursor_lexicographic_two_keys() {
+    let handle = cockroach_pool().await;
+    handle
+        .pool
+        .execute(
+            "CREATE TABLE ranked (
+                id   INT PRIMARY KEY,
+                rank INT
+            )",
+        )
+        .await
+        .expect("create ranked");
+    for (id, rank) in [(1i64, Some(1i32)), (2, None), (3, Some(3)), (4, None)] {
+        sqlx::query("INSERT INTO ranked (id, rank) VALUES ($1, $2)")
+            .bind(id)
+            .bind(rank)
+            .execute(&handle.pool)
+            .await
+            .expect("insert");
+    }
+
+    let source = PgSource::connect(
+        "test_source".to_string(),
+        PgSourceConfig {
+            url: handle.url_with_database(),
+            dialect: Dialect::Cockroach,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect cockroach source");
+
+    let spec = ReadSpec {
+        columns: vec!["id".into(), "rank".into()],
+        table: "public.ranked".to_string(),
+        cursor_fields: vec!["rank".into(), "id".into()],
+        cursor_order: air_elt_core::config::model::CursorOrder::Asc,
+        limit: 2,
+        source_options: toml::Table::new(),
+    };
+
+    let ctx = source.build_context(&spec).await.expect("build_context");
+
+    // First batch: NULL ranks come first under ASC NULLS FIRST.
+    let batch = source
+        .read_batch(&spec, ctx.clone(), None)
+        .await
+        .expect("batch 1");
+    assert_eq!(batch.rows.len(), 2);
+    assert_eq!(batch.rows[0].values[1], Value::Null);
+    assert_eq!(batch.rows[1].values[1], Value::Null);
+    let cursor1 = batch.next_cursor.expect("cursor after batch 1");
+    assert!(
+        cursor1
+            .fields
+            .iter()
+            .any(|f| f.name == "rank" && f.value == Value::Null),
+        "cursor must carry NULL rank"
+    );
+
+    // Second batch: cursor=(NULL, last_id) → null-aware path picks up
+    // non-null ranks 1 and 3.
+    let batch = source
+        .read_batch(&spec, ctx.clone(), Some(&cursor1))
+        .await
+        .expect("batch 2");
+    assert_eq!(batch.rows.len(), 2);
+    // Cockroach normalises `INT` to `INT8` (i64) — the schema introspection
+    // reads `udt_name = 'int8'`, which maps to `DataType::Int64`.
+    assert_eq!(batch.rows[0].values[1], Value::Int64(1));
+    assert_eq!(batch.rows[1].values[1], Value::Int64(3));
+
+    // Drain.
+    let cursor2 = batch.next_cursor.expect("cursor after batch 2");
+    let empty = source
+        .read_batch(&spec, ctx, Some(&cursor2))
+        .await
+        .expect("drain");
+    assert!(empty.rows.is_empty());
+    handle.pool.close().await;
 }

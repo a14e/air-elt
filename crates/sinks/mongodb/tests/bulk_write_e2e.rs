@@ -80,6 +80,7 @@ async fn bulk_write_path_on_modern_server() {
         v.minor
     );
     round_trip_overwrite(sink, &handle.database, &handle.client).await;
+    handle.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -100,4 +101,5 @@ async fn fallback_path_on_legacy_server() {
         v.minor
     );
     round_trip_overwrite(sink, &handle.database, &handle.client).await;
+    handle.client.clone().shutdown().await;
 }

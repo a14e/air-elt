@@ -4,19 +4,33 @@
 //! Two modes, chosen at runtime:
 //!
 //! 1. If `AIR_ELT_TEST_MONGO_URL` is set, connect there and create a
-//!    unique sandbox database per test. The database is dropped when
-//!    the handle is dropped. CI uses this mode.
-//! 2. Otherwise launch a fresh MongoDB container via testcontainers.
+//!    unique sandbox database per test.
+//! 2. Otherwise launch a MongoDB container via testcontainers in
+//!    `ReuseDirective::Always` mode — labelled with the current ryuk
+//!    session and `air-elt.kind=mongo` (or `mongo-legacy`), so the
+//!    container is shared across every test process of one cargo
+//!    invocation and reaped automatically when the last process exits.
+//!
+//! Two `OnceCell`s cache the resolved `(base_url, mongodb::Client)` per
+//! variant — modern (≥ 8.0) and legacy (7.0, used by the bulk-write
+//! versioning tests). Per-test sandbox databases are created and dropped
+//! on the cached client.
+
+use std::future::Future;
+use std::pin::Pin;
 
 use mongodb::Client;
 use rand::distr::{Alphanumeric, SampleString};
 use rand::rng;
+use testcontainers::core::Mount;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ImageExt};
+use testcontainers::{ImageExt, ReuseDirective};
 use testcontainers_modules::mongo::Mongo as MongoImage;
-use tracing::{info, warn};
+use tokio::sync::OnceCell;
+use tracing::info;
 
 use crate::backend::{TestBackend, detect_with_timeout, prepare_container_env};
+use crate::ryuk;
 
 const URL_VAR: &str = "AIR_ELT_TEST_MONGO_URL";
 /// Optional URL pointing at a *legacy* (pre-8.0) MongoDB. The mongo
@@ -24,6 +38,21 @@ const URL_VAR: &str = "AIR_ELT_TEST_MONGO_URL";
 /// older falls back to a `replace_one` loop. Tests that need to
 /// exercise the fallback set this to a 7.x server.
 const LEGACY_URL_VAR: &str = "AIR_ELT_TEST_MONGO_LEGACY_URL";
+const RS_URL_VAR: &str = "AIR_ELT_TEST_MONGO_RS_URL";
+const KIND_LABEL_KEY: &str = "air-elt.kind";
+
+/// Cached connection URL only. We deliberately do **not** cache a
+/// `mongodb::Client` here: the driver spawns background tasks on the
+/// tokio runtime that constructed it, and `#[tokio::test]` builds a
+/// fresh runtime per test. A client cached on test 1's runtime starts
+/// failing on test 2 with "A Tokio 1.x context was found, but it is
+/// being shutdown.". Cheap to reconstruct per test.
+struct MongoInfra {
+    base_url: String,
+}
+
+static MONGO_INFRA: OnceCell<MongoInfra> = OnceCell::const_new();
+static MONGO_LEGACY_INFRA: OnceCell<MongoInfra> = OnceCell::const_new();
 
 pub struct MongoTestHandle {
     pub client: Client,
@@ -31,7 +60,6 @@ pub struct MongoTestHandle {
     pub url: String,
     /// Sandbox database name. Unique per handle.
     pub database: String,
-    _cleanup: CleanupGuard,
 }
 
 impl MongoTestHandle {
@@ -40,95 +68,97 @@ impl MongoTestHandle {
     }
 }
 
-enum CleanupGuard {
-    External {
-        client: Client,
-        database: String,
-    },
-    Container {
-        _container: Box<ContainerAsync<MongoImage>>,
-    },
+async fn mongo_infra(env_var: &str, container_tag: &str) -> &'static MongoInfra {
+    let cell = if env_var == LEGACY_URL_VAR {
+        &MONGO_LEGACY_INFRA
+    } else {
+        &MONGO_INFRA
+    };
+    cell.get_or_init(|| async move {
+        if let Ok(external) = std::env::var(env_var) {
+            let (base_url, _existing_db) = strip_db(&external);
+            return MongoInfra { base_url };
+        }
+        let backend = detect_with_timeout(env_var)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let socket = match backend {
+            TestBackend::ExternalUrl => unreachable!("handled above"),
+            TestBackend::Container { socket } => socket,
+        };
+        prepare_container_env(&socket);
+        ryuk::ensure_session(&socket).await;
+        let (sk, sv) = ryuk::session_label();
+        let start_lock = crate::filelock::acquire_lock(if env_var == LEGACY_URL_VAR {
+            "mongo-legacy"
+        } else {
+            "mongo"
+        });
+        // Differentiate modern-vs-legacy mongo by tag, since reuse-mode
+        // matches by labels: each variant gets its own kind value.
+        let kind_value = if env_var == LEGACY_URL_VAR {
+            "mongo-legacy"
+        } else {
+            "mongo"
+        };
+        info!(
+            tag = container_tag,
+            "ensuring shared mongo container (reuse=Always, ryuk-managed)"
+        );
+        // tmpfs on /data/db: container is reaped at session end, so
+        // on-disk state has no value.
+        let container = MongoImage::default()
+            .with_tag(container_tag)
+            .with_container_name(format!("air-elt-{kind_value}-{sv}"))
+            .with_label(sk, sv)
+            .with_label(KIND_LABEL_KEY, kind_value)
+            .with_mount(Mount::tmpfs_mount("/data/db"))
+            .with_reuse(ReuseDirective::Always)
+            .start()
+            .await
+            .expect("start mongo container failed");
+        drop(start_lock);
+        let host = container.get_host().await.expect("container host");
+        let port = container
+            .get_host_port_ipv4(27017)
+            .await
+            .expect("container port");
+        let base_url = format!("mongodb://{host}:{port}");
+        drop(container);
+        MongoInfra { base_url }
+    })
+    .await
 }
 
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        match self {
-            CleanupGuard::External { client, database } => {
-                let client = client.clone();
-                let database = database.clone();
-                let join = std::thread::spawn(move || {
-                    // Panic-safe: a `Drop` that panics during unwind aborts
-                    // the process. If we cannot build a runtime here, log and
-                    // give up — the sandbox database is already disposable
-                    // (each run gets a fresh randomised name).
-                    let rt = match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            warn!(error = %e, db = %database, "could not build cleanup runtime; skipping db drop");
-                            return;
-                        }
-                    };
-                    rt.block_on(async move {
-                        let db = client.database(&database);
-                        let drop_fut = db.drop();
-                        match tokio::time::timeout(std::time::Duration::from_secs(5), drop_fut)
-                            .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                warn!(error = %e, db = %database, "failed to drop test database");
-                            }
-                            Err(_) => {
-                                warn!(db = %database, "drop database timed out");
-                            }
-                        }
-                    });
-                });
-                if let Err(e) = join.join() {
-                    warn!(?e, "cleanup thread panicked");
-                }
-            }
-            CleanupGuard::Container { .. } => {}
-        }
-    }
-}
-
-pub async fn mongo_pool() -> MongoTestHandle {
-    if let Ok(external) = std::env::var(URL_VAR) {
-        return external_with_sandbox(&external).await;
-    }
-    let backend = detect_with_timeout(URL_VAR)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
-    match backend {
-        TestBackend::ExternalUrl => unreachable!("handled above"),
-        TestBackend::Container { socket } => {
-            prepare_container_env(&socket);
-            spawn_container("8").await
-        }
-    }
+pub fn mongo_pool() -> Pin<Box<dyn Future<Output = MongoTestHandle> + Send + 'static>> {
+    Box::pin(async move {
+        let infra = mongo_infra(URL_VAR, "8").await;
+        handle_for(infra).await
+    })
 }
 
 /// Sandbox handle pointing at a legacy (pre-8.0) MongoDB. Used only by
 /// the bulk-write versioning e2e tests; everything else should use
 /// `mongo_pool`. Honours `AIR_ELT_TEST_MONGO_LEGACY_URL`; falls back to
 /// a `mongo:7.0` container.
-pub async fn mongo_pool_legacy() -> MongoTestHandle {
-    if let Ok(external) = std::env::var(LEGACY_URL_VAR) {
-        return external_with_sandbox(&external).await;
-    }
-    let backend = detect_with_timeout(LEGACY_URL_VAR)
+pub fn mongo_pool_legacy() -> Pin<Box<dyn Future<Output = MongoTestHandle> + Send + 'static>> {
+    Box::pin(async move {
+        let infra = mongo_infra(LEGACY_URL_VAR, "7.0").await;
+        handle_for(infra).await
+    })
+}
+
+async fn handle_for(infra: &MongoInfra) -> MongoTestHandle {
+    let database = random_db();
+    info!(db = %database, "allocating sandbox mongo database");
+    let client = Client::with_uri_str(&infra.base_url)
         .await
-        .unwrap_or_else(|e| panic!("{e}"));
-    match backend {
-        TestBackend::ExternalUrl => unreachable!("handled above"),
-        TestBackend::Container { socket } => {
-            prepare_container_env(&socket);
-            spawn_container("7.0").await
-        }
+        .expect("connect to mongo failed");
+
+    MongoTestHandle {
+        client,
+        url: infra.base_url.clone(),
+        database,
     }
 }
 
@@ -159,27 +189,6 @@ fn strip_db_from_path(head: &str) -> (String, Option<String>) {
     }
 }
 
-async fn external_with_sandbox(url: &str) -> MongoTestHandle {
-    let (base_url, _existing_db) = strip_db(url);
-    let database = random_db();
-    info!(db = %database, "creating sandbox database on external mongo");
-    let client = Client::with_uri_str(&base_url)
-        .await
-        .expect("connect to AIR_ELT_TEST_MONGO_URL failed");
-    // Touching a collection materialises the database; nothing to do
-    // explicitly — Mongo databases are implicit.
-    let cleanup = CleanupGuard::External {
-        client: client.clone(),
-        database: database.clone(),
-    };
-    MongoTestHandle {
-        client,
-        url: base_url,
-        database,
-        _cleanup: cleanup,
-    }
-}
-
 /// Sandbox handle backed by a Mongo deployment with change-streams
 /// enabled (i.e. a replica set). Required by every e2e test for the
 /// `mongo-cdc` source, since Change Streams cannot run on a
@@ -203,43 +212,26 @@ pub fn mongo_rs_url_or_skip() -> Option<String> {
     std::env::var(RS_URL_VAR).ok()
 }
 
-pub async fn mongo_rs_pool() -> MongoTestHandle {
-    let url = std::env::var(RS_URL_VAR).unwrap_or_else(|_| {
-        panic!(
-            "{RS_URL_VAR} not set — mongo-cdc e2e tests need a replica-set mongo. \
-             See `mongo_rs_url_or_skip` docstring for setup."
-        )
-    });
-    external_with_sandbox(&url).await
-}
+pub fn mongo_rs_pool() -> Pin<Box<dyn Future<Output = MongoTestHandle> + Send + 'static>> {
+    Box::pin(async move {
+        let url = std::env::var(RS_URL_VAR).unwrap_or_else(|_| {
+            panic!(
+                "{RS_URL_VAR} not set — mongo-cdc e2e tests need a replica-set mongo. \
+                 See `mongo_rs_url_or_skip` docstring for setup."
+            )
+        });
+        let (base_url, _existing_db) = strip_db(&url);
+        let client = Client::with_uri_str(&base_url)
+            .await
+            .expect("connect to RS mongo failed");
 
-const RS_URL_VAR: &str = "AIR_ELT_TEST_MONGO_RS_URL";
-
-async fn spawn_container(tag: &str) -> MongoTestHandle {
-    info!(tag, "starting ephemeral mongo container");
-    let container = MongoImage::default()
-        .with_tag(tag)
-        .start()
-        .await
-        .expect("start mongo container failed");
-    let host = container.get_host().await.expect("container host");
-    let port = container
-        .get_host_port_ipv4(27017)
-        .await
-        .expect("container port");
-    let base_url = format!("mongodb://{host}:{port}");
-    let client = Client::with_uri_str(&base_url)
-        .await
-        .expect("connect to containerised mongo failed");
-    let database = random_db();
-    MongoTestHandle {
-        client,
-        url: base_url,
-        database,
-        _cleanup: CleanupGuard::Container {
-            _container: Box::new(container),
-        },
-    }
+        let database = random_db();
+        MongoTestHandle {
+            client,
+            url: base_url,
+            database,
+        }
+    })
 }
 
 fn random_db() -> String {

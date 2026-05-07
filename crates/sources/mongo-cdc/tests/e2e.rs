@@ -157,6 +157,7 @@ async fn cdc_emits_upsert_for_inserts_replace_and_delete() {
     assert_eq!(batch.rows[3].values.len(), spec.columns.len());
     assert_eq!(batch.rows[3].values[1], Value::Null);
     assert!(batch.next_cursor.is_some());
+    mongo.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -191,6 +192,7 @@ async fn cdc_lookup_on_update_attaches_post_image_via_find() {
     assert_eq!(batch.rows[0].values[0], Value::Int32(7));
     // The lookup find must have attached the post-image.
     assert_eq!(batch.rows[0].values[1], Value::Text("after".into()));
+    mongo.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -231,6 +233,7 @@ async fn cdc_lookup_on_update_skips_when_doc_deleted_between_event_and_find() {
     assert_eq!(batch.rows.len(), 1);
     assert_eq!(batch.rows[0].op, RowOp::Delete);
     assert_eq!(batch.rows[0].values[0], Value::Int32(9));
+    mongo.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -261,6 +264,7 @@ async fn cdc_drop_collection_surfaces_runtime_error() {
         msg.contains("invalidated") || msg.contains("Drop") || msg.contains("Invalidate"),
         "expected drop/invalidate marker in error, got: {msg}"
     );
+    mongo.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -333,6 +337,8 @@ async fn cdc_to_pg_sink_round_trip_with_inserts_and_deletes() {
         count.0, 0,
         "upsert→delete in one batch must land as absent (sink applies upsert first, delete second)"
     );
+    mongo.client.clone().shutdown().await;
+    pg.pool.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -367,6 +373,7 @@ async fn cdc_describe_schema_unifies_heterogeneous_bson() {
     use air_elt_core::types::DataType;
     assert_eq!(n.data_type, DataType::Int64);
     assert_eq!(x.data_type, DataType::Float64);
+    mongo.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -431,6 +438,8 @@ async fn resume_token_round_trips_through_pg_storage_with_reopen() {
             .is_none(),
         "unknown flow → None"
     );
+    mongo.client.clone().shutdown().await;
+    pg.pool.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -474,6 +483,7 @@ async fn validate_delete_access_real_db_succeeds_for_owner() {
         count.0, 3,
         "validate_delete_access must roll back — no rows touched"
     );
+    pg.pool.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -542,6 +552,8 @@ async fn cdc_to_mysql_sink_round_trip_with_inserts_and_deletes() {
         .await
         .unwrap();
     assert_eq!(count.0, 0);
+    mongo.client.clone().shutdown().await;
+    mysql.pool.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -618,6 +630,8 @@ async fn cdc_to_mongo_sink_round_trip_with_inserts_and_deletes() {
         .unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].get_i32("_id").unwrap(), 32);
+    mongo.client.clone().shutdown().await;
+    sink_handle.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -706,6 +720,7 @@ async fn validate_delete_access_pg_fails_for_role_without_delete_privilege() {
         .execute(format!("DROP ROLE IF EXISTS \"{role}\"").as_str())
         .await
         .ok();
+    pg.pool.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -773,6 +788,7 @@ async fn validate_delete_access_mysql_fails_for_user_without_delete_privilege() 
         .execute(&mysql.pool)
         .await
         .ok();
+    mysql.pool.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -791,6 +807,7 @@ async fn cdc_validate_access_succeeds_on_not_yet_existing_collection() {
         .validate_access(&spec)
         .await
         .expect("validate_access on missing collection must not error");
+    mongo.client.clone().shutdown().await;
 }
 
 fn extract_db(url: &str) -> Option<&str> {

@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use sqlx::{PgPool, QueryBuilder, Row};
 use tracing::{debug, info};
 
+use air_elt_commons_pg::Dialect;
 use air_elt_commons_pg::pool;
+use air_elt_commons_pg::retry::with_serialization_retry;
 use air_elt_commons_pg::sink_bind::bind_value_separated;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::model::{Batch, Row as CoreRow, RowOp, Schema, SinkCtx, WriteReport, WriteSpec};
@@ -20,7 +22,8 @@ struct PgSinkCtx {
     insert_statement: String,
     /// `ON CONFLICT (...) DO ...` suffix derived from the flow's
     /// `[flow.<name>.conflict]` block; empty string when no conflict
-    /// directive is set.
+    /// directive is set. Same for Postgres and CockroachDB — the standard
+    /// `INSERT … ON CONFLICT` path is used in both cases.
     conflict_suffix: String,
     /// Delete plan; `Some` only when the flow declares a conflict
     /// block. The full DELETE SQL is assembled per call because the
@@ -46,10 +49,12 @@ impl SinkCtx for PgSinkCtx {
 
 pub struct PgSink {
     pool: PgPool,
+    dialect: Dialect,
 }
 
 impl PgSink {
     pub async fn connect(config: PgSinkConfig) -> RuntimeResult<Self> {
+        let dialect = config.dialect;
         let pool = pool::connect(
             &config.url,
             pool::PoolSettings::from_options(
@@ -63,7 +68,7 @@ impl PgSink {
             ),
         )
         .await?;
-        Ok(Self { pool })
+        Ok(Self { pool, dialect })
     }
 
     async fn ensure_connection_alive(&self) -> RuntimeResult<()> {
@@ -220,23 +225,30 @@ impl PgSink {
         if !rows.iter().any(is_upsert) {
             return Ok(0);
         }
-        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(&pg_ctx.insert_statement);
+        // The QueryBuilder is consumed by `.build().execute(...)`, so it has
+        // to be rebuilt per attempt. The retry wrapper is a no-op on
+        // Postgres dialect; on Cockroach it re-runs on `40001`.
         let column_types_ref = &pg_ctx.column_types;
-        qb.push_values(rows.iter().filter(|r| is_upsert(r)), |mut tuple, row| {
-            for (value, dt) in row.values.iter().zip(column_types_ref.iter()) {
-                bind_value_separated(&mut tuple, value, dt);
+        with_serialization_retry(self.dialect, || async {
+            let mut qb: QueryBuilder<'_, sqlx::Postgres> =
+                QueryBuilder::new(&pg_ctx.insert_statement);
+            qb.push_values(rows.iter().filter(|r| is_upsert(r)), |mut tuple, row| {
+                for (value, dt) in row.values.iter().zip(column_types_ref.iter()) {
+                    bind_value_separated(&mut tuple, value, dt);
+                }
+            });
+            if !pg_ctx.conflict_suffix.is_empty() {
+                qb.push(&pg_ctx.conflict_suffix);
             }
-        });
-        if !pg_ctx.conflict_suffix.is_empty() {
-            qb.push(&pg_ctx.conflict_suffix);
-        }
-        debug!(sql = %qb.sql(), "pg insert batch");
-        let result = qb
-            .build()
-            .execute(&self.pool)
-            .await
-            .map_err(RuntimeError::backend)?;
-        Ok(result.rows_affected())
+            debug!(sql = %qb.sql(), "pg insert batch");
+            let result = qb
+                .build()
+                .execute(&self.pool)
+                .await
+                .map_err(RuntimeError::backend)?;
+            Ok(result.rows_affected())
+        })
+        .await
     }
 
     async fn write_delete_batch(&self, pg_ctx: &PgSinkCtx, rows: &[CoreRow]) -> RuntimeResult<u64> {
@@ -250,34 +262,37 @@ impl PgSink {
                     .into(),
             )
         })?;
-        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(&plan.prefix);
         let key_indices = &plan.key_indices;
         let column_types_ref = &pg_ctx.column_types;
-        if key_indices.len() == 1 {
-            let mut sep = qb.separated(", ");
-            let i = key_indices[0];
-            let dt = &column_types_ref[i];
-            for row in rows.iter().filter(|r| is_delete(r)) {
-                let v = row.values.get(i).unwrap_or(&Value::Null);
-                bind_value_separated(&mut sep, v, dt);
-            }
-        } else {
-            qb.push_tuples(rows.iter().filter(|r| is_delete(r)), |mut tuple, row| {
-                for &i in key_indices {
-                    let dt = &column_types_ref[i];
+        with_serialization_retry(self.dialect, || async {
+            let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(&plan.prefix);
+            if key_indices.len() == 1 {
+                let mut sep = qb.separated(", ");
+                let i = key_indices[0];
+                let dt = &column_types_ref[i];
+                for row in rows.iter().filter(|r| is_delete(r)) {
                     let v = row.values.get(i).unwrap_or(&Value::Null);
-                    bind_value_separated(&mut tuple, v, dt);
+                    bind_value_separated(&mut sep, v, dt);
                 }
-            });
-        }
-        qb.push(")");
-        debug!(sql = %qb.sql(), "pg delete batch");
-        let result = qb
-            .build()
-            .execute(&self.pool)
-            .await
-            .map_err(RuntimeError::backend)?;
-        Ok(result.rows_affected())
+            } else {
+                qb.push_tuples(rows.iter().filter(|r| is_delete(r)), |mut tuple, row| {
+                    for &i in key_indices {
+                        let dt = &column_types_ref[i];
+                        let v = row.values.get(i).unwrap_or(&Value::Null);
+                        bind_value_separated(&mut tuple, v, dt);
+                    }
+                });
+            }
+            qb.push(")");
+            debug!(sql = %qb.sql(), "pg delete batch");
+            let result = qb
+                .build()
+                .execute(&self.pool)
+                .await
+                .map_err(RuntimeError::backend)?;
+            Ok(result.rows_affected())
+        })
+        .await
     }
 }
 

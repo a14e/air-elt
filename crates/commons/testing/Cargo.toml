@@ -7,17 +7,22 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 air-elt-commons = { workspace = true }
 sqlx = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+bollard = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 mongodb = { workspace = true }
 bson = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

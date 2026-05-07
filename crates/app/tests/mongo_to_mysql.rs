@@ -25,14 +25,12 @@
 
 #![allow(clippy::unwrap_used)]
 
+use air_elt_app::App;
 use air_elt_commons_testing::mongo::mongo_pool;
 use air_elt_commons_testing::mysql::mysql_pool;
 use bson::doc;
 use chrono::{DateTime, TimeZone, Utc};
 use sqlx::Executor;
-
-mod common;
-use common::guard::{MongoDbGuard, MysqlDbGuard};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mongo_to_mysql_with_many_types_and_nulls() {
@@ -42,12 +40,6 @@ async fn mongo_to_mysql_with_many_types_and_nulls() {
     let src_db_mongo = format!("{}_src", mongo.database);
     let state_db_mongo = format!("{}_state", mongo.database);
     let dst_db_sql = format!("{}_dst", mysql.schema);
-
-    let _mysql_guard = MysqlDbGuard::new(mysql.pool.clone(), vec![dst_db_sql.clone()]);
-    let _mongo_guard = MongoDbGuard::new(
-        mongo.client.clone(),
-        vec![src_db_mongo.clone(), state_db_mongo.clone()],
-    );
 
     mysql
         .pool
@@ -190,7 +182,8 @@ strategy = "overwrite"
     let tmp = tempfile::tempdir().unwrap();
     let config_path = tmp.path().join("config.toml");
     std::fs::write(&config_path, &config_toml).unwrap();
-    common::pipeline::run_once(&config_path).await;
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
 
     // NOT NULL columns are non-Option in the SELECT — sqlx will panic
     // if any row has a SQL NULL there, which would itself be the bug
@@ -237,7 +230,7 @@ strategy = "overwrite"
     // Re-run is a no-op thanks to the upsert. Verify both row count
     // and content survived — a buggy upsert that wiped substituted
     // defaults back to NULL would surface here.
-    common::pipeline::run_once(&config_path).await;
+    app.run_once().await.expect("run_once (re-run)");
     let rows2: Vec<(i64, String, i32)> = sqlx::query_as(&format!(
         "SELECT id, name, score FROM `{dst_db_sql}`.users ORDER BY id"
     ))
@@ -259,4 +252,6 @@ strategy = "overwrite"
         .unwrap()
         .expect("cursor saved");
     assert!(cursor_doc.get("cursor").is_some());
+
+    mysql.pool.close().await;
 }

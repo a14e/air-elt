@@ -12,6 +12,7 @@ use crate::types::{ConversionContext, DataType};
 /// without I/O validation yet. Returned by `validation::pipeline::assemble`.
 /// Cannot be passed to the runner — call `validate` first to obtain a
 /// `FlowState`.
+#[derive(Clone)]
 pub struct AssembledFlow {
     pub name: String,
     /// Shared via `Arc` so multiple flows referencing the same source by
@@ -82,6 +83,7 @@ impl ConversionPlan {
 /// only by `validation::pipeline::validate` — there is no public
 /// constructor that lets you build one with a stale or empty `conversions`
 /// slice. Tests reach `for_test` via the `flow::test_utils` module.
+#[derive(Clone)]
 pub struct FlowState {
     inner: AssembledFlow,
     /// Per-column conversion plan. Identity columns get an identity plan;

@@ -17,6 +17,7 @@
 
 #![allow(clippy::unwrap_used)]
 
+use air_elt_app::App;
 use air_elt_commons_testing::mongo::mongo_pool;
 use air_elt_commons_testing::pg::pg_pool;
 use air_elt_core::types::Value;
@@ -25,9 +26,6 @@ use chrono::{TimeZone, Utc};
 use futures::TryStreamExt;
 use sqlx::Executor;
 
-mod common;
-use common::guard::{MongoDbGuard, PgSchemaGuard};
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_to_mongo_with_mixed_nullability_and_nested_path() {
     let pg = pg_pool().await;
@@ -35,11 +33,6 @@ async fn pg_to_mongo_with_mixed_nullability_and_nested_path() {
 
     let src_schema = format!("{}_src", pg.schema);
     let dst_db = format!("{}_dst", mongo.database);
-
-    // Sibling resources outside the handle's sandbox — guard so they
-    // are dropped on test panic too.
-    let _pg_guard = PgSchemaGuard::new(pg.pool.clone(), vec![src_schema.clone()]);
-    let _mongo_guard = MongoDbGuard::new(mongo.client.clone(), vec![dst_db.clone()]);
 
     pg.pool
         .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
@@ -143,7 +136,8 @@ strategy = "overwrite"
     let tmp = tempfile::tempdir().unwrap();
     let config_path = tmp.path().join("config.toml");
     std::fs::write(&config_path, &config_toml).unwrap();
-    common::pipeline::run_once(&config_path).await;
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
 
     let sink = mongo
         .client
@@ -226,4 +220,6 @@ strategy = "overwrite"
     assert_eq!(parsed.fields[0].name, "created_at");
     assert_eq!(parsed.fields[1].name, "id");
     assert_eq!(parsed.fields[1].value, Value::Int64(5));
+
+    pg.pool.close().await;
 }

@@ -51,4 +51,6 @@ async fn migrate_and_upsert_cursor_on_mariadb() {
         .expect("load")
         .expect("present");
     assert_eq!(loaded.fields[0].value, Value::Int64(2));
+
+    handle.pool.close().await;
 }

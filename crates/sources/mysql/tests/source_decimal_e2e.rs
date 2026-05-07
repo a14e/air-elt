@@ -93,6 +93,7 @@ async fn decimal_zero_scale_decoded_as_bigint_and_decimal() {
         Value::BigInt(BigInt::from_str(neg_str).unwrap()),
         "negative arbitrary-precision integer round-trips"
     );
+    handle.pool.close().await;
 }
 
 /// MySQL UNSIGNED int columns map to `UInt8/16/32/64` and round-trip
@@ -195,4 +196,5 @@ async fn unsigned_int_columns_round_trip() {
         Value::UInt64(u64::MAX),
         "u64 wire-level max preserved (would overflow i64)"
     );
+    handle.pool.close().await;
 }

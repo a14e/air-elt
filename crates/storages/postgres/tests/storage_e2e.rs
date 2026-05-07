@@ -1,4 +1,6 @@
 #![allow(clippy::unwrap_used)]
+use air_elt_commons_pg::Dialect;
+use air_elt_commons_testing::cockroach::cockroach_pool;
 use air_elt_commons_testing::pg::pg_pool;
 use air_elt_core::model::{CursorFieldValue, CursorState};
 use air_elt_core::traits::Storage;
@@ -62,6 +64,8 @@ async fn migrate_and_upsert_cursor() {
         storage.load_cursor(flow).await.unwrap().unwrap().fields[0].value,
         Value::Int64(43)
     );
+
+    handle.pool.close().await;
 }
 
 /// Exercise the tagged-serde round-trip for every `Value` variant through
@@ -128,6 +132,8 @@ async fn cursor_roundtrip_all_value_variants() {
             .unwrap_or_else(|| panic!("missing cursor for {flow}"));
         assert_eq!(loaded, state, "{flow}: variant did not round-trip");
     }
+
+    handle.pool.close().await;
 }
 
 #[tokio::test]
@@ -177,4 +183,62 @@ async fn resume_token_round_trip_and_reopen() {
             .is_none(),
         "unknown flow after reopen → None"
     );
+
+    handle.pool.close().await;
+}
+
+#[tokio::test]
+async fn cockroach_migrate_and_save_load_round_trip() {
+    let handle = cockroach_pool().await;
+    let storage = PgStorage::connect(PgStorageConfig {
+        dialect: Dialect::Cockroach,
+        url: handle.url_with_database(),
+        ..Default::default()
+    })
+    .await
+    .expect("connect cockroach storage");
+
+    storage.migrate().await.expect("cockroach migrate");
+
+    let flow = "flow_x";
+    assert!(storage.load_cursor(flow).await.unwrap().is_none());
+
+    let state = CursorState::new(vec![CursorFieldValue {
+        name: "id".into(),
+        value: Value::Int64(101),
+    }]);
+    storage
+        .save_cursor(flow, &state)
+        .await
+        .expect("cockroach save_cursor");
+    assert_eq!(storage.load_cursor(flow).await.unwrap().unwrap(), state);
+
+    let token = serde_json::json!({ "_data": "82AABB" });
+    storage
+        .save_resume_token(flow, &token)
+        .await
+        .expect("cockroach save_resume_token");
+    assert_eq!(
+        storage.load_resume_token(flow).await.unwrap().unwrap(),
+        token
+    );
+
+    handle.pool.close().await;
+}
+
+#[tokio::test]
+async fn cockroach_migrate_idempotent() {
+    let handle = cockroach_pool().await;
+    let storage = PgStorage::connect(PgStorageConfig {
+        dialect: Dialect::Cockroach,
+        url: handle.url_with_database(),
+        ..Default::default()
+    })
+    .await
+    .expect("connect cockroach storage");
+
+    storage.migrate().await.expect("cockroach migrate first");
+    storage.migrate().await.expect("cockroach migrate second");
+
+    handle.pool.close().await;
 }
