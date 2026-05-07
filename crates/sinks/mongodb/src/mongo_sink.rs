@@ -9,17 +9,15 @@
 //!   still propagate.
 //! - **`strategy = "overwrite"`** — server-version dependent. On
 //!   server >=8.0 we use `Client::bulk_write` to ship every row's
-//!   `ReplaceOneModel { upsert=true }` in a single round-trip — the
-//!   preferred path; it scales linearly with batch size and doesn't
-//!   stress the connection pool. On older servers `Client::bulk_write`
-//!   is unavailable, so we fall back to a per-row
-//!   `replace_one(filter, upsert=true)` loop fired with bounded
-//!   concurrency via `futures::stream::buffer_unordered`. The bound
-//!   keeps in-flight futures below the driver's pool ceiling so large
-//!   `batch-limit` values don't pile up against `WaitQueueTimeout`.
-//!   The choice is decided once at `connect()` (via
-//!   `commons-mongodb::version::detect`) and cached in
-//!   `MongoSink::server_version` + `MongoSinkCtx::server_version`.
+//!   `ReplaceOneModel { upsert=true }` in a single round-trip. On
+//!   older servers `Client::bulk_write` is unavailable (the cross-
+//!   collection admin command is an 8.0 feature), so we fall back to
+//!   issuing one `update` command via `run_command` with N
+//!   `{ q, u, upsert: true }` entries — also a single round-trip,
+//!   honoured by every server since 2.6. `ordered=false` on both
+//!   paths so a single bad row doesn't abort the rest. The choice is
+//!   decided once at `connect()` (via `commons-mongodb::version::detect`)
+//!   and cached in `MongoSink::server_version` + `MongoSinkCtx::server_version`.
 //! - **`_id` fast path**: when `conflict.key == ["_id"]` (single key,
 //!   exact `_id`) we still use replaceOne but skip the FieldPath
 //!   round-trip — `_id` is the primary key, indexed natively, no need
@@ -34,9 +32,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bson::{Bson, Document, doc};
-use futures::stream::{self, StreamExt};
 use mongodb::error::ErrorKind;
-use mongodb::options::{InsertManyOptions, ReplaceOptions};
+use mongodb::options::InsertManyOptions;
 use mongodb::{Client, Collection};
 use tracing::{debug, info, warn};
 
@@ -53,16 +50,6 @@ use crate::config::MongoSinkConfig;
 
 /// MongoDB duplicate-key error code; emitted on unique-index violations.
 const E11000_DUPLICATE_KEY: i32 = 11_000;
-
-/// Bound on in-flight `replace_one` futures during parallel upsert.
-/// Sized to fit comfortably below the driver's default `max_pool_size`
-/// (100) so we don't queue operations ten-deep behind the pool when the
-/// flow's `batch-limit` is large; small enough that the driver's
-/// connection multiplexing can keep them all moving without
-/// `WaitQueueTimeout`. Operators tuning `max-connections` very low can
-/// still hit the pool ceiling — the driver will serialise, just with
-/// the same predictable backpressure.
-const UPSERT_PARALLELISM: usize = 16;
 
 pub struct MongoSink {
     client: Client,
@@ -372,7 +359,15 @@ impl MongoSink {
                     )
                     .await?
                 } else {
-                    write_upsert_parallel(coll, docs, keys, my_ctx.id_fast_path).await?
+                    write_upsert_via_update(
+                        &self.client,
+                        &self.database,
+                        &spec.table,
+                        docs,
+                        keys,
+                        my_ctx.id_fast_path,
+                    )
+                    .await?
                 }
             }
         };
@@ -495,46 +490,114 @@ fn inserted_count_if_only_dup_keys(err: &mongodb::error::Error, batch_size: u64)
     None
 }
 
-async fn write_upsert_parallel(
-    coll: &Collection<Document>,
+/// Server-side batched upsert for deployments without `Client::bulk_write`
+/// (server <8.0). Issues one `update` command via `run_command` carrying
+/// N `{ q, u, upsert: true }` entries — a single round-trip, equivalent
+/// in semantics to N `replace_one(filter, upsert=true)` calls but
+/// without the per-row latency. `ordered=false` so a single failure
+/// doesn't abort the rest, mirroring the modern `bulk_write` path.
+///
+/// `rows_written` is taken from `n` in the response (matched + upserted),
+/// matching the `bulk_write` accounting.
+async fn write_upsert_via_update(
+    client: &Client,
+    database: &str,
+    collection: &str,
     docs: Vec<Document>,
     keys: &[UpsertKey],
     id_fast_path: bool,
 ) -> RuntimeResult<u64> {
-    let opts = ReplaceOptions::builder().upsert(Some(true)).build();
     debug!(
         rows = docs.len(),
-        id_fast_path, "mongodb replace_one upsert (bounded parallel)"
+        id_fast_path, "mongodb update command upsert"
     );
-    // Build the filter+doc pairs up front so an invalid filter aborts the
-    // batch before any I/O happens.
-    let mut planned = Vec::with_capacity(docs.len());
+    let mut updates: Vec<Document> = Vec::with_capacity(docs.len());
     for d in docs {
         let filter = build_upsert_filter(&d, keys, id_fast_path)?;
-        planned.push((filter, d));
+        updates.push(doc! {
+            "q": filter,
+            "u": d,
+            "upsert": true,
+        });
     }
+    let cmd = doc! {
+        "update": collection,
+        "updates": updates,
+        "ordered": false,
+    };
+    let res = client
+        .database(database)
+        .run_command(cmd)
+        .await
+        .map_err(RuntimeError::backend)?;
+    parse_update_response(&res)
+}
 
-    let count = stream::iter(planned)
-        .map(|(filter, d)| {
-            let opts = opts.clone();
-            let coll = coll.clone();
-            async move {
-                coll.replace_one(filter, d)
-                    .with_options(opts)
-                    .await
-                    .map_err(RuntimeError::backend)
-                    .map(|_| ())
+/// Extract `rows_written` from an `update` command reply.
+///
+/// Surfaces three error shapes that the typed driver helpers
+/// (`replace_one`, `Client::bulk_write`) would normally raise on our
+/// behalf — `run_command` returns the raw `Document` instead, so we
+/// have to inspect them here:
+///
+/// - **Top-level `ok: 0`** → command-level failure (auth denied,
+///   namespace not found, oversized batch, ...). Carries `code` /
+///   `errmsg`. Without this check a rejected command would silently
+///   report "0 rows written" instead of erroring.
+/// - **Non-empty `writeErrors`** → per-document failures.
+/// - **`writeConcernError`** → durability failure on an otherwise
+///   acknowledged write.
+///
+/// Numeric parsing: `n` is documented as Int32 on modern servers but
+/// older 3.x-era replies sometimes used Double — accept both via
+/// `try_from`. Refuse silent precision loss / sign loss.
+fn parse_update_response(res: &Document) -> RuntimeResult<u64> {
+    let ok = match res.get("ok") {
+        Some(Bson::Double(v)) => *v,
+        Some(Bson::Int32(v)) => f64::from(*v),
+        Some(Bson::Int64(v)) => *v as f64,
+        _ => 0.0,
+    };
+    if ok != 1.0 {
+        let code = res.get_i32("code").ok();
+        let errmsg = res.get_str("errmsg").unwrap_or("(no errmsg)");
+        return Err(RuntimeError::Other(format!(
+            "mongodb update command failed: ok={ok} code={code:?} errmsg={errmsg:?}"
+        )));
+    }
+    if let Ok(errors) = res.get_array("writeErrors") {
+        if !errors.is_empty() {
+            return Err(RuntimeError::Other(format!(
+                "mongodb update command write errors: {errors:?}"
+            )));
+        }
+    }
+    if let Ok(wce) = res.get_document("writeConcernError") {
+        return Err(RuntimeError::Other(format!(
+            "mongodb update command write concern error: {wce:?}"
+        )));
+    }
+    let n_i64 = match res.get("n") {
+        Some(Bson::Int32(v)) => i64::from(*v),
+        Some(Bson::Int64(v)) => *v,
+        Some(Bson::Double(v)) => {
+            if !v.is_finite() {
+                return Err(RuntimeError::Other(format!(
+                    "mongodb update response 'n' is non-finite: {v}"
+                )));
             }
-        })
-        .buffer_unordered(UPSERT_PARALLELISM)
-        .fold(Ok::<u64, RuntimeError>(0_u64), |acc, r| async move {
-            match (acc, r) {
-                (Ok(n), Ok(())) => Ok(n + 1),
-                (Err(e), _) | (_, Err(e)) => Err(e),
-            }
-        })
-        .await?;
-    Ok(count)
+            // `n` is a counter — bounded by `maxWriteBatchSize` (~10^5),
+            // so any plausible value lands well within Int53 precision.
+            *v as i64
+        }
+        other => {
+            return Err(RuntimeError::Other(format!(
+                "mongodb update response missing or non-numeric 'n': {other:?}"
+            )));
+        }
+    };
+    u64::try_from(n_i64.max(0))
+        .map_err(|e| RuntimeError::Other(format!("mongodb update response 'n' overflow: {e}")))
 }
 
 /// Server-side batched upsert via `Client::bulk_write` (MongoDB 8.0+).
@@ -636,6 +699,95 @@ mod tests {
         let keys = vec![key(0, "tenant"), key(2, "addr.city")];
         let f = build_upsert_filter(&d, &keys, false).unwrap();
         assert_eq!(f, doc! { "tenant": "acme", "addr.city": "Berlin" });
+    }
+
+    #[test]
+    fn parse_update_response_reports_n_as_int32() {
+        let res = doc! { "ok": 1.0, "n": 5_i32, "nModified": 3_i32 };
+        assert_eq!(parse_update_response(&res).unwrap(), 5);
+    }
+
+    #[test]
+    fn parse_update_response_reports_n_as_int64() {
+        let res = doc! { "ok": 1.0, "n": 7_i64, "nModified": 7_i64 };
+        assert_eq!(parse_update_response(&res).unwrap(), 7);
+    }
+
+    #[test]
+    fn parse_update_response_surfaces_write_errors() {
+        let res = doc! {
+            "ok": 1.0,
+            "n": 1_i32,
+            "writeErrors": [ doc! { "index": 1_i32, "code": 11000_i32, "errmsg": "dup" } ],
+        };
+        let err = parse_update_response(&res).unwrap_err();
+        assert!(err.to_string().contains("write errors"));
+    }
+
+    #[test]
+    fn parse_update_response_ignores_empty_write_errors_array() {
+        let empty: Vec<Bson> = Vec::new();
+        let res = doc! { "ok": 1.0, "n": 2_i32, "writeErrors": empty };
+        assert_eq!(parse_update_response(&res).unwrap(), 2);
+    }
+
+    #[test]
+    fn parse_update_response_surfaces_write_concern_error() {
+        let res = doc! {
+            "ok": 1.0,
+            "n": 1_i32,
+            "writeConcernError": doc! { "code": 64_i32, "errmsg": "majority" },
+        };
+        let err = parse_update_response(&res).unwrap_err();
+        assert!(err.to_string().contains("write concern"));
+    }
+
+    #[test]
+    fn parse_update_response_errors_when_n_missing() {
+        let res = doc! { "ok": 1.0 };
+        assert!(parse_update_response(&res).is_err());
+    }
+
+    #[test]
+    fn parse_update_response_zero_n_is_ok() {
+        let res = doc! { "ok": 1.0, "n": 0_i32 };
+        assert_eq!(parse_update_response(&res).unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_update_response_accepts_double_n() {
+        let res = doc! { "ok": 1.0, "n": 4.0_f64 };
+        assert_eq!(parse_update_response(&res).unwrap(), 4);
+    }
+
+    #[test]
+    fn parse_update_response_surfaces_ok_zero() {
+        // Command-level rejection (auth, namespace, oversized batch).
+        // Without an `ok` check the driver would hand us this Document
+        // verbatim and we'd silently report "0 rows written".
+        let res = doc! {
+            "ok": 0.0,
+            "code": 13_i32,
+            "errmsg": "not authorized",
+            "n": 0_i32,
+        };
+        let err = parse_update_response(&res).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ok=0"), "msg should reference ok=0: {msg}");
+        assert!(
+            msg.contains("not authorized"),
+            "msg should include errmsg: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_update_response_clamps_negative_n() {
+        // Defensive: real servers don't emit negative `n`, but our cast
+        // path explicitly clamps via `.max(0)` — pin the behaviour so
+        // a refactor can't silently turn a stray negative into a giant
+        // u64 wrap.
+        let res = doc! { "ok": 1.0, "n": -1_i64 };
+        assert_eq!(parse_update_response(&res).unwrap(), 0);
     }
 
     #[test]

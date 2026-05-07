@@ -25,7 +25,6 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-futures = { workspace = true }
 
 [dev-dependencies]
 air-elt-commons-testing = { workspace = true }

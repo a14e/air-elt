@@ -170,7 +170,6 @@ dependencies = [
  "air-elt-core",
  "async-trait",
  "bson",
- "futures",
  "mongodb",
  "serde",
  "tokio",
