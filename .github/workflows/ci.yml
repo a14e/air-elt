@@ -92,26 +92,6 @@ jobs:
           --health-timeout=5s
           --health-retries=20
           --tmpfs=/var/lib/mysql:rw,size=512m
-      mongo:
-        image: mongo:8.0
-        ports:
-          - 27017:27017
-        options: >-
-          --health-cmd="mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' | grep 1"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=20
-          --tmpfs=/data/db:rw,size=512m
-      mongo-legacy:
-        image: mongo:7.0
-        ports:
-          - 27018:27017
-        options: >-
-          --health-cmd="mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' | grep 1"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=20
-          --tmpfs=/data/db:rw,size=512m
     env:
       AIR_ELT_TEST_PG_URL: "postgres://postgres:postgres@localhost:5432/postgres"
       AIR_ELT_TEST_MYSQL_URL: "mysql://root@localhost:3306/airelt"
@@ -131,6 +111,28 @@ jobs:
         with:
           shared-key: air-elt-test
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Start standalone Mongo (modern + legacy)
+        # GHA `services:` cannot override CMD, so we cannot pass
+        # `mongod --quiet` to silence per-connection NETWORK/ACCESS log
+        # spam (healthcheck pings every 5 s produce megabytes of JSON
+        # over a CI run). Run as plain `docker run` instead.
+        run: |
+          set -euo pipefail
+          for spec in "mongo:8.0 27017 mongo-modern" "mongo:7.0 27018 mongo-legacy"; do
+            read -r image port name <<<"$spec"
+            docker run -d --name "$name" -p "$port:27017" \
+              --tmpfs /data/db:rw,size=512m \
+              "$image" mongod --quiet --bind_ip_all
+          done
+          for name in mongo-modern mongo-legacy; do
+            for i in $(seq 1 30); do
+              if docker exec "$name" mongosh --quiet --eval 'db.runCommand({ping:1}).ok' \
+                  | grep -q '^1$'; then
+                echo "$name ready after ${i}s"; break
+              fi
+              sleep 1
+            done
+          done
       - name: Start replica-set Mongo for mongo-cdc
         # GHA `services:` runs the image's default CMD and offers no
         # way to append `--replSet`, so we boot the RS node as a
@@ -143,7 +145,7 @@ jobs:
           set -euo pipefail
           docker run -d --name mongo-rs -p 27019:27017 \
             --tmpfs /data/db:rw,size=512m \
-            mongo:8.0 mongod --replSet rs0 --bind_ip_all
+            mongo:8.0 mongod --quiet --replSet rs0 --bind_ip_all
           for i in $(seq 1 30); do
             if docker exec mongo-rs mongosh --quiet --eval 'db.runCommand({ping:1}).ok' \
                 | grep -q '^1$'; then break; fi
