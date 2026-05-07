@@ -1,8 +1,21 @@
 name: CI
 
 on:
+  # Run on every PR for feature branches; on `main` we still need a
+  # post-merge run to keep the default-branch status green. Without the
+  # `branches` filter, a push to a branch with an open PR fires the
+  # whole pipeline twice (once per trigger).
   push:
+    branches: [main]
   pull_request:
+
+# Cancel in-flight runs for the same ref when a new commit arrives —
+# avoids two builds racing each other when you push twice in quick
+# succession. `pull_request` runs key on `github.head_ref`; `push` keys
+# on `github.ref` (the branch).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -40,11 +53,16 @@ jobs:
           POSTGRES_DB: postgres
         ports:
           - 5432:5432
+        # tmpfs on the data dir: GHA `services` cannot override CMD, so
+        # the durability flags `-c fsync=off` etc. that we set on the
+        # local testcontainers config don't apply here. tmpfs alone still
+        # buys most of the win because syscalls hit RAM.
         options: >-
           --health-cmd="pg_isready -U postgres"
           --health-interval=5s
           --health-timeout=5s
           --health-retries=10
+          --tmpfs=/var/lib/postgresql/data:rw,size=512m
       mysql:
         image: mysql:8.4
         env:
@@ -57,6 +75,7 @@ jobs:
           --health-interval=5s
           --health-timeout=5s
           --health-retries=20
+          --tmpfs=/var/lib/mysql:rw,size=512m
       mariadb:
         # Pinned to 11.x: native UUID column (added in 10.7) is required by
         # the MariaDB e2e suite. Mapped to host port 3307 so it doesn't
@@ -72,6 +91,7 @@ jobs:
           --health-interval=5s
           --health-timeout=5s
           --health-retries=20
+          --tmpfs=/var/lib/mysql:rw,size=512m
       mongo:
         image: mongo:8.0
         ports:
@@ -81,6 +101,7 @@ jobs:
           --health-interval=5s
           --health-timeout=5s
           --health-retries=20
+          --tmpfs=/data/db:rw,size=512m
       mongo-legacy:
         image: mongo:7.0
         ports:
@@ -90,6 +111,7 @@ jobs:
           --health-interval=5s
           --health-timeout=5s
           --health-retries=20
+          --tmpfs=/data/db:rw,size=512m
     env:
       AIR_ELT_TEST_PG_URL: "postgres://postgres:postgres@localhost:5432/postgres"
       AIR_ELT_TEST_MYSQL_URL: "mysql://root@localhost:3306/airelt"
@@ -120,6 +142,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run -d --name mongo-rs -p 27019:27017 \
+            --tmpfs /data/db:rw,size=512m \
             mongo:8.0 mongod --replSet rs0 --bind_ip_all
           for i in $(seq 1 30); do
             if docker exec mongo-rs mongosh --quiet --eval 'db.runCommand({ping:1}).ok' \
@@ -148,7 +171,8 @@ jobs:
         run: |
           set -euo pipefail
           docker run -d --name cockroach -p 26257:26257 \
-            cockroachdb/cockroach:v25.1.0 start-single-node --insecure
+            cockroachdb/cockroach:v25.1.0 start-single-node --insecure \
+            --store=type=mem,size=1GiB
           for i in $(seq 1 30); do
             if docker exec cockroach \
                 /cockroach/cockroach sql --insecure --host=localhost:26257 \

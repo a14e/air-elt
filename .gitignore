@@ -29,6 +29,8 @@ Thumbs.db
 # Test artefacts
 /tmp/
 *.tmp
+air-elt-test-session/
+ryuk-start-*.lock
 /.claude/scheduled_tasks.lock
 /.claude/settings.json
 /.claude/agent-memory

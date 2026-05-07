@@ -8,14 +8,16 @@
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
-use tokio::sync::watch;
+use tokio::sync::{OnceCell, watch};
 
 use air_elt_core::config::loader;
 use air_elt_core::config::model::RootConfig;
 use air_elt_core::flow::engine::FlowEngine;
 use air_elt_core::flow::runner::RunMode;
+use air_elt_core::model::FlowState;
 use air_elt_core::registry::Registry;
 use air_elt_core::validation::pipeline::{assemble, validate};
 
@@ -36,6 +38,21 @@ pub struct ListedKinds {
 pub struct App {
     config: RootConfig,
     registry: Registry,
+    /// Tracks whether `Storage::migrate` has run for this `App`. Set by
+    /// either an explicit `migrate()` call or the implicit one inside
+    /// `run_once()`. Subsequent calls skip the DDL pass — sqlx migrate
+    /// is already idempotent at the SQL level, but the round-trip is
+    /// still measurable, and skipping it keeps the contract obvious:
+    /// migrate exactly once per `App`.
+    migrated: AtomicBool,
+    /// Lazily-populated cache of the validated flows. Filled on first
+    /// call to `flows()` and reused by every subsequent `migrate` /
+    /// `validate` / `run_once` / `run_daemon`. Caching the validated
+    /// `Vec<FlowState>` (rather than re-running `assemble + validate`
+    /// per call) keeps the same `Arc<dyn Source/Sink/Storage>` —
+    /// and therefore the same sqlx/mongo pools — alive across
+    /// successive operations on the same `App`.
+    flows: OnceCell<Vec<FlowState>>,
 }
 
 impl App {
@@ -51,7 +68,23 @@ impl App {
         Self {
             config,
             registry: build_registry(),
+            migrated: AtomicBool::new(false),
+            flows: OnceCell::new(),
         }
+    }
+
+    /// Lazily compute (and cache) the validated `Vec<FlowState>` for this
+    /// `App`. Internal helper used by `migrate`, `validate`, `run_once`,
+    /// and `run_daemon` so they share a single `assemble + validate`
+    /// pass — and thereby the same connector `Arc`s and pools.
+    async fn flows(&self) -> Result<&Vec<FlowState>> {
+        self.flows
+            .get_or_try_init(|| async {
+                let assembled = assemble(&self.config, &self.registry).await?;
+                let flows = validate(assembled).await?;
+                Ok::<_, anyhow::Error>(flows)
+            })
+            .await
     }
 
     /// Sorted lists of registered source / sink / storage kinds.
@@ -67,36 +100,45 @@ impl App {
     /// against every declared connector.
     pub fn validate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            let assembled = assemble(&self.config, &self.registry).await?;
-            let _flows = validate(assembled).await?;
+            self.flows().await?;
             Ok(())
         })
     }
 
-    /// Run `Storage::migrate` for every declared storage. Performs an
-    /// initial assemble + validate so storage handles exist.
+    /// Run `Storage::migrate` for every declared storage. The DDL is
+    /// issued through the `assemble`-built `Arc<dyn Storage>` handles —
+    /// no separate validate pass, since validate's purpose is to
+    /// I/O-probe and we'd rather defer that to the runner caller. After
+    /// this returns, the `migrated` flag is set so `run_once` won't
+    /// repeat the DDL.
     pub fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            let assembled = assemble(&self.config, &self.registry).await?;
-            let flows = validate(assembled).await?;
-            for f in &flows {
-                f.storage.migrate().await?;
+            let flows = self.flows().await?;
+            if !self.migrated.swap(true, Ordering::AcqRel) {
+                for f in flows {
+                    f.storage.migrate().await?;
+                }
             }
             Ok(())
         })
     }
 
     /// Run all flows once (drain + exit). Mirrors `air-elt run --once`.
-    /// The pipeline is assembled twice intentionally: the first pass exists
-    /// solely to produce `Storage` handles for `migrate`, so the second
-    /// pass's access probes land against the migrated cursor table.
+    /// Single assemble + validate pass: storage migrations run before
+    /// `validate` so its cursor-table probes succeed, and we skip the
+    /// migrate DDL if `migrate()` already ran on this `App`.
     pub fn run_once(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            self.migrate().await?;
-            let assembled = assemble(&self.config, &self.registry).await?;
-            let flows = validate(assembled).await?;
+            let flows = self.flows().await?;
+            if !self.migrated.swap(true, Ordering::AcqRel) {
+                for f in flows {
+                    f.storage.migrate().await?;
+                }
+            }
             let (_tx, rx) = watch::channel(false);
-            FlowEngine::new(flows, RunMode::Once, rx).run().await?;
+            FlowEngine::new(flows.clone(), RunMode::Once, rx)
+                .run()
+                .await?;
             Ok(())
         })
     }
@@ -109,9 +151,8 @@ impl App {
         shutdown: watch::Receiver<bool>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            let assembled = assemble(&self.config, &self.registry).await?;
-            let flows = validate(assembled).await?;
-            FlowEngine::new(flows, RunMode::Daemon, shutdown)
+            let flows = self.flows().await?;
+            FlowEngine::new(flows.clone(), RunMode::Daemon, shutdown)
                 .run()
                 .await?;
             Ok(())

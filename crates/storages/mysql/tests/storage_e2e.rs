@@ -53,6 +53,8 @@ async fn migrate_and_upsert_cursor() {
         storage.load_cursor(flow).await.unwrap().unwrap().fields[0].value,
         Value::Int64(43)
     );
+
+    handle.pool.close().await;
 }
 
 #[tokio::test]
@@ -111,6 +113,8 @@ async fn cursor_roundtrip_all_value_variants() {
             .unwrap_or_else(|| panic!("missing cursor for {flow}"));
         assert_eq!(loaded, state, "{flow}: variant did not round-trip");
     }
+
+    handle.pool.close().await;
 }
 
 #[tokio::test]
@@ -151,4 +155,6 @@ async fn resume_token_round_trip_and_reopen() {
             .unwrap()
             .is_none()
     );
+
+    handle.pool.close().await;
 }

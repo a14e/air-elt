@@ -4544,8 +4544,3 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
-
-[[patch.unused]]
-name = "bollard"
-version = "0.21.0"
-source = "git+https://github.com/fussybeaver/bollard?branch=master#f536c94c040c904baafb7b8376c0ed17c20bdd89"

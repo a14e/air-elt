@@ -86,6 +86,7 @@ async fn numeric_zero_scale_decoded_as_bigint() {
         batch.rows[0].values[2],
         Value::Decimal(BigDecimal::from_str(dec_str).unwrap())
     );
+    handle.pool.close().await;
 }
 
 /// Cockroach mirror: a `DECIMAL(10, 2)` column round-trips as
@@ -148,4 +149,5 @@ async fn cockroach_decimal_round_trip() {
         batch.rows[0].values[1],
         Value::Decimal(BigDecimal::from_str(amount_str).unwrap())
     );
+    handle.pool.close().await;
 }

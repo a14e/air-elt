@@ -94,6 +94,7 @@ async fn overwrite_replaces_existing_rows() {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0], (1, "fresh-1".into()));
     assert_eq!(rows[2], (3, "fresh-3".into()));
+    handle.pool.close().await;
 }
 
 #[tokio::test]
@@ -121,6 +122,7 @@ async fn ignore_preserves_existing_rows() {
     // ignore: the pre-existing rows survive untouched.
     assert_eq!(rows[0], (1, "kept-1".into()));
     assert_eq!(rows[2], (3, "kept-3".into()));
+    handle.pool.close().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +182,7 @@ async fn cockroach_overwrite_single_key_via_on_conflict_do_update() {
         .await
         .unwrap();
     assert_eq!(row, (1, "b".into()));
+    handle.pool.close().await;
 }
 
 #[tokio::test]
@@ -228,6 +231,7 @@ async fn cockroach_overwrite_two_key_uses_on_conflict() {
             .await
             .unwrap();
     assert_eq!(row, (1, 1, "y".into()));
+    handle.pool.close().await;
 }
 
 #[tokio::test]
@@ -273,6 +277,7 @@ async fn cockroach_ignore_does_nothing() {
         .await
         .unwrap();
     assert_eq!(row, (1, "a".into()));
+    handle.pool.close().await;
 }
 
 #[tokio::test]
@@ -311,6 +316,7 @@ async fn cockroach_pk_only_table_overwrite_falls_back_to_do_nothing() {
         .await
         .unwrap();
     assert_eq!(count.0, 1);
+    handle.pool.close().await;
 }
 
 #[tokio::test]
@@ -331,4 +337,5 @@ async fn overwrite_is_idempotent_on_rerun() {
     let rows = fetch_labels(&handle.pool).await;
     assert_eq!(rows.len(), 2, "re-run must not duplicate");
     assert_eq!(rows[0], (1, "v1".into()));
+    handle.pool.close().await;
 }

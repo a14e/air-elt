@@ -18,15 +18,13 @@
 
 #![allow(clippy::unwrap_used)]
 
+use air_elt_app::App;
 use air_elt_commons_testing::mariadb::mariadb_pool;
 use air_elt_commons_testing::pg::pg_pool;
 use air_elt_core::types::Value;
 use chrono::{DateTime, TimeZone, Utc};
 use sqlx::Executor;
 use uuid::Uuid;
-
-mod common;
-use common::guard::{MysqlDbGuard, PgSchemaGuard};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mariadb_to_pg_with_uuid_and_mixed_nullability() {
@@ -35,9 +33,6 @@ async fn mariadb_to_pg_with_uuid_and_mixed_nullability() {
 
     let src_db = format!("{}_src", mariadb.schema);
     let dst_schema = format!("{}_dst", pg.schema);
-
-    let _src_guard = MysqlDbGuard::new(mariadb.pool.clone(), vec![src_db.clone()]);
-    let _dst_guard = PgSchemaGuard::new(pg.pool.clone(), vec![dst_schema.clone()]);
 
     mariadb
         .pool
@@ -166,7 +161,8 @@ cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
     let tmp = tempfile::tempdir().unwrap();
     let config_path = tmp.path().join("config.toml");
     std::fs::write(&config_path, &config_toml).unwrap();
-    common::pipeline::run_once(&config_path).await;
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
 
     #[allow(clippy::type_complexity)]
     let rows: Vec<(
@@ -216,4 +212,7 @@ cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
     let parsed: air_elt_core::model::CursorState =
         serde_json::from_value(cursors[0].1.clone()).unwrap();
     assert_eq!(parsed.fields[0].value, Value::Int64(5));
+
+    mariadb.pool.close().await;
+    pg.pool.close().await;
 }

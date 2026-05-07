@@ -18,6 +18,9 @@
 //! `sqlx::PgPool`. URLs follow the `postgres://root@host:26257/<db>?sslmode=disable`
 //! form, matching what `air-elt-commons-pg::pool::connect` understands.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use rand::distr::{Alphanumeric, SampleString};
 use rand::rng;
 use sqlx::PgPool;
@@ -26,7 +29,7 @@ use testcontainers::core::ContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt, ReuseDirective};
 use tokio::sync::OnceCell;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::backend::{TestBackend, detect_with_timeout, prepare_container_env};
 use crate::ryuk;
@@ -40,7 +43,6 @@ const KIND_LABEL_KEY: &str = "air-elt.kind";
 const KIND_LABEL_VALUE: &str = "cockroach";
 
 static COCKROACH_BASE_URL: OnceCell<String> = OnceCell::const_new();
-static SELF_HEAL_DONE: OnceCell<()> = OnceCell::const_new();
 
 pub struct CockroachTestHandle {
     pub pool: PgPool,
@@ -50,7 +52,6 @@ pub struct CockroachTestHandle {
     /// `format!("{}.public.users", handle.database)` if they need cross-db
     /// statements; the pool itself is already pinned to this database.
     pub database: String,
-    _cleanup: CleanupGuard,
 }
 
 impl CockroachTestHandle {
@@ -58,41 +59,6 @@ impl CockroachTestHandle {
     /// up a *separate* pool against the same database.
     pub fn url_with_database(&self) -> String {
         url_with_db(&self.url, &self.database)
-    }
-}
-
-struct CleanupGuard {
-    bootstrap: PgPool,
-    db: String,
-}
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let pool = self.bootstrap.clone();
-        let db = std::mem::take(&mut self.db);
-        let join = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build cleanup runtime");
-            rt.block_on(async move {
-                let stmt = format!("DROP DATABASE IF EXISTS \"{db}\" CASCADE");
-                let drop_fut = sqlx::query(&stmt).execute(&pool);
-                match tokio::time::timeout(std::time::Duration::from_secs(5), drop_fut).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        warn!(error = %e, db, "failed to drop test database");
-                    }
-                    Err(_) => {
-                        warn!(db, "drop database timed out — relying on self-heal");
-                    }
-                }
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), pool.close()).await;
-            });
-        });
-        if let Err(e) = join.join() {
-            warn!(?e, "cleanup thread panicked");
-        }
     }
 }
 
@@ -114,6 +80,7 @@ async fn cockroach_base_url() -> &'static String {
             ryuk::ensure_session(&socket).await;
             let (sk, sv) = ryuk::session_label();
             info!("ensuring shared cockroach container (reuse=Always, ryuk-managed)");
+            let start_lock = crate::filelock::acquire_lock("cockroach");
             // No `WaitFor` log marker: CockroachDB's startup banner lands
             // on stderr in some image builds and stdout in others, and a
             // mismatched marker leaves testcontainers blocked on the
@@ -123,7 +90,14 @@ async fn cockroach_base_url() -> &'static String {
             // amortised across every test that follows.
             let image = GenericImage::new(COCKROACH_IMAGE, COCKROACH_TAG)
                 .with_exposed_port(ContainerPort::Tcp(26257))
-                .with_cmd(["start-single-node", "--insecure"])
+                // In-memory store: cockroach's native equivalent of tmpfs.
+                // Container is reaped at session end so durability has no
+                // value here.
+                .with_cmd([
+                    "start-single-node",
+                    "--insecure",
+                    "--store=type=mem,size=1GiB",
+                ])
                 .with_container_name(format!("air-elt-cockroach-{sv}"))
                 .with_label(sk, sv)
                 .with_label(KIND_LABEL_KEY, KIND_LABEL_VALUE)
@@ -132,6 +106,7 @@ async fn cockroach_base_url() -> &'static String {
                 .start()
                 .await
                 .expect("start cockroach container failed");
+            drop(start_lock);
             let host = container.get_host().await.expect("container host");
             let port = container
                 .get_host_port_ipv4(26257)
@@ -145,52 +120,42 @@ async fn cockroach_base_url() -> &'static String {
         .await
 }
 
-pub async fn cockroach_pool() -> CockroachTestHandle {
-    let base_url = cockroach_base_url().await;
-    let db = random_db();
-    info!(db = %db, "creating sandbox database");
+pub fn cockroach_pool() -> Pin<Box<dyn Future<Output = CockroachTestHandle> + Send + 'static>> {
+    Box::pin(async move {
+        let base_url = cockroach_base_url().await;
+        let db = random_db();
+        info!(db = %db, "creating sandbox database");
 
-    // Bootstrap connection goes against `defaultdb` so we can issue
-    // `CREATE DATABASE`. The bootstrap pool is per-test (cheap: the
-    // container is already up). Reuse query string from the user's URL
-    // if present.
-    let bootstrap_url = url_with_db(base_url, "defaultdb");
-    let bootstrap_pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&bootstrap_url)
-        .await
-        .expect("connect to cockroach failed");
+        // Bootstrap connection goes against `defaultdb` so we can issue
+        // `CREATE DATABASE`. The bootstrap pool is per-test (cheap: the
+        // container is already up). Reuse query string from the user's URL
+        // if present.
+        let bootstrap_url = url_with_db(base_url, "defaultdb");
+        let bootstrap_pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&bootstrap_url)
+            .await
+            .expect("connect to cockroach failed");
 
-    SELF_HEAL_DONE
-        .get_or_init(|| async {
-            drop_stale_test_databases(&bootstrap_pool, 24 * 3600).await;
-        })
-        .await;
+        let create = format!("CREATE DATABASE \"{db}\"");
+        sqlx::query(&create)
+            .execute(&bootstrap_pool)
+            .await
+            .expect("create sandbox database failed");
 
-    let create = format!("CREATE DATABASE \"{db}\"");
-    sqlx::query(&create)
-        .execute(&bootstrap_pool)
-        .await
-        .expect("create sandbox database failed");
+        let scoped_url = url_with_db(base_url, &db);
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&scoped_url)
+            .await
+            .expect("connect to sandbox database failed");
 
-    let cleanup = CleanupGuard {
-        bootstrap: bootstrap_pool.clone(),
-        db: db.clone(),
-    };
-
-    let scoped_url = url_with_db(base_url, &db);
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&scoped_url)
-        .await
-        .expect("connect to sandbox database failed");
-
-    CockroachTestHandle {
-        pool,
-        url: base_url.clone(),
-        database: db,
-        _cleanup: cleanup,
-    }
+        CockroachTestHandle {
+            pool,
+            url: base_url.clone(),
+            database: db,
+        }
+    })
 }
 
 /// Strip the `/<dbname>` path component from a Postgres-style URL — mirroring
@@ -262,50 +227,6 @@ async fn wait_for_ready(base_url: &str) {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
     panic!("cockroach did not become ready within 180s: {:?}", last_err);
-}
-
-async fn drop_stale_test_databases(pool: &PgPool, max_age_secs: u64) {
-    let cutoff = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-        .saturating_sub(max_age_secs);
-
-    // CockroachDB exposes `information_schema.schemata`; the database
-    // listing path is a plain `SELECT` against `catalog_name`.
-    let rows: Vec<(String,)> = match sqlx::query_as(
-        "SELECT catalog_name FROM information_schema.schemata \
-         WHERE catalog_name LIKE 'test\\_%' ESCAPE '\\' \
-         GROUP BY catalog_name",
-    )
-    .fetch_all(pool)
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not enumerate test_* databases for self-heal");
-            return;
-        }
-    };
-
-    for (db,) in rows {
-        let ts = db
-            .strip_prefix("test_")
-            .and_then(|s| s.split_once('_'))
-            .and_then(|(ts_str, _)| ts_str.parse::<u64>().ok());
-        let Some(ts) = ts else {
-            continue;
-        };
-        if ts >= cutoff {
-            continue;
-        }
-        let stmt = format!("DROP DATABASE IF EXISTS \"{db}\" CASCADE");
-        if let Err(e) = sqlx::query(&stmt).execute(pool).await {
-            tracing::warn!(error = %e, db = %db, "failed to drop stale database");
-        } else {
-            tracing::debug!(db = %db, "self-healed stale test database");
-        }
-    }
 }
 
 fn random_db() -> String {

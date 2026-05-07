@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 # commons is the foundational layer — it MUST NOT depend on any other
 # air-elt-* crate. See `project-conventions` skill, "Commons isolation".

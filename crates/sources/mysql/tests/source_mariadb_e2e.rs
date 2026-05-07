@@ -71,4 +71,5 @@ async fn reads_native_uuid_column_from_mariadb() {
         .expect("read_batch");
     assert_eq!(batch.rows.len(), 1);
     assert_eq!(batch.rows[0].values[1], Value::Uuid(known));
+    handle.pool.close().await;
 }

@@ -89,6 +89,11 @@ The test strategy is inverted pyramid: heavy e2e against real services, focused 
 - **Deterministic time in tests.** Use `#[tokio::test(start_paused = true)]` instead of real `sleep`/wall-clock waits. This makes tests instant and non-flaky. Ensure mocked sources drain (return empty batch after data) so Once-mode tests terminate.
 - **No N×N matrices for connector pairs.** Each source / sink / storage owns its own e2e suite covering its typical cases (types, NULLs, cursors, schema quirks). Cross-vendor pipelines are exercised by a *small, fixed* sample of combinations — enough to prove the runner glues things together — not by every pair. Adding a new connector means adding its own suite plus one or two sample cross-vendor flows, not 2N new combination tests.
 - try to avoid "sleep" in tests
+- **Shutdown sqlx pools before test exit.** End every `#[tokio::test]` with `handle.pool.close().await` for any sqlx-backed handle. Sync `Pool` Drop on a tearing-down tokio runtime hangs for seconds. (For `MongoTestHandle` do NOT call `Client::shutdown` from tests — it deadlocks against still-live Arc clones; let the runtime tear it down.)
+- **Close pools/clients only where it pays.** sqlx: explicit `Pool::close().await` is a big win — saves seconds on the runtime-shutdown hang. mongo: skipping `Client::shutdown` is the win — calling it stalls the test on Arc-clone deadlock.
+- **File-lock test infra at the narrowest window.** Cross-process locks (`crate::filelock::acquire_lock`) around container `start()` are required so nextest doesn't race on `reuse=Always`. Hold the lock only across the create-or-reuse call — release before any `wait_for_*`, TCP handshake, or other slow probe so siblings can proceed in parallel.
+- **Doctests are disabled workspace-wide.** Every lib crate's `Cargo.toml` must declare `[lib]` with `doctest = false` so `cargo test --workspace` skips doc-tests automatically. Add the section when creating a new crate.
+- **Consolidate test files into one binary per crate.** Use `autotests = false` in `Cargo.toml` and a single `tests/all.rs` that does `mod foo; mod bar;` for each test file. Cuts cargo's per-binary serialization overhead.
 
 ## After every change
 

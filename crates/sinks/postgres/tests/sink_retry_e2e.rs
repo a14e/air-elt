@@ -86,4 +86,5 @@ async fn cockroach_retries_on_serialization_failure() {
     assert_eq!(id, 1);
     // Last writer wins — must be one of the two values written.
     assert!(n == 10 || n == 20, "unexpected final value: {n}");
+    handle.pool.close().await;
 }

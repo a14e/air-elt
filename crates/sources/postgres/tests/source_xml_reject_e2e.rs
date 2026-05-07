@@ -55,4 +55,5 @@ async fn postgres_accepts_xml_column_at_validate_access() {
         .validate_access(&spec)
         .await
         .expect("PG dialect must allow XML columns");
+    handle.pool.close().await;
 }

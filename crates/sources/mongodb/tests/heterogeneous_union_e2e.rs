@@ -78,4 +78,5 @@ async fn heterogeneous_field_inferred_as_union_and_read_back() {
     assert_eq!(batch.rows[0].values[1], Value::Int32(42));
     assert_eq!(batch.rows[1].values[1], Value::Text("hello".into()));
     assert_eq!(batch.rows[2].values[1], Value::Int32(99));
+    handle.client.clone().shutdown().await;
 }

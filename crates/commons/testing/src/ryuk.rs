@@ -22,7 +22,7 @@
 //!    open, ryuk preserves matching containers.
 //! 3. The connection is held by a `static` for the lifetime of the test
 //!    process; the OS closes it on exit (clean or abrupt). When all clients
-//!    disconnect, ryuk waits `RYUK_RECONNECTION_TIMEOUT` (10 s) for new
+//!    disconnect, ryuk waits `RYUK_RECONNECTION_TIMEOUT` (5 min) for new
 //!    connections, then removes every matching container — including the
 //!    user's pg / mongo / mysql infra — and finally exits, removing itself
 //!    via the `--rm` (auto_remove) flag.
@@ -106,18 +106,18 @@ pub async fn ensure_session(socket: &str) {
     let socket = socket.to_string();
     SESSION_HANDLE
         .get_or_init(|| async move {
-            // Retry the full handshake. If first attempt fails, the
-            // existing ryuk container is in a bad state (mid-shutdown,
-            // socket disconnect race, etc.) — testcontainers reuse-mode
-            // would just keep grabbing the same broken instance. Before
-            // each retry we explicitly force-remove the ryuk container
-            // by name so the next `start()` actually creates a fresh
-            // one. Three attempts is plenty in practice.
+            // The cross-process lock is now scoped narrowly inside
+            // `start_session` — it covers only the create-or-reuse race
+            // window (`image.start().await`), so the TCP handshake and
+            // ACK exchange run unlocked. Force-removes between retries
+            // are also taken under the same lock to avoid stomping on
+            // a sibling process that just won the start race.
             let sid = session_id();
             let container_name = format!("air-elt-ryuk-{}", sanitize_for_container_name(sid));
             let mut last_err = String::new();
             for attempt in 0..3 {
                 if attempt > 0 {
+                    let _lock = crate::filelock::acquire_lock("ryuk");
                     if let Err(e) = remove_ryuk_container(&container_name).await {
                         warn!(error = %e, "could not force-remove ryuk before retry");
                     }
@@ -171,12 +171,13 @@ async fn start_session(socket: &str) -> Result<SessionHandle, String> {
         .with_label(SESSION_LABEL_KEY, sid)
         // Reconnection grace must cover the gap between sibling test
         // binaries: `cargo test --workspace` runs each binary in its own
-        // process. Cargo doesn't compile between test runs (everything is
-        // built up front), so the typical gap is 1-2 s — 30 s is plenty
-        // and lets the *last* binary finalise cleanup quickly. If a
-        // process arrives mid-shutdown and the ACK comes back as reset,
-        // `start_session` retries and brings up a fresh ryuk.
-        .with_env_var("RYUK_RECONNECTION_TIMEOUT", "30s")
+        // process. The drop chain on exit (tokio runtime, sqlx pools,
+        // bollard) plus the next binary's bollard/testcontainers init
+        // can stretch the gap well past 30 s in practice — observed
+        // containers cycling 5× in 2 min. 5 min is comfortably wider
+        // than any realistic inter-binary gap and only delays final
+        // teardown after the last test exits.
+        .with_env_var("RYUK_RECONNECTION_TIMEOUT", "5m")
         // Initial-connection timeout: if nothing dials ryuk within this,
         // it self-shuts. 60 s accommodates slow first-run image pulls.
         .with_env_var("RYUK_CONNECTION_TIMEOUT", "60s")
@@ -199,10 +200,14 @@ async fn start_session(socket: &str) -> Result<SessionHandle, String> {
         .with_user("0:0")
         .with_privileged(true)
         .with_reuse(ReuseDirective::Always);
+    // Lock only across the create-or-reuse race window — TCP handshake
+    // and the ACK exchange below are safe under concurrency.
+    let start_lock = crate::filelock::acquire_lock("ryuk");
     let container = image
         .start()
         .await
         .map_err(|e| format!("start ryuk container failed: {e}"))?;
+    drop(start_lock);
     let host = container
         .get_host()
         .await

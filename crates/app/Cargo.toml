@@ -6,10 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+autotests = false
 
 [lib]
 name = "air_elt_app"
 path = "src/lib.rs"
+doctest = false
 
 [[bin]]
 name = "air-elt"
@@ -48,3 +50,7 @@ futures = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "all"
+path = "tests/all.rs"

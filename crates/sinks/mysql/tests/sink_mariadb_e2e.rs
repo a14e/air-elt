@@ -62,4 +62,5 @@ async fn writes_native_uuid_column_to_mariadb() {
     let text = std::str::from_utf8(&ext).expect("uuid text");
     let got = Uuid::parse_str(text).expect("parse");
     assert_eq!(got, known);
+    handle.pool.close().await;
 }

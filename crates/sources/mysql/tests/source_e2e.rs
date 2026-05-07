@@ -93,6 +93,7 @@ async fn describe_and_read_with_cursor() {
         .await
         .expect("read_batch tail");
     assert!(empty.rows.is_empty());
+    handle.pool.close().await;
 }
 
 /// Nullable cursor with mixed NULL/non-null data. MySQL's default ASC
@@ -169,6 +170,7 @@ async fn read_with_nullable_cursor() {
     assert_eq!(batch.rows.len(), 2);
     assert_eq!(batch.rows[0].values[1], Value::Int32(1));
     assert_eq!(batch.rows[1].values[1], Value::Int32(3));
+    handle.pool.close().await;
 }
 
 /// DESC + nullable cursor: MySQL's default `ORDER BY col DESC` puts NULLs
@@ -237,6 +239,7 @@ async fn read_with_nullable_cursor_desc() {
     assert_eq!(batch.rows.len(), 2);
     assert_eq!(batch.rows[0].values[1], Value::Null);
     assert_eq!(batch.rows[1].values[1], Value::Null);
+    handle.pool.close().await;
 }
 
 /// `tinyint(1)` is the canonical MySQL "boolean" — must surface as
@@ -306,6 +309,7 @@ async fn tinyint_one_round_trips_as_bool() {
     assert_eq!(batch.rows[1].values[2], Value::Bool(false));
     assert_eq!(batch.rows[2].values[1], Value::Bool(true));
     assert_eq!(batch.rows[2].values[2], Value::Null);
+    handle.pool.close().await;
 }
 
 /// `binary(N)` / `varbinary(N)` must surface as `DataType::Bytes { size: Some(N) }`.
@@ -373,4 +377,5 @@ async fn binary_columns_carry_size() {
         batch.rows[0].values[2],
         Value::Bytes(vec![0x01, 0x02, 0x03])
     );
+    handle.pool.close().await;
 }

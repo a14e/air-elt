@@ -81,4 +81,6 @@ async fn cockroach_save_cursor_handles_serialization_retry() {
         (0..BURST_PER_WRITER as i64).contains(&i),
         "burst index out of range: {i}"
     );
+
+    handle.pool.close().await;
 }

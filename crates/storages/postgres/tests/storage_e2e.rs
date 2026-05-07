@@ -64,6 +64,8 @@ async fn migrate_and_upsert_cursor() {
         storage.load_cursor(flow).await.unwrap().unwrap().fields[0].value,
         Value::Int64(43)
     );
+
+    handle.pool.close().await;
 }
 
 /// Exercise the tagged-serde round-trip for every `Value` variant through
@@ -130,6 +132,8 @@ async fn cursor_roundtrip_all_value_variants() {
             .unwrap_or_else(|| panic!("missing cursor for {flow}"));
         assert_eq!(loaded, state, "{flow}: variant did not round-trip");
     }
+
+    handle.pool.close().await;
 }
 
 #[tokio::test]
@@ -179,6 +183,8 @@ async fn resume_token_round_trip_and_reopen() {
             .is_none(),
         "unknown flow after reopen → None"
     );
+
+    handle.pool.close().await;
 }
 
 #[tokio::test]
@@ -216,6 +222,8 @@ async fn cockroach_migrate_and_save_load_round_trip() {
         storage.load_resume_token(flow).await.unwrap().unwrap(),
         token
     );
+
+    handle.pool.close().await;
 }
 
 #[tokio::test]
@@ -231,4 +239,6 @@ async fn cockroach_migrate_idempotent() {
 
     storage.migrate().await.expect("cockroach migrate first");
     storage.migrate().await.expect("cockroach migrate second");
+
+    handle.pool.close().await;
 }

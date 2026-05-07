@@ -10,13 +10,11 @@
 
 #![allow(clippy::unwrap_used)]
 
+use air_elt_app::App;
 use air_elt_commons_testing::cockroach::cockroach_pool;
 use air_elt_commons_testing::pg::pg_pool;
 use air_elt_core::types::Value;
 use sqlx::Executor;
-
-mod common;
-use common::guard::PgSchemaGuard;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cockroachdb_to_pg_smoke() {
@@ -24,7 +22,6 @@ async fn cockroachdb_to_pg_smoke() {
     let pg = pg_pool().await;
 
     let dst_schema = format!("{}_dst", pg.schema);
-    let _dst_guard = PgSchemaGuard::new(pg.pool.clone(), vec![dst_schema.clone()]);
 
     cockroach
         .pool
@@ -102,7 +99,8 @@ cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
     let tmp = tempfile::tempdir().unwrap();
     let config_path = tmp.path().join("config.toml");
     std::fs::write(&config_path, &config_toml).unwrap();
-    common::pipeline::run_once(&config_path).await;
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
 
     let rows: Vec<(i64, String)> = sqlx::query_as(&format!(
         "SELECT id, payload FROM \"{dst_schema}\".events ORDER BY id"
@@ -126,4 +124,7 @@ cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
     let parsed: air_elt_core::model::CursorState =
         serde_json::from_value(cursors[0].1.clone()).unwrap();
     assert_eq!(parsed.fields[0].value, Value::Int64(4));
+
+    cockroach.pool.close().await;
+    pg.pool.close().await;
 }

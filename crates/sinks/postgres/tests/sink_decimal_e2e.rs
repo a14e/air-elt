@@ -69,6 +69,7 @@ async fn writes_numeric_bigint_and_decimal() {
     .unwrap();
     assert_eq!(big, BigDecimal::from_str(big_str).unwrap());
     assert_eq!(rate, BigDecimal::from_str(rate_str).unwrap());
+    handle.pool.close().await;
 }
 
 /// Cockroach round-trip for `DECIMAL(10, 2)`. CockroachDB exposes the same
@@ -113,4 +114,5 @@ async fn cockroach_writes_numeric_decimal() {
         .await
         .unwrap();
     assert_eq!(rate, BigDecimal::from_str(rate_str).unwrap());
+    handle.pool.close().await;
 }

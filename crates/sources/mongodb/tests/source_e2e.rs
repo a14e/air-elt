@@ -70,6 +70,7 @@ async fn read_with_cursor_and_dot_notation() {
         .expect("read_batch second");
     assert_eq!(batch2.rows.len(), 2);
     assert_eq!(batch2.rows[0].values[0], Value::Int64(4));
+    handle.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -111,6 +112,7 @@ async fn sample_returns_documents() {
     for row in &rows {
         assert_eq!(row.values.len(), 2);
     }
+    handle.client.clone().shutdown().await;
 }
 
 /// Compound `(updated_at, _id)` cursor — the typical idempotent ELT
@@ -184,4 +186,5 @@ async fn compound_cursor_updated_at_id() {
         .await
         .expect("batch3 (drain)");
     assert_eq!(batch3.rows.len(), 0, "no more rows after the last id");
+    handle.client.clone().shutdown().await;
 }

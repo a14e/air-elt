@@ -87,6 +87,7 @@ async fn write_batch_and_validate_access() {
         (1, "one".into(), Some(serde_json::json!({"k": 1})))
     );
     assert_eq!(rows[1], (2, "two".into(), None));
+    handle.pool.close().await;
 }
 
 /// All-nullable columns, one `Value::Null` bound per `DataType`. Catches any
@@ -202,6 +203,7 @@ async fn all_nulls_across_data_types() {
     assert!(probe2.3.is_none());
     assert!(probe2.4.is_none());
     assert!(probe2.5.is_none());
+    handle.pool.close().await;
 }
 
 /// Non-null values for all 12 DataType variants — complementary to
@@ -306,6 +308,7 @@ async fn all_types_non_null_round_trip() {
             .unwrap();
     assert_eq!(c_date, date);
     assert_eq!(c_ts, ts);
+    handle.pool.close().await;
 }
 
 /// Smoke test against CockroachDB: create a table, insert several rows, read
@@ -353,4 +356,5 @@ async fn cockroach_smoke_insert_and_read_back() {
     assert_eq!(back.len(), 5);
     assert_eq!(back[0], (1, "row-1".into()));
     assert_eq!(back[4], (5, "row-5".into()));
+    handle.pool.close().await;
 }

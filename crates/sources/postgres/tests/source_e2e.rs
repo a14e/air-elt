@@ -93,6 +93,7 @@ async fn describe_and_read_with_cursor() {
         .expect("read_batch drained");
     assert!(empty.rows.is_empty());
     assert!(empty.next_cursor.is_none());
+    handle.pool.close().await;
 }
 
 /// Nullable cursor with mixed NULL/non-null data. With `NULL < everything`
@@ -179,6 +180,7 @@ async fn read_with_nullable_cursor() {
         .await
         .expect("drain");
     assert!(empty.rows.is_empty());
+    handle.pool.close().await;
 }
 
 /// Cockroach mirror of `describe_and_read_with_cursor`: smoke-tests the full
@@ -241,6 +243,7 @@ async fn cockroach_read_batch_smoke() {
     let cursor = batch.next_cursor.expect("cursor");
     assert_eq!(cursor.fields[0].name, "id");
     assert_eq!(cursor.fields[0].value, Value::Int64(5));
+    handle.pool.close().await;
 }
 
 /// Cockroach mirror of `read_with_nullable_cursor`: NULL-cursor lexicographic
@@ -326,4 +329,5 @@ async fn cockroach_null_cursor_lexicographic_two_keys() {
         .await
         .expect("drain");
     assert!(empty.rows.is_empty());
+    handle.pool.close().await;
 }

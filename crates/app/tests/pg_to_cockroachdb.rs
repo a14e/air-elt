@@ -13,13 +13,11 @@
 
 #![allow(clippy::unwrap_used)]
 
+use air_elt_app::App;
 use air_elt_commons_testing::cockroach::cockroach_pool;
 use air_elt_commons_testing::pg::pg_pool;
 use air_elt_core::types::Value;
 use sqlx::Executor;
-
-mod common;
-use common::guard::PgSchemaGuard;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_to_cockroachdb_with_upsert_overwrite() {
@@ -27,7 +25,6 @@ async fn pg_to_cockroachdb_with_upsert_overwrite() {
     let cockroach = cockroach_pool().await;
 
     let src_schema = format!("{}_src", pg.schema);
-    let _src_guard = PgSchemaGuard::new(pg.pool.clone(), vec![src_schema.clone()]);
 
     pg.pool
         .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
@@ -122,7 +119,8 @@ conflict = {{ key = ["id"], strategy = "overwrite" }}
     let tmp = tempfile::tempdir().unwrap();
     let config_path = tmp.path().join("config.toml");
     std::fs::write(&config_path, &config_toml).unwrap();
-    common::pipeline::run_once(&config_path).await;
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
 
     // 5 rows landed; row id=1 was overwritten (stale → fresh email).
     let rows: Vec<(i64, String, String)> =
@@ -151,4 +149,7 @@ conflict = {{ key = ["id"], strategy = "overwrite" }}
     let parsed: air_elt_core::model::CursorState =
         serde_json::from_value(cursors[0].1.clone()).unwrap();
     assert_eq!(parsed.fields[0].value, Value::Int64(5));
+
+    pg.pool.close().await;
+    cockroach.pool.close().await;
 }

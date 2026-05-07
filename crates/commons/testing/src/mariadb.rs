@@ -17,15 +17,19 @@
 //! stay per-test since sqlx connection workers are tied to the spawning
 //! `#[tokio::test]` runtime.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use rand::distr::{Alphanumeric, SampleString};
 use rand::rng;
 use sqlx::MySqlPool;
 use sqlx::mysql::MySqlPoolOptions;
+use testcontainers::core::Mount;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ImageExt, ReuseDirective};
 use testcontainers_modules::mariadb::Mariadb as MariaDbImage;
 use tokio::sync::OnceCell;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::backend::{TestBackend, detect_with_timeout, prepare_container_env};
 use crate::ryuk;
@@ -35,7 +39,6 @@ const KIND_LABEL_KEY: &str = "air-elt.kind";
 const KIND_LABEL_VALUE: &str = "mariadb";
 
 static MARIADB_BASE_URL: OnceCell<String> = OnceCell::const_new();
-static SELF_HEAL_DONE: OnceCell<()> = OnceCell::const_new();
 
 pub struct MariaDbTestHandle {
     pub pool: MySqlPool,
@@ -43,47 +46,11 @@ pub struct MariaDbTestHandle {
     pub url: String,
     /// Sandbox database name (called "schema" to mirror the pg helper).
     pub schema: String,
-    _cleanup: CleanupGuard,
 }
 
 impl MariaDbTestHandle {
     pub fn url_with_database(&self) -> String {
         format!("{}/{}", self.url, self.schema)
-    }
-}
-
-struct CleanupGuard {
-    bootstrap: MySqlPool,
-    db: String,
-}
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let pool = self.bootstrap.clone();
-        let db = std::mem::take(&mut self.db);
-        let join = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build cleanup runtime");
-            rt.block_on(async move {
-                let stmt = format!("DROP DATABASE IF EXISTS `{db}`");
-                let drop_fut = sqlx::query(&stmt).execute(&pool);
-                match tokio::time::timeout(std::time::Duration::from_secs(5), drop_fut).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        warn!(error = %e, db, "failed to drop test database");
-                    }
-                    Err(_) => {
-                        warn!(db, "drop database timed out — relying on self-heal");
-                    }
-                }
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), pool.close()).await;
-            });
-        });
-        if let Err(e) = join.join() {
-            warn!(?e, "cleanup thread panicked");
-        }
     }
 }
 
@@ -105,17 +72,31 @@ async fn mariadb_base_url() -> &'static String {
             ryuk::ensure_session(&socket).await;
             let (sk, sv) = ryuk::session_label();
             info!("ensuring shared mariadb container (reuse=Always, ryuk-managed)");
+            let start_lock = crate::filelock::acquire_lock("mariadb");
             // The module's default tag already targets a recent MariaDB
             // (≥ 11.x) which ships native UUID (added in 10.7). Overriding
             // with `.with_tag()` can race the readiness probe — leave it.
+            // tmpfs on the data dir + relaxed durability flags trade
+            // crash-safety for raw throughput. Acceptable in tests: the
+            // container is reaped at session end, so on-disk state has no
+            // value.
             let container = MariaDbImage::default()
                 .with_container_name(format!("air-elt-mariadb-{sv}"))
                 .with_label(sk, sv)
                 .with_label(KIND_LABEL_KEY, KIND_LABEL_VALUE)
+                .with_mount(Mount::tmpfs_mount("/var/lib/mysql"))
+                .with_cmd([
+                    "mariadbd",
+                    "--innodb-flush-log-at-trx-commit=0",
+                    "--innodb-doublewrite=0",
+                    "--sync-binlog=0",
+                    "--skip-log-bin",
+                ])
                 .with_reuse(ReuseDirective::Always)
                 .start()
                 .await
                 .expect("start mariadb container failed");
+            drop(start_lock);
             let host = container.get_host().await.expect("container host");
             let port = container
                 .get_host_port_ipv4(3306)
@@ -136,47 +117,37 @@ async fn mariadb_base_url() -> &'static String {
         .await
 }
 
-pub async fn mariadb_pool() -> MariaDbTestHandle {
-    let base_url = mariadb_base_url().await;
-    let db = random_db();
-    info!(db = %db, "creating sandbox database");
+pub fn mariadb_pool() -> Pin<Box<dyn Future<Output = MariaDbTestHandle> + Send + 'static>> {
+    Box::pin(async move {
+        let base_url = mariadb_base_url().await;
+        let db = random_db();
+        info!(db = %db, "creating sandbox database");
 
-    let bootstrap_pool = MySqlPoolOptions::new()
-        .max_connections(2)
-        .connect(base_url)
-        .await
-        .expect("connect to mariadb failed");
+        let bootstrap_pool = MySqlPoolOptions::new()
+            .max_connections(2)
+            .connect(base_url)
+            .await
+            .expect("connect to mariadb failed");
 
-    SELF_HEAL_DONE
-        .get_or_init(|| async {
-            drop_stale_test_databases(&bootstrap_pool, 24 * 3600).await;
-        })
-        .await;
+        let create = format!("CREATE DATABASE `{db}`");
+        sqlx::query(&create)
+            .execute(&bootstrap_pool)
+            .await
+            .expect("create sandbox database failed");
 
-    let create = format!("CREATE DATABASE `{db}`");
-    sqlx::query(&create)
-        .execute(&bootstrap_pool)
-        .await
-        .expect("create sandbox database failed");
+        let scoped_url = format!("{}/{}", base_url, db);
+        let pool = MySqlPoolOptions::new()
+            .max_connections(5)
+            .connect(&scoped_url)
+            .await
+            .expect("connect to sandbox database failed");
 
-    let cleanup = CleanupGuard {
-        bootstrap: bootstrap_pool.clone(),
-        db: db.clone(),
-    };
-
-    let scoped_url = format!("{}/{}", base_url, db);
-    let pool = MySqlPoolOptions::new()
-        .max_connections(5)
-        .connect(&scoped_url)
-        .await
-        .expect("connect to sandbox database failed");
-
-    MariaDbTestHandle {
-        pool,
-        url: base_url.clone(),
-        schema: db,
-        _cleanup: cleanup,
-    }
+        MariaDbTestHandle {
+            pool,
+            url: base_url.clone(),
+            schema: db,
+        }
+    })
 }
 
 fn strip_db(url: &str) -> (String, Option<String>) {
@@ -248,47 +219,6 @@ async fn wait_for_steady_state(base_url: &str) {
         "mariadb did not reach steady state within 60s: {:?}",
         last_err
     );
-}
-
-async fn drop_stale_test_databases(pool: &MySqlPool, max_age_secs: u64) {
-    let cutoff = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-        .saturating_sub(max_age_secs);
-
-    let rows: Vec<(String,)> = match sqlx::query_as(
-        "SELECT schema_name FROM information_schema.schemata \
-         WHERE schema_name LIKE 'test\\_%' ESCAPE '\\\\'",
-    )
-    .fetch_all(pool)
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not enumerate test_* databases for self-heal");
-            return;
-        }
-    };
-
-    for (db,) in rows {
-        let ts = db
-            .strip_prefix("test_")
-            .and_then(|s| s.split_once('_'))
-            .and_then(|(ts_str, _)| ts_str.parse::<u64>().ok());
-        let Some(ts) = ts else {
-            continue;
-        };
-        if ts >= cutoff {
-            continue;
-        }
-        let stmt = format!("DROP DATABASE IF EXISTS `{db}`");
-        if let Err(e) = sqlx::query(&stmt).execute(pool).await {
-            tracing::warn!(error = %e, db = %db, "failed to drop stale database");
-        } else {
-            tracing::debug!(db = %db, "self-healed stale test database");
-        }
-    }
 }
 
 fn random_db() -> String {

@@ -16,14 +16,18 @@
 //! versioning tests). Per-test sandbox databases are created and dropped
 //! on the cached client.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use mongodb::Client;
 use rand::distr::{Alphanumeric, SampleString};
 use rand::rng;
+use testcontainers::core::Mount;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ImageExt, ReuseDirective};
 use testcontainers_modules::mongo::Mongo as MongoImage;
 use tokio::sync::OnceCell;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::backend::{TestBackend, detect_with_timeout, prepare_container_env};
 use crate::ryuk;
@@ -56,56 +60,11 @@ pub struct MongoTestHandle {
     pub url: String,
     /// Sandbox database name. Unique per handle.
     pub database: String,
-    _cleanup: CleanupGuard,
 }
 
 impl MongoTestHandle {
     pub fn url_with_database(&self) -> String {
         format!("{}/{}", self.url, self.database)
-    }
-}
-
-struct CleanupGuard {
-    client: Client,
-    database: String,
-}
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let client = self.client.clone();
-        let database = std::mem::take(&mut self.database);
-        let join = std::thread::spawn(move || {
-            // Panic-safe: a `Drop` that panics during unwind aborts
-            // the process. If we cannot build a runtime here, log and
-            // give up — the sandbox database is already disposable
-            // (each run gets a fresh randomised name).
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    warn!(error = %e, db = %database, "could not build cleanup runtime; skipping db drop");
-                    return;
-                }
-            };
-            rt.block_on(async move {
-                let db = client.database(&database);
-                let drop_fut = db.drop();
-                match tokio::time::timeout(std::time::Duration::from_secs(5), drop_fut).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        warn!(error = %e, db = %database, "failed to drop test database");
-                    }
-                    Err(_) => {
-                        warn!(db = %database, "drop database timed out");
-                    }
-                }
-            });
-        });
-        if let Err(e) = join.join() {
-            warn!(?e, "cleanup thread panicked");
-        }
     }
 }
 
@@ -130,6 +89,11 @@ async fn mongo_infra(env_var: &str, container_tag: &str) -> &'static MongoInfra 
         prepare_container_env(&socket);
         ryuk::ensure_session(&socket).await;
         let (sk, sv) = ryuk::session_label();
+        let start_lock = crate::filelock::acquire_lock(if env_var == LEGACY_URL_VAR {
+            "mongo-legacy"
+        } else {
+            "mongo"
+        });
         // Differentiate modern-vs-legacy mongo by tag, since reuse-mode
         // matches by labels: each variant gets its own kind value.
         let kind_value = if env_var == LEGACY_URL_VAR {
@@ -141,15 +105,19 @@ async fn mongo_infra(env_var: &str, container_tag: &str) -> &'static MongoInfra 
             tag = container_tag,
             "ensuring shared mongo container (reuse=Always, ryuk-managed)"
         );
+        // tmpfs on /data/db: container is reaped at session end, so
+        // on-disk state has no value.
         let container = MongoImage::default()
             .with_tag(container_tag)
             .with_container_name(format!("air-elt-{kind_value}-{sv}"))
             .with_label(sk, sv)
             .with_label(KIND_LABEL_KEY, kind_value)
+            .with_mount(Mount::tmpfs_mount("/data/db"))
             .with_reuse(ReuseDirective::Always)
             .start()
             .await
             .expect("start mongo container failed");
+        drop(start_lock);
         let host = container.get_host().await.expect("container host");
         let port = container
             .get_host_port_ipv4(27017)
@@ -162,18 +130,22 @@ async fn mongo_infra(env_var: &str, container_tag: &str) -> &'static MongoInfra 
     .await
 }
 
-pub async fn mongo_pool() -> MongoTestHandle {
-    let infra = mongo_infra(URL_VAR, "8").await;
-    handle_for(infra).await
+pub fn mongo_pool() -> Pin<Box<dyn Future<Output = MongoTestHandle> + Send + 'static>> {
+    Box::pin(async move {
+        let infra = mongo_infra(URL_VAR, "8").await;
+        handle_for(infra).await
+    })
 }
 
 /// Sandbox handle pointing at a legacy (pre-8.0) MongoDB. Used only by
 /// the bulk-write versioning e2e tests; everything else should use
 /// `mongo_pool`. Honours `AIR_ELT_TEST_MONGO_LEGACY_URL`; falls back to
 /// a `mongo:7.0` container.
-pub async fn mongo_pool_legacy() -> MongoTestHandle {
-    let infra = mongo_infra(LEGACY_URL_VAR, "7.0").await;
-    handle_for(infra).await
+pub fn mongo_pool_legacy() -> Pin<Box<dyn Future<Output = MongoTestHandle> + Send + 'static>> {
+    Box::pin(async move {
+        let infra = mongo_infra(LEGACY_URL_VAR, "7.0").await;
+        handle_for(infra).await
+    })
 }
 
 async fn handle_for(infra: &MongoInfra) -> MongoTestHandle {
@@ -182,11 +154,11 @@ async fn handle_for(infra: &MongoInfra) -> MongoTestHandle {
     let client = Client::with_uri_str(&infra.base_url)
         .await
         .expect("connect to mongo failed");
+
     MongoTestHandle {
-        client: client.clone(),
+        client,
         url: infra.base_url.clone(),
-        database: database.clone(),
-        _cleanup: CleanupGuard { client, database },
+        database,
     }
 }
 
@@ -240,24 +212,26 @@ pub fn mongo_rs_url_or_skip() -> Option<String> {
     std::env::var(RS_URL_VAR).ok()
 }
 
-pub async fn mongo_rs_pool() -> MongoTestHandle {
-    let url = std::env::var(RS_URL_VAR).unwrap_or_else(|_| {
-        panic!(
-            "{RS_URL_VAR} not set — mongo-cdc e2e tests need a replica-set mongo. \
-             See `mongo_rs_url_or_skip` docstring for setup."
-        )
-    });
-    let (base_url, _existing_db) = strip_db(&url);
-    let client = Client::with_uri_str(&base_url)
-        .await
-        .expect("connect to RS mongo failed");
-    let database = random_db();
-    MongoTestHandle {
-        client: client.clone(),
-        url: base_url,
-        database: database.clone(),
-        _cleanup: CleanupGuard { client, database },
-    }
+pub fn mongo_rs_pool() -> Pin<Box<dyn Future<Output = MongoTestHandle> + Send + 'static>> {
+    Box::pin(async move {
+        let url = std::env::var(RS_URL_VAR).unwrap_or_else(|_| {
+            panic!(
+                "{RS_URL_VAR} not set — mongo-cdc e2e tests need a replica-set mongo. \
+                 See `mongo_rs_url_or_skip` docstring for setup."
+            )
+        });
+        let (base_url, _existing_db) = strip_db(&url);
+        let client = Client::with_uri_str(&base_url)
+            .await
+            .expect("connect to RS mongo failed");
+
+        let database = random_db();
+        MongoTestHandle {
+            client,
+            url: base_url,
+            database,
+        }
+    })
 }
 
 fn random_db() -> String {
