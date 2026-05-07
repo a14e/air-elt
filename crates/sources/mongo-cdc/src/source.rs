@@ -37,6 +37,7 @@ use mongodb::{Client, Collection};
 use tracing::{debug, info, warn};
 
 use air_elt_commons_mongodb::client::{PoolSettings, connect, database_from_url};
+use air_elt_commons_mongodb::key_bson::KeyBson;
 use air_elt_commons_mongodb::{bson_value, identifier, path, sampling};
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::mapping::FieldPath;
@@ -275,10 +276,41 @@ impl Source for MongoCdcSource {
             last_token = stream.resume_token();
         }
 
+        // Why dedup-by-`_id` here, last-event-wins:
+        //   * delete(k) → insert(k): the sink applies upserts before
+        //     deletes (preserves insert→delete ordering on distinct
+        //     keys). If both arrive for the same key, the upsert
+        //     would land first and the delete would erase it,
+        //     inverting intent. Only the latest event must survive.
+        //   * N updates for the same `_id` in LookupOnUpdate mode
+        //     would otherwise emit N rows with the same post-image
+        //     after one `find`. Dedup-before-lookup makes `find`
+        //     issue over unique `_id`s only.
+        // Events without a `documentKey` (collection-level — Drop /
+        // Invalidate / etc.) are kept as-is so the per-event match
+        // arm below can surface them as runtime errors.
+        if events.len() > 1 {
+            let mut seen: ahash::AHashSet<KeyBson> = ahash::AHashSet::with_capacity(events.len());
+            let mut kept_rev: Vec<ChangeStreamEvent<Document>> = Vec::with_capacity(events.len());
+            for ev in events.into_iter().rev() {
+                let id = ev.document_key.as_ref().and_then(|d| d.get("_id").cloned());
+                match id {
+                    Some(id) => {
+                        if seen.insert(KeyBson(id)) {
+                            kept_rev.push(ev);
+                        }
+                    }
+                    None => kept_rev.push(ev),
+                }
+            }
+            kept_rev.reverse();
+            events = kept_rev;
+        }
+
         // Mode = LookupOnUpdate: collect _ids of update events that
-        // arrived without fullDocument and one-shot fetch. Bson is
-        // neither Hash nor Eq so we use a Vec — N is bounded by the
-        // batch limit, linear lookup is fine.
+        // arrived without fullDocument for one-shot `find($in)`. The
+        // events list is already deduped above, so the resulting list
+        // has unique `_id`s by construction.
         let ids_to_lookup: Vec<Bson> = if my_ctx.mode == UpdateMode::LookupOnUpdate {
             events
                 .iter()

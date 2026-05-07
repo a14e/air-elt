@@ -13,6 +13,7 @@ pub mod bson_value;
 pub mod client;
 pub mod identifier;
 pub mod infer;
+pub mod key_bson;
 pub mod path;
 pub mod sampling;
 pub mod version;

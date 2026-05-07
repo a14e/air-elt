@@ -237,6 +237,122 @@ async fn cdc_lookup_on_update_skips_when_doc_deleted_between_event_and_find() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cdc_post_image_collapses_multiple_updates_per_id() {
+    // Multiple updates of the same `_id` in one batch collapse to a
+    // single Upsert row carrying the chronologically-last post-image.
+    let Some(mongo) = mongo_rs_pool_or_return().await else {
+        return;
+    };
+    let coll_name = "multi_updates";
+    let coll = mongo
+        .client
+        .database(&mongo.database)
+        .collection::<Document>(coll_name);
+    coll.insert_one(doc! { "_id": 1, "name": "init" })
+        .await
+        .expect("seed");
+    enable_pre_post_images(&mongo, coll_name).await;
+
+    let source = cdc_source(&mongo).await.unwrap();
+    let spec = cdc_spec(coll_name, 4, "post-image");
+    let ctx = source.build_context(&spec).await.expect("ctx");
+
+    let cursor = capture_pbrt(&coll).await;
+    coll.update_one(doc! { "_id": 1 }, doc! { "$set": { "name": "a" } })
+        .await
+        .unwrap();
+    coll.update_one(doc! { "_id": 1 }, doc! { "$set": { "name": "b" } })
+        .await
+        .unwrap();
+    coll.update_one(doc! { "_id": 1 }, doc! { "$set": { "name": "c" } })
+        .await
+        .unwrap();
+
+    let batch = source
+        .read_batch(&spec, ctx, Some(&cursor))
+        .await
+        .expect("read");
+    assert_eq!(batch.rows.len(), 1);
+    assert_eq!(batch.rows[0].op, RowOp::Upsert);
+    assert_eq!(batch.rows[0].values[1], Value::Text("c".into()));
+    mongo.client.clone().shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cdc_post_image_insert_then_delete_emits_only_delete() {
+    // insert(_id) + delete(_id) in one batch must collapse to a
+    // single Delete — not Upsert + Delete (which would otherwise
+    // require strict insert-before-delete ordering at the sink).
+    let Some(mongo) = mongo_rs_pool_or_return().await else {
+        return;
+    };
+    let coll_name = "insert_then_delete";
+    let coll = mongo
+        .client
+        .database(&mongo.database)
+        .collection::<Document>(coll_name);
+    enable_pre_post_images(&mongo, coll_name).await;
+
+    let source = cdc_source(&mongo).await.unwrap();
+    let spec = cdc_spec(coll_name, 4, "post-image");
+    let ctx = source.build_context(&spec).await.expect("ctx");
+
+    let cursor = capture_pbrt(&coll).await;
+    coll.insert_one(doc! { "_id": 5, "name": "ephemeral" })
+        .await
+        .unwrap();
+    coll.delete_one(doc! { "_id": 5 }).await.unwrap();
+
+    let batch = source
+        .read_batch(&spec, ctx, Some(&cursor))
+        .await
+        .expect("read");
+    assert_eq!(batch.rows.len(), 1);
+    assert_eq!(batch.rows[0].op, RowOp::Delete);
+    assert_eq!(batch.rows[0].values[0], Value::Int32(5));
+    mongo.client.clone().shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cdc_lookup_on_update_collapses_multiple_updates_to_single_row() {
+    // Same as the post-image case but exercising the LookupOnUpdate
+    // path: dedup happens before `find`, so we end up with one row
+    // carrying the final post-image fetched by lookup.
+    let Some(mongo) = mongo_rs_pool_or_return().await else {
+        return;
+    };
+    let coll_name = "lookup_multi_updates";
+    let coll = mongo
+        .client
+        .database(&mongo.database)
+        .collection::<Document>(coll_name);
+    coll.insert_one(doc! { "_id": 3, "name": "before" })
+        .await
+        .expect("seed");
+
+    let source = cdc_source(&mongo).await.unwrap();
+    let spec = cdc_spec(coll_name, 4, "lookup-on-update");
+    let ctx = source.build_context(&spec).await.expect("ctx");
+
+    let cursor = capture_pbrt(&coll).await;
+    coll.update_one(doc! { "_id": 3 }, doc! { "$set": { "name": "mid" } })
+        .await
+        .unwrap();
+    coll.update_one(doc! { "_id": 3 }, doc! { "$set": { "name": "final" } })
+        .await
+        .unwrap();
+
+    let batch = source
+        .read_batch(&spec, ctx, Some(&cursor))
+        .await
+        .expect("read");
+    assert_eq!(batch.rows.len(), 1);
+    assert_eq!(batch.rows[0].op, RowOp::Upsert);
+    assert_eq!(batch.rows[0].values[1], Value::Text("final".into()));
+    mongo.client.clone().shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cdc_drop_collection_surfaces_runtime_error() {
     let Some(mongo) = mongo_rs_pool_or_return().await else {
         return;
@@ -322,9 +438,11 @@ async fn cdc_to_pg_sink_round_trip_with_inserts_and_deletes() {
         .read_batch(&read_spec, src_ctx, Some(&cursor))
         .await
         .expect("read");
-    assert_eq!(batch.rows.len(), 4);
-    assert_eq!(batch.rows[0].op, RowOp::Upsert);
-    assert_eq!(batch.rows[2].op, RowOp::Delete);
+    // The source dedups by `_id`, last-event-wins. insert(11) +
+    // delete(11) collapses to one Delete; same for 12 — so the
+    // batch carries exactly two Delete rows.
+    assert_eq!(batch.rows.len(), 2);
+    assert!(batch.rows.iter().all(|r| r.op == RowOp::Delete));
     sink.write_batch(&write_spec, sink_ctx, &batch)
         .await
         .expect("mixed batch");
