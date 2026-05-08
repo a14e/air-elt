@@ -79,6 +79,13 @@ pub fn parse(literal: &toml::Value, sink: &DataType) -> Result<Value, DefaultPar
         // never carry Union (only sources can — see `DataType::Union`),
         // so this arm is unreachable in well-typed flows.
         DataType::Union(_) => Err(DefaultParseError::TypeMismatch { dst: sink.clone() }),
+        // Connector-defined types delegate. `parse_default` returning
+        // `Ok(None)` means the type does not accept literal defaults
+        // — we surface that as `TypeMismatch` so the validation
+        // pipeline reports a recognisable error.
+        DataType::Custom(t) => t
+            .parse_default(literal)?
+            .ok_or_else(|| DefaultParseError::TypeMismatch { dst: sink.clone() }),
     }
 }
 
@@ -944,5 +951,72 @@ mod tests {
         // serde_json::Number::from_f64(NaN) is None → mapped to JSON null.
         let v = parse(&toml::Value::Float(f64::NAN), &DataType::Json).unwrap();
         assert_eq!(v, Value::Json(serde_json::Value::Null));
+    }
+
+    /// Stub `DynType` whose `parse_default` accepts string literals
+    /// and emits a sentinel `Value::Bool(true)`. Lets us exercise
+    /// both arms of the `Custom` route in `parse(...)`: the `Some`
+    /// pass-through and the `Ok(None) → TypeMismatch` mapping.
+    #[derive(Debug, Clone, Copy)]
+    struct StubCustom {
+        accept: bool,
+    }
+
+    impl crate::types::dynamic::DynType for StubCustom {
+        fn kind(&self) -> &'static str {
+            "test.stub_custom"
+        }
+        fn can_convert_to(&self, _t: &DataType, _truncate: bool) -> bool {
+            false
+        }
+        fn can_construct_from(&self, _s: &DataType, _truncate: bool) -> bool {
+            false
+        }
+        fn convert(
+            &self,
+            _v: Value,
+            _t: &DataType,
+            _ctx: &crate::types::convert::ConversionContext,
+        ) -> Result<Value, crate::types::convert::ConvertError> {
+            unimplemented!()
+        }
+        fn construct(
+            &self,
+            _v: Value,
+            _s: &DataType,
+            _ctx: &crate::types::convert::ConversionContext,
+        ) -> Result<Value, crate::types::convert::ConvertError> {
+            unimplemented!()
+        }
+        fn parse_default(
+            &self,
+            _literal: &toml::Value,
+        ) -> Result<Option<Value>, DefaultParseError> {
+            if self.accept {
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(None)
+            }
+        }
+        fn clone_box(&self) -> Box<dyn crate::types::dynamic::DynType> {
+            Box::new(*self)
+        }
+    }
+
+    #[test]
+    fn custom_default_passthrough_when_dyn_type_returns_some() {
+        let dt = DataType::Custom(Box::new(StubCustom { accept: true }));
+        let v = parse(&lit("anything"), &dt).unwrap();
+        assert_eq!(v, Value::Bool(true));
+    }
+
+    #[test]
+    fn custom_default_none_maps_to_type_mismatch() {
+        let dt = DataType::Custom(Box::new(StubCustom { accept: false }));
+        let res = parse(&lit("anything"), &dt);
+        assert!(
+            matches!(res, Err(DefaultParseError::TypeMismatch { .. })),
+            "got {res:?}"
+        );
     }
 }

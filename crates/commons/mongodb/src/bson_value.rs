@@ -32,6 +32,8 @@ use std::str::FromStr;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::types::{DataType, Value};
 
+use crate::types::{MongoJsType, MongoJsValue, MongoObjectIdType, MongoObjectIdValue};
+
 /// Decode a `Bson` value into the canonical `Value`. Returns an
 /// error for BSON types we cannot represent losslessly (regex,
 /// JavaScript code, DBPointer, MinKey, MaxKey, etc.).
@@ -44,7 +46,8 @@ pub fn from_bson(b: &Bson) -> RuntimeResult<Value> {
         Bson::Double(v) => Value::Float64(*v),
         Bson::String(s) => Value::Text(s.clone()),
         Bson::Binary(b) => Value::Bytes(b.bytes.clone()),
-        Bson::ObjectId(oid) => Value::Bytes(oid.bytes().to_vec()),
+        Bson::ObjectId(oid) => Value::Custom(Box::new(MongoObjectIdValue(oid.bytes()))),
+        Bson::JavaScriptCode(s) => Value::Custom(Box::new(MongoJsValue(s.clone()))),
         Bson::DateTime(dt) => {
             let millis = dt.timestamp_millis();
             let secs = millis.div_euclid(1000);
@@ -119,6 +122,19 @@ pub fn to_bson(v: &Value) -> RuntimeResult<Bson> {
             bytes: u.as_bytes().to_vec(),
         }),
         Value::Json(j) => bson::to_bson(j).map_err(RuntimeError::backend)?,
+        Value::Custom(inner) => {
+            let any = inner.as_any();
+            if let Some(oid) = any.downcast_ref::<MongoObjectIdValue>() {
+                Bson::ObjectId(bson::oid::ObjectId::from_bytes(oid.0))
+            } else if let Some(js) = any.downcast_ref::<MongoJsValue>() {
+                Bson::JavaScriptCode(js.0.clone())
+            } else {
+                return Err(RuntimeError::Other(format!(
+                    "unsupported Value::Custom kind for mongo encoder: {:?}",
+                    inner.dyn_type().kind()
+                )));
+            }
+        }
     })
 }
 
@@ -137,7 +153,8 @@ pub fn infer_type(b: &Bson) -> Option<DataType> {
             bson::spec::BinarySubtype::Uuid | bson::spec::BinarySubtype::UuidOld => DataType::Uuid,
             _ => DataType::Bytes { size: None },
         },
-        Bson::ObjectId(_) => DataType::Bytes { size: Some(12) },
+        Bson::ObjectId(_) => DataType::Custom(Box::new(MongoObjectIdType)),
+        Bson::JavaScriptCode(_) => DataType::Custom(Box::new(MongoJsType)),
         Bson::DateTime(_) => DataType::Timestamp,
         Bson::Decimal128(_) => DataType::Decimal {
             precision: None,
@@ -173,21 +190,75 @@ mod tests {
     }
 
     #[test]
-    fn objectid_to_bytes() {
+    fn objectid_decodes_to_custom_value() {
         let oid = ObjectId::new();
         let v = from_bson(&Bson::ObjectId(oid)).unwrap();
-        match v {
-            Value::Bytes(b) => assert_eq!(b.len(), 12),
-            other => panic!("expected bytes, got {other:?}"),
+        match &v {
+            Value::Custom(inner) => {
+                let casted = inner
+                    .as_any()
+                    .downcast_ref::<MongoObjectIdValue>()
+                    .expect("downcast");
+                assert_eq!(casted.0, oid.bytes());
+            }
+            other => panic!("expected Value::Custom, got {other:?}"),
         }
     }
 
     #[test]
-    fn infer_type_objectid_is_bytes12() {
-        assert_eq!(
-            infer_type(&Bson::ObjectId(ObjectId::new())),
-            Some(DataType::Bytes { size: Some(12) })
-        );
+    fn objectid_round_trips_back_to_bson_object_id() {
+        let oid = ObjectId::new();
+        let v = from_bson(&Bson::ObjectId(oid)).unwrap();
+        let encoded = to_bson(&v).unwrap();
+        match encoded {
+            Bson::ObjectId(round) => assert_eq!(round, oid),
+            other => panic!("expected Bson::ObjectId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn javascript_code_decodes_to_custom_value() {
+        let code = "function () { return 1; }".to_string();
+        let v = from_bson(&Bson::JavaScriptCode(code.clone())).unwrap();
+        match &v {
+            Value::Custom(inner) => {
+                let casted = inner
+                    .as_any()
+                    .downcast_ref::<MongoJsValue>()
+                    .expect("downcast");
+                assert_eq!(casted.0, code);
+            }
+            other => panic!("expected Value::Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn javascript_code_round_trips_back_to_bson() {
+        let code = "function f() { return 42; }".to_string();
+        let v = from_bson(&Bson::JavaScriptCode(code.clone())).unwrap();
+        let encoded = to_bson(&v).unwrap();
+        match encoded {
+            Bson::JavaScriptCode(s) => assert_eq!(s, code),
+            other => panic!("expected Bson::JavaScriptCode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn infer_type_objectid_is_custom() {
+        let dt = infer_type(&Bson::ObjectId(ObjectId::new())).expect("Some");
+        match dt {
+            DataType::Custom(t) => assert_eq!(t.kind(), "mongodb.object_id"),
+            other => panic!("expected DataType::Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn infer_type_javascript_is_custom() {
+        let dt = infer_type(&Bson::JavaScriptCode("x".into())).expect("Some");
+        match dt {
+            DataType::Custom(t) => assert_eq!(t.kind(), "mongodb.javascript"),
+            other => panic!("expected DataType::Custom, got {other:?}"),
+        }
     }
 
     #[test]

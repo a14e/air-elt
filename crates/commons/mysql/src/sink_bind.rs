@@ -70,6 +70,9 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
                 sep.push_bind::<Option<String>>(None);
             }
             DataType::Union(_) => unreachable!("mysql sinks never carry Union types"),
+            DataType::Custom(_) => unreachable!(
+                "DataType::Custom must be handled by the connector before reaching sink_bind"
+            ),
         },
         Value::Bool(b) => {
             sep.push_bind(*b);
@@ -124,6 +127,9 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
         }
         Value::UInt64(n) => {
             sep.push_bind(*n);
+        }
+        Value::Custom(_) => {
+            unreachable!("Value::Custom must be handled by the connector before reaching sink_bind")
         }
     }
 }

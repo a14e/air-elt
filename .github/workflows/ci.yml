@@ -47,7 +47,11 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # Citus image is wire-compatible with stock Postgres and ships
+        # the postgresql-hll extension preinstalled. The local
+        # testcontainers handle uses the same image; matching it here
+        # keeps CI and dev parity. Pinned to 13.1.
+        image: citusdata/citus:13.1
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
@@ -93,7 +97,11 @@ jobs:
           --health-retries=20
           --tmpfs=/var/lib/mysql:rw,size=512m
     env:
-      AIR_ELT_TEST_PG_URL: "postgres://postgres:postgres@localhost:5432/postgres"
+      # `?sslmode=disable`: Citus generates a self-signed cert at boot
+      # that sqlx's rustls layer rejects (`UnsupportedCertVersion`).
+      # Loopback in CI doesn't benefit from TLS; disabling matches the
+      # local testcontainers handle.
+      AIR_ELT_TEST_PG_URL: "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
       AIR_ELT_TEST_MYSQL_URL: "mysql://root@localhost:3306/airelt"
       AIR_ELT_TEST_MARIADB_URL: "mysql://root@localhost:3307/airelt"
       AIR_ELT_TEST_MONGO_URL: "mongodb://localhost:27017"

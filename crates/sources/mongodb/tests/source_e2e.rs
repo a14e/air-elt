@@ -5,12 +5,14 @@
 
 #![allow(clippy::unwrap_used)]
 
+use air_elt_commons_mongodb::types::MongoObjectIdValue;
 use air_elt_commons_testing::mongo::mongo_pool;
 use air_elt_core::model::ReadSpec;
 use air_elt_core::traits::Source;
 use air_elt_core::types::Value;
 use air_elt_source_mongodb::{MongoSource, MongoSourceConfig};
 use bson::doc;
+use bson::oid::ObjectId;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_with_cursor_and_dot_notation() {
@@ -70,7 +72,6 @@ async fn read_with_cursor_and_dot_notation() {
         .expect("read_batch second");
     assert_eq!(batch2.rows.len(), 2);
     assert_eq!(batch2.rows[0].values[0], Value::Int64(4));
-    handle.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -112,7 +113,6 @@ async fn sample_returns_documents() {
     for row in &rows {
         assert_eq!(row.values.len(), 2);
     }
-    handle.client.clone().shutdown().await;
 }
 
 /// Compound `(updated_at, _id)` cursor — the typical idempotent ELT
@@ -186,5 +186,64 @@ async fn compound_cursor_updated_at_id() {
         .await
         .expect("batch3 (drain)");
     assert_eq!(batch3.rows.len(), 0, "no more rows after the last id");
-    handle.client.clone().shutdown().await;
+}
+
+/// Source emits `Value::Custom(MongoObjectIdValue)` for `_id`-of-type
+/// `ObjectId`, instead of the legacy flattened `Bytes(12)` shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_object_id_emits_custom_value() {
+    let handle = mongo_pool().await;
+    let coll = handle
+        .client
+        .database(&handle.database)
+        .collection::<bson::Document>("oid_users");
+    let oid_a = ObjectId::new();
+    let oid_b = ObjectId::new();
+    coll.insert_one(doc! { "_id": oid_a, "name": "alice" })
+        .await
+        .expect("seed a");
+    coll.insert_one(doc! { "_id": oid_b, "name": "bob" })
+        .await
+        .expect("seed b");
+
+    let source = MongoSource::connect(
+        "test_source_oid".into(),
+        MongoSourceConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect");
+
+    let spec = ReadSpec {
+        columns: vec!["_id".into(), "name".into()],
+        table: "oid_users".into(),
+        cursor_fields: vec!["_id".into()],
+        cursor_order: air_elt_core::config::model::CursorOrder::Asc,
+        limit: 10,
+        source_options: toml::Table::new(),
+    };
+    let ctx = source.build_context(&spec).await.expect("build_context");
+    let batch = source
+        .read_batch(&spec, ctx, None)
+        .await
+        .expect("read_batch");
+    assert_eq!(batch.rows.len(), 2);
+    let mut seen: Vec<[u8; 12]> = Vec::new();
+    for row in &batch.rows {
+        match &row.values[0] {
+            Value::Custom(v) => {
+                let oid = v
+                    .as_any()
+                    .downcast_ref::<MongoObjectIdValue>()
+                    .expect("downcast MongoObjectIdValue");
+                seen.push(oid.0);
+            }
+            other => panic!("expected Value::Custom(MongoObjectIdValue), got {other:?}"),
+        }
+    }
+    assert!(seen.contains(&oid_a.bytes()));
+    assert!(seen.contains(&oid_b.bytes()));
 }

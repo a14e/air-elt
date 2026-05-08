@@ -22,6 +22,8 @@ use uuid::Uuid;
 
 use air_elt_core::types::{DataType, Value};
 
+use crate::types::{PgHllType, PgHllValue};
+
 pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Value, dt: &DataType) {
     match v {
         Value::Null => match dt {
@@ -71,6 +73,19 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
                 unreachable!("postgres has no unsigned integer column types")
             }
             DataType::Union(_) => unreachable!("postgres sinks never carry Union types"),
+            // HLL NULL: bind a typed NULL Vec<u8> and tack on `::hll` so
+            // the placeholder lands as `$N::hll`. sqlx cannot infer a
+            // type for NULL, and PG itself will not accept an untyped
+            // NULL into an `hll` column even when the column is
+            // nullable. Same shape as the non-null arm below — the only
+            // difference is the bound payload.
+            DataType::Custom(t) if t.kind() == PgHllType::KIND => {
+                sep.push_bind::<Option<Vec<u8>>>(None);
+                sep.push_unseparated("::hll");
+            }
+            DataType::Custom(_) => unreachable!(
+                "DataType::Custom must be handled by the connector before reaching sink_bind"
+            ),
         },
         Value::Bool(b) => {
             sep.push_bind(*b);
@@ -122,6 +137,22 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
                  dispatcher rewrites every UInt → Int*/BigInt/Decimal mapping into \
                  the target variant before binding"
             )
+        }
+        Value::Custom(v) => {
+            // HLL: bind raw bytes, then append `::hll` to cast the
+            // bound bytea to the extension type at execution time.
+            // sqlx has no native HLL type registration, so the cast
+            // is mandatory — without it, PG rejects the binary as
+            // `bytea` rather than `hll`.
+            if let Some(hll) = v.as_any().downcast_ref::<PgHllValue>() {
+                sep.push_bind(hll.0.clone());
+                sep.push_unseparated("::hll");
+            } else {
+                unreachable!(
+                    "postgres sink received unsupported custom value kind {:?}",
+                    v.dyn_type().kind()
+                )
+            }
         }
     }
 }

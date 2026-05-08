@@ -41,6 +41,23 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
         return false;
     }
 
+    // Custom routing: if either side is a connector-specific opaque
+    // type, delegate through the trait. Identity is the cheap pre-
+    // check (handled by the `source_t == sink_t` arm above); reaching
+    // here means at least one side is Custom and they are not equal.
+    if let (Custom(a), Custom(b)) = (&source_t, &sink_t) {
+        // Two distinct custom types — only `eq_dyn` knows whether
+        // they actually represent the same descriptor (parametric
+        // types may differ structurally).
+        return a.eq_dyn(&**b);
+    }
+    if let Custom(a) = &source_t {
+        return a.can_convert_to(&sink_t, false);
+    }
+    if let Custom(b) = &sink_t {
+        return b.can_construct_from(&source_t, false);
+    }
+
     match (source_t, sink_t) {
         // Integer widening
         (Int16, Int32) | (Int16, Int64) | (Int32, Int64) => true,
@@ -155,6 +172,20 @@ pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool
     }
     if matches!(sink_t, Union(_)) {
         return false;
+    }
+    // Custom routing under truncate. Identity is delegated to
+    // `is_compatible` below; for distinct `(Custom, Custom)` we
+    // again compare via `eq_dyn`, with no special truncate semantics
+    // (custom types decide their own narrowing rules through
+    // `can_convert_to` / `can_construct_from`).
+    if let (Custom(a), Custom(b)) = (&source_t, &sink_t) {
+        return a.eq_dyn(&**b);
+    }
+    if let Custom(a) = &source_t {
+        return a.can_convert_to(&sink_t, true);
+    }
+    if let Custom(b) = &sink_t {
+        return b.can_construct_from(&source_t, true);
     }
     if is_compatible(source_t.clone(), sink_t.clone()) {
         // truncate=true on a pair that's already lossless: harmless no-op,
@@ -271,6 +302,11 @@ pub fn is_narrowing(source_t: DataType, sink_t: DataType) -> bool {
         return vs.iter().all(|v| is_narrowing(v.clone(), sink_t.clone()));
     }
     if matches!(sink_t, Union(_)) {
+        return false;
+    }
+    // Custom-narrowing is opaque to the matrix — the type's own
+    // `can_convert_to(_with_truncate=true)` is the source of truth.
+    if matches!(&source_t, Custom(_)) || matches!(&sink_t, Custom(_)) {
         return false;
     }
     if let (Text { size: Some(a) }, Text { size: Some(b) }) = (&source_t, &sink_t) {
@@ -1016,5 +1052,92 @@ mod tests {
         // Duplicates are collapsed.
         let c = DataType::union(vec![DataType::Int32, DataType::Int32]);
         assert_eq!(c, DataType::Int32);
+    }
+
+    // ---- Custom routing -------------------------------------------
+
+    use crate::types::convert::ConvertError;
+    use crate::types::convert::context::ConversionContext;
+    use crate::types::dynamic::DynType;
+    use crate::types::value::Value;
+
+    /// Test type that converts to/from `Bytes { size: None }` only.
+    #[derive(Debug)]
+    struct BytesyType;
+
+    impl DynType for BytesyType {
+        fn kind(&self) -> &'static str {
+            "test.bytesy"
+        }
+        fn can_convert_to(&self, target: &DataType, _truncate: bool) -> bool {
+            matches!(target, DataType::Bytes { size: None })
+        }
+        fn can_construct_from(&self, src: &DataType, _truncate: bool) -> bool {
+            matches!(src, DataType::Bytes { size: None })
+        }
+        fn convert(
+            &self,
+            v: Value,
+            _t: &DataType,
+            _ctx: &ConversionContext,
+        ) -> Result<Value, ConvertError> {
+            Ok(v)
+        }
+        fn construct(
+            &self,
+            v: Value,
+            _t: &DataType,
+            _ctx: &ConversionContext,
+        ) -> Result<Value, ConvertError> {
+            Ok(v)
+        }
+        fn clone_box(&self) -> Box<dyn DynType> {
+            Box::new(BytesyType)
+        }
+    }
+
+    #[test]
+    fn custom_to_bytes_via_can_convert_to() {
+        let src = DataType::Custom(Box::new(BytesyType));
+        assert!(is_compatible(src.clone(), DataType::Bytes { size: None }));
+        assert!(is_compatible_with_truncate(
+            src,
+            DataType::Bytes { size: None }
+        ));
+    }
+
+    #[test]
+    fn custom_to_canonical_rejects_unsupported_target() {
+        let src = DataType::Custom(Box::new(BytesyType));
+        assert!(!is_compatible(src.clone(), DataType::Int32));
+        assert!(!is_compatible_with_truncate(src, DataType::Int32));
+    }
+
+    #[test]
+    fn canonical_into_custom_via_can_construct_from() {
+        let dst = DataType::Custom(Box::new(BytesyType));
+        assert!(is_compatible(DataType::Bytes { size: None }, dst.clone()));
+        assert!(is_compatible_with_truncate(
+            DataType::Bytes { size: None },
+            dst
+        ));
+    }
+
+    #[test]
+    fn custom_to_custom_identity() {
+        let a = DataType::Custom(Box::new(BytesyType));
+        let b = DataType::Custom(Box::new(BytesyType));
+        assert!(is_compatible(a.clone(), b.clone()));
+        assert!(is_compatible_with_truncate(a, b));
+    }
+
+    #[test]
+    fn is_narrowing_returns_false_for_custom() {
+        let custom = DataType::Custom(Box::new(BytesyType));
+        assert!(!is_narrowing(
+            custom.clone(),
+            DataType::Bytes { size: None }
+        ));
+        assert!(!is_narrowing(DataType::Bytes { size: None }, custom));
     }
 }

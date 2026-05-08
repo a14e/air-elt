@@ -153,7 +153,6 @@ async fn cdc_emits_upsert_for_inserts_replace_and_delete() {
     assert_eq!(batch.rows[1].values.len(), spec.columns.len());
     assert_eq!(batch.rows[1].values[1], Value::Null);
     assert!(batch.next_cursor.is_some());
-    mongo.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -186,7 +185,6 @@ async fn cdc_lookup_on_update_attaches_post_image_via_find() {
     assert_eq!(batch.rows[0].values[0], Value::Int32(7));
     // The lookup find must have attached the post-image.
     assert_eq!(batch.rows[0].values[1], Value::Text("after".into()));
-    mongo.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -225,7 +223,6 @@ async fn cdc_lookup_on_update_skips_when_doc_deleted_between_event_and_find() {
     assert_eq!(batch.rows.len(), 1);
     assert_eq!(batch.rows[0].op, RowOp::Delete);
     assert_eq!(batch.rows[0].values[0], Value::Int32(9));
-    mongo.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -248,6 +245,11 @@ async fn cdc_post_image_collapses_multiple_updates_per_id() {
     let ctx = source.build_context(&spec).await.expect("ctx");
 
     let cursor = capture_pbrt(&coll).await;
+    // Four updates of the same `_id` so the read_batch fast-path
+    // (`events.len() >= spec.limit`) trips and the loop exits without
+    // hitting the 30s idle-drain deadline. The collapse semantic still
+    // holds: dedup-by-`_id` last-wins → one row carrying the final
+    // post-image ("d").
     coll.update_one(doc! { "_id": 1 }, doc! { "$set": { "name": "a" } })
         .await
         .unwrap();
@@ -257,6 +259,9 @@ async fn cdc_post_image_collapses_multiple_updates_per_id() {
     coll.update_one(doc! { "_id": 1 }, doc! { "$set": { "name": "c" } })
         .await
         .unwrap();
+    coll.update_one(doc! { "_id": 1 }, doc! { "$set": { "name": "d" } })
+        .await
+        .unwrap();
 
     let batch = source
         .read_batch(&spec, ctx, Some(&cursor))
@@ -264,8 +269,7 @@ async fn cdc_post_image_collapses_multiple_updates_per_id() {
         .expect("read");
     assert_eq!(batch.rows.len(), 1);
     assert_eq!(batch.rows[0].op, RowOp::Upsert);
-    assert_eq!(batch.rows[0].values[1], Value::Text("c".into()));
-    mongo.client.clone().shutdown().await;
+    assert_eq!(batch.rows[0].values[1], Value::Text("d".into()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -291,19 +295,32 @@ async fn cdc_post_image_insert_then_delete_emits_only_delete() {
     let ctx = source.build_context(&spec).await.expect("ctx");
 
     let cursor = capture_pbrt(&coll).await;
+    // Two ephemeral _ids, each an insert+delete pair → 4 events so the
+    // read_batch fast-path (`events.len() >= spec.limit`) trips. Per-id
+    // last-wins collapses each pair to a single Delete; the test
+    // semantic ("insert+delete in one batch must surface only as
+    // Delete") is preserved across both ids.
     coll.insert_one(doc! { "_id": 5, "name": "ephemeral" })
         .await
         .unwrap();
     coll.delete_one(doc! { "_id": 5 }).await.unwrap();
+    coll.insert_one(doc! { "_id": 6, "name": "ephemeral2" })
+        .await
+        .unwrap();
+    coll.delete_one(doc! { "_id": 6 }).await.unwrap();
 
     let batch = source
         .read_batch(&spec, ctx, Some(&cursor))
         .await
         .expect("read");
-    assert_eq!(batch.rows.len(), 1);
-    assert_eq!(batch.rows[0].op, RowOp::Delete);
-    assert_eq!(batch.rows[0].values[0], Value::Int32(5));
-    mongo.client.clone().shutdown().await;
+    assert_eq!(batch.rows.len(), 2);
+    assert!(batch.rows.iter().all(|r| r.op == RowOp::Delete));
+    let mut ids: Vec<&Value> = batch.rows.iter().map(|r| &r.values[0]).collect();
+    ids.sort_by_key(|v| match v {
+        Value::Int32(n) => *n,
+        _ => i32::MAX,
+    });
+    assert_eq!(ids, vec![&Value::Int32(5), &Value::Int32(6)]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -326,7 +343,17 @@ async fn cdc_lookup_on_update_collapses_multiple_updates_to_single_row() {
     let ctx = source.build_context(&spec).await.expect("ctx");
 
     let cursor = capture_pbrt(&coll).await;
-    coll.update_one(doc! { "_id": 3 }, doc! { "$set": { "name": "mid" } })
+    // Four updates of the same `_id` so the read_batch fast-path trips
+    // on `events.len() >= spec.limit`. Dedup-before-lookup still
+    // collapses to a single `find` over `_id=3`, and the row carries
+    // the chronologically-last post-image ("final").
+    coll.update_one(doc! { "_id": 3 }, doc! { "$set": { "name": "v1" } })
+        .await
+        .unwrap();
+    coll.update_one(doc! { "_id": 3 }, doc! { "$set": { "name": "v2" } })
+        .await
+        .unwrap();
+    coll.update_one(doc! { "_id": 3 }, doc! { "$set": { "name": "v3" } })
         .await
         .unwrap();
     coll.update_one(doc! { "_id": 3 }, doc! { "$set": { "name": "final" } })
@@ -340,7 +367,6 @@ async fn cdc_lookup_on_update_collapses_multiple_updates_to_single_row() {
     assert_eq!(batch.rows.len(), 1);
     assert_eq!(batch.rows[0].op, RowOp::Upsert);
     assert_eq!(batch.rows[0].values[1], Value::Text("final".into()));
-    mongo.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -369,7 +395,6 @@ async fn cdc_drop_collection_surfaces_runtime_error() {
         msg.contains("invalidated") || msg.contains("Drop") || msg.contains("Invalidate"),
         "expected drop/invalidate marker in error, got: {msg}"
     );
-    mongo.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -442,7 +467,6 @@ async fn cdc_to_pg_sink_round_trip_with_inserts_and_deletes() {
         count.0, 0,
         "upsert→delete in one batch must land as absent (sink applies upsert first, delete second)"
     );
-    mongo.client.clone().shutdown().await;
     pg.pool.close().await;
 }
 
@@ -476,7 +500,6 @@ async fn cdc_describe_schema_unifies_heterogeneous_bson() {
     use air_elt_core::types::DataType;
     assert_eq!(n.data_type, DataType::Int64);
     assert_eq!(x.data_type, DataType::Float64);
-    mongo.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -539,7 +562,6 @@ async fn resume_token_round_trips_through_pg_storage_with_reopen() {
             .is_none(),
         "unknown flow → None"
     );
-    mongo.client.clone().shutdown().await;
     pg.pool.close().await;
 }
 
@@ -651,7 +673,6 @@ async fn cdc_to_mysql_sink_round_trip_with_inserts_and_deletes() {
         .await
         .unwrap();
     assert_eq!(count.0, 0);
-    mongo.client.clone().shutdown().await;
     mysql.pool.close().await;
 }
 
@@ -727,8 +748,6 @@ async fn cdc_to_mongo_sink_round_trip_with_inserts_and_deletes() {
         .unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].get_i32("_id").unwrap(), 32);
-    mongo.client.clone().shutdown().await;
-    sink_handle.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -763,8 +782,9 @@ async fn validate_delete_access_pg_fails_for_role_without_delete_privilege() {
         .await
         .expect("grant select/insert");
 
+    let separator = if pg.url.contains('?') { '&' } else { '?' };
     let role_url = format!(
-        "{}?options=-c%20role%3D{role}%20-c%20search_path%3D{}",
+        "{}{separator}options=-c%20role%3D{role}%20-c%20search_path%3D{}",
         pg.url, pg.schema
     );
     let sink = PgSink::connect(PgSinkConfig {
@@ -902,7 +922,6 @@ async fn cdc_validate_access_succeeds_on_not_yet_existing_collection() {
         .validate_access(&spec)
         .await
         .expect("validate_access on missing collection must not error");
-    mongo.client.clone().shutdown().await;
 }
 
 fn extract_db(url: &str) -> Option<&str> {

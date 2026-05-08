@@ -22,7 +22,7 @@ pub fn build_registry() -> Registry {
     // CockroachDB is a Postgres-wire-compatible engine; the same connector
     // crates serve it under a separate `type = "cockroachdb"` registry key
     // with `Dialect::Cockroach` selecting the few divergent code paths
-    // (UPSERT for 1-key conflicts, 40001 retry, XML-type rejection).
+    // (40001 retry, XML-type rejection).
     registry.register_source("cockroachdb", Arc::new(PgSourceFactory::cockroach()));
     registry.register_sink("cockroachdb", Arc::new(PgSinkFactory::cockroach()));
     registry.register_storage("cockroachdb", Arc::new(PgStorageFactory::cockroach()));

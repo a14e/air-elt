@@ -14,6 +14,7 @@ use air_elt_core::traits::Source;
 use air_elt_core::types::{DataType, Value};
 use air_elt_source_mongodb::{MongoSource, MongoSourceConfig};
 use bson::doc;
+use bson::oid::ObjectId;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn heterogeneous_field_inferred_as_union_and_read_back() {
@@ -78,5 +79,54 @@ async fn heterogeneous_field_inferred_as_union_and_read_back() {
     assert_eq!(batch.rows[0].values[1], Value::Int32(42));
     assert_eq!(batch.rows[1].values[1], Value::Text("hello".into()));
     assert_eq!(batch.rows[2].values[1], Value::Int32(99));
-    handle.client.clone().shutdown().await;
+}
+
+/// Heterogeneous field with an ObjectId observation alongside a string:
+/// inferred type must become `Union(Custom(MongoObjectIdType), Text)`,
+/// confirming Custom-types participate in Union schemas correctly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heterogeneous_field_with_object_id_emits_union_with_custom() {
+    let handle = mongo_pool().await;
+    let coll = handle
+        .client
+        .database(&handle.database)
+        .collection::<bson::Document>("oid_union");
+    let oid = ObjectId::new();
+    coll.insert_many(vec![
+        doc! { "_id": 1_i64, "value": oid },
+        doc! { "_id": 2_i64, "value": "stringy" },
+    ])
+    .await
+    .unwrap();
+
+    let source = MongoSource::connect(
+        "test_oid_union".into(),
+        MongoSourceConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect");
+
+    let schema = source.describe_schema("oid_union").await.expect("describe");
+    let f = schema.find("value").expect("value field");
+    match &f.data_type {
+        DataType::Union(vs) => {
+            assert_eq!(vs.len(), 2);
+            assert!(
+                vs.iter().any(|v| matches!(
+                    v,
+                    DataType::Custom(t) if t.kind() == air_elt_commons_mongodb::types::MongoObjectIdType::KIND
+                )),
+                "Union must include ObjectId Custom: {vs:?}"
+            );
+            assert!(
+                vs.contains(&DataType::Text { size: None }),
+                "Union must include unbounded Text: {vs:?}"
+            );
+        }
+        other => panic!("expected Union, got {other:?}"),
+    }
 }

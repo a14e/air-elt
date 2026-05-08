@@ -12,5 +12,7 @@ pub mod pool;
 pub mod retry;
 pub mod schema;
 pub mod sink_bind;
+pub mod types;
 
 pub use dialect::Dialect;
+pub use types::{PgHllType, PgHllValue};

@@ -140,6 +140,7 @@ impl Source for PgSource {
         let initial_read_query = Arc::new(sql::build_read_batch(
             &spec.table,
             &spec.columns,
+            &column_types,
             &spec.cursor_fields,
             spec.cursor_order,
             None,
@@ -161,6 +162,7 @@ impl Source for PgSource {
         let non_null_read_query = Arc::new(sql::build_read_batch(
             &spec.table,
             &spec.columns,
+            &column_types,
             &spec.cursor_fields,
             spec.cursor_order,
             Some(&sentinel_state),
@@ -192,6 +194,7 @@ impl Source for PgSource {
             Some(_) => Arc::new(sql::build_read_batch(
                 &spec.table,
                 &spec.columns,
+                &pg_ctx.column_types,
                 &spec.cursor_fields,
                 spec.cursor_order,
                 cursor,

@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+use air_elt_commons_mongodb::types::{MongoJsValue, MongoObjectIdValue};
 use air_elt_commons_testing::mongo::mongo_pool;
 use air_elt_core::config::conflict::{ConflictConfig, ConflictStrategy};
 use air_elt_core::model::{Batch, Row, WriteSpec};
@@ -7,6 +8,7 @@ use air_elt_core::traits::Sink;
 use air_elt_core::types::Value;
 use air_elt_sink_mongodb::{MongoSink, MongoSinkConfig};
 use bson::doc;
+use bson::oid::ObjectId;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_and_upsert_with_dot_notation() {
@@ -73,5 +75,102 @@ async fn insert_and_upsert_with_dot_notation() {
         .expect("doc");
     let inner = doc_alice.get_document("addr").unwrap();
     assert_eq!(inner.get_str("city").unwrap(), "Hamburg");
-    handle.client.clone().shutdown().await;
+}
+
+/// `_id: Custom(MongoObjectIdValue)` round-trips through the sink as
+/// `Bson::ObjectId` — not as `Bson::Binary(Generic, …)` (the legacy
+/// flattened shape).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_object_id_lands_as_bson_object_id() {
+    let handle = mongo_pool().await;
+    let sink = MongoSink::connect(MongoSinkConfig {
+        url: handle.url.clone(),
+        database: Some(handle.database.clone()),
+        ..Default::default()
+    })
+    .await
+    .expect("connect");
+
+    let spec = WriteSpec {
+        columns: vec!["_id".into(), "name".into()],
+        table: "oid_sink".into(),
+        conflict: Some(ConflictConfig {
+            key: vec!["_id".into()],
+            strategy: ConflictStrategy::Overwrite,
+        }),
+    };
+    sink.validate_access(&spec).await.expect("validate_access");
+    let ctx = sink.build_context(&spec).await.expect("build_context");
+
+    let oid = ObjectId::new();
+    let batch = Batch {
+        rows: vec![Row::upsert(vec![
+            Value::Custom(Box::new(MongoObjectIdValue(oid.bytes()))),
+            Value::Text("alice".into()),
+        ])],
+        next_cursor: None,
+    };
+    sink.write_batch(&spec, ctx, &batch).await.unwrap();
+
+    let coll = handle
+        .client
+        .database(&handle.database)
+        .collection::<bson::Document>("oid_sink");
+    let doc_a = coll
+        .find_one(doc! { "_id": oid })
+        .await
+        .expect("find")
+        .expect("doc");
+    match doc_a.get("_id").expect("present") {
+        bson::Bson::ObjectId(read_oid) => assert_eq!(read_oid, &oid),
+        other => panic!("expected Bson::ObjectId, got {other:?}"),
+    }
+}
+
+/// `Bson::JavaScriptCode` round-trips through the mongo sink end-to-end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_javascript_code_round_trip() {
+    let handle = mongo_pool().await;
+    let sink = MongoSink::connect(MongoSinkConfig {
+        url: handle.url.clone(),
+        database: Some(handle.database.clone()),
+        ..Default::default()
+    })
+    .await
+    .expect("connect");
+
+    let spec = WriteSpec {
+        columns: vec!["_id".into(), "code".into()],
+        table: "js_sink".into(),
+        conflict: Some(ConflictConfig {
+            key: vec!["_id".into()],
+            strategy: ConflictStrategy::Overwrite,
+        }),
+    };
+    sink.validate_access(&spec).await.expect("validate_access");
+    let ctx = sink.build_context(&spec).await.expect("build_context");
+
+    let code = "function () { return 42; }".to_string();
+    let batch = Batch {
+        rows: vec![Row::upsert(vec![
+            Value::Int64(1),
+            Value::Custom(Box::new(MongoJsValue(code.clone()))),
+        ])],
+        next_cursor: None,
+    };
+    sink.write_batch(&spec, ctx, &batch).await.unwrap();
+
+    let coll = handle
+        .client
+        .database(&handle.database)
+        .collection::<bson::Document>("js_sink");
+    let doc_a = coll
+        .find_one(doc! { "_id": 1_i64 })
+        .await
+        .expect("find")
+        .expect("doc");
+    match doc_a.get("code").expect("present") {
+        bson::Bson::JavaScriptCode(s) => assert_eq!(s, &code),
+        other => panic!("expected Bson::JavaScriptCode, got {other:?}"),
+    }
 }

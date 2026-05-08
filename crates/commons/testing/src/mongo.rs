@@ -3,18 +3,34 @@
 //!
 //! Two modes, chosen at runtime:
 //!
-//! 1. If `AIR_ELT_TEST_MONGO_URL` is set, connect there and create a
-//!    unique sandbox database per test.
+//! 1. If `AIR_ELT_TEST_MONGO_URL` / `AIR_ELT_TEST_MONGO_RS_URL` is set,
+//!    connect there and create a unique sandbox database per test.
+//!    Note: `AIR_ELT_TEST_MONGO_URL` is now expected to point at an
+//!    RS-capable Mongo (single-node `replSet rs0` is fine), since
+//!    `mongo_pool` shares one container with `mongo_rs_pool` and tests
+//!    may exercise change-stream-shaped operations on either handle.
+//!    Pointing it at a plain standalone is the operator's choice and
+//!    is unsupported.
 //! 2. Otherwise launch a MongoDB container via testcontainers in
 //!    `ReuseDirective::Always` mode — labelled with the current ryuk
-//!    session and `air-elt.kind=mongo` (or `mongo-legacy`), so the
+//!    session and `air-elt.kind=mongo-rs` (or `mongo-legacy`), so the
 //!    container is shared across every test process of one cargo
 //!    invocation and reaped automatically when the last process exits.
 //!
-//! Two `OnceCell`s cache the resolved `(base_url, mongodb::Client)` per
-//! variant — modern (≥ 8.0) and legacy (7.0, used by the bulk-write
-//! versioning tests). Per-test sandbox databases are created and dropped
-//! on the cached client.
+//! Two `OnceCell`s cache the resolved base URL per variant:
+//!
+//! * `MONGO_RS_INFRA` — `mongo:8 --replSet rs0` single-node, backing
+//!   both `mongo_pool()` and `mongo_rs_pool()`. The base URL carries
+//!   `?replicaSet=rs0&directConnection=true` so plain CRUD callers
+//!   inherit the same client semantics as CDC ones.
+//! * `MONGO_LEGACY_INFRA` — `mongo:7` standalone, used only by
+//!   `mongo_pool_legacy()` for the bulk-write fallback / standalone
+//!   smoke tests.
+//!
+//! Per-test sandbox databases are created and dropped on a fresh
+//! `mongodb::Client` (the driver spawns background tasks tied to the
+//! tokio runtime that built it; `#[tokio::test]` constructs a fresh
+//! runtime per test, so caching a `Client` would break across tests).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -53,7 +69,6 @@ struct MongoInfra {
     base_url: String,
 }
 
-static MONGO_INFRA: OnceCell<MongoInfra> = OnceCell::const_new();
 static MONGO_LEGACY_INFRA: OnceCell<MongoInfra> = OnceCell::const_new();
 static MONGO_RS_INFRA: OnceCell<MongoInfra> = OnceCell::const_new();
 
@@ -71,73 +86,99 @@ impl MongoTestHandle {
     }
 }
 
-async fn mongo_infra(env_var: &str, container_tag: &str) -> &'static MongoInfra {
-    let cell = if env_var == LEGACY_URL_VAR {
-        &MONGO_LEGACY_INFRA
-    } else {
-        &MONGO_INFRA
-    };
-    cell.get_or_init(|| async move {
-        if let Ok(external) = std::env::var(env_var) {
-            let (base_url, _existing_db) = strip_db(&external);
-            return MongoInfra { base_url };
-        }
-        let backend = detect_with_timeout(env_var)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let socket = match backend {
-            TestBackend::ExternalUrl => unreachable!("handled above"),
-            TestBackend::Container { socket } => socket,
-        };
-        prepare_container_env(&socket);
-        ryuk::ensure_session(&socket).await;
-        let (sk, sv) = ryuk::session_label();
-        let start_lock = crate::filelock::acquire_lock(if env_var == LEGACY_URL_VAR {
-            "mongo-legacy"
-        } else {
-            "mongo"
-        });
-        // Differentiate modern-vs-legacy mongo by tag, since reuse-mode
-        // matches by labels: each variant gets its own kind value.
-        let kind_value = if env_var == LEGACY_URL_VAR {
-            "mongo-legacy"
-        } else {
-            "mongo"
-        };
-        info!(
-            tag = container_tag,
-            "ensuring shared mongo container (reuse=Always, ryuk-managed)"
-        );
-        // tmpfs on /data/db: container is reaped at session end, so
-        // on-disk state has no value.
-        let container = MongoImage::default()
-            .with_tag(container_tag)
-            .with_container_name(format!("air-elt-{kind_value}-{sv}"))
-            .with_label(sk, sv)
-            .with_label(KIND_LABEL_KEY, kind_value)
-            .with_mount(Mount::tmpfs_mount("/data/db"))
-            .with_reuse(ReuseDirective::Always)
-            .start()
-            .await
-            .expect("start mongo container failed");
-        drop(start_lock);
-        let host = container.get_host().await.expect("container host");
-        let port = container
-            .get_host_port_ipv4(27017)
-            .await
-            .expect("container port");
-        let base_url = format!("mongodb://{host}:{port}");
-        drop(container);
-        MongoInfra { base_url }
-    })
-    .await
+/// Provisions the legacy (pre-8.0) standalone MongoDB container. Used
+/// only by `mongo_pool_legacy()` for the bulk-write fallback /
+/// standalone-semantics smoke path. The modern (≥ 8.0) handle now
+/// shares the RS container with `mongo_rs_pool()` — see
+/// `mongo_rs_infra()`.
+async fn mongo_legacy_infra() -> &'static MongoInfra {
+    MONGO_LEGACY_INFRA
+        .get_or_init(|| async move {
+            if let Ok(external) = std::env::var(LEGACY_URL_VAR) {
+                let (base_url, _existing_db) = strip_db(&external);
+                return MongoInfra { base_url };
+            }
+            let backend = detect_with_timeout(LEGACY_URL_VAR)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let socket = match backend {
+                TestBackend::ExternalUrl => unreachable!("handled above"),
+                TestBackend::Container { socket } => socket,
+            };
+            prepare_container_env(&socket);
+            ryuk::ensure_session(&socket).await;
+            let (sk, sv) = ryuk::session_label();
+            let start_lock = crate::filelock::acquire_lock("mongo-legacy");
+            let kind_value = "mongo-legacy";
+            info!(
+                tag = "7.0",
+                kind = kind_value,
+                "ensuring shared mongo-legacy standalone container (reuse=Always, ryuk-managed)"
+            );
+            // tmpfs on /data/db: container is reaped at session end, so
+            // on-disk state has no value.
+            let container = MongoImage::default()
+                .with_tag("7.0")
+                .with_container_name(format!("air-elt-{kind_value}-{sv}"))
+                .with_label(sk, sv)
+                .with_label(KIND_LABEL_KEY, kind_value)
+                .with_mount(Mount::tmpfs_mount("/data/db"))
+                .with_reuse(ReuseDirective::Always)
+                .start()
+                .await
+                .expect("start mongo-legacy container failed");
+            drop(start_lock);
+            let host = container.get_host().await.expect("container host");
+            let port = container
+                .get_host_port_ipv4(27017)
+                .await
+                .expect("container port");
+            let base_url = format!("mongodb://{host}:{port}");
+            drop(container);
+            MongoInfra { base_url }
+        })
+        .await
 }
 
+/// Sandbox handle pointing at the shared modern (≥ 8.0) MongoDB. Now
+/// backed by the same `mongo:8 --replSet rs0` single-node container as
+/// `mongo_rs_pool()` — there is no longer a separate standalone
+/// `mongo:8` container, since maintaining two near-identical Mongo 8
+/// containers per test session bought no extra coverage and cost
+/// startup time.
+///
+/// Honours `AIR_ELT_TEST_MONGO_URL` for external-Mongo mode. The
+/// supplied URL is expected to point at an RS-capable Mongo (since
+/// callers may now do CDC-shaped operations on this handle); a plain
+/// standalone is the operator's deployment choice and unsupported.
 pub fn mongo_pool() -> Pin<Box<dyn Future<Output = MongoTestHandle> + Send + 'static>> {
     Box::pin(async move {
-        let infra = mongo_infra(URL_VAR, "8").await;
+        // Honour the modern external override first; otherwise fall
+        // through to the shared RS container (which also honours
+        // `AIR_ELT_TEST_MONGO_RS_URL`).
+        if std::env::var(URL_VAR).is_ok() {
+            let infra = mongo_external_infra().await;
+            return handle_for(infra).await;
+        }
+        let infra = mongo_rs_infra().await;
         handle_for(infra).await
     })
+}
+
+/// Cached external-mongo infra honouring `AIR_ELT_TEST_MONGO_URL`. Kept
+/// distinct from `MONGO_RS_INFRA` so the two env vars don't fight over
+/// a single cell when both are set.
+static MONGO_EXTERNAL_INFRA: OnceCell<MongoInfra> = OnceCell::const_new();
+
+async fn mongo_external_infra() -> &'static MongoInfra {
+    MONGO_EXTERNAL_INFRA
+        .get_or_init(|| async move {
+            let external = std::env::var(URL_VAR)
+                .expect("mongo_external_infra called without AIR_ELT_TEST_MONGO_URL set");
+            let (base_url, _existing_db) = strip_db(&external);
+            MongoInfra { base_url }
+        })
+        .await
 }
 
 /// Sandbox handle pointing at a legacy (pre-8.0) MongoDB. Used only by
@@ -146,7 +187,7 @@ pub fn mongo_pool() -> Pin<Box<dyn Future<Output = MongoTestHandle> + Send + 'st
 /// a `mongo:7.0` container.
 pub fn mongo_pool_legacy() -> Pin<Box<dyn Future<Output = MongoTestHandle> + Send + 'static>> {
     Box::pin(async move {
-        let infra = mongo_infra(LEGACY_URL_VAR, "7.0").await;
+        let infra = mongo_legacy_infra().await;
         handle_for(infra).await
     })
 }
@@ -226,7 +267,11 @@ async fn mongo_rs_infra() -> &'static MongoInfra {
             ryuk::ensure_session(&socket).await;
             let (sk, sv) = ryuk::session_label();
             let start_lock = crate::filelock::acquire_lock("mongo-rs");
-            info!("ensuring shared mongo-rs container (reuse=Always, ryuk-managed)");
+            info!(
+                kind = "mongo-rs",
+                "ensuring shared mongo-rs container (reuse=Always, ryuk-managed) — \
+                 backs both mongo_pool() and mongo_rs_pool()"
+            );
             // GenericImage rather than testcontainers_modules::Mongo —
             // we need to override the entrypoint command with
             // `--replSet rs0 --bind_ip_all`. tmpfs on /data/db: container

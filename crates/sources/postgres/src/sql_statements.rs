@@ -6,10 +6,11 @@
 //! `QueryBuilder`).
 
 use air_elt_commons_pg::identifier::{quote_columns, quote_ident, quote_qualified};
+use air_elt_commons_pg::types::PgHllType;
 use air_elt_core::config::model::CursorOrder;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::model::CursorState;
-use air_elt_core::types::Value;
+use air_elt_core::types::{DataType, Value};
 
 pub const PING: &str = "SELECT 1";
 
@@ -21,6 +22,38 @@ pub fn probe_select(table: &str, columns: &[String]) -> RuntimeResult<String> {
     let quoted_table = quote_qualified(table)?;
     let cols = quote_columns(columns)?;
     Ok(format!("SELECT {cols} FROM {quoted_table} WHERE false"))
+}
+
+/// Build the SELECT projection list, applying per-column wire-format
+/// adapters where sqlx cannot decode the native type directly.
+///
+/// `hll` is the only such case today: sqlx has no `hll` decoder, so
+/// we project each HLL column through `hll_send(col)::bytea AS col`.
+/// `hll_send` is the extension's binary output function — it returns
+/// the same wire bytes that `hll_recv` (used by the sink's `::hll`
+/// cast) accepts on input, so the round-trip is byte-exact.
+fn projection_for(columns: &[String], column_types: &[DataType]) -> RuntimeResult<String> {
+    if column_types.len() != columns.len() {
+        return Err(RuntimeError::Other(format!(
+            "column_types length {} does not match columns length {}",
+            column_types.len(),
+            columns.len()
+        )));
+    }
+    let mut out = String::new();
+    for (i, (col, dt)) in columns.iter().zip(column_types.iter()).enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let q = quote_ident(col);
+        match dt {
+            DataType::Custom(t) if t.kind() == PgHllType::KIND => {
+                out.push_str(&format!("hll_send({q})::bytea AS {q}"));
+            }
+            _ => out.push_str(&q),
+        }
+    }
+    Ok(out)
 }
 
 pub struct ReadQuery {
@@ -52,13 +85,14 @@ pub struct ReadQuery {
 pub fn build_read_batch(
     table: &str,
     columns: &[String],
+    column_types: &[DataType],
     cursor_fields: &[String],
     order: CursorOrder,
     cursor_state: Option<&CursorState>,
     cursor_nullable: &[bool],
 ) -> RuntimeResult<ReadQuery> {
     let quoted_table = quote_qualified(table)?;
-    let cols = quote_columns(columns)?;
+    let cols = projection_for(columns, column_types)?;
 
     // NULL < everything → ASC NULLS FIRST, DESC NULLS LAST.
     let (order_sql, nulls_sql) = match order {
@@ -256,6 +290,14 @@ mod tests {
     use super::*;
     use air_elt_core::model::CursorFieldValue;
 
+    fn types_for(columns: &[&str]) -> Vec<DataType> {
+        // Test helper: every column gets `Int64` so `projection_for`
+        // emits a plain quoted-identifier projection. Tests in this
+        // module focus on cursor SQL shape, not type-aware projection
+        // (which has dedicated cases below).
+        columns.iter().map(|_| DataType::Int64).collect()
+    }
+
     fn state_with(values: Vec<(&str, Value)>) -> CursorState {
         CursorState::new(
             values
@@ -266,6 +308,30 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[test]
+    fn projection_emits_hll_send_cast_for_hll_columns() {
+        use air_elt_commons_pg::types::PgHllType;
+        let cols: Vec<String> = vec!["id".into(), "sketch".into(), "name".into()];
+        let types = vec![
+            DataType::Int64,
+            DataType::Custom(Box::new(PgHllType)),
+            DataType::Text { size: None },
+        ];
+        let proj = projection_for(&cols, &types).unwrap();
+        assert_eq!(
+            proj,
+            r#""id", hll_send("sketch")::bytea AS "sketch", "name""#
+        );
+    }
+
+    #[test]
+    fn projection_length_mismatch_is_an_error() {
+        let cols: Vec<String> = vec!["a".into(), "b".into()];
+        let types = vec![DataType::Int64];
+        let err = projection_for(&cols, &types);
+        assert!(err.is_err());
     }
 
     #[test]
@@ -282,6 +348,7 @@ mod tests {
         let q = build_read_batch(
             "public.users",
             &["id".into(), "created_at".into()],
+            &types_for(&["id", "created_at"]),
             &["created_at".into(), "id".into()],
             CursorOrder::Asc,
             None,
@@ -303,6 +370,7 @@ mod tests {
         let q = build_read_batch(
             "public.users",
             &["id".into()],
+            &types_for(&["id"]),
             &["created_at".into(), "id".into()],
             CursorOrder::Asc,
             Some(&state),
@@ -320,6 +388,7 @@ mod tests {
         let q = build_read_batch(
             "public.users",
             &["id".into()],
+            &types_for(&["id"]),
             &["id".into()],
             CursorOrder::Desc,
             Some(&state),
@@ -336,6 +405,7 @@ mod tests {
         let q = build_read_batch(
             "public.users",
             &["id".into()],
+            &types_for(&["id"]),
             &["id".into()],
             CursorOrder::Asc,
             Some(&state),
@@ -352,6 +422,7 @@ mod tests {
         let q = build_read_batch(
             "public.users",
             &["id".into()],
+            &types_for(&["id"]),
             &["id".into()],
             CursorOrder::Desc,
             Some(&state),
@@ -368,6 +439,7 @@ mod tests {
         let q = build_read_batch(
             "public.users",
             &["id".into()],
+            &types_for(&["id"]),
             &["created_at".into(), "id".into()],
             CursorOrder::Asc,
             Some(&state),
@@ -387,6 +459,7 @@ mod tests {
         let q = build_read_batch(
             "public.t",
             &["id".into()],
+            &types_for(&["id"]),
             &["rank".into()],
             CursorOrder::Desc,
             Some(&state),
@@ -404,6 +477,7 @@ mod tests {
         let q1 = build_read_batch(
             "public.t",
             &["id".into()],
+            &types_for(&["id"]),
             &["id".into()],
             CursorOrder::Asc,
             Some(&s1),
@@ -413,6 +487,7 @@ mod tests {
         let q2 = build_read_batch(
             "public.t",
             &["id".into()],
+            &types_for(&["id"]),
             &["id".into()],
             CursorOrder::Asc,
             Some(&s2),
@@ -430,6 +505,7 @@ mod tests {
         let q_normal = build_read_batch(
             "public.t",
             &["id".into()],
+            &types_for(&["id"]),
             &["id".into()],
             CursorOrder::Asc,
             Some(&non_null),
@@ -439,6 +515,7 @@ mod tests {
         let q_null = build_read_batch(
             "public.t",
             &["id".into()],
+            &types_for(&["id"]),
             &["id".into()],
             CursorOrder::Asc,
             Some(&with_null),
