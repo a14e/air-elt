@@ -396,6 +396,20 @@ async fn validate_one(flow: AssembledFlow) -> Result<FlowState, ValidationError>
         };
 
         checks::check_cursor(&flow.name, &src_schema, &flow.read_spec.cursor_fields)?;
+        // Cursor type guard. After `check_cursor` has confirmed every
+        // cursor field is present in the source schema, reject any
+        // type that has no total order (`Json` / `Xml` / `Union`) or
+        // any `Custom` descriptor whose `can_be_cursor` is false.
+        for field_name in &flow.read_spec.cursor_fields {
+            if let Some(field) = src_schema.find(field_name)
+                && !field.data_type.can_be_cursor()
+            {
+                return Err(ValidationError::CursorTypeUnsupported {
+                    field: field_name.clone(),
+                    data_type: field.data_type.clone(),
+                });
+            }
+        }
         checks::check_mapping(&src_schema, &dst_schema, &flow.mappings)?;
 
         let flow_name = flow.name.clone();
@@ -651,6 +665,136 @@ mod tests {
         assert!(
             matches!(err, ValidationError::DefaultRequiresFields { .. }),
             "expected DefaultRequiresFields, got {err:?}"
+        );
+    }
+
+    // ---- Cursor type guard ---------------------------------------
+
+    use crate::model::{Field, Schema};
+    use crate::types::convert::ConvertError;
+    use crate::types::convert::context::ConversionContext;
+    use crate::types::dynamic::DynType;
+    use crate::types::value::Value;
+
+    #[derive(Debug)]
+    struct NonCursorCustom;
+
+    impl DynType for NonCursorCustom {
+        fn kind(&self) -> &'static str {
+            "test.non_cursor"
+        }
+        fn can_convert_to(&self, _t: &DataType, _trunc: bool) -> bool {
+            false
+        }
+        fn can_construct_from(&self, _t: &DataType, _trunc: bool) -> bool {
+            false
+        }
+        fn convert(
+            &self,
+            _v: Value,
+            _t: &DataType,
+            _ctx: &ConversionContext,
+        ) -> Result<Value, ConvertError> {
+            unimplemented!()
+        }
+        fn construct(
+            &self,
+            _v: Value,
+            _t: &DataType,
+            _ctx: &ConversionContext,
+        ) -> Result<Value, ConvertError> {
+            unimplemented!()
+        }
+        fn clone_box(&self) -> Box<dyn DynType> {
+            Box::new(NonCursorCustom)
+        }
+    }
+
+    fn flow_for_cursor_test(cursor_field_type: DataType) -> AssembledFlow {
+        let src_schema = Schema::new(vec![Field {
+            name: "a".into(),
+            data_type: cursor_field_type,
+            nullable: false,
+        }]);
+        let mut source = MockSource::new();
+        source.expect_name().return_const("src".to_string());
+        source
+            .expect_describe_schema()
+            .returning(move |_| Ok(src_schema.clone()));
+        let mut sink = MockSink::new();
+        // Schemaless mongo-style: sink schema is derived from the
+        // source schema, so describe_schema is never called.
+        sink.expect_schemaless().return_const(true);
+        let storage = MockStorage::new();
+
+        let mappings = vec![ColumnMapping {
+            from: "a".into(),
+            to: "a".into(),
+            truncate: false,
+            default_literal: None,
+        }];
+        flow_with(source, sink, storage, mappings, true)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cursor_guard_rejects_json_field() {
+        let flow = flow_for_cursor_test(DataType::Json);
+        let res = validate_one(flow).await;
+        let err = match res {
+            Ok(_) => panic!("expected CursorTypeUnsupported, got Ok"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ValidationError::CursorTypeUnsupported { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cursor_guard_rejects_xml_field() {
+        let flow = flow_for_cursor_test(DataType::Xml);
+        let res = validate_one(flow).await;
+        let err = match res {
+            Ok(_) => panic!("expected CursorTypeUnsupported, got Ok"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ValidationError::CursorTypeUnsupported { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cursor_guard_rejects_union_field() {
+        let flow = flow_for_cursor_test(DataType::Union(vec![DataType::Int32, DataType::Int64]));
+        let res = validate_one(flow).await;
+        let err = match res {
+            Ok(_) => panic!("expected CursorTypeUnsupported, got Ok"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ValidationError::CursorTypeUnsupported { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cursor_guard_accepts_int64_field() {
+        let flow = flow_for_cursor_test(DataType::Int64);
+        validate_one(flow).await.expect("Int64 cursor should pass");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cursor_guard_rejects_custom_without_can_be_cursor() {
+        let flow = flow_for_cursor_test(DataType::Custom(Box::new(NonCursorCustom)));
+        let res = validate_one(flow).await;
+        let err = match res {
+            Ok(_) => panic!("expected CursorTypeUnsupported, got Ok"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ValidationError::CursorTypeUnsupported { .. }),
+            "got {err:?}"
         );
     }
 }

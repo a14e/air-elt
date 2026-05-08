@@ -21,6 +21,8 @@ use uuid::Uuid;
 
 use air_elt_core::types::DataType;
 
+use crate::types::PgHllType;
+
 pub fn bind_typed_null<'q>(
     query: Query<'q, Postgres, PgArguments>,
     dt: DataType,
@@ -59,5 +61,20 @@ pub fn bind_typed_null<'q>(
         // column types, and the validation pipeline rejects Union → PG
         // before any bind happens.
         DataType::Union(_) => unreachable!("postgres sinks never carry Union types"),
+        // HLL: bind a typed NULL `Vec<u8>` (matches the `bytea`-shaped
+        // wire encoding sqlx uses for HLL bytes). The `::hll` cast is
+        // emitted by the SQL template builder rather than here — this
+        // helper has no access to the surrounding SQL fragment. The
+        // cursor path never reaches this arm because HLL has
+        // `can_be_cursor() == false`; this is the safety net for any
+        // future write/cursor code that null-binds HLL.
+        DataType::Custom(t) if t.kind() == PgHllType::KIND => query.bind::<Option<Vec<u8>>>(None),
+        // Other custom types are connector-specific and need a
+        // dedicated bind path. Reaching this arm means the matrix /
+        // validation guards let through a custom type with no codec
+        // wired in — a structural bug, not a runtime data shape.
+        DataType::Custom(_) => unreachable!(
+            "DataType::Custom must be handled by the connector before reaching null_bind"
+        ),
     }
 }

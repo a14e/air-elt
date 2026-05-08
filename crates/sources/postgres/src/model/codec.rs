@@ -5,6 +5,7 @@ use sqlx::postgres::PgRow;
 use uuid::Uuid;
 
 use air_elt_commons_pg::null_bind;
+use air_elt_commons_pg::types::{PgHllType, PgHllValue};
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::types::{DataType, Value};
 
@@ -86,6 +87,21 @@ pub fn decode_column(row: &PgRow, index: usize, data_type: DataType) -> RuntimeR
         // for pg `information_schema`). Mirrors the pg sink's
         // `unreachable!` for the same invariant.
         DataType::Union(_) => unreachable!("postgres sources never produce Union types"),
+        // HLL: the wire shape is a binary blob — sqlx decodes it as
+        // `Vec<u8>` (sqlx has no native registration for the HLL type
+        // OID, but `bytea`-shaped types decode fine through the binary
+        // codec). We wrap the bytes in `PgHllValue` so the sink path
+        // can re-emit them under an `::hll` cast.
+        DataType::Custom(t) if t.kind() == PgHllType::KIND => {
+            match nullable::<Vec<u8>>(row, index)? {
+                None => Ok(Value::Null),
+                Some(bytes) => Ok(Value::Custom(Box::new(PgHllValue(bytes)))),
+            }
+        }
+        DataType::Custom(t) => Err(RuntimeError::Other(format!(
+            "postgres source has no decoder for custom type {kind:?}",
+            kind = t.kind()
+        ))),
     }
 }
 
@@ -126,5 +142,8 @@ pub fn bind_cursor_value<'q>(
         Value::UInt8(_) | Value::UInt16(_) | Value::UInt32(_) | Value::UInt64(_) => {
             unreachable!("postgres has no unsigned int columns; cursor cannot carry unsigned")
         }
+        Value::Custom(_) => unreachable!(
+            "Value::Custom must be handled by the connector before reaching bind_cursor_value"
+        ),
     }
 }

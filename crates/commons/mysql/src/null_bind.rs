@@ -47,5 +47,8 @@ pub fn bind_typed_null<'q>(
         // concrete column types, and validation rejects Union → MySQL
         // before any bind happens.
         DataType::Union(_) => unreachable!("mysql sinks never carry Union types"),
+        DataType::Custom(_) => unreachable!(
+            "DataType::Custom must be handled by the connector before reaching null_bind"
+        ),
     }
 }

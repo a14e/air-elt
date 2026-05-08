@@ -70,6 +70,14 @@ Canonical types are the only pivot — connectors do NOT introduce parallel enum
 - **`core::types::default_value::parse`** — parses a TOML default literal against the sink `DataType`. Bytes columns require a typed prefix (`hex:` / `base64:` / `utf8:` / `bin:`).
 - **`FlowState::conversions`** is populated in `validation::pipeline::validate`. The runner skips identity plans and dispatches the rest via `convert`.
 
+### Connector-local custom types (`DynType` / `DynValue`)
+
+Backend-specific types that don't reduce to canonical pivots live behind `DataType::Custom(Box<dyn DynType>)` / `Value::Custom(Box<dyn DynValue>)`. Impls live in `commons-{backend}/src/types/`, never in `core`. Matrix and dispatcher delegate to trait methods.
+
+- `kind()` format `"<vendor>.<type>"`. The string is wire-stable. Existing kinds: `mongodb.object_id`, `mongodb.javascript`, `postgresql.hll`.
+- **Mandatory: `pub const KIND: &'static str = "..."` on the type struct.** Every recognition site compares `t.kind() == T::KIND` — never spell the literal twice (rename must propagate via the compiler).
+- `Custom` forbidden as cursor field; `Value::Custom` / `DataType::Custom` Deserialize errors out (cursor-storage JSON never carries one).
+
 ## Validation pipeline
 
 Two stages: `assemble` (no I/O) → `validate` (probes, schema introspection, matrix, sampling). The pipeline groups assembled flows by `Source::name()` and runs them through `futures::join_all` — one async worker per source, sequential within. The CLI prints `running validation in {N} workers` at start. Output is sorted back into config order so error reporting is deterministic.
@@ -102,6 +110,8 @@ Optional `[flow.<name>.conflict]` block. `core::config::conflict::{ConflictConfi
 - `[dev-dependencies]` only — testcontainers must not ship in release builds.
 - Database mocks are forbidden. **`mockall`** (dev-dep) is used only for runner-logic unit tests via `#[cfg_attr(test, mockall::automock)]` on `core::traits`.
 - E2e suites: each connector owns its own. Cross-vendor flows are exercised by a *small fixed* sample, not an N×N matrix.
+- **Match test fixture size to `ReadSpec.limit`.** Sources with idle-drain semantics (CDC change streams in particular) only exit `read_batch` early when `events.len() >= spec.limit`; with fewer events the loop blocks on the underlying stream until `operation_timeout` (default 30s) fires. When writing a test, count the events your fixture produces and set `limit` to that exact number — or pad the fixture to match `limit`. Don't paper over the wait by lowering `operation_timeout` in tests; that hides the contract from production callers and invites flakes under CI jitter.
+- Per-test test binaries are slow to build and link. Aggregate `tests/*.rs` files via a single `tests/all.rs` (`mod foo; mod bar;`) plus `autotests = false` + `[[test]] name = "all"` in `Cargo.toml`. New integration tests go as a `mod` inside `all.rs`, not as a new top-level file.
 
 ## Traits, runtime, registration
 

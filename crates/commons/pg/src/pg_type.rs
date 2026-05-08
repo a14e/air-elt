@@ -8,6 +8,8 @@
 
 use air_elt_core::types::DataType;
 
+use super::types::PgHllType;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PgType {
     Bool,
@@ -32,6 +34,13 @@ pub enum PgType {
     /// `DataType` so the matrix can apply XML-specific rules (well-formed
     /// validation, forbidden Xml→Xml truncation).
     Xml,
+    /// `hll` from the `postgresql-hll` extension (bundled in
+    /// `citusdata/citus`). User-defined extension types arrive in
+    /// `information_schema` as `data_type = 'USER-DEFINED'`,
+    /// `udt_name = '<extname>'` — we identify by `udt_name`.
+    /// Mapped to a connector-defined `Custom(PgHllType)` rather than a
+    /// canonical `DataType` variant; HLL has no canonical analogue.
+    Hll,
 }
 
 impl PgType {
@@ -61,6 +70,11 @@ impl PgType {
             "jsonb" => PgType::Jsonb,
             "numeric" | "decimal" => PgType::Numeric,
             "xml" => PgType::Xml,
+            // `hll` only appears as a `udt_name`; matching it here as well so
+            // a caller passing the `udt_name` string also resolves it (the
+            // `data_type` column is `'USER-DEFINED'` for extension types
+            // and never equals `"hll"`).
+            "hll" => PgType::Hll,
             // `timestamp` / `timestamp without time zone` intentionally omitted.
             _ => return None,
         };
@@ -118,6 +132,7 @@ pub fn to_internal(
             (Some(p), None) => DataType::BigInt { width: Some(p) },
         },
         PgType::Xml => DataType::Xml,
+        PgType::Hll => DataType::Custom(Box::new(PgHllType)),
     }
 }
 
@@ -147,6 +162,21 @@ mod tests {
     #[test]
     fn unknown_type_is_none() {
         assert!(PgType::parse("money").is_none());
+    }
+
+    #[test]
+    fn hll_parses_from_udt_name() {
+        assert_eq!(PgType::parse("hll"), Some(PgType::Hll));
+        assert_eq!(PgType::parse("HLL"), Some(PgType::Hll));
+    }
+
+    #[test]
+    fn hll_maps_to_custom_data_type() {
+        let dt = to_internal(PgType::Hll, None, None, None);
+        match dt {
+            DataType::Custom(t) => assert_eq!(t.kind(), "postgresql.hll"),
+            other => panic!("expected DataType::Custom(hll), got {other:?}"),
+        }
     }
 
     #[test]

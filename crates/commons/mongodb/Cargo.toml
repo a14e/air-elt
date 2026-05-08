@@ -25,6 +25,7 @@ tracing = { workspace = true }
 ahash = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
+toml = { workspace = true }
 
 [lints]
 workspace = true

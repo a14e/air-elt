@@ -32,6 +32,12 @@ impl Dialect {
             Dialect::Postgres => None,
             Dialect::Cockroach => match dt {
                 DataType::Xml => Some("CockroachDB has no XML type"),
+                // The `postgresql-hll` extension is a Postgres-only loadable
+                // module — CockroachDB has no analogue. Mirror the XML arm
+                // and reject up-front rather than failing at the first row.
+                DataType::Custom(t) if t.kind() == crate::types::PgHllType::KIND => {
+                    Some("CockroachDB has no HLL extension")
+                }
                 _ => None,
             },
         }
@@ -46,6 +52,14 @@ mod tests {
     fn default_is_postgres() {
         assert_eq!(Dialect::default(), Dialect::Postgres);
         assert!(!Dialect::default().is_cockroach());
+    }
+
+    #[test]
+    fn excludes_hll_only_for_cockroach() {
+        use crate::types::PgHllType;
+        let hll = DataType::Custom(Box::new(PgHllType));
+        assert_eq!(Dialect::Postgres.excludes_type(&hll), None);
+        assert!(Dialect::Cockroach.excludes_type(&hll).is_some());
     }
 
     #[test]

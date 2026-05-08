@@ -16,4 +16,7 @@ pub mod infer;
 pub mod key_bson;
 pub mod path;
 pub mod sampling;
+pub mod types;
 pub mod version;
+
+pub use types::{MongoJsType, MongoJsValue, MongoObjectIdType, MongoObjectIdValue};

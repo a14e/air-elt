@@ -31,8 +31,10 @@ bigdecimal = { workspace = true }
 
 [dev-dependencies]
 air-elt-commons-testing = { workspace = true }
+air-elt-source-postgres = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 num-bigint = { workspace = true }
+toml = { workspace = true }
 
 [lints]
 workspace = true

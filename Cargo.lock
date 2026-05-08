@@ -82,6 +82,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]
@@ -111,6 +112,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]
@@ -204,6 +206,7 @@ dependencies = [
  "air-elt-commons-pg",
  "air-elt-commons-testing",
  "air-elt-core",
+ "air-elt-source-postgres",
  "async-trait",
  "bigdecimal",
  "chrono",
@@ -212,6 +215,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]
@@ -251,6 +255,7 @@ dependencies = [
  "air-elt-commons-mongodb",
  "air-elt-commons-testing",
  "air-elt-core",
+ "air-elt-sink-mongodb",
  "async-trait",
  "bson",
  "futures",

@@ -15,6 +15,7 @@
 
 #![allow(clippy::unwrap_used)]
 
+use air_elt_commons_mongodb::types::MongoObjectIdValue;
 use air_elt_commons_testing::mongo::{mongo_pool, mongo_pool_legacy};
 use air_elt_core::config::conflict::{ConflictConfig, ConflictStrategy};
 use air_elt_core::model::{Batch, Row, WriteSpec};
@@ -22,6 +23,7 @@ use air_elt_core::traits::Sink;
 use air_elt_core::types::Value;
 use air_elt_sink_mongodb::{MongoSink, MongoSinkConfig};
 use bson::doc;
+use bson::oid::ObjectId;
 
 async fn round_trip_overwrite(sink: MongoSink, db: &str, client: &mongodb::Client) {
     let spec = WriteSpec {
@@ -82,7 +84,6 @@ async fn bulk_write_path_on_modern_server() {
         v.minor
     );
     round_trip_overwrite(sink, &handle.database, &handle.client).await;
-    handle.client.clone().shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -97,7 +98,6 @@ async fn fallback_path_compound_key_on_legacy_server() {
     .expect("connect");
     assert!(!sink.server_version().supports_bulk_write());
     round_trip_overwrite_compound_key(sink, &handle.database, &handle.client).await;
-    handle.client.clone().shutdown().await;
 }
 
 /// Drives the legacy `update` run_command path through a compound
@@ -166,6 +166,65 @@ async fn round_trip_overwrite_compound_key(sink: MongoSink, db: &str, client: &m
     assert_eq!(berlin.get_str("label").unwrap(), "v2-a");
 }
 
+/// `_id: ObjectId` mapping written via the modern `bulk_write` path
+/// must land as `Bson::ObjectId` on the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bulk_write_object_id_lands_as_bson_object_id() {
+    let handle = mongo_pool().await;
+    let sink = MongoSink::connect(MongoSinkConfig {
+        url: handle.url.clone(),
+        database: Some(handle.database.clone()),
+        ..Default::default()
+    })
+    .await
+    .expect("connect");
+    assert!(sink.server_version().supports_bulk_write());
+
+    let spec = WriteSpec {
+        columns: vec!["_id".into(), "label".into()],
+        table: "bulk_oid".into(),
+        conflict: Some(ConflictConfig {
+            key: vec!["_id".into()],
+            strategy: ConflictStrategy::Overwrite,
+        }),
+    };
+    sink.validate_access(&spec).await.expect("validate_access");
+    let ctx = sink.build_context(&spec).await.expect("build_context");
+
+    let oids: Vec<ObjectId> = (0..3).map(|_| ObjectId::new()).collect();
+    let batch = Batch {
+        rows: oids
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                Row::upsert(vec![
+                    Value::Custom(Box::new(MongoObjectIdValue(o.bytes()))),
+                    Value::Text(format!("v-{i}")),
+                ])
+            })
+            .collect(),
+        next_cursor: None,
+    };
+    let report = sink.write_batch(&spec, ctx, &batch).await.unwrap();
+    assert_eq!(report.rows_written, 3);
+
+    let coll = handle
+        .client
+        .database(&handle.database)
+        .collection::<bson::Document>("bulk_oid");
+    for o in &oids {
+        let doc_one = coll
+            .find_one(doc! { "_id": *o })
+            .await
+            .expect("find")
+            .expect("doc");
+        match doc_one.get("_id").expect("present") {
+            bson::Bson::ObjectId(read_oid) => assert_eq!(read_oid, o),
+            other => panic!("expected Bson::ObjectId, got {other:?}"),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fallback_path_on_legacy_server() {
     let handle = mongo_pool_legacy().await;
@@ -184,5 +243,4 @@ async fn fallback_path_on_legacy_server() {
         v.minor
     );
     round_trip_overwrite(sink, &handle.database, &handle.client).await;
-    handle.client.clone().shutdown().await;
 }

@@ -209,7 +209,13 @@ fn merge_types(types: impl IntoIterator<Item = DataType>) -> DataType {
     DataType::union(all)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd)]
+/// Coarse-grained type bucket used by [`merge_types`] to detect
+/// homogeneous-modulo-width observations. The discriminant fields
+/// matter for `Eq`/`Ord` (used as a `BTreeSet` key): two `Custom`
+/// observations carry the full `DataType` so distinct vendor types
+/// (e.g. `mongodb.object_id` vs `mongodb.javascript`) are kept apart
+/// while two `mongodb.object_id` observations collapse.
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
 enum TypeKind {
     Bool,
     Int,
@@ -221,7 +227,9 @@ enum TypeKind {
     Timestamp,
     Decimal,
     Json,
-    Other,
+    Xml,
+    Union,
+    Custom(DataType),
 }
 
 impl TypeKind {
@@ -244,7 +252,9 @@ impl TypeKind {
             DataType::Timestamp => TypeKind::Timestamp,
             DataType::Decimal { .. } => TypeKind::Decimal,
             DataType::Json => TypeKind::Json,
-            _ => TypeKind::Other,
+            DataType::Xml => TypeKind::Xml,
+            DataType::Union(_) => TypeKind::Union,
+            DataType::Custom(_) => TypeKind::Custom(dt.clone()),
         }
     }
 }
@@ -402,6 +412,69 @@ mod tests {
         let f = find(&s, "x");
         assert_eq!(f.data_type, DataType::Json);
         assert!(!s.fields.iter().any(|f| f.name == "x.y"));
+    }
+
+    #[test]
+    fn two_object_id_observations_collapse_to_single_custom_type() {
+        use bson::oid::ObjectId;
+        let docs = vec![doc! { "k": ObjectId::new() }, doc! { "k": ObjectId::new() }];
+        let s = infer_schema_from_sample(&docs).unwrap();
+        let f = find(&s, "k");
+        match &f.data_type {
+            DataType::Custom(t) => assert_eq!(t.kind(), "mongodb.object_id"),
+            other => panic!("expected DataType::Custom(mongodb.object_id), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_id_vs_string_observation_emits_union() {
+        use bson::oid::ObjectId;
+        let docs = vec![doc! { "k": ObjectId::new() }, doc! { "k": "abc" }];
+        let s = infer_schema_from_sample(&docs).unwrap();
+        let f = find(&s, "k");
+        match &f.data_type {
+            DataType::Union(vs) => {
+                assert_eq!(vs.len(), 2);
+                assert!(
+                    vs.iter().any(|v| matches!(
+                        v,
+                        DataType::Custom(t) if t.kind() == crate::types::MongoObjectIdType::KIND
+                    )),
+                    "Union must contain ObjectId Custom: {vs:?}"
+                );
+                assert!(
+                    vs.contains(&DataType::Text { size: None }),
+                    "Union must contain unbounded Text: {vs:?}"
+                );
+            }
+            other => panic!("expected Union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_id_and_javascript_observations_emit_union_of_two_customs() {
+        use bson::oid::ObjectId;
+        let docs = vec![
+            doc! { "k": ObjectId::new() },
+            doc! { "k": Bson::JavaScriptCode("function () {}".into()) },
+        ];
+        let s = infer_schema_from_sample(&docs).unwrap();
+        let f = find(&s, "k");
+        match &f.data_type {
+            DataType::Union(vs) => {
+                assert_eq!(vs.len(), 2);
+                let kinds: Vec<&str> = vs
+                    .iter()
+                    .filter_map(|v| match v {
+                        DataType::Custom(t) => Some(t.kind()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(kinds.contains(&"mongodb.object_id"));
+                assert!(kinds.contains(&"mongodb.javascript"));
+            }
+            other => panic!("expected Union, got {other:?}"),
+        }
     }
 
     #[test]

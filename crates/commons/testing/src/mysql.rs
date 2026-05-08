@@ -93,6 +93,12 @@ async fn mysql_base_url() -> &'static String {
                     "--innodb-doublewrite=0",
                     "--sync-binlog=0",
                     "--skip-log-bin",
+                    // nextest spawns ~one process per test (≈800 here),
+                    // each opening its own pool. Default `max_connections=151`
+                    // and `max_connect_errors=100` are blown through and
+                    // mysqld starts dropping/blocking connections.
+                    "--max-connections=500",
+                    "--max-connect-errors=100000",
                 ])
                 .with_reuse(ReuseDirective::Always)
                 .start()
@@ -116,11 +122,12 @@ pub fn mysql_pool() -> Pin<Box<dyn Future<Output = MySqlTestHandle> + Send + 'st
         let db = random_db();
         info!(db = %db, "creating sandbox database");
 
-        let bootstrap_pool = MySqlPoolOptions::new()
-            .max_connections(2)
-            .connect(base_url)
-            .await
-            .expect("connect to mysql failed");
+        // mysqld drops new TCP connections (UnexpectedEof) when many
+        // test processes hit it cold simultaneously (nextest runs one
+        // process per test). Retry the bootstrap connect for up to
+        // 30s before giving up. Each iteration sleeps briefly to let
+        // the server work through the connect-error backoff window.
+        let bootstrap_pool = retry_connect(base_url, 30).await;
 
         let create = format!("CREATE DATABASE `{db}`");
         sqlx::query(&create)
@@ -129,11 +136,7 @@ pub fn mysql_pool() -> Pin<Box<dyn Future<Output = MySqlTestHandle> + Send + 'st
             .expect("create sandbox database failed");
 
         let scoped_url = format!("{}/{}", base_url, db);
-        let pool = MySqlPoolOptions::new()
-            .max_connections(5)
-            .connect(&scoped_url)
-            .await
-            .expect("connect to sandbox database failed");
+        let pool = retry_connect(&scoped_url, 30).await;
 
         MySqlTestHandle {
             pool,
@@ -182,6 +185,26 @@ fn random_db() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("test_{now}_{suffix}")
+}
+
+async fn retry_connect(url: &str, deadline_secs: u64) -> sqlx::MySqlPool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(deadline_secs);
+    let mut last_err: Option<sqlx::Error> = None;
+    while std::time::Instant::now() < deadline {
+        match MySqlPoolOptions::new()
+            .max_connections(5)
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .connect(url)
+            .await
+        {
+            Ok(pool) => return pool,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+    panic!("connect to mysql failed within {deadline_secs}s: {last_err:?}");
 }
 
 #[cfg(test)]

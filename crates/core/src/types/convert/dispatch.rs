@@ -41,6 +41,25 @@ pub fn convert(
         return convert(value, &concrete, dst, ctx);
     }
 
+    // Custom routing: opaque types own their conversion logic; the
+    // dispatcher delegates without inspecting the value variant. Both-
+    // sides Custom is identity iff the descriptors match.
+    if let (DataType::Custom(a), DataType::Custom(b)) = (src, dst) {
+        if a.eq_dyn(&**b) {
+            return Ok(value);
+        }
+        return Err(ConvertError::Unsupported {
+            src: src.clone(),
+            dst: dst.clone(),
+        });
+    }
+    if let DataType::Custom(a) = src {
+        return a.convert(value, dst, ctx);
+    }
+    if let DataType::Custom(b) = dst {
+        return b.construct(value, src, ctx);
+    }
+
     if src == dst {
         return identity_or_forbid(value, src, dst, ctx);
     }
@@ -488,6 +507,7 @@ fn concrete_type_of(value: &Value) -> Option<DataType> {
         Value::Timestamp(_) => Some(DataType::Timestamp),
         Value::Uuid(_) => Some(DataType::Uuid),
         Value::Json(_) => Some(DataType::Json),
+        Value::Custom(v) => Some(DataType::Custom(v.dyn_type())),
     }
 }
 
@@ -1222,5 +1242,138 @@ mod tests {
         let src = DataType::union(vec![DataType::Int32, DataType::Int64]);
         let out = convert(Value::Null, &src, &DataType::Int64, &passthrough()).unwrap();
         assert_eq!(out, Value::Null);
+    }
+
+    // ---- Custom routing ------------------------------------------
+
+    use crate::types::dynamic::{DynType, DynValue};
+    use std::any::Any;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CONVERT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Debug)]
+    struct DispatchTestType;
+
+    impl DynType for DispatchTestType {
+        fn kind(&self) -> &'static str {
+            "test.dispatch"
+        }
+        fn can_convert_to(&self, target: &DataType, _trunc: bool) -> bool {
+            matches!(target, DataType::Bytes { size: None })
+        }
+        fn can_construct_from(&self, src: &DataType, _trunc: bool) -> bool {
+            matches!(src, DataType::Bytes { size: None })
+        }
+        fn convert(
+            &self,
+            v: Value,
+            _t: &DataType,
+            _ctx: &ConversionContext,
+        ) -> Result<Value, ConvertError> {
+            CONVERT_CALLS.fetch_add(1, Ordering::SeqCst);
+            // Translate the opaque value's payload back to bytes so the
+            // caller sees a deterministic result.
+            match v {
+                Value::Custom(inner) => {
+                    let v = inner
+                        .as_any()
+                        .downcast_ref::<DispatchTestValue>()
+                        .map(|v| v.0.clone())
+                        .unwrap_or_default();
+                    Ok(Value::Bytes(v))
+                }
+                _ => Err(ConvertError::ValueShapeMismatch {
+                    src: DataType::Custom(Box::new(DispatchTestType)),
+                }),
+            }
+        }
+        fn construct(
+            &self,
+            v: Value,
+            _t: &DataType,
+            _ctx: &ConversionContext,
+        ) -> Result<Value, ConvertError> {
+            match v {
+                Value::Bytes(b) => Ok(Value::Custom(Box::new(DispatchTestValue(b)))),
+                _ => Err(ConvertError::ValueShapeMismatch {
+                    src: DataType::Bytes { size: None },
+                }),
+            }
+        }
+        fn clone_box(&self) -> Box<dyn DynType> {
+            Box::new(DispatchTestType)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct DispatchTestValue(Vec<u8>);
+
+    impl DynValue for DispatchTestValue {
+        fn dyn_type(&self) -> Box<dyn DynType> {
+            Box::new(DispatchTestType)
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+            other
+                .as_any()
+                .downcast_ref::<DispatchTestValue>()
+                .map(|o| o.0 == self.0)
+                .unwrap_or(false)
+        }
+        fn clone_box(&self) -> Box<dyn DynValue> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[test]
+    fn convert_custom_to_bytes_invokes_trait() {
+        let before = CONVERT_CALLS.load(Ordering::SeqCst);
+        let v = Value::Custom(Box::new(DispatchTestValue(vec![1, 2, 3])));
+        let out = convert(
+            v,
+            &DataType::Custom(Box::new(DispatchTestType)),
+            &DataType::Bytes { size: None },
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Bytes(vec![1, 2, 3]));
+        assert_eq!(CONVERT_CALLS.load(Ordering::SeqCst), before + 1);
+    }
+
+    #[test]
+    fn convert_bytes_to_custom_via_construct() {
+        let out = convert(
+            Value::Bytes(vec![9, 9]),
+            &DataType::Bytes { size: None },
+            &DataType::Custom(Box::new(DispatchTestType)),
+            &passthrough(),
+        )
+        .unwrap();
+        match out {
+            Value::Custom(v) => {
+                let inner = v
+                    .as_any()
+                    .downcast_ref::<DispatchTestValue>()
+                    .expect("downcast");
+                assert_eq!(inner.0, vec![9, 9]);
+            }
+            other => panic!("expected Value::Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_custom_to_custom_identity_passthrough() {
+        let v = Value::Custom(Box::new(DispatchTestValue(vec![5])));
+        let out = convert(
+            v.clone(),
+            &DataType::Custom(Box::new(DispatchTestType)),
+            &DataType::Custom(Box::new(DispatchTestType)),
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, v);
     }
 }

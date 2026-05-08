@@ -31,6 +31,7 @@ ahash = { workspace = true }
 [dev-dependencies]
 toml = { workspace = true }
 air-elt-commons-testing = { workspace = true }
+air-elt-sink-mongodb = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

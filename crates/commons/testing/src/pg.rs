@@ -25,10 +25,10 @@ use rand::distr::{Alphanumeric, SampleString};
 use rand::rng;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
-use testcontainers::core::Mount;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ImageExt, ReuseDirective};
-use testcontainers_modules::postgres::Postgres as PgImage;
+use testcontainers::core::build::build_options::BuildImageOptions;
+use testcontainers::core::{ContainerPort, Mount, WaitFor};
+use testcontainers::runners::{AsyncBuilder, AsyncRunner};
+use testcontainers::{GenericBuildableImage, ImageExt, ReuseDirective};
 use tokio::sync::OnceCell;
 use tracing::info;
 
@@ -38,6 +38,21 @@ use crate::ryuk;
 const URL_VAR: &str = "AIR_ELT_TEST_PG_URL";
 const KIND_LABEL_KEY: &str = "air-elt.kind";
 const KIND_LABEL_VALUE: &str = "pg";
+
+/// Image we run for the postgres test handle.
+///
+/// Custom image built locally from `docker/pg-hll/Dockerfile` — stock
+/// `postgres:16` plus the `postgresql-hll` extension. Lighter than
+/// `citusdata/citus` (which has a per-connection routing layer that
+/// dominates nextest runtime where each test is its own process) and
+/// drops the Citus-specific URL handling (`?sslmode=disable`,
+/// `search_path=…,public`).
+const PG_IMAGE: &str = "air-elt-pg-hll";
+const PG_TAG: &str = "16";
+
+/// Path to the Dockerfile directory relative to the workspace root.
+/// Used by `ensure_image_built()` to build on first use.
+const DOCKERFILE_DIR: &str = "crates/commons/testing/docker/pg-hll";
 
 static PG_BASE_URL: OnceCell<String> = OnceCell::const_new();
 
@@ -49,7 +64,14 @@ pub struct PgTestHandle {
 
 impl PgTestHandle {
     pub fn url_with_search_path(&self) -> String {
-        format!("{}?options=-c%20search_path%3D{}", self.url, self.schema)
+        // Include `public` so extension types (e.g. `hll`, installed
+        // at container init in the public schema) resolve from
+        // sandbox schemas without explicit qualification.
+        let separator = if self.url.contains('?') { '&' } else { '?' };
+        format!(
+            "{}{separator}options=-c%20search_path%3D{}%2Cpublic",
+            self.url, self.schema
+        )
     }
 }
 
@@ -57,6 +79,12 @@ async fn pg_base_url() -> &'static String {
     PG_BASE_URL
         .get_or_init(|| async {
             if let Ok(external) = std::env::var(URL_VAR) {
+                // CI / external-PG mode still needs the HLL extension
+                // installed (the e2e suite assumes it). Install is
+                // idempotent (`IF NOT EXISTS`); if the server doesn't
+                // ship the extension shared object the call fails
+                // loud, which is the right CI signal.
+                install_hll_extension(&external).await;
                 return external;
             }
             let backend = detect_with_timeout(URL_VAR)
@@ -78,11 +106,30 @@ async fn pg_base_url() -> &'static String {
             // (`start().await`). Once the daemon has the container,
             // other processes resolve via `reuse=Always` instantly.
             let start_lock = crate::filelock::acquire_lock("pg");
-            let container = PgImage::default()
-                .with_tag("16-alpine")
+            // Build the custom pg+hll image once per session.
+            // `BuildImageOptions::with_skip_if_exists(true)` makes
+            // the build a no-op when the tag is already present, so
+            // every nextest process passes through cheaply after the
+            // first one does the actual work. The build itself is
+            // serialised across processes by the start_lock above.
+            let dockerfile = workspace_root().join(DOCKERFILE_DIR).join("Dockerfile");
+            let _built = GenericBuildableImage::new(PG_IMAGE, PG_TAG)
+                .with_dockerfile(dockerfile)
+                .build_image_with(BuildImageOptions::new().with_skip_if_exists(true))
+                .await
+                .expect("build air-elt-pg-hll image");
+            let container = _built
+                .with_exposed_port(ContainerPort::Tcp(5432))
+                .with_wait_for(WaitFor::message_on_stderr(
+                    "database system is ready to accept connections",
+                ))
                 .with_container_name(format!("air-elt-pg-{sv}"))
                 .with_label(sk, sv)
                 .with_label(KIND_LABEL_KEY, KIND_LABEL_VALUE)
+                .with_env_var("POSTGRES_USER", "postgres")
+                .with_env_var("POSTGRES_PASSWORD", "postgres")
+                .with_env_var("POSTGRES_DB", "postgres")
+                .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
                 .with_mount(Mount::tmpfs_mount("/var/lib/postgresql/data"))
                 .with_cmd([
                     "postgres",
@@ -92,6 +139,11 @@ async fn pg_base_url() -> &'static String {
                     "synchronous_commit=off",
                     "-c",
                     "full_page_writes=off",
+                    // Bump the backend cap so workspace runs (esp.
+                    // nextest, one process per test) don't hit the
+                    // PG default `max_connections=100`.
+                    "-c",
+                    "max_connections=500",
                 ])
                 .with_reuse(ReuseDirective::Always)
                 .start()
@@ -106,9 +158,32 @@ async fn pg_base_url() -> &'static String {
             // Container handle is intentionally dropped — ryuk holds its
             // lifetime via the session label.
             drop(container);
-            format!("postgres://postgres:postgres@{host}:{port}/postgres")
+            // Stock postgres:16 doesn't ship SSL; plain URL is fine.
+            let base_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+            install_hll_extension(&base_url).await;
+            base_url
         })
         .await
+}
+
+/// Walk up from `CARGO_MANIFEST_DIR` (the commons-testing crate dir)
+/// to the workspace root by looking for the workspace `Cargo.toml`.
+/// We need an absolute path because the build runs in whatever cwd
+/// the test binary inherited.
+fn workspace_root() -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    loop {
+        let candidate = p.join("Cargo.toml");
+        if candidate.exists() {
+            let txt = std::fs::read_to_string(&candidate).unwrap_or_default();
+            if txt.contains("[workspace]") {
+                return p;
+            }
+        }
+        if !p.pop() {
+            panic!("workspace root not found above {DOCKERFILE_DIR}");
+        }
+    }
 }
 
 pub fn pg_pool() -> Pin<Box<dyn Future<Output = PgTestHandle> + Send + 'static>> {
@@ -129,7 +204,12 @@ pub fn pg_pool() -> Pin<Box<dyn Future<Output = PgTestHandle> + Send + 'static>>
             .await
             .expect("create sandbox schema failed");
 
-        let scoped_url = format!("{}?options=-c%20search_path%3D{}", base_url, schema);
+        // Add `public` to the search path so extension types (e.g.
+        // `hll`) installed at container init resolve from sandbox
+        // schemas without explicit qualification.
+        let separator = if base_url.contains('?') { '&' } else { '?' };
+        let scoped_url =
+            format!("{base_url}{separator}options=-c%20search_path%3D{schema}%2Cpublic");
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(&scoped_url)
@@ -142,6 +222,40 @@ pub fn pg_pool() -> Pin<Box<dyn Future<Output = PgTestHandle> + Send + 'static>>
             schema,
         }
     })
+}
+
+/// Install `hll` once per container lifetime. Citus ships the extension
+/// as a preinstalled shared object but does NOT run `CREATE EXTENSION`
+/// automatically — that has to happen per-database. We do it on
+/// `postgres` (the bootstrap database) so any sandbox schema in that
+/// database inherits the type. `IF NOT EXISTS` makes this idempotent
+/// across reused containers.
+async fn install_hll_extension(base_url: &str) {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(base_url)
+        .await
+        .expect("connect to bootstrap postgres failed");
+    // `IF NOT EXISTS` is *not* atomic against the catalog: under
+    // concurrent invocation (nextest spawns one test process at a
+    // time per worker, each running this OnceCell initialiser), two
+    // racers can both pass the IF-NOT-EXISTS check and then collide
+    // on the `pg_extension_name_index` unique constraint (SQLSTATE
+    // 23505). Treat that specific collision as success — the other
+    // process won the race; the extension is installed.
+    let res = sqlx::query("CREATE EXTENSION IF NOT EXISTS hll")
+        .execute(&pool)
+        .await;
+    if let Err(e) = res {
+        let already_present =
+            e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23505");
+        if !already_present {
+            panic!(
+                "CREATE EXTENSION hll failed — image must ship the postgresql-hll extension: {e}"
+            );
+        }
+    }
+    pool.close().await;
 }
 
 fn random_schema() -> String {

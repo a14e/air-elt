@@ -147,6 +147,9 @@ pub enum ValidationError {
     #[error("cursor field {field:?} is missing in source schema for flow {flow:?}")]
     MissingCursorField { flow: String, field: String },
 
+    #[error("cursor field '{field}' has type {data_type} which cannot be used as a cursor")]
+    CursorTypeUnsupported { field: String, data_type: DataType },
+
     #[error(
         "field {column:?}: `default` is set but the source column is NOT NULL — \
          the default would never be applied"

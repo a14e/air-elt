@@ -91,6 +91,9 @@ async fn mariadb_base_url() -> &'static String {
                     "--innodb-doublewrite=0",
                     "--sync-binlog=0",
                     "--skip-log-bin",
+                    // See mysql.rs — same rationale for nextest load.
+                    "--max-connections=500",
+                    "--max-connect-errors=100000",
                 ])
                 .with_reuse(ReuseDirective::Always)
                 .start()
@@ -123,11 +126,9 @@ pub fn mariadb_pool() -> Pin<Box<dyn Future<Output = MariaDbTestHandle> + Send +
         let db = random_db();
         info!(db = %db, "creating sandbox database");
 
-        let bootstrap_pool = MySqlPoolOptions::new()
-            .max_connections(2)
-            .connect(base_url)
-            .await
-            .expect("connect to mariadb failed");
+        // mariadbd, like mysqld, drops new connections under
+        // high-concurrency cold start. Retry the bootstrap connect.
+        let bootstrap_pool = retry_connect(base_url, 30).await;
 
         let create = format!("CREATE DATABASE `{db}`");
         sqlx::query(&create)
@@ -136,11 +137,7 @@ pub fn mariadb_pool() -> Pin<Box<dyn Future<Output = MariaDbTestHandle> + Send +
             .expect("create sandbox database failed");
 
         let scoped_url = format!("{}/{}", base_url, db);
-        let pool = MySqlPoolOptions::new()
-            .max_connections(5)
-            .connect(&scoped_url)
-            .await
-            .expect("connect to sandbox database failed");
+        let pool = retry_connect(&scoped_url, 30).await;
 
         MariaDbTestHandle {
             pool,
@@ -230,4 +227,24 @@ fn random_db() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("test_{now}_{suffix}")
+}
+
+async fn retry_connect(url: &str, deadline_secs: u64) -> sqlx::MySqlPool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(deadline_secs);
+    let mut last_err: Option<sqlx::Error> = None;
+    while std::time::Instant::now() < deadline {
+        match MySqlPoolOptions::new()
+            .max_connections(5)
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .connect(url)
+            .await
+        {
+            Ok(pool) => return pool,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+    panic!("connect to mariadb failed within {deadline_secs}s: {last_err:?}");
 }
