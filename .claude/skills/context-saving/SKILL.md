@@ -3,7 +3,6 @@ name: context-saving
 description: Materials and recommendations for saving context window — invoke when context conservation is needed
 user-invocable: false
 ---
-*Written by a human*
 
 # Follow these rules to save context
 
