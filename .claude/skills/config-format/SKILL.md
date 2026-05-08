@@ -13,6 +13,7 @@ Air Elt accepts both TOML (`.toml`) and YAML (`.yml`/`.yaml`). Format is detecte
 - Each `[secrets]` key must also be defined exactly once across the include graph. Duplicates are a `DuplicateSecret` error (was silently first-wins before).
 - 16 MiB per-file size cap and absolute-path-include rejection apply to both formats.
 - When invoked without `--config`, the CLI probes `./config.toml`, then `./config.yml`, then `./config.yaml`, and uses the first one found.
+- A YAML file may contain multiple `---`-separated documents. Their `sources` / `sinks` / `storages` arrays concatenate, the `flow` map and `secrets` map merge, and `config.include` concatenates — exactly as if each document were a separate include. The "one definition per name, anywhere" rule still applies: declaring the same source/sink/storage/flow/secret name in two documents of one file is the same `DuplicateName` / `DuplicateFlow` / `DuplicateSecret` error a cross-file collision would raise. TOML has no equivalent — single document per `.toml` file.
 
 ## `[config]`
 

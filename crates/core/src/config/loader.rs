@@ -122,13 +122,34 @@ fn parse_root(
                 source,
             })
         }
-        ConfigFormat::Yaml => {
-            serde_yaml::from_str::<RootConfig>(expanded).map_err(|source| ConfigError::YamlParse {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
+        ConfigFormat::Yaml => parse_yaml_root(expanded, path),
     }
+}
+
+/// Parse a YAML payload that may contain multiple `---`-separated documents
+/// and merge them into one logical `RootConfig`. Each document is treated
+/// like a separate include of the same file: arrays of sources/sinks/storages
+/// concatenate, the `flow` map merges, `config.include` concatenates, and
+/// duplicate names across documents are rejected with the same errors a
+/// cross-file include would produce.
+fn parse_yaml_root(expanded: &str, path: &Path) -> Result<RootConfig, ConfigError> {
+    let mut merged = RootConfig::default();
+    let mut secrets_origin: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut saw_doc = false;
+    for doc in serde_yaml::Deserializer::from_str(expanded) {
+        let extra = RootConfig::deserialize(doc).map_err(|source| ConfigError::YamlParse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        saw_doc = true;
+        merge_extra_into(&mut merged, extra, path, &mut secrets_origin)?;
+    }
+    if !saw_doc {
+        // `serde_yaml::Deserializer` yields zero documents on empty input;
+        // preserve the historical behaviour (empty file → default RootConfig).
+        return Ok(RootConfig::default());
+    }
+    Ok(merged)
 }
 
 /// A minimal first-pass parse that only extracts `[secrets]`. We need secrets
@@ -141,24 +162,46 @@ fn extract_secrets(
     path: &Path,
     format: ConfigFormat,
 ) -> Result<BTreeMap<String, String>, ConfigError> {
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Default)]
     struct SecretsOnly {
         #[serde(default)]
         secrets: BTreeMap<String, String>,
     }
-    let parsed: SecretsOnly = match format {
-        ConfigFormat::Toml => toml::from_str(raw).map_err(|source| ConfigError::TomlParse {
-            path: path.to_path_buf(),
-            source,
-        })?,
-        ConfigFormat::Yaml => {
-            serde_yaml::from_str(raw).map_err(|source| ConfigError::YamlParse {
-                path: path.to_path_buf(),
-                source,
-            })?
+    match format {
+        ConfigFormat::Toml => {
+            let parsed: SecretsOnly =
+                toml::from_str(raw).map_err(|source| ConfigError::TomlParse {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            Ok(parsed.secrets)
         }
-    };
-    Ok(parsed.secrets)
+        ConfigFormat::Yaml => {
+            // Multi-doc YAML: each `---` section may declare its own
+            // `secrets`. Mirror the cross-file rule — a key declared in two
+            // documents of the same file is a `DuplicateSecret` error
+            // against the same path twice.
+            let mut merged: BTreeMap<String, String> = BTreeMap::new();
+            for doc in serde_yaml::Deserializer::from_str(raw) {
+                let parsed =
+                    SecretsOnly::deserialize(doc).map_err(|source| ConfigError::YamlParse {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                for (k, v) in parsed.secrets {
+                    if merged.contains_key(&k) {
+                        return Err(ConfigError::DuplicateSecret {
+                            key: k,
+                            first: path.to_path_buf(),
+                            second: path.to_path_buf(),
+                        });
+                    }
+                    merged.insert(k, v);
+                }
+            }
+            Ok(merged)
+        }
+    }
 }
 
 struct PathCycleDetector {
@@ -237,7 +280,22 @@ fn merge_file(
     let raw = read_single(path)?;
     let expanded = env_expand::expand(&raw, secrets)?;
     let extra = parse_root(&expanded, path, format)?;
+    merge_extra_into(root, extra, path, secrets_origin)
+}
 
+/// Fold `extra` into `root` using the project's "one definition per name,
+/// anywhere" rule for sources/sinks/storages/flow/secrets. Used both when
+/// merging an `include`'d file and when stitching together `---`-separated
+/// YAML documents inside a single file.
+fn merge_extra_into(
+    root: &mut RootConfig,
+    extra: RootConfig,
+    path: &Path,
+    secrets_origin: &mut BTreeMap<String, PathBuf>,
+) -> Result<(), ConfigError> {
+    for inc in extra.config.include {
+        root.config.include.push(inc);
+    }
     for (name, flow) in extra.flow {
         if root.flow.contains_key(&name) {
             return Err(ConfigError::DuplicateFlow { name });
@@ -1205,5 +1263,165 @@ cursor = { fields = ["id"] }
         );
         let err = load(dir.path().join("config.toml")).unwrap_err();
         assert!(matches!(err, ConfigError::DuplicateFlow { .. }));
+    }
+
+    /// `---`-separated YAML documents in one file are folded into one
+    /// logical config: source/sink/storage arrays concatenate, the flow
+    /// map merges. Lets operators split a single file along role lines
+    /// without inventing per-role files.
+    #[test]
+    fn yaml_multi_document_root_merges_arrays_and_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "config.yml",
+            r#"
+sources:
+  - { name: pg_src, type: postgres, config: { url: "postgres://x" } }
+---
+sinks:
+  - { name: pg_sink, type: postgres, config: { url: "postgres://y" } }
+---
+storages:
+  - { name: pg_state, type: postgres, config: { url: "postgres://z" } }
+flow:
+  users:
+    source: pg_src
+    sink: pg_sink
+    storage: pg_state
+    from: users
+    to: users
+    mapping: [{ from: id, to: id }]
+    cursor: { fields: [id] }
+"#,
+        );
+        let root = load(&path).unwrap();
+        assert_eq!(root.sources.len(), 1);
+        assert_eq!(root.sinks.len(), 1);
+        assert_eq!(root.storages.len(), 1);
+        assert_eq!(root.flow.len(), 1);
+        assert_eq!(root.sources[0].name, "pg_src");
+        assert_eq!(root.sinks[0].name, "pg_sink");
+        assert_eq!(root.storages[0].name, "pg_state");
+    }
+
+    /// Duplicate component name across `---` documents in one file fires
+    /// the same `DuplicateName` error a cross-file collision would —
+    /// keeps the "one definition per name, anywhere" rule single-shape.
+    #[test]
+    fn yaml_multi_document_rejects_duplicate_source_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "config.yml",
+            r#"
+sources:
+  - { name: pg, type: postgres, config: {} }
+---
+sources:
+  - { name: pg, type: postgres, config: {} }
+"#,
+        );
+        let err = load(&path).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::DuplicateName { kind: "source", name } if name == "pg"),
+            "got {err:?}"
+        );
+    }
+
+    /// Same rule applies to flow names: declaring `flow.users` in two
+    /// documents of the same file is a `DuplicateFlow`.
+    #[test]
+    fn yaml_multi_document_rejects_duplicate_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "config.yml",
+            r#"
+sources:
+  - { name: pg, type: postgres, config: {} }
+sinks:
+  - { name: pg, type: postgres, config: {} }
+storages:
+  - { name: pg, type: postgres, config: {} }
+flow:
+  users:
+    source: pg
+    sink: pg
+    storage: pg
+    from: t
+    to: t
+    mapping: [{ from: id, to: id }]
+    cursor: { fields: [id] }
+---
+flow:
+  users:
+    source: pg
+    sink: pg
+    storage: pg
+    from: t
+    to: t
+    mapping: [{ from: id, to: id }]
+    cursor: { fields: [id] }
+"#,
+        );
+        let err = load(&path).unwrap_err();
+        assert!(matches!(&err, ConfigError::DuplicateFlow { name } if name == "users"));
+    }
+
+    /// Secrets declared across `---` documents in the same file merge
+    /// and resolve `${VAR}` expansion across the whole file.
+    #[test]
+    fn yaml_multi_document_secrets_merge_and_expand() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "config.yml",
+            r#"
+secrets:
+  PG_HOST: "db.local"
+---
+secrets:
+  PG_PORT: "5432"
+---
+sources:
+  - name: pg
+    type: postgres
+    config:
+      url: "postgres://${PG_HOST}:${PG_PORT}/x"
+sinks:
+  - { name: pg, type: postgres, config: {} }
+storages:
+  - { name: pg, type: postgres, config: {} }
+"#,
+        );
+        let root = load(&path).unwrap();
+        assert_eq!(
+            root.sources[0].config.get("url").and_then(|v| v.as_str()),
+            Some("postgres://db.local:5432/x")
+        );
+    }
+
+    /// Same secret key in two documents of one file is a duplicate, just
+    /// like across includes.
+    #[test]
+    fn yaml_multi_document_rejects_duplicate_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "config.yml",
+            r#"
+secrets:
+  PG_HOST: "a"
+---
+secrets:
+  PG_HOST: "b"
+"#,
+        );
+        let err = load(&path).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::DuplicateSecret { key, .. } if key == "PG_HOST"),
+            "got {err:?}"
+        );
     }
 }

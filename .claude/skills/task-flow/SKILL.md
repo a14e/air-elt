@@ -2,9 +2,10 @@
 name: task-flow
 description: Mandatory planning and execution flow for any non-trivial task. Load before planning starts and before any code change is made.
 ---
-*Written by a human*
 
-# Planning and iteration flow.
+**Every rule in this skill is `(Mandatory)`.** The marker is repeated per section so a quick scan can't miss it, but the document as a whole is a hard contract — not guidance, not a checklist of nice-to-haves.
+
+# Planning and iteration flow. `(Mandatory)`
 
 For any non-trivial task, enter plan mode.
 
@@ -13,7 +14,7 @@ Gather aggregations and important information through separate agents so the mai
 When the task introduces a new database, always launch a researcher agent first to map out the contract specifics — protocol quirks, type system edges, isolation defaults, migration semantics, retry/error codes — before planning the implementation.
 
 
-# Execution graph
+# Execution graph `(Mandatory)`
 
 As part of planning, work out which stages can run in parallel and launch parallel agents for them.
 In other words, the planning stage must produce an ordering graph.
@@ -21,16 +22,16 @@ For trivial stages that don't need the full context, also launch separate agents
 
 
 
-# Test order during development
+# Test order during development `(Mandatory)`
 
 Tests are slow, so first narrow down to the specific tests tied to the current task,
 then the full test set.
 If you have local tests, start with them. E2E tests come last.
-And the FULL test set is the very last call (Mandatory).
+And the FULL test set is the very last call.
 In other words, we have a testing funnel to optimise test time.
 
 
-# Test writing order.
+# Test writing order. `(Mandatory)`
 The choice between the TDD path and the code-first path must be made during planning, not improvised mid-implementation.
 
 When the flow and API are clear — approach the task in a TDD style.
@@ -48,17 +49,17 @@ After writing the tests, launch 2 agents
 
 
 
-# User assignments.
+# User assignments. `(Mandatory)`
 When you're asked to translate something or to author a skill and you want to look at how similar examples are done.
 Launch an agent so it inspects them, mirrors the same approach as in the examples, and reports back to you.
 
 
-# Composition of the rules above
+# Composition of the rules above `(Mandatory)`
 The rules work hierarchically.
 That is, if local agents collect and validate local tests, they test only their own module. Larger tests
 and more serious validations are done by higher-level agents
 
-# Reporting
+# Reporting `(Mandatory)`
 
 All agents must return a concise report of the work done.
 It should not be bloated and must contain the necessary meaning.

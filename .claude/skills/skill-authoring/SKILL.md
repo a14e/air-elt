@@ -2,12 +2,10 @@
 name: skill-authoring
 description: Rules and requirements for writing and maintaining skills in this repository. Read before creating a new skill, editing an existing one, or reviewing skill content. Defines frontmatter shape, tone, structure, length, and what a skill must never contain.
 ---
-*Written by a human*
 
 # General requirements for skills
 1. Skills are written exclusively in English.
 2. Skills must be understandable and readable both for agents and for people.
-3. If a skill is written by a human, when refactoring or translating it keep it as close to the original as possible (but fix formatting and spelling).
 4. Avoid typical AI slop.
 5. When writing skills, avoid duplicating the same text.
 6. Avoid text for the sake of text — every part must add meaning.
