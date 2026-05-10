@@ -13,7 +13,8 @@ use crate::config::validation::SamplingConfig;
 use crate::error::{RuntimeError, ValidationError};
 use crate::mapping::{self, ColumnMapping, DirectMapping};
 use crate::model::{
-    AssembledFlow, ColumnConversionPlan, DerivedPlans, FlowState, ReadSpec, Schema, WriteSpec,
+    AssembledFlow, ColumnConversionPlan, ConfigReadSpec, ConfigWriteSpec, DerivedPlans, FlowState,
+    ReadSpec, Schema, WriteSpec,
 };
 use crate::registry::Registry;
 use crate::traits::{Sink, Source, Storage};
@@ -180,28 +181,18 @@ pub async fn assemble(
             source: Box::new(RuntimeError::Config(e)),
         })?;
 
-        // Pre-fill ReadSpec/WriteSpec columns from the *direct* rules
-        // visible at assemble time. Wildcard / json-pack rules are
-        // expanded later in `validate_flow` once schemas are available;
-        // at that point the spec columns are overwritten with the
-        // expanded shape. For all-direct flows the assemble-time
-        // shape is final.
-        let (read_columns, write_columns) = derive_direct_columns(&rules);
-        let read_spec = ReadSpec {
-            columns: read_columns,
+        // Schema-independent halves of the read/write specs. The
+        // post-expansion `ReadSpec` / `WriteSpec` (with `columns` and
+        // `needs_body`) is built later in `validate_flow` once schemas
+        // are available and materialised onto `DerivedPlans`.
+        let config_read_spec = ConfigReadSpec {
             table: flow.from.clone(),
             cursor_fields: flow.cursor.fields.clone(),
             cursor_order: flow.cursor.order,
             limit: flow.batch_limit,
             source_options: flow.source.options(),
-            // Default. Body presence is only known post-expansion;
-            // `build_derived_plans_from_expanded` overwrites this
-            // flag on the derived `read_spec` once it sees the
-            // expanded mapping's json-pack targets.
-            needs_body: false,
         };
-        let write_spec = WriteSpec {
-            columns: write_columns,
+        let config_write_spec = ConfigWriteSpec {
             table: flow.to.clone(),
             conflict: flow.conflict.clone(),
         };
@@ -218,8 +209,8 @@ pub async fn assemble(
             sink,
             storage,
             rules,
-            read_spec,
-            write_spec,
+            config_read_spec,
+            config_write_spec,
             interval,
             query_timeout,
             sampling,
@@ -235,22 +226,6 @@ pub async fn assemble(
     }
 
     Ok(flows)
-}
-
-/// Pull `from` / `to` columns from the rules' `Direct` entries only.
-/// Wildcard / Body rules contribute nothing pre-expansion — those
-/// flows have their spec columns rewritten in `validate_flow` once
-/// schemas are introspected.
-fn derive_direct_columns(rules: &[ColumnMapping]) -> (Vec<String>, Vec<String>) {
-    let mut from_cols = Vec::new();
-    let mut to_cols = Vec::new();
-    for rule in rules {
-        if let ColumnMapping::Direct { from, to, .. } = rule {
-            from_cols.push(from.clone());
-            to_cols.push(to.clone());
-        }
-    }
-    (from_cols, to_cols)
 }
 
 /// I/O validation: access checks, schema introspection, type compatibility,
@@ -353,7 +328,7 @@ fn passthrough_plans(
 /// ctx-cached schema later on its hot path.
 async fn fetch_source_schema(flow: &AssembledFlow) -> Result<Schema, ValidationError> {
     flow.source
-        .describe_schema(&flow.read_spec.table)
+        .describe_schema(&flow.config_read_spec.table)
         .await
         .map_err(|e| ValidationError::AccessFailed {
             component: "source:schema",
@@ -364,7 +339,7 @@ async fn fetch_source_schema(flow: &AssembledFlow) -> Result<Schema, ValidationE
 
 async fn fetch_sink_schema(flow: &AssembledFlow) -> Result<Schema, ValidationError> {
     flow.sink
-        .describe_schema(&flow.write_spec.table)
+        .describe_schema(&flow.config_write_spec.table)
         .await
         .map_err(|e| ValidationError::AccessFailed {
             component: "sink:schema",
@@ -381,21 +356,19 @@ async fn fetch_sink_schema(flow: &AssembledFlow) -> Result<Schema, ValidationErr
 /// the live tick exercises runs here, so any drift between sampling
 /// and runtime would surface in this call.
 ///
-/// `flow.read_spec.limit` is overridden to `size` so the sample probe
-/// pulls the configured row count regardless of the user-declared
-/// `batch-limit`.
+/// `flow.config_read_spec.limit` is overridden to `size` so the sample
+/// probe pulls the configured row count regardless of the user-declared
+/// `batch-limit`. The runner's first tick rebuilds derived from the
+/// post-override `config_read_spec`, so we don't need to mutate the
+/// provided `derived` snapshot here.
 async fn run_sampling_via_tick(
     flow: &AssembledFlow,
     derived: &DerivedPlans,
     size: usize,
 ) -> Result<(), ValidationError> {
     let mut sample_flow = flow.clone();
-    sample_flow.read_spec.limit = size;
-    // Mirror the read_spec override into the cached derived plans so
-    // the runner's per-tick clone of `derived().read_spec` carries the
-    // sampling-sized limit. `derived.write_spec` is unchanged.
-    let mut sample_derived = derived.clone();
-    sample_derived.read_spec.limit = size;
+    sample_flow.config_read_spec.limit = size;
+    let sample_derived = derived.clone();
 
     let state = FlowState::new(sample_flow, sample_derived);
     crate::flow::runner::FlowRunner::run_sample_probe(state)
@@ -411,7 +384,7 @@ async fn run_sampling_via_tick(
     Ok(())
 }
 
-async fn validate_flow(mut flow: AssembledFlow) -> Result<FlowState, ValidationError> {
+async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError> {
     info!(flow = %flow.name, "validating flow");
 
     // ---- expansion ---------------------------------------------------
@@ -505,12 +478,12 @@ async fn validate_flow(mut flow: AssembledFlow) -> Result<FlowState, ValidationE
             b.targets.len() == 1 && b.targets[0] == crate::mapping::ROOT_BODY_TARGET
         });
     if is_root_passthrough {
-        if !flow.read_spec.cursor_fields.is_empty() {
+        if !flow.config_read_spec.cursor_fields.is_empty() {
             return Err(ValidationError::CursorRequiresExplicitFields {
                 flow: flow.name.clone(),
             });
         }
-        if let Some(conflict) = &flow.write_spec.conflict
+        if let Some(conflict) = &flow.config_write_spec.conflict
             && let Some(first) = conflict.key.first()
         {
             return Err(ValidationError::ConflictKeyNotInMapping {
@@ -520,12 +493,24 @@ async fn validate_flow(mut flow: AssembledFlow) -> Result<FlowState, ValidationE
         }
     }
 
-    // Rewrite spec columns from the expanded shape. Every direct
-    // mapping contributes both a source column and a sink column;
-    // packs append their target. Helpers on `ExpandedMapping` are
-    // shared with the runner-side rebuild path.
-    flow.read_spec.columns = expanded.read_columns();
-    flow.write_spec.columns = expanded.write_columns();
+    // Build probe `ReadSpec` / `WriteSpec` from the post-expansion
+    // column lists + the schema-independent config spec halves. These
+    // mirror the shape the runner ultimately consumes via `DerivedPlans`
+    // and feed the access/insert probes below.
+    let probe_read_spec = ReadSpec {
+        columns: expanded.read_columns(),
+        table: flow.config_read_spec.table.clone(),
+        cursor_fields: flow.config_read_spec.cursor_fields.clone(),
+        cursor_order: flow.config_read_spec.cursor_order,
+        limit: flow.config_read_spec.limit,
+        source_options: flow.config_read_spec.source_options.clone(),
+        needs_body: expanded.body.is_some(),
+    };
+    let probe_write_spec = WriteSpec {
+        columns: expanded.write_columns(),
+        table: flow.config_write_spec.table.clone(),
+        conflict: flow.config_write_spec.conflict.clone(),
+    };
 
     // ---- access probes -----------------------------------------------
     if flow.access_check {
@@ -538,7 +523,7 @@ async fn validate_flow(mut flow: AssembledFlow) -> Result<FlowState, ValidationE
                 source: Box::new(e),
             })?;
         flow.source
-            .validate_access(&flow.read_spec)
+            .validate_access(&probe_read_spec)
             .await
             .map_err(|e| ValidationError::AccessFailed {
                 component: "source",
@@ -550,16 +535,16 @@ async fn validate_flow(mut flow: AssembledFlow) -> Result<FlowState, ValidationE
     }
     if flow.inserts_check {
         flow.sink
-            .validate_access(&flow.write_spec)
+            .validate_access(&probe_write_spec)
             .await
             .map_err(|e| ValidationError::AccessFailed {
                 component: "sink",
                 name: flow.name.clone(),
                 source: Box::new(e),
             })?;
-        if flow.source.emits_deletes() && flow.write_spec.conflict.is_some() {
+        if flow.source.emits_deletes() && flow.config_write_spec.conflict.is_some() {
             flow.sink
-                .validate_delete_access(&flow.write_spec)
+                .validate_delete_access(&probe_write_spec)
                 .await
                 .map_err(|e| ValidationError::AccessFailed {
                     component: "sink:delete",
@@ -595,8 +580,12 @@ async fn validate_flow(mut flow: AssembledFlow) -> Result<FlowState, ValidationE
         };
 
         // Cursor presence + cursor-typability.
-        checks::check_cursor(&flow.name, &src_schema_full, &flow.read_spec.cursor_fields)?;
-        for field_name in &flow.read_spec.cursor_fields {
+        checks::check_cursor(
+            &flow.name,
+            &src_schema_full,
+            &flow.config_read_spec.cursor_fields,
+        )?;
+        for field_name in &flow.config_read_spec.cursor_fields {
             if let Some(field) = src_schema_full.find(field_name)
                 && !field.data_type.can_be_cursor()
             {
@@ -648,7 +637,7 @@ async fn validate_flow(mut flow: AssembledFlow) -> Result<FlowState, ValidationE
             // cursor.fields ⊆ direct.from.
             let direct_from: ahash::AHashSet<&str> =
                 expanded.direct.iter().map(|d| d.from.as_str()).collect();
-            for cf in &flow.read_spec.cursor_fields {
+            for cf in &flow.config_read_spec.cursor_fields {
                 if !direct_from.contains(cf.as_str()) {
                     return Err(ValidationError::MissingCursorField {
                         flow: flow.name.clone(),
@@ -657,7 +646,7 @@ async fn validate_flow(mut flow: AssembledFlow) -> Result<FlowState, ValidationE
                 }
             }
             // conflict.key ⊆ direct.to (or any body target).
-            if let Some(conflict) = &flow.write_spec.conflict {
+            if let Some(conflict) = &flow.config_write_spec.conflict {
                 let direct_to: ahash::AHashSet<&str> =
                     expanded.direct.iter().map(|d| d.to.as_str()).collect();
                 let pack_targets: ahash::AHashSet<&str> = expanded
@@ -683,14 +672,14 @@ async fn validate_flow(mut flow: AssembledFlow) -> Result<FlowState, ValidationE
         // batch_limit × column_count ≤ 60_000 (post-expansion).
         let pack_cols = expanded.body.as_ref().map(|p| p.targets.len()).unwrap_or(0);
         let total_cols = expanded.direct.len() + pack_cols;
-        let product = flow.read_spec.limit.saturating_mul(total_cols);
+        let product = flow.config_read_spec.limit.saturating_mul(total_cols);
         if product > 60_000 {
             return Err(ValidationError::AccessFailed {
                 component: "flow",
                 name: flow.name.clone(),
                 source: Box::new(RuntimeError::Other(format!(
                     "flow {:?}: batch-limit ({}) × mapping cols ({}) = {} exceeds 60000",
-                    flow.name, flow.read_spec.limit, total_cols, product
+                    flow.name, flow.config_read_spec.limit, total_cols, product
                 ))),
             });
         }
@@ -722,19 +711,32 @@ async fn validate_flow(mut flow: AssembledFlow) -> Result<FlowState, ValidationE
         // skip default_literal parsing (the helper would need a sink
         // type to parse defaults against).
         let conversions = passthrough_plans(&flow.name, &expanded.direct)?;
-        let mut read_spec = flow.read_spec.clone();
-        read_spec.needs_body = expanded.body.is_some();
+        let read_columns = expanded.read_columns();
+        let read_spec = ReadSpec {
+            columns: read_columns.clone(),
+            table: flow.config_read_spec.table.clone(),
+            cursor_fields: flow.config_read_spec.cursor_fields.clone(),
+            cursor_order: flow.config_read_spec.cursor_order,
+            limit: flow.config_read_spec.limit,
+            source_options: flow.config_read_spec.source_options.clone(),
+            needs_body: expanded.body.is_some(),
+        };
+        let write_spec = WriteSpec {
+            columns: expanded.write_columns(),
+            table: flow.config_write_spec.table.clone(),
+            conflict: flow.config_write_spec.conflict.clone(),
+        };
         let body_data_type = flow.source.body_data_type();
         let transform = crate::transform::compile_to_transform(
             &expanded,
             body_data_type,
             &conversions,
             &[],
-            &read_spec.columns,
+            &read_columns,
         )?;
         DerivedPlans {
             read_spec,
-            write_spec: flow.write_spec.clone(),
+            write_spec,
             transform,
         }
     };
@@ -758,7 +760,7 @@ mod tests {
     use crate::error::ValidationError;
     use crate::flow::test_utils::{default_source_mock, raw_passthrough_source_mock};
     use crate::mapping::ColumnMapping;
-    use crate::model::{AssembledFlow, ReadSpec, WriteSpec};
+    use crate::model::{AssembledFlow, ConfigReadSpec, ConfigWriteSpec};
     use crate::traits::{MockSink, MockSource, MockStorage};
     use crate::types::DataType;
 
@@ -771,24 +773,20 @@ mod tests {
         rules: Vec<ColumnMapping>,
         fields_check: bool,
     ) -> AssembledFlow {
-        let (read_columns, write_columns) = derive_direct_columns(&rules);
         AssembledFlow {
             name: "test".into(),
             source: Arc::new(source),
             sink: Arc::new(sink),
             storage: Arc::new(storage),
             rules,
-            read_spec: ReadSpec {
-                columns: read_columns,
+            config_read_spec: ConfigReadSpec {
                 table: "t".into(),
                 cursor_fields: vec!["a".into()],
                 cursor_order: CursorOrder::Asc,
                 limit: 1,
                 source_options: toml::Table::new(),
-                needs_body: false,
             },
-            write_spec: WriteSpec {
-                columns: write_columns,
+            config_write_spec: ConfigWriteSpec {
                 table: "t".into(),
                 conflict: None,
             },
@@ -834,7 +832,7 @@ mod tests {
         let flow = flow_with(source, sink, storage, rules, false);
 
         let state = validate_flow(flow).await.unwrap();
-        let derived = state.derived().unwrap();
+        let derived = state.derived();
         assert_eq!(derived.transform.cols.len(), 1);
     }
 
@@ -847,7 +845,7 @@ mod tests {
         let rules = vec![rule_direct("a", "a")];
         let mut flow = flow_with(source, sink, storage, rules, false);
         flow.inserts_check = true;
-        flow.write_spec.conflict = conflict;
+        flow.config_write_spec.conflict = conflict;
         flow
     }
 
@@ -1082,7 +1080,7 @@ mod tests {
         sink.expect_schemaless().return_const(true);
         let storage = MockStorage::new();
         let mut flow = flow_with(source, sink, storage, vec![ColumnMapping::Wildcard], true);
-        flow.read_spec.cursor_fields = vec!["id".into()];
+        flow.config_read_spec.cursor_fields = vec!["id".into()];
         let err = validate_flow(flow).await.unwrap_err();
         assert!(
             matches!(&err, ValidationError::MissingCursorField { field, .. } if field == "id"),
@@ -1111,8 +1109,8 @@ mod tests {
         sink.expect_schemaless().return_const(true);
         let storage = MockStorage::new();
         let mut flow = flow_with(source, sink, storage, vec![ColumnMapping::Wildcard], true);
-        flow.read_spec.cursor_fields = vec!["c0".into()];
-        flow.read_spec.limit = 200;
+        flow.config_read_spec.cursor_fields = vec!["c0".into()];
+        flow.config_read_spec.limit = 200;
         let err = validate_flow(flow).await.unwrap_err();
         // 200 * 301 = 60_200 > 60_000.
         let msg = err.to_string();
@@ -1158,7 +1156,7 @@ mod tests {
             vec![ColumnMapping::Body { to: "body".into() }],
             true,
         );
-        flow.read_spec.cursor_fields = vec!["a".into()];
+        flow.config_read_spec.cursor_fields = vec!["a".into()];
         let err = validate_flow(flow).await.unwrap_err();
         // Body target type check now flows through the standard
         // matrix: `Json → Text` is rejected as `IncompatibleTypes`.
@@ -1180,7 +1178,7 @@ mod tests {
         sink.expect_schemaless().return_const(true);
         let storage = MockStorage::new();
         let mut flow = flow_with(source, sink, storage, vec![ColumnMapping::Wildcard], true);
-        flow.read_spec.cursor_fields = vec!["id".into()];
+        flow.config_read_spec.cursor_fields = vec!["id".into()];
         let err = validate_flow(flow).await.unwrap_err();
         assert!(
             matches!(err, ValidationError::CursorRequiresExplicitFields { .. }),
@@ -1197,8 +1195,8 @@ mod tests {
         sink.expect_schemaless().return_const(true);
         let storage = MockStorage::new();
         let mut flow = flow_with(source, sink, storage, vec![ColumnMapping::Wildcard], true);
-        flow.read_spec.cursor_fields = vec![];
-        flow.write_spec.conflict = Some(crate::config::conflict::ConflictConfig {
+        flow.config_read_spec.cursor_fields = vec![];
+        flow.config_write_spec.conflict = Some(crate::config::conflict::ConflictConfig {
             key: vec!["id".into()],
             strategy: crate::config::conflict::ConflictStrategy::Overwrite,
         });
@@ -1242,7 +1240,7 @@ mod tests {
             vec![rule_direct("missing", "b")],
             true,
         );
-        flow.read_spec.cursor_fields = vec![];
+        flow.config_read_spec.cursor_fields = vec![];
         let err = validate_flow(flow).await.unwrap_err();
         assert!(
             matches!(&err, ValidationError::MissingField { side: "source", field, .. } if field == "missing"),
