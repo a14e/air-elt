@@ -2,20 +2,25 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sqlx::{MySqlPool, QueryBuilder};
+use sqlx::{Executor, MySql, MySqlPool, QueryBuilder};
 use tracing::{debug, info};
 
 use air_elt_commons_mysql::pool;
 use air_elt_commons_mysql::sink_bind::bind_value_separated;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
-use air_elt_core::model::{Batch, Row as CoreRow, RowOp, Schema, SinkCtx, WriteReport, WriteSpec};
+use air_elt_core::model::{
+    Batch, Row as CoreRow, RowOp, Schema, SchemaProvider, SinkCtx, WriteReport, WriteSpec,
+};
 use air_elt_core::traits::Sink;
 use air_elt_core::types::{DataType, Value};
 
 use crate::config::model::MySqlSinkConfig;
 use crate::sql_statements as sql;
 
-struct MySqlSinkCtx {
+pub struct MySqlSinkCtx {
+    /// Authoritative sink-side schema for `spec.table`. Populated once
+    /// in `build_context`.
+    pub schema: Schema,
     column_types: Vec<DataType>,
     insert_statement: String,
     /// `ON DUPLICATE KEY UPDATE ...` suffix for `Overwrite` strategy;
@@ -35,6 +40,15 @@ struct DeletePlan {
 impl SinkCtx for MySqlSinkCtx {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+    fn as_schema_provider(&self) -> Option<&dyn SchemaProvider> {
+        Some(self)
+    }
+}
+
+impl SchemaProvider for MySqlSinkCtx {
+    fn schema(&self) -> &Schema {
+        &self.schema
     }
 }
 
@@ -110,7 +124,7 @@ impl Sink for MySqlSink {
     }
 
     async fn build_context(&self, spec: &WriteSpec) -> RuntimeResult<Arc<dyn SinkCtx>> {
-        let schema = air_elt_commons_mysql::schema::fetch_schema(&self.pool, &spec.table).await?;
+        let schema = self.describe_schema(&spec.table).await?;
         let column_types: Vec<DataType> = spec
             .columns
             .iter()
@@ -157,6 +171,7 @@ impl Sink for MySqlSink {
             None => None,
         };
         Ok(Arc::new(MySqlSinkCtx {
+            schema,
             column_types,
             insert_statement,
             conflict_suffix,
@@ -164,96 +179,159 @@ impl Sink for MySqlSink {
         }))
     }
 
+    /// Write a batch of rows.
+    ///
+    /// Dry-run uses `tx.begin() → real INSERT/DELETE → tx.rollback()`,
+    /// not a `WHERE FALSE` short-circuit. Why: MySQL/MariaDB
+    /// short-circuit the projection on a constant-false WHERE *before*
+    /// validating server-side column constraints — most importantly,
+    /// `JSON NOT NULL` columns never see the bind, so malformed JSON
+    /// passes silently. Running the production INSERT/DELETE against
+    /// an open transaction and rolling it back forces the server to
+    /// fully validate every value (JSON parsing, CHECK constraints,
+    /// FK lookups) and then unwind side-effects.
+    ///
+    /// Trade-offs of the rollback approach:
+    /// * `AUTO_INCREMENT` values consumed by rolled-back inserts are
+    ///   not returned — InnoDB advances the counter. Acceptable for
+    ///   sample-probe semantics: validate runs at startup, not in
+    ///   steady state, so the gap is tiny and fixed.
+    /// * Triggers fire and their effects (including writes to other
+    ///   tables) are rolled back along with the probe. The work is
+    ///   done; only the side-effects are unwound.
+    /// * Error precedence: if the INSERT/DELETE fails, that error
+    ///   wins over any later `tx.rollback()` failure (the latter is
+    ///   discarded after the rollback attempt). If the INSERT/DELETE
+    ///   succeeds but the subsequent `tx.rollback()` fails, the
+    ///   rollback error is surfaced — the caller must know the probe
+    ///   may have leaked state.
+    ///
+    /// Asymmetry vs Postgres: pg's planner type-checks projections at
+    /// plan time *before* WHERE evaluation, so pg dry-run stays on
+    /// `WHERE FALSE` and does not need a transaction. MySQL doesn't
+    /// have that property, so it pays the rollback cost.
     async fn write_batch(
         &self,
         _spec: &WriteSpec,
         ctx: Arc<dyn SinkCtx>,
-        batch: &Batch,
+        batch: Batch,
+        dry_run: bool,
     ) -> RuntimeResult<WriteReport> {
         if batch.rows.is_empty() {
             return Ok(WriteReport { rows_written: 0 });
         }
         let my_ctx = ctx.downcast_ref_to::<MySqlSinkCtx>()?;
-        let upserted = self.write_upsert_batch(my_ctx, &batch.rows).await?;
-        let deleted = self.write_delete_batch(my_ctx, &batch.rows).await?;
+        if dry_run {
+            let mut tx = self.pool.begin().await.map_err(RuntimeError::backend)?;
+            // Run the same SQL builder/binds as production against the
+            // transaction. Capture the result, always roll back, and
+            // give precedence to the execute error if any.
+            let upsert_result = write_upsert_batch(&mut *tx, my_ctx, &batch.rows).await;
+            let delete_result = match &upsert_result {
+                Ok(_) => write_delete_batch(&mut *tx, my_ctx, &batch.rows).await,
+                // Skip the delete probe if the upsert already failed —
+                // the outer rollback will unwind whichever statements
+                // landed on the connection.
+                Err(_) => Ok(0),
+            };
+            let rollback_result = tx.rollback().await.map_err(RuntimeError::backend);
+            // Execute errors win over rollback errors (the rollback
+            // error is incidental noise once the probe already failed).
+            upsert_result?;
+            delete_result?;
+            rollback_result?;
+            return Ok(WriteReport { rows_written: 0 });
+        }
+        let upserted = write_upsert_batch(&self.pool, my_ctx, &batch.rows).await?;
+        let deleted = write_delete_batch(&self.pool, my_ctx, &batch.rows).await?;
         Ok(WriteReport {
             rows_written: upserted + deleted,
         })
     }
 }
 
-impl MySqlSink {
-    async fn write_upsert_batch(
-        &self,
-        my_ctx: &MySqlSinkCtx,
-        rows: &[CoreRow],
-    ) -> RuntimeResult<u64> {
-        if !rows.iter().any(is_upsert) {
-            return Ok(0);
+/// Build and execute the upsert path against any sqlx executor —
+/// `&MySqlPool` for production, `&mut Transaction<'_, MySql>` for
+/// dry-run. Same SQL, same binds.
+async fn write_upsert_batch<'e, E>(
+    executor: E,
+    my_ctx: &MySqlSinkCtx,
+    rows: &[CoreRow],
+) -> RuntimeResult<u64>
+where
+    E: Executor<'e, Database = MySql>,
+{
+    if !rows.iter().any(is_upsert) {
+        return Ok(0);
+    }
+    let mut qb: QueryBuilder<'_, MySql> = QueryBuilder::new(&my_ctx.insert_statement);
+    let column_types_ref = &my_ctx.column_types;
+    qb.push_values(rows.iter().filter(|r| is_upsert(r)), |mut tuple, row| {
+        for (value, dt) in row.values.iter().zip(column_types_ref.iter()) {
+            bind_value_separated(&mut tuple, value, dt);
         }
-        let mut qb: QueryBuilder<'_, sqlx::MySql> = QueryBuilder::new(&my_ctx.insert_statement);
-        let column_types_ref = &my_ctx.column_types;
-        qb.push_values(rows.iter().filter(|r| is_upsert(r)), |mut tuple, row| {
-            for (value, dt) in row.values.iter().zip(column_types_ref.iter()) {
-                bind_value_separated(&mut tuple, value, dt);
+    });
+    if !my_ctx.conflict_suffix.is_empty() {
+        qb.push(&my_ctx.conflict_suffix);
+    }
+    debug!(sql = %qb.sql(), "mysql insert batch");
+    let result = qb
+        .build()
+        .execute(executor)
+        .await
+        .map_err(RuntimeError::backend)?;
+    Ok(result.rows_affected())
+}
+
+/// Build and execute the delete path against any sqlx executor —
+/// `&MySqlPool` for production, `&mut Transaction<'_, MySql>` for
+/// dry-run. Same SQL, same binds.
+async fn write_delete_batch<'e, E>(
+    executor: E,
+    my_ctx: &MySqlSinkCtx,
+    rows: &[CoreRow],
+) -> RuntimeResult<u64>
+where
+    E: Executor<'e, Database = MySql>,
+{
+    if !rows.iter().any(is_delete) {
+        return Ok(0);
+    }
+    let plan = my_ctx.delete.as_ref().ok_or_else(|| {
+        RuntimeError::Other(
+            "mysql sink received Delete row but no [flow.<x>.conflict] block \
+             configured — Delete requires a key"
+                .into(),
+        )
+    })?;
+    let mut qb: QueryBuilder<'_, MySql> = QueryBuilder::new(&plan.prefix);
+    let key_indices = &plan.key_indices;
+    let column_types_ref = &my_ctx.column_types;
+    if key_indices.len() == 1 {
+        let mut sep = qb.separated(", ");
+        let i = key_indices[0];
+        let dt = &column_types_ref[i];
+        for row in rows.iter().filter(|r| is_delete(r)) {
+            let v = row.values.get(i).unwrap_or(&Value::Null);
+            bind_value_separated(&mut sep, v, dt);
+        }
+    } else {
+        qb.push_tuples(rows.iter().filter(|r| is_delete(r)), |mut tuple, row| {
+            for &i in key_indices {
+                let dt = &column_types_ref[i];
+                let v = row.values.get(i).unwrap_or(&Value::Null);
+                bind_value_separated(&mut tuple, v, dt);
             }
         });
-        if !my_ctx.conflict_suffix.is_empty() {
-            qb.push(&my_ctx.conflict_suffix);
-        }
-        debug!(sql = %qb.sql(), "mysql insert batch");
-        let result = qb
-            .build()
-            .execute(&self.pool)
-            .await
-            .map_err(RuntimeError::backend)?;
-        Ok(result.rows_affected())
     }
-
-    async fn write_delete_batch(
-        &self,
-        my_ctx: &MySqlSinkCtx,
-        rows: &[CoreRow],
-    ) -> RuntimeResult<u64> {
-        if !rows.iter().any(is_delete) {
-            return Ok(0);
-        }
-        let plan = my_ctx.delete.as_ref().ok_or_else(|| {
-            RuntimeError::Other(
-                "mysql sink received Delete row but no [flow.<x>.conflict] block \
-                 configured — Delete requires a key"
-                    .into(),
-            )
-        })?;
-        let mut qb: QueryBuilder<'_, sqlx::MySql> = QueryBuilder::new(&plan.prefix);
-        let key_indices = &plan.key_indices;
-        let column_types_ref = &my_ctx.column_types;
-        if key_indices.len() == 1 {
-            let mut sep = qb.separated(", ");
-            let i = key_indices[0];
-            let dt = &column_types_ref[i];
-            for row in rows.iter().filter(|r| is_delete(r)) {
-                let v = row.values.get(i).unwrap_or(&Value::Null);
-                bind_value_separated(&mut sep, v, dt);
-            }
-        } else {
-            qb.push_tuples(rows.iter().filter(|r| is_delete(r)), |mut tuple, row| {
-                for &i in key_indices {
-                    let dt = &column_types_ref[i];
-                    let v = row.values.get(i).unwrap_or(&Value::Null);
-                    bind_value_separated(&mut tuple, v, dt);
-                }
-            });
-        }
-        qb.push(")");
-        debug!(sql = %qb.sql(), "mysql delete batch");
-        let result = qb
-            .build()
-            .execute(&self.pool)
-            .await
-            .map_err(RuntimeError::backend)?;
-        Ok(result.rows_affected())
-    }
+    qb.push(")");
+    debug!(sql = %qb.sql(), "mysql delete batch");
+    let result = qb
+        .build()
+        .execute(executor)
+        .await
+        .map_err(RuntimeError::backend)?;
+    Ok(result.rows_affected())
 }
 
 fn is_upsert(r: &CoreRow) -> bool {

@@ -1,6 +1,7 @@
 ---
 name: project-conventions
 description: Mandatory shared utilities and patterns for Air Elt — load before changing any Rust code so you use the right crate helpers instead of writing ad-hoc alternatives. Covers logging, SQL identifier escaping, value binding, config loading, secret resolution, type model, testing, factory wiring, and error types. Update this file whenever a new cross-crate utility is introduced.
+user-invocable: false
 ---
 
 # Project conventions — mandatory utilities
@@ -66,9 +67,11 @@ Canonical types are the only pivot — connectors do NOT introduce parallel enum
 
 - **`core::types::{DataType, Value}`** — the type enums. `Text`/`Bytes` carry `size: Option<u32>` (None = unbounded). `BigInt { width }` covers integer-only `numeric(p, 0)` (carrying `num_bigint::BigInt`); `Decimal { precision, scale }` covers fractional `numeric(p, s>0)` (carrying `bigdecimal::BigDecimal`). Unsigned variants exist solely for MySQL/MariaDB UNSIGNED columns — pg never produces them.
 - **`core::types::matrix`** — validation-time width check. `is_compatible` is the lossless matrix; `is_compatible_with_truncate` widens to admit narrowing arms when a mapping has `truncate=true`. Reverse paths (`BigInt/Decimal → Int*`, `Float ↔ BigInt/Decimal`) are deliberately rejected by the lossless matrix.
-- **`core::types::convert`** — runtime per-cell dispatcher (`convert(value, src, dst, &ctx)`). Identity / pure-widening pairs return the value unchanged. Connectors must NOT implement these conversions themselves; the runner builds a `ConversionPlan` per column and dispatches via `convert`.
+- **`core::types::convert`** — runtime per-cell dispatcher (`convert(value, src, dst, &ctx)`). Identity / pure-widening pairs return the value unchanged. Connectors must NOT implement these conversions themselves; the Transform layer wraps a `ColumnConversionPlan` in `TransformOp::Convert` and dispatches via `convert` at apply time.
 - **`core::types::default_value::parse`** — parses a TOML default literal against the sink `DataType`. Bytes columns require a typed prefix (`hex:` / `base64:` / `utf8:` / `bin:`).
-- **`FlowState::conversions`** is populated in `validation::pipeline::validate`. The runner skips identity plans and dispatches the rest via `convert`.
+- The compiled `Transform` program is owned by `DerivedPlans` and rebuilt whenever the schema is re-introspected.
+
+**Spec carries the body flag.** `ReadSpec` precomputes `needs_body: bool` — set when the compiled Transform contains at least one `TransformOp::Body` (i.e. some sink column is fed from the row body). Sources MUST consult this flag and only populate `RawRow.body` when set. Relational sources build the body via `air_elt_core::transform::build_body_json`; Mongo wraps the document as `Value::Custom(BsonObjectValue)`. Sources MUST NOT compute conversions or pack bodies for sink columns themselves — that happens in Transform.
 
 ### Connector-local custom types (`DynType` / `DynValue`)
 
@@ -76,7 +79,48 @@ Backend-specific types that don't reduce to canonical pivots live behind `DataTy
 
 - `kind()` format `"<vendor>.<type>"`. The string is wire-stable. Existing kinds: `mongodb.object_id`, `mongodb.javascript`, `postgresql.hll`.
 - **Mandatory: `pub const KIND: &'static str = "..."` on the type struct.** Every recognition site compares `t.kind() == T::KIND` — never spell the literal twice (rename must propagate via the compiler).
+- **Mandatory: `DynValue::to_json(&self) -> Result<serde_json::Value, JsonEncodeError>`** on every custom value. Powers the canonical JSON encoder (`core::types::json_encode::value_to_json`) and the `Body { to }` body-mapping path. Existing impls: `MongoObjectIdValue` → 24-hex string, `MongoJsValue` → code as string, `PgHllValue` → base64 string, `BsonObjectValue` → BSON-bridge via `commons-mongodb::bson_value`.
+- **`DynType::is_object() -> bool`** (default `false`). Set to `true` for types that wrap a whole-document object, signalling that they may legally feed a body slot for schemaless raw passthrough. `BsonObjectType` overrides to `true`. Mirrored at the canonical level by `DataType::is_object()` (`true` for `Json`, delegates for `Custom(t)`).
 - `Custom` forbidden as cursor field; `Value::Custom` / `DataType::Custom` Deserialize errors out (cursor-storage JSON never carries one).
+- **Existing custom kinds**: `mongodb.object_id`, `mongodb.javascript`, `mongodb.bson_object` (whole-document raw passthrough — `commons-mongodb::types::bson_object`), `postgresql.hll`.
+
+## Schema on context
+
+Each source / sink ctx struct (`PgSourceCtx`, `MySqlSinkCtx`, etc.) carries its schema as a plain field, populated once in `build_context`:
+
+- SQL ctxs: `pub schema: Schema`.
+- Mongo ctxs: `pub schema: Option<Schema>` — the schema is sample-derived and may be absent when the collection is empty or unreachable.
+
+Generic access goes through the `SchemaProvider` trait + `as_schema_provider()` helper on `dyn SourceCtx` / `dyn SinkCtx`. **Never** wrap the schema in `RwLock<HashMap<String, Schema>>` or similar — caching primitives are forbidden here. The ctx is rebuilt as a unit, not refreshed in place.
+
+**Reset on backend error**: the runner drops the ctx Arc on `RuntimeError::Backend` *before* the backoff sleep; the next tick calls `build_context` again, which re-introspects the schema. Per-row data errors (`RuntimeError::JsonEncode`, `Type`) do NOT trigger ctx-drop — the connection is fine, the row isn't.
+
+## Derived plans on FlowState
+
+`FlowState` carries `derived: Option<DerivedPlans>` (a plain field, **not** behind a `Mutex` — `FlowState` is owned exclusively by a single `FlowRunner`; concurrent access is not part of the contract because each `tokio::spawn` moves a fresh `FlowState`). `DerivedPlans` holds:
+
+- `transform: Transform` — the compiled per-flow Transform program (sequence of `TransformOp` lowered from the expanded mapping, with the identity short-circuit and absorb-when-last optimisation baked in),
+- `read_spec_columns` / `write_spec_columns` (post-expansion, runner snapshots into `ReadSpec`/`WriteSpec` per tick).
+
+Pure rebuild lives in `core::model::flow_state::build_derived_plans` (also used by validation pipeline at startup). Runner calls `state.invalidate_derived()` alongside ctx-drop and `state.rebuild_derived(...)` on the next tick after `build_context` populates fresh schemas — so a schema change between reconnects propagates through into a freshly compiled Transform.
+
+## Transform layer
+
+`core::transform` owns the only Row→Row machinery. The IR is closed:
+
+```rust
+pub enum TransformOp {
+    Take { source_index: usize },                              // raw.values[i].take()
+    Body,                                                       // raw.body.take()
+    Convert { input: Box<TransformOp>, plan: ColumnConversionPlan },
+}
+```
+
+`Transform::apply(raw: RawBatch) -> RuntimeResult<Batch>` runs the program per row. The compiler caches an identity short-circuit (every column is `Take{i}` for `i in 0..len`) — that path zero-copies the source values. The "absorb-when-last" optimisation moves the value out of the last `TransformOp::Take{i}` referencing source slot `i` (and likewise for the `Body` payload); earlier references clone.
+
+Body construction for relational sources goes through **`air_elt_core::transform::build_body_json`** (relational sources call it when `ReadSpec.needs_body` is set). Mongo sources push `Value::Custom(BsonObjectValue(doc))` directly. The synthetic mapping target `core::mapping::expand::ROOT_BODY_TARGET = "_root"` is the lowered shape of mongo→mongo `["*"]` raw passthrough — it compiles to a single `TransformOp::Body`.
+
+**Forbidden idiom**: `serde_json::to_value(&value)`. `Value`'s own `Serialize` emits the cursor-envelope `{type, value}` for storage, NOT the canonical wire format. Always go through `core::types::json_encode::value_to_json` (or `build_body_json`, which delegates to it).
 
 ## Validation pipeline
 
@@ -86,7 +130,7 @@ The flow-level `[flow.<name>.validation]` block exposes four toggles: `access`, 
 
 `Sink::schemaless()` is `true` for Mongo. The pipeline then derives the sink schema from the source's declared types, skipping the matrix narrowing check.
 
-`Source::sample` drives `read_batch` with `limit=n` (validates the cursor SQL). `Source::sample_fresh` is an optional companion override for backends with random-access — Mongo overrides via `$sample`. Sampling-validation runs both and unions the rows before exercising the conversion plan.
+`Source::sample` is a single probe used by sampling-validation. The default delegates to `read_batch` with `spec.limit = n` and no cursor state — pull-based sources stay on the default so the probe exercises the same query the runner runs. CDC sources (`mongo-cdc`) override because their `read_batch` would block on the open change stream; the override aggregates `$sample` on the watched collection. Sampling-validation feeds the returned `RawBatch` through the compiled Transform.
 
 `core::mapping::FieldPath` — `parse(&str)` produces a validated dot-notation path. SQL connectors reject `is_nested()` paths; Mongo accepts them.
 
@@ -126,7 +170,7 @@ Optional `[flow.<name>.conflict]` block. `core::config::conflict::{ConflictConfi
 
 ## Errors
 
-Dedicated variants — use the right one instead of `RuntimeError::Other`. Wrap third-party errors with `RuntimeError::backend(err)` to preserve the `source` chain. Notable: `ValidationError::{NullabilityMismatch, DuplicateSinkField, SamplingFailed, MissingField, AccessFailed}`, `TypeError::NullSinkColumn`, `ConfigError::{UnresolvedReference, ConfigTooLarge, AbsoluteIncludeNotAllowed, Invalid}`.
+Dedicated variants — use the right one instead of `RuntimeError::Other`. Wrap third-party errors with `RuntimeError::backend(err)` to preserve the `source` chain. Notable: `ValidationError::{NullabilityMismatch, DuplicateSinkField, SamplingFailed, MissingField, AccessFailed, WildcardWithoutSchema, WildcardUniverseTooLarge, WildcardMissingNonNullableSource, CursorRequiresExplicitFields, ConflictKeyNotInMapping}`, `TypeError::NullSinkColumn`, `ConfigError::{UnresolvedReference, ConfigTooLarge, AbsoluteIncludeNotAllowed, Invalid}`, `RuntimeError::JsonEncode`, `JsonEncodeError::{Variant, DepthExceeded, CustomFailed}`.
 
 ## After changes
 

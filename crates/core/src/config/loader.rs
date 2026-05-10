@@ -7,7 +7,7 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::config::env_expand;
-use crate::config::model::RootConfig;
+use crate::config::model::{MappingRule, RootConfig};
 use crate::error::ConfigError;
 
 /// Hard cap on a single config file. Operator-controlled files in MVP are
@@ -347,6 +347,52 @@ fn merge_extra_into(
     Ok(())
 }
 
+/// `true` iff the raw shorthand string is a wildcard or json-pack token
+/// (`"*"`, `"*:*"`, or `"*:NAME"`). The loader only needs textual
+/// recognition — full grammar validation runs later in
+/// `crate::mapping::shorthand::parse`.
+fn shorthand_defers_subset_checks(s: &str) -> bool {
+    s == "*" || s == "*:*" || s.starts_with("*:")
+}
+
+/// `true` iff `mapping` contains any rule that triggers post-expansion
+/// resolution (wildcard or JSON auto-pack). Such rules invalidate the
+/// loader-time subset checks (`cursor.fields ⊆ mapping.from`,
+/// `conflict.key ⊆ mapping.to`, `batch_limit × cols ≤ 60_000`) because
+/// the actual column set is unknown until expansion runs in
+/// `validation::pipeline::validate`.
+fn mapping_defers_subset_checks(mapping: &[MappingRule]) -> bool {
+    mapping.iter().any(|r| match r {
+        MappingRule::Shorthand(s) => shorthand_defers_subset_checks(s),
+        MappingRule::Full(_) => false,
+    })
+}
+
+/// Pull `(from, to)` out of a mapping rule when it is statically
+/// determinable at loader time. Returns `None` for shorthands that
+/// require parsing (handled by `mapping::shorthand::parse` later) and
+/// for wildcard / json-pack tokens (caller must already have decided
+/// not to perform subset checks). When a shorthand is a literal column
+/// name `"NAME"` we treat both sides as `NAME`; for `"FROM:TO"` we
+/// split on the first colon. Anything that doesn't conform is left for
+/// the shorthand parser to reject — the loader's job is best-effort
+/// extraction for the subset checks.
+fn extract_static_pair(rule: &MappingRule) -> Option<(&str, &str)> {
+    match rule {
+        MappingRule::Full(entry) => Some((entry.from.as_str(), entry.to.as_str())),
+        MappingRule::Shorthand(s) => {
+            if shorthand_defers_subset_checks(s) {
+                return None;
+            }
+            if let Some((from, to)) = s.split_once(':') {
+                Some((from, to))
+            } else {
+                Some((s.as_str(), s.as_str()))
+            }
+        }
+    }
+}
+
 /// Structural checks after all files are merged.
 fn validate_post_merge(root: &RootConfig) -> Result<(), ConfigError> {
     for (flow_name, flow) in &root.flow {
@@ -371,49 +417,71 @@ fn validate_post_merge(root: &RootConfig) -> Result<(), ConfigError> {
                 });
             }
         }
-        // Why: Postgres rejects statements with more than 65 535 bind parameters
-        // (wire protocol uses u16 for bind-count). A sink batch of N rows over
-        // C mapped columns emits N*C binds; we cap below the hard limit so
-        // operators see a clear error at validate rather than sqlx complaining
-        // mid-drain. Source SELECTs only bind cursor fields per batch, so the
-        // check is guided by sink shape.
-        let cols = flow.mapping.len();
-        if flow.batch_limit.saturating_mul(cols) > 60_000 {
-            return Err(ConfigError::Invalid {
-                reason: format!(
-                    "flow {flow_name:?}: batch_limit={} × mapping_cols={} exceeds 60_000 bind parameters",
-                    flow.batch_limit, cols
-                ),
-            });
-        }
-        // Cursor fields must appear in mapping.from — otherwise the source
-        // SELECT will not project them and runtime will emit a misleading
-        // error. This used to be a silent dead-fallback in pg_source.
-        let mapped_froms: AHashSet<&str> = flow.mapping.iter().map(|m| m.from.as_str()).collect();
-        for cf in &flow.cursor.fields {
-            if !mapped_froms.contains(cf.as_str()) {
+        // When mapping contains a wildcard or JSON auto-pack rule, the
+        // post-expansion column set isn't known yet — defer the bind
+        // and subset checks to `validation::pipeline::validate`, which
+        // re-runs them after `mapping::expand` produces the concrete
+        // expanded column list.
+        let defer = mapping_defers_subset_checks(&flow.mapping);
+
+        if !defer {
+            // Why: Postgres rejects statements with more than 65 535 bind
+            // parameters (wire protocol uses u16 for bind-count). A sink
+            // batch of N rows over C mapped columns emits N*C binds; we
+            // cap below the hard limit so operators see a clear error at
+            // validate rather than sqlx complaining mid-drain. Source
+            // SELECTs only bind cursor fields per batch, so the check is
+            // guided by sink shape.
+            let cols = flow.mapping.len();
+            if flow.batch_limit.saturating_mul(cols) > 60_000 {
                 return Err(ConfigError::Invalid {
                     reason: format!(
-                        "flow {flow_name:?}: cursor field {cf:?} must be listed in mapping.from"
+                        "flow {flow_name:?}: batch_limit={} × mapping_cols={} exceeds 60_000 bind parameters",
+                        flow.batch_limit, cols
                     ),
                 });
+            }
+            // Cursor fields must appear in mapping.from — otherwise the
+            // source SELECT will not project them and runtime will emit
+            // a misleading error.
+            let mapped_froms: AHashSet<&str> = flow
+                .mapping
+                .iter()
+                .filter_map(extract_static_pair)
+                .map(|(from, _)| from)
+                .collect();
+            for cf in &flow.cursor.fields {
+                if !mapped_froms.contains(cf.as_str()) {
+                    return Err(ConfigError::Invalid {
+                        reason: format!(
+                            "flow {flow_name:?}: cursor field {cf:?} must be listed in mapping.from"
+                        ),
+                    });
+                }
             }
         }
         if let Some(conflict) = &flow.conflict {
             conflict.validate().map_err(|reason| ConfigError::Invalid {
                 reason: format!("flow {flow_name:?}: {reason}"),
             })?;
-            // Every conflict.key entry must appear in mapping.to —
-            // otherwise the upsert filter would reference a sink column
-            // we never write.
-            let mapped_tos: AHashSet<&str> = flow.mapping.iter().map(|m| m.to.as_str()).collect();
-            for k in &conflict.key {
-                if !mapped_tos.contains(k.as_str()) {
-                    return Err(ConfigError::Invalid {
-                        reason: format!(
-                            "flow {flow_name:?}: conflict.key entry {k:?} must be listed in mapping.to"
-                        ),
-                    });
+            if !defer {
+                // Every conflict.key entry must appear in mapping.to —
+                // otherwise the upsert filter would reference a sink
+                // column we never write.
+                let mapped_tos: AHashSet<&str> = flow
+                    .mapping
+                    .iter()
+                    .filter_map(extract_static_pair)
+                    .map(|(_, to)| to)
+                    .collect();
+                for k in &conflict.key {
+                    if !mapped_tos.contains(k.as_str()) {
+                        return Err(ConfigError::Invalid {
+                            reason: format!(
+                                "flow {flow_name:?}: conflict.key entry {k:?} must be listed in mapping.to"
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -1422,6 +1490,239 @@ secrets:
         assert!(
             matches!(&err, ConfigError::DuplicateSecret { key, .. } if key == "PG_HOST"),
             "got {err:?}"
+        );
+    }
+
+    /// Wildcard mapping defers the
+    /// `cursor.fields ⊆ mapping.from` check to validation. The
+    /// loader must accept `cursor=["id"]` + `mapping=["*"]` even
+    /// though no concrete `from` is known yet.
+    #[test]
+    fn wildcard_defers_cursor_subset_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "config.toml",
+            r#"
+[[sources]]
+name = "pg"
+type = "postgres"
+config = {}
+[[sinks]]
+name = "pg"
+type = "postgres"
+config = {}
+[[storages]]
+name = "pg"
+type = "postgres"
+config = {}
+[flow.f]
+source = "pg"
+sink = "pg"
+storage = "pg"
+from = "t"
+to = "t"
+mapping = ["*"]
+cursor = { fields = ["id"] }
+"#,
+        );
+        let root = load(&path).unwrap();
+        // Wildcard rule survives to validation as a Shorthand("*") token.
+        let mapping = &root.flow["f"].mapping;
+        assert_eq!(mapping.len(), 1);
+        assert!(matches!(
+            &mapping[0],
+            crate::config::model::MappingRule::Shorthand(s) if s == "*"
+        ));
+    }
+
+    /// Wildcard mapping also defers the
+    /// `conflict.key ⊆ mapping.to` check.
+    #[test]
+    fn wildcard_defers_conflict_key_subset_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "config.toml",
+            r#"
+[[sources]]
+name = "pg"
+type = "postgres"
+config = {}
+[[sinks]]
+name = "pg"
+type = "postgres"
+config = {}
+[[storages]]
+name = "pg"
+type = "postgres"
+config = {}
+[flow.f]
+source = "pg"
+sink = "pg"
+storage = "pg"
+from = "t"
+to = "t"
+mapping = ["*"]
+cursor = { fields = ["id"] }
+conflict = { key = ["id"], strategy = "overwrite" }
+"#,
+        );
+        let root = load(&path).unwrap();
+        assert!(root.flow["f"].conflict.is_some());
+    }
+
+    /// `["id", "*"]` together: the explicit
+    /// `id` would satisfy the cursor subset check on its own, but
+    /// the wildcard's presence still defers the check. We verify
+    /// the load succeeds and both rules survive.
+    #[test]
+    fn wildcard_with_explicit_cursor_field_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "config.toml",
+            r#"
+[[sources]]
+name = "pg"
+type = "postgres"
+config = {}
+[[sinks]]
+name = "pg"
+type = "postgres"
+config = {}
+[[storages]]
+name = "pg"
+type = "postgres"
+config = {}
+[flow.f]
+source = "pg"
+sink = "pg"
+storage = "pg"
+from = "t"
+to = "t"
+mapping = ["id", "*"]
+cursor = { fields = ["id"] }
+"#,
+        );
+        let root = load(&path).unwrap();
+        assert_eq!(root.flow["f"].mapping.len(), 2);
+    }
+
+    /// YAML/TOML parity for `mapping` containing every shorthand
+    /// variant. Both formats must
+    /// produce a deeply-equal `flow.mapping` shape.
+    #[test]
+    fn yaml_toml_mapping_shorthand_parity() {
+        use crate::config::model::MappingRule;
+
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = write(
+            dir.path(),
+            "config.toml",
+            r#"
+[[sources]]
+name = "pg"
+type = "postgres"
+config = {}
+[[sinks]]
+name = "pg"
+type = "postgres"
+config = {}
+[[storages]]
+name = "pg"
+type = "postgres"
+config = {}
+[flow.f]
+source = "pg"
+sink = "pg"
+storage = "pg"
+from = "t"
+to = "t"
+mapping = ["id", "*", "*:body"]
+cursor = { fields = ["id"] }
+"#,
+        );
+        let yaml_path = write(
+            dir.path(),
+            "config.yml",
+            r#"
+sources:
+  - { name: pg, type: postgres, config: {} }
+sinks:
+  - { name: pg, type: postgres, config: {} }
+storages:
+  - { name: pg, type: postgres, config: {} }
+flow:
+  f:
+    source: pg
+    sink: pg
+    storage: pg
+    from: t
+    to: t
+    mapping: ["id", "*", "*:body"]
+    cursor: { fields: ["id"] }
+"#,
+        );
+        let toml_root = load(&toml_path).unwrap();
+        let yaml_root = load(&yaml_path).unwrap();
+
+        let toml_mapping = &toml_root.flow["f"].mapping;
+        let yaml_mapping = &yaml_root.flow["f"].mapping;
+        assert_eq!(toml_mapping.len(), 3);
+        assert_eq!(yaml_mapping.len(), 3);
+        // Why: assert each rule shape rather than relying on a
+        // derived `PartialEq` (the enum wraps `MappingEntry` whose
+        // `default: Option<toml::Value>` field doesn't implement
+        // `PartialEq` on every dependency version).
+        for mapping in [toml_mapping, yaml_mapping] {
+            assert!(matches!(
+                &mapping[0],
+                MappingRule::Shorthand(s) if s == "id"
+            ));
+            assert!(matches!(
+                &mapping[1],
+                MappingRule::Shorthand(s) if s == "*"
+            ));
+            assert!(matches!(
+                &mapping[2],
+                MappingRule::Shorthand(s) if s == "*:body"
+            ));
+        }
+    }
+
+    /// Non-string scalar (integer, bool) under a mapping entry must
+    /// surface a friendly error from the `MappingRule` visitor naming
+    /// both shapes.
+    #[test]
+    fn mapping_non_string_non_table_rejected_with_friendly_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "config.yml",
+            r#"
+sources:
+  - { name: pg, type: postgres, config: {} }
+sinks:
+  - { name: pg, type: postgres, config: {} }
+storages:
+  - { name: pg, type: postgres, config: {} }
+flow:
+  f:
+    source: pg
+    sink: pg
+    storage: pg
+    from: t
+    to: t
+    mapping: [123]
+    cursor: { fields: [id] }
+"#,
+        );
+        let err = load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("string") && msg.contains("table"),
+            "expected error to mention both shapes; got {msg:?}",
         );
     }
 }

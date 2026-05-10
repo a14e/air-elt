@@ -34,14 +34,14 @@ async fn migrate_and_upsert_cursor_on_mariadb() {
         name: "id".into(),
         value: Value::Int64(1),
     }]);
-    storage.save_cursor(flow, &s1).await.expect("save 1");
+    storage.save_cursor(flow, &s1, false).await.expect("save 1");
 
     let s2 = CursorState::new(vec![CursorFieldValue {
         name: "id".into(),
         value: Value::Int64(2),
     }]);
     storage
-        .save_cursor(flow, &s2)
+        .save_cursor(flow, &s2, false)
         .await
         .expect("save 2 (upsert)");
 

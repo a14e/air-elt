@@ -3,8 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::error::RuntimeResult;
+use crate::model::raw::RawBatch;
 use crate::model::{
-    Batch, CursorState, ReadSpec, Row, Schema, SinkCtx, SourceCtx, WriteReport, WriteSpec,
+    Batch, CursorState, ReadSpec, Schema, SinkCtx, SourceCtx, WriteReport, WriteSpec,
 };
 
 #[cfg_attr(test, mockall::automock)]
@@ -28,33 +29,24 @@ pub trait Source: Send + Sync {
         spec: &ReadSpec,
         ctx: Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
-    ) -> RuntimeResult<Batch>;
+    ) -> RuntimeResult<RawBatch>;
 
-    /// Pull up to `n` rows for sampling-validation by driving the
-    /// cursor query — same code path the runner uses, so a wedged
-    /// cursor query surfaces here too. The default implementation
-    /// issues a single cursor-less `read_batch` with `spec.limit`
-    /// overridden by `n`, discards the returned cursor state, and
-    /// returns the rows. Connectors do not override this; they
-    /// override `sample_fresh` to add a complementary random sample.
-    async fn sample(&self, spec: &ReadSpec, n: usize) -> RuntimeResult<Vec<Row>> {
+    /// Probe read for sampling-validation. Returns rows in the same
+    /// pre-Transform shape `read_batch` produces — the runner applies
+    /// the `Transform` program afterwards, so the sampling probe
+    /// exercises the same projection / body-folding / conversion path
+    /// the live tick does. The default delegates to `read_batch` with
+    /// `spec.limit` overridden by `n`; CDC sources override because
+    /// their `read_batch` blocks on the change stream.
+    async fn sample(
+        &self,
+        spec: &ReadSpec,
+        ctx: Arc<dyn SourceCtx>,
+        n: usize,
+    ) -> RuntimeResult<RawBatch> {
         let mut sample_spec = spec.clone();
         sample_spec.limit = n;
-        let ctx = self.build_context(&sample_spec).await?;
-        let batch = self.read_batch(&sample_spec, ctx, None).await?;
-        Ok(batch.rows)
-    }
-
-    /// Optional companion to `sample` — pulls a *random* slice instead
-    /// of the cursor-ordered head. Default returns an empty vector for
-    /// backends without a cheap random-access primitive (Postgres,
-    /// MySQL/MariaDB). Mongo overrides this with
-    /// `aggregate([{ $sample: { size: n } }])`. Sampling-validation
-    /// runs both `sample` (for the cursor path) and `sample_fresh`
-    /// (for representativeness) and unions the rows before exercising
-    /// the conversion plan.
-    async fn sample_fresh(&self, _spec: &ReadSpec, _n: usize) -> RuntimeResult<Vec<Row>> {
-        Ok(Vec::new())
+        self.read_batch(&sample_spec, ctx, None).await
     }
 
     /// `true` when this connector's in-flight futures are safe to drop
@@ -81,6 +73,28 @@ pub trait Source: Send + Sync {
     fn emits_deletes(&self) -> bool {
         false
     }
+
+    /// `true` for sources that have no authoritative column schema —
+    /// notably MongoDB, where collections accept any BSON shape.
+    /// Mirrors `Sink::schemaless()`. Used by the `*` wildcard expansion:
+    /// when **both** source and sink are schemaless, wildcard
+    /// expansion falls back to raw passthrough rather than column
+    /// enumeration. SQL connectors keep the default `false`.
+    fn schemaless(&self) -> bool {
+        false
+    }
+
+    /// The canonical [`DataType`] of the body payload this source
+    /// attaches to `RawRow.body` when `ReadSpec.needs_body` is `true`.
+    /// Drives the per-body-target conversion plan's source `DataType`,
+    /// the matrix check on body sink columns, and the Transform
+    /// compiler's object-shape assertion. Must satisfy
+    /// `body_data_type().is_object()` for body folds to compile.
+    /// Default: `DataType::Json` (relational sources). Mongo overrides
+    /// to `DataType::Custom(BsonObjectType)`.
+    fn body_data_type(&self) -> crate::types::DataType {
+        crate::types::DataType::Json
+    }
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -102,7 +116,8 @@ pub trait Sink: Send + Sync {
         &self,
         spec: &WriteSpec,
         ctx: Arc<dyn SinkCtx>,
-        batch: &Batch,
+        batch: Batch,
+        dry_run: bool,
     ) -> RuntimeResult<WriteReport>;
 
     /// `true` for sinks that have no authoritative column schema —
@@ -128,7 +143,12 @@ pub trait Storage: Send + Sync {
     async fn validate_access(&self) -> RuntimeResult<()>;
     async fn migrate(&self) -> RuntimeResult<()>;
     async fn load_cursor(&self, flow: &str) -> RuntimeResult<Option<CursorState>>;
-    async fn save_cursor(&self, flow: &str, state: &CursorState) -> RuntimeResult<()>;
+    async fn save_cursor(
+        &self,
+        flow: &str,
+        state: &CursorState,
+        dry_run: bool,
+    ) -> RuntimeResult<()>;
 
     /// CDC resume tokens are conceptually distinct from column-based
     /// cursors — they are opaque per-stream blobs (BSON for Mongo)
@@ -145,6 +165,7 @@ pub trait Storage: Send + Sync {
         &self,
         _flow: &str,
         _token: &serde_json::Value,
+        _dry_run: bool,
     ) -> RuntimeResult<()> {
         Err(crate::error::RuntimeError::Other(
             "this storage backend does not implement CDC resume-token \
@@ -190,8 +211,8 @@ mod tests {
             _spec: &ReadSpec,
             _ctx: Arc<dyn SourceCtx>,
             _cursor: Option<&'a CursorState>,
-        ) -> RuntimeResult<Batch> {
-            Ok(Batch::default())
+        ) -> RuntimeResult<RawBatch> {
+            Ok(RawBatch::default())
         }
     }
 
@@ -210,7 +231,8 @@ mod tests {
             &self,
             _spec: &WriteSpec,
             _ctx: Arc<dyn SinkCtx>,
-            _batch: &Batch,
+            _batch: Batch,
+            _dry_run: bool,
         ) -> RuntimeResult<WriteReport> {
             Ok(WriteReport::default())
         }
@@ -227,7 +249,12 @@ mod tests {
         async fn load_cursor(&self, _flow: &str) -> RuntimeResult<Option<CursorState>> {
             Ok(None)
         }
-        async fn save_cursor(&self, _flow: &str, _state: &CursorState) -> RuntimeResult<()> {
+        async fn save_cursor(
+            &self,
+            _flow: &str,
+            _state: &CursorState,
+            _dry_run: bool,
+        ) -> RuntimeResult<()> {
             Ok(())
         }
     }
@@ -263,8 +290,8 @@ mod tests {
             _spec: &ReadSpec,
             _ctx: Arc<dyn SourceCtx>,
             _cursor: Option<&'a CursorState>,
-        ) -> RuntimeResult<Batch> {
-            Ok(Batch::default())
+        ) -> RuntimeResult<RawBatch> {
+            Ok(RawBatch::default())
         }
         fn cancel_safe(&self) -> bool {
             false

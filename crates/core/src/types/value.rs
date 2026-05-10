@@ -404,6 +404,9 @@ mod tests {
         fn as_any(&self) -> &dyn Any {
             self
         }
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+            self
+        }
         fn eq_dyn(&self, _other: &dyn DynValue) -> bool {
             true
         }

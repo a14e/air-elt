@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use serde::de::{Deserializer, Error as DeError, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 /// Root configuration file (TOML).
@@ -94,7 +96,7 @@ pub struct FlowConfig {
     pub from: String,
     pub to: String,
     #[serde(default)]
-    pub mapping: Vec<MappingEntry>,
+    pub mapping: Vec<MappingRule>,
     /// Cursor config. Pull-based sources (postgres, mysql, mongodb)
     /// require non-empty `fields`. CDC sources (mongo-cdc) require
     /// empty `fields` — pagination is driven by the resume token.
@@ -138,6 +140,79 @@ fn default_batch_limit() -> usize {
 /// `#[serde(deny_unknown_fields)]` blocks the previously-reserved fields
 /// (`transform`, `timezone`, `data-type`) and any future leakage of
 /// "for-the-future" knobs into the config surface.
+/// A single mapping rule on a flow's `mapping = [...]` array.
+///
+/// Two surface forms accepted by the loader:
+///
+/// 1. **Shorthand** — a bare string. Interpreted later by
+///    `crate::mapping::shorthand::parse`. Examples: `"id"` (identity),
+///    `"a:b"` (rename), `"*"` / `"*:*"` (wildcard expansion),
+///    `"*:body"` (JSON auto-pack).
+/// 2. **Full** — the long-form table `{ from, to, truncate?, default? }`,
+///    matching `MappingEntry` exactly (preserves `deny_unknown_fields`).
+///
+/// Deserialization uses a hand-written `Visitor` rather than
+/// `#[serde(untagged)]` so the error message names both alternatives
+/// when neither shape matches (e.g. a YAML integer or boolean).
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum MappingRule {
+    /// A shorthand string. Parsed downstream into one of `Field`,
+    /// `Renamed`, `Wildcard`, or `Body` by
+    /// `crate::mapping::shorthand::parse`.
+    Shorthand(String),
+    /// The long-form mapping entry. Carries the same shape as
+    /// `MappingEntry` and inherits its `deny_unknown_fields` discipline.
+    Full(MappingEntry),
+}
+
+impl<'de> Deserialize<'de> for MappingRule {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(MappingRuleVisitor)
+    }
+}
+
+/// Custom visitor that produces a single, explicit error naming both
+/// accepted shapes when input is neither a string nor a table. This is
+/// nicer than the default `#[serde(untagged)]` "data did not match any
+/// variant" message which collapses both branches into one line and
+/// hides which variant tripped which way.
+struct MappingRuleVisitor;
+
+impl<'de> Visitor<'de> for MappingRuleVisitor {
+    type Value = MappingRule;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a mapping rule: expected string shorthand or full mapping table")
+    }
+
+    fn visit_str<E: DeError>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(MappingRule::Shorthand(v.to_string()))
+    }
+
+    fn visit_string<E: DeError>(self, v: String) -> Result<Self::Value, E> {
+        Ok(MappingRule::Shorthand(v))
+    }
+
+    fn visit_borrowed_str<E: DeError>(self, v: &'de str) -> Result<Self::Value, E> {
+        Ok(MappingRule::Shorthand(v.to_string()))
+    }
+
+    fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        // Reuse `MappingEntry`'s own deserializer so `deny_unknown_fields`
+        // and field-rename semantics stay in lockstep with the long-form
+        // shape declared below.
+        let entry = MappingEntry::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+        Ok(MappingRule::Full(entry))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct MappingEntry {

@@ -11,7 +11,7 @@
 #![allow(clippy::unwrap_used)]
 
 use air_elt_commons_mongodb::types::{MongoJsType, MongoObjectIdType};
-use air_elt_core::mapping::ColumnMapping;
+use air_elt_core::mapping::DirectMapping;
 use air_elt_core::model::{Field, Schema};
 use air_elt_core::types::DataType;
 use air_elt_core::validation::checks::check_mapping;
@@ -34,13 +34,13 @@ fn check_mapping_object_id_identity_is_compatible() {
     // shape literally to exercise the matrix Custom-Custom identity arm.
     let sink_schema = src_schema.clone();
     let mappings = vec![
-        ColumnMapping {
+        DirectMapping {
             from: "_id".into(),
             to: "_id".into(),
             truncate: false,
             default_literal: None,
         },
-        ColumnMapping {
+        DirectMapping {
             from: "name".into(),
             to: "name".into(),
             truncate: false,
@@ -58,7 +58,7 @@ fn check_mapping_javascript_identity_is_compatible() {
         nullable: true,
     }]);
     let sink_schema = src_schema.clone();
-    let mappings = vec![ColumnMapping {
+    let mappings = vec![DirectMapping {
         from: "code".into(),
         to: "code".into(),
         truncate: false,

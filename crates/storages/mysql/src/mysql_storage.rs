@@ -117,8 +117,16 @@ impl Storage for MySqlStorage {
             .transpose()
     }
 
-    async fn save_cursor(&self, flow: &str, state: &CursorState) -> RuntimeResult<()> {
+    async fn save_cursor(
+        &self,
+        flow: &str,
+        state: &CursorState,
+        dry_run: bool,
+    ) -> RuntimeResult<()> {
         let json = serde_json::to_value(state).map_err(RuntimeError::from)?;
+        if dry_run {
+            return Ok(());
+        }
         sqlx::query(self.upsert_sql)
             .bind(flow)
             .bind(json)
@@ -137,10 +145,22 @@ impl Storage for MySqlStorage {
         Ok(row.map(|(j,)| j))
     }
 
-    async fn save_resume_token(&self, flow: &str, token: &serde_json::Value) -> RuntimeResult<()> {
+    async fn save_resume_token(
+        &self,
+        flow: &str,
+        token: &serde_json::Value,
+        dry_run: bool,
+    ) -> RuntimeResult<()> {
+        // Always serialize: a serialization failure is a real bug we
+        // want to surface even in dry-run. Only the network execute
+        // is skipped.
+        let json = serde_json::to_value(token).map_err(RuntimeError::from)?;
+        if dry_run {
+            return Ok(());
+        }
         sqlx::query(self.upsert_resume_token_sql)
             .bind(flow)
-            .bind(token)
+            .bind(json)
             .execute(&self.pool)
             .await
             .map_err(RuntimeError::backend)?;

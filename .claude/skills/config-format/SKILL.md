@@ -1,6 +1,7 @@
 ---
 name: config-format
 description: Complete reference for the Air Elt TOML/YAML config format — all sections, fields, defaults, and validation rules. Load before editing config files, config structs, or the loader.
+user-invocable: false
 ---
 
 # Config format
@@ -151,7 +152,7 @@ size = 100
 | `inserts` | bool | `true` | Run the sink write probe (insert + delete sentinel). |
 | `sampling` | bool / table | per-backend default | Enable sampling-validation. `true` → enabled with size 100. `false` → disabled. Table form `{ enabled, size }` overrides the default size. |
 
-**Backend defaults**: when `validation.sampling` is omitted, the source factory chooses — `mongodb` defaults **on** (size 100), `postgres` and `mysql` default **off**. Sampling pulls `size` rows from the source via the cursor query (`Source::sample`) and, for backends that support it (Mongo `$sample`), an extra random slice via `Source::sample_fresh`. Both row sets are run through every `ConversionPlan::convert`, surfacing data that violates the declared types (overflow integers, malformed UUIDs, etc.). The recommendation is to enable it on SQL flows whose data shape you don't fully trust — the cost is one extra round-trip per validate run.
+**Backend defaults**: when `validation.sampling` is omitted, the source factory chooses — `mongodb` defaults **on** (size 100), `postgres` and `mysql` default **off**. Sampling pulls `size` rows from the source via `Source::sample` (default impl drives the cursor query the runner uses; CDC sources override with `$sample` on the watched collection because their `read_batch` would block). Rows are run through the compiled Transform (each `ColumnConversionPlan` dispatches via `core::types::convert`), surfacing data that violates the declared types (overflow integers, malformed UUIDs, etc.). The recommendation is to enable it on SQL flows whose data shape you don't fully trust — the cost is one extra round-trip per validate run.
 
 ### `conflict`
 
@@ -175,15 +176,21 @@ strategy = "overwrite"  # "ignore" | "overwrite"
 
 ### `mapping`
 
-Single flat shape (object form with reserved future-fields was removed — see the no-future-proofing rule in `rust-guidelines`):
+Two surfaces coexist: a long-form table that carries the full feature set (`truncate`, `default`), and a short string form for the common cases.
 
 ```toml
 mapping = [
-  { from = "col_a", to = "col_b" },
-  { from = "long_text",  to = "summary",   truncate = true },
-  { from = "blob_in",    to = "blob_out",  default = "hex:00" },
+  { from = "col_a", to = "col_b" },                              # long form
+  { from = "long_text", to = "summary", truncate = true },
+  { from = "blob_in",   to = "blob_out", default = "hex:00" },
+  "created_at",                                                  # short: ≡ {from, to = "created_at"}
+  "src_name:dst_name",                                           # short: from:to
+  "*",                                                           # wildcard expansion
+  "*:body",                                                      # body mapping
 ]
 ```
+
+**Long-form fields**
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -192,7 +199,62 @@ mapping = [
 | `truncate` | bool | `false` | Opt the column into narrowing conversions: text/bytes shrink (UTF-safe for text), integer/float saturate to target's max/min, decimal scale drop, json/xml → `text(n)` serialize. Forbidden combinations (`Json → Json`, `Xml → Xml`, UUID truncations, `Date → Timestamp`) remain rejected. |
 | `default` | scalar / table | none | Fallback value substituted when the source value is `Null`. Permits mapping a nullable source into a `NOT NULL` sink. Validation rejects `default` if the source column is `NOT NULL` (the substitution would never fire). The literal is parsed against the resolved sink `DataType` (see grammar below). |
 
-`#[serde(deny_unknown_fields)]` rejects any additional keys at parse time — this includes the previously-reserved `transform`, `timezone`, `data-type` placeholders, which are now removed.
+`#[serde(deny_unknown_fields)]` rejects any additional keys at parse time on the long form — this includes the previously-reserved `transform`, `timezone`, `data-type` placeholders, which are now removed.
+
+**Short-form grammar**
+
+| Form | Equivalent long form | Notes |
+|------|---------------------|-------|
+| `"name"` | `{from = "name", to = "name"}` | Identity. `name` validated as an identifier (dot-paths allowed for Mongo). |
+| `"a:b"` | `{from = "a", to = "b"}` | Order is `from:to`. |
+| `"*"` (or `"*:*"`) | wildcard expansion | See **Wildcard** below. |
+| `"*:body"` | wildcard body mapping | Lowers to `Body { to = "body" }` — routes the row body into one sink column named `body`. |
+
+Whitespace inside the string is rejected — no trim, no leading/trailing/inner spaces (including unicode whitespace). Short-form entries cannot carry `truncate` or `default`; if you need either, use the long form. Forbidden: `"field:*"` (single source field broadcast to all sink columns is ambiguous). Forbidden: more than one `"*"`; cannot combine `"*"` with `"*:NAME"` in the same mapping.
+
+**Wildcard `"*"`**
+
+Resolution order: prefer the **sink** schema, fall back to the **source** schema, fall back to **raw passthrough**. Raw passthrough is admitted only when both `Source::schemaless()` and `Sink::schemaless()` are `true` AND `source.body_data_type().is_object()` is `true` (today: Mongo source + Mongo sink, since `BsonObjectType::is_object() = true`). The lowered mapping is empty `direct` plus a single body slot under the synthetic target `_root` (`ROOT_BODY_TARGET`), compiled to one `TransformOp::Body`. Sources whose body type is non-object surface `WildcardWithoutSchema`. Otherwise — both schemas absent on a non-schemaless pair — also fails with `WildcardWithoutSchema`.
+
+Expansion ordering is locked: wildcard fills first in **schema declaration order**; explicit entries iterate in user-declaration order; an explicit whose `to` matches a wildcard slot **replaces in place**, otherwise it is **appended**. A `Body { to }` mapping always appends one synthetic sink column.
+
+When wildcard expansion picks the sink schema and a sink column has no same-named source column, the sink column must be **nullable** — the runner injects `Value::Null` for that slot at runtime. A non-nullable column with no source pair fails with `WildcardMissingNonNullableSource` (recovery: declare the column long-form with `default = ...`).
+
+The matrix is NOT relaxed under `*` — same-name pairs still go through the N+N type check; mismatches require an explicit long-form entry with `truncate` / `default`.
+
+`cursor.fields` and `conflict.key` must appear as explicit entries in the mapping when `"*"` or `"*:body"` is used (loader defers the subset check; validate-pipeline re-runs it after expansion). Raw passthrough rejects any non-empty `cursor.fields` (`CursorRequiresExplicitFields`) and any `conflict.key` (`ConflictKeyNotInMapping`).
+
+Universe-size cap: 4096 columns post-expansion → `WildcardUniverseTooLarge`.
+
+**Body mapping `"*:body"`** (lowered to `Body { to }`)
+
+Routes the row body into a single sink column. For relational sources the source builds the body as `Value::Json` via `air_elt_core::transform::build_body_json`; for Mongo sources the body is `Value::Custom(BsonObjectValue)`. The sink column type must accept the body shape (`Json` for the SQL sinks, schemaless for Mongo). Mixed mappings work: `["id", "*:body"]` keeps `id` as a separate sink column AND includes `id` in the body. Multiple `*:NAME` rules are allowed when their target columns differ. Duplicate target → `DuplicateSinkField`.
+
+NULL fields are omitted from the body object — an all-NULL row produces `{}`.
+
+Nesting depth limit: **64** (enforced inside `value_to_json`).
+
+**Packed-JSON encoding (Debezium-compatible, no prefixes)**
+
+| Canonical type | JSON representation |
+|----------------|---------------------|
+| Bool | bool |
+| Int*/UInt* (≤ 2^53) | number |
+| UInt64 > 2^53 / large Int64 | string |
+| Float* | number; NaN/±Inf → `null` |
+| BigInt / Decimal | string |
+| Text | string |
+| Bytes | bare hex string (no `hex:` prefix) |
+| Date | `"YYYY-MM-DD"` |
+| Timestamp | RFC3339 UTC (`...Z`) |
+| Uuid | canonical string |
+| Json | recursive |
+| Xml | string (raw text) |
+| Custom `mongodb.object_id` | 24-hex string |
+| Custom `mongodb.javascript` | code as string |
+| Custom `postgresql.hll` | base64 string |
+
+Custom values delegate to `DynValue::to_json()`. New custom types must implement that method.
 
 #### `default` value grammar
 
@@ -216,7 +278,7 @@ mapping = [
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `fields` | `[string]` | required | Cursor column(s), must be subset of mapping |
+| `fields` | `[string]` | required | Cursor column(s), must be subset of mapping. With `"*"` or `"*:body"` the loader defers this check; the validate-pipeline re-runs it post-expansion against `direct.from`. |
 | `order` | `"asc"` / `"desc"` | `"asc"` | Cursor direction |
 | `interval` | Duration | `"1s"` | Idle interval between drain ticks |
 

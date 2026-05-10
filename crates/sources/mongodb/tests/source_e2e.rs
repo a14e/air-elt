@@ -49,6 +49,7 @@ async fn read_with_cursor_and_dot_notation() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 3,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
 
     source
@@ -105,13 +106,27 @@ async fn sample_returns_documents() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 1024,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
 
-    let rows = source.sample(&spec, 5).await.expect("sample");
-    assert!(!rows.is_empty());
-    assert!(rows.len() <= 5);
-    for row in &rows {
+    let ctx = source.build_context(&spec).await.expect("ctx");
+    let raw = source.sample(&spec, ctx, 5).await.expect("sample");
+    assert!(!raw.rows.is_empty());
+    assert!(raw.rows.len() <= 5);
+    for row in &raw.rows {
         assert_eq!(row.values.len(), 2);
+        // Concrete type assertions — guards against a degenerate
+        // "all-null" pipeline that would still satisfy the length checks.
+        assert!(
+            matches!(row.values[0], Value::Int64(_)),
+            "_id should decode as Int64, got {:?}",
+            row.values[0]
+        );
+        assert!(
+            matches!(row.values[1], Value::Int64(_)),
+            "v should decode as Int64, got {:?}",
+            row.values[1]
+        );
     }
 }
 
@@ -154,6 +169,7 @@ async fn compound_cursor_updated_at_id() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 2,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
 
     let ctx = source.build_context(&spec).await.expect("build_context");
@@ -224,6 +240,7 @@ async fn read_object_id_emits_custom_value() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 10,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
     let ctx = source.build_context(&spec).await.expect("build_context");
     let batch = source

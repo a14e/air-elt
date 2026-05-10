@@ -27,6 +27,8 @@ The codebase favours clarity over cleverness. Code is read far more often than w
   variables. (except for pattern matching extraction — that is acceptable)
 - do not make lines and blocks oversaturated — separate into variables and try to follow the one line per expression
   approach
+- Do not use abbreviations or acronyms except for commonly accepted ones. Use commonly accepted abbreviations only when
+  other alternatives are unwieldy
 
 ## Timeouts and cancellation safety
 

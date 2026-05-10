@@ -1,6 +1,7 @@
 ---
 name: skill-authoring
 description: Rules and requirements for writing and maintaining skills in this repository. Read before creating a new skill, editing an existing one, or reviewing skill content. Defines frontmatter shape, tone, structure, length, and what a skill must never contain.
+user-invocable: false
 ---
 
 # General requirements for skills

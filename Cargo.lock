@@ -29,6 +29,7 @@ name = "air-elt-app"
 version = "0.1.0"
 dependencies = [
  "air-elt-commons",
+ "air-elt-commons-mongodb",
  "air-elt-commons-testing",
  "air-elt-core",
  "air-elt-sink-mongodb",
@@ -77,6 +78,7 @@ dependencies = [
  "bson",
  "chrono",
  "futures",
+ "hex",
  "mongodb",
  "num-bigint",
  "serde_json",
@@ -107,6 +109,7 @@ version = "0.1.0"
 dependencies = [
  "air-elt-commons",
  "air-elt-core",
+ "base64 0.22.1",
  "bigdecimal",
  "chrono",
  "serde_json",

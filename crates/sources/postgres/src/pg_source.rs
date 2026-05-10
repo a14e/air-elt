@@ -8,8 +8,9 @@ use tracing::{debug, info};
 use air_elt_commons_pg::Dialect;
 use air_elt_commons_pg::pool;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
-use air_elt_core::model::{Batch, ReadSpec, Row as CoreRow, Schema, SourceCtx};
+use air_elt_core::model::raw::{RawBatch, RawRow};
 use air_elt_core::model::{CursorFieldValue, CursorState};
+use air_elt_core::model::{ReadSpec, Schema, SchemaProvider, SourceCtx};
 use air_elt_core::traits::Source;
 use air_elt_core::types::{DataType, Value};
 
@@ -17,7 +18,12 @@ use crate::config::model::PgSourceConfig;
 use crate::model::codec;
 use crate::sql_statements as sql;
 
-struct PgSourceCtx {
+pub struct PgSourceCtx {
+    /// Authoritative source-side schema for `spec.table`. Computed once
+    /// in `build_context` and reused by validation.
+    /// Refresh = drop the ctx Arc; the runner does this on
+    /// `RuntimeError::Backend`.
+    pub schema: Schema,
     /// Pre-built plan for the initial tick (no cursor → no WHERE).
     initial_read_query: Arc<sql::ReadQuery>,
     /// Pre-built plan for the all-non-null cursor path. Cursor values are
@@ -36,6 +42,15 @@ struct PgSourceCtx {
 impl SourceCtx for PgSourceCtx {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+    fn as_schema_provider(&self) -> Option<&dyn SchemaProvider> {
+        Some(self)
+    }
+}
+
+impl SchemaProvider for PgSourceCtx {
+    fn schema(&self) -> &Schema {
+        &self.schema
     }
 }
 
@@ -120,8 +135,7 @@ impl Source for PgSource {
     }
 
     async fn build_context(&self, spec: &ReadSpec) -> RuntimeResult<Arc<dyn SourceCtx>> {
-        let schema =
-            Arc::new(air_elt_commons_pg::schema::fetch_schema(&self.pool, &spec.table).await?);
+        let schema = self.describe_schema(&spec.table).await?;
         let column_types = resolve_types(&schema, &spec.columns, &spec.table)?;
         let cursor_types = resolve_types(&schema, &spec.cursor_fields, &spec.table)?;
         let cursor_nullable: Vec<bool> = spec
@@ -169,6 +183,7 @@ impl Source for PgSource {
             &cursor_nullable,
         )?);
         Ok(Arc::new(PgSourceCtx {
+            schema,
             initial_read_query,
             non_null_read_query,
             column_types,
@@ -183,7 +198,7 @@ impl Source for PgSource {
         spec: &ReadSpec,
         ctx: Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
-    ) -> RuntimeResult<Batch> {
+    ) -> RuntimeResult<RawBatch> {
         let pg_ctx = ctx.downcast_ref_to::<PgSourceCtx>()?;
 
         let query_plan = match cursor {
@@ -276,7 +291,17 @@ impl Source for PgSource {
                 cursor_values.push(value);
             }
             last_cursor_values = Some(cursor_values);
-            out_rows.push(CoreRow::upsert(values));
+            // Cost-guarded body: when the flow has body targets the
+            // Transform interpreter `Body` op consumes the attached
+            // `Value::Json(...)`. For non-body flows we skip the
+            // encoding entirely (no extra allocation).
+            let body = if spec.needs_body {
+                let json = air_elt_core::transform::build_body_json(&values, &spec.columns)?;
+                Some(Value::Json(json))
+            } else {
+                None
+            };
+            out_rows.push(RawRow::upsert(values).with_body(body));
         }
 
         let next_cursor = last_cursor_values.map(|values| {
@@ -292,7 +317,7 @@ impl Source for PgSource {
             CursorState::new(fields)
         });
 
-        Ok(Batch {
+        Ok(RawBatch {
             rows: out_rows,
             next_cursor,
         })

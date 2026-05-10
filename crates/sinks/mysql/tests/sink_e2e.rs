@@ -73,7 +73,10 @@ async fn write_batch_and_validate_access() {
         next_cursor: None,
     };
     let ctx = sink.build_context(&spec).await.expect("build_context");
-    let report = sink.write_batch(&spec, ctx, &batch).await.expect("write");
+    let report = sink
+        .write_batch(&spec, ctx, batch, false)
+        .await
+        .expect("write");
     assert_eq!(report.rows_written, 2);
 
     let rows: Vec<(i64, String, Option<serde_json::Value>)> =
@@ -151,7 +154,10 @@ async fn all_nulls_across_data_types() {
         next_cursor: None,
     };
     let ctx = sink.build_context(&spec).await.expect("build_context");
-    let report = sink.write_batch(&spec, ctx, &batch).await.expect("write");
+    let report = sink
+        .write_batch(&spec, ctx, batch, false)
+        .await
+        .expect("write");
     assert_eq!(report.rows_written, 1);
 
     #[allow(clippy::type_complexity)]
@@ -270,7 +276,10 @@ async fn all_types_non_null_round_trip() {
     };
 
     let ctx = sink.build_context(&spec).await.expect("build_context");
-    let report = sink.write_batch(&spec, ctx, &batch).await.expect("write");
+    let report = sink
+        .write_batch(&spec, ctx, batch, false)
+        .await
+        .expect("write");
     assert_eq!(report.rows_written, 1);
 
     let (c_bool, c_i16, c_i32, c_i64): (bool, i16, i32, i64) =

@@ -16,6 +16,10 @@
 
 use std::any::Any;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+
+use air_elt_core::error::JsonEncodeError;
 use air_elt_core::types::convert::ConvertError;
 use air_elt_core::types::convert::context::ConversionContext;
 use air_elt_core::types::data_type::DataType;
@@ -114,6 +118,9 @@ impl DynValue for PgHllValue {
     fn as_any(&self) -> &dyn Any {
         self
     }
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
 
     fn eq_dyn(&self, other: &dyn DynValue) -> bool {
         match other.as_any().downcast_ref::<PgHllValue>() {
@@ -124,6 +131,13 @@ impl DynValue for PgHllValue {
 
     fn clone_box(&self) -> Box<dyn DynValue> {
         Box::new(self.clone())
+    }
+
+    /// JSON auto-pack encoding: base64 of the opaque payload. The
+    /// sketch has no useful textual projection; base64 keeps the
+    /// bytes recoverable while staying JSON-safe.
+    fn to_json(&self) -> Result<serde_json::Value, JsonEncodeError> {
+        Ok(serde_json::Value::String(BASE64_STANDARD.encode(&self.0)))
     }
 }
 
@@ -226,6 +240,13 @@ mod tests {
     fn value_dyn_type_returns_hll_descriptor() {
         let v = PgHllValue(vec![]);
         assert_eq!(v.dyn_type().kind(), "postgresql.hll");
+    }
+
+    #[test]
+    fn dyn_value_to_json_emits_base64() {
+        let v = PgHllValue(vec![0xde, 0xad, 0xbe, 0xef]);
+        let j = DynValue::to_json(&v).unwrap();
+        assert_eq!(j, serde_json::json!("3q2+7w=="));
     }
 
     #[test]

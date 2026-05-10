@@ -7,8 +7,9 @@ use tracing::{debug, info};
 
 use air_elt_commons_mysql::pool;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
-use air_elt_core::model::{Batch, ReadSpec, Row as CoreRow, Schema, SourceCtx};
+use air_elt_core::model::raw::{RawBatch, RawRow};
 use air_elt_core::model::{CursorFieldValue, CursorState};
+use air_elt_core::model::{ReadSpec, Schema, SchemaProvider, SourceCtx};
 use air_elt_core::traits::Source;
 use air_elt_core::types::{DataType, Value};
 
@@ -16,7 +17,10 @@ use crate::config::model::MySqlSourceConfig;
 use crate::model::codec;
 use crate::sql_statements as sql;
 
-struct MySqlSourceCtx {
+pub struct MySqlSourceCtx {
+    /// Authoritative source-side schema for `spec.table`. Populated
+    /// once in `build_context`.
+    pub schema: Schema,
     initial_read_query: Arc<sql::ReadQuery>,
     non_null_read_query: Arc<sql::ReadQuery>,
     column_types: Vec<DataType>,
@@ -28,6 +32,15 @@ struct MySqlSourceCtx {
 impl SourceCtx for MySqlSourceCtx {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+    fn as_schema_provider(&self) -> Option<&dyn SchemaProvider> {
+        Some(self)
+    }
+}
+
+impl SchemaProvider for MySqlSourceCtx {
+    fn schema(&self) -> &Schema {
+        &self.schema
     }
 }
 
@@ -96,8 +109,7 @@ impl Source for MySqlSource {
     }
 
     async fn build_context(&self, spec: &ReadSpec) -> RuntimeResult<Arc<dyn SourceCtx>> {
-        let schema =
-            Arc::new(air_elt_commons_mysql::schema::fetch_schema(&self.pool, &spec.table).await?);
+        let schema = self.describe_schema(&spec.table).await?;
         let column_types = resolve_types(&schema, &spec.columns, &spec.table)?;
         let cursor_types = resolve_types(&schema, &spec.cursor_fields, &spec.table)?;
         let cursor_nullable: Vec<bool> = spec
@@ -136,6 +148,7 @@ impl Source for MySqlSource {
             &cursor_nullable,
         )?);
         Ok(Arc::new(MySqlSourceCtx {
+            schema,
             initial_read_query,
             non_null_read_query,
             column_types,
@@ -150,7 +163,7 @@ impl Source for MySqlSource {
         spec: &ReadSpec,
         ctx: Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
-    ) -> RuntimeResult<Batch> {
+    ) -> RuntimeResult<RawBatch> {
         let my_ctx = ctx.downcast_ref_to::<MySqlSourceCtx>()?;
 
         let query_plan = match cursor {
@@ -229,7 +242,13 @@ impl Source for MySqlSource {
                 cursor_values.push(value);
             }
             last_cursor_values = Some(cursor_values);
-            out_rows.push(CoreRow::upsert(values));
+            let body = if spec.needs_body {
+                let json = air_elt_core::transform::build_body_json(&values, &spec.columns)?;
+                Some(Value::Json(json))
+            } else {
+                None
+            };
+            out_rows.push(RawRow::upsert(values).with_body(body));
         }
 
         let next_cursor = last_cursor_values.map(|values| {
@@ -245,7 +264,7 @@ impl Source for MySqlSource {
             CursorState::new(fields)
         });
 
-        Ok(Batch {
+        Ok(RawBatch {
             rows: out_rows,
             next_cursor,
         })

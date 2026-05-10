@@ -65,6 +65,7 @@ async fn heterogeneous_field_inferred_as_union_and_read_back() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 10,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
     source.validate_access(&spec).await.expect("validate");
     let ctx = source.build_context(&spec).await.expect("build_context");

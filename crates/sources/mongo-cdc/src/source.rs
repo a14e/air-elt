@@ -38,14 +38,16 @@ use tracing::{debug, info, warn};
 
 use air_elt_commons_mongodb::client::{PoolSettings, connect, database_from_url};
 use air_elt_commons_mongodb::key_bson::KeyBson;
+use air_elt_commons_mongodb::types::BsonObjectValue;
 use air_elt_commons_mongodb::{bson_value, identifier, path, sampling};
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::mapping::FieldPath;
+use air_elt_core::model::raw::{RawBatch, RawRow};
 use air_elt_core::model::{
-    Batch, CursorFieldValue, CursorState, ReadSpec, Row, RowOp, Schema, SourceCtx,
+    CursorFieldValue, CursorState, ReadSpec, RowOp, Schema, SchemaProvider, SourceCtx,
 };
 use air_elt_core::traits::Source;
-use air_elt_core::types::Value;
+use air_elt_core::types::{DataType, Value};
 
 use crate::config::{MongoCdcFlowOptions, MongoCdcSourceConfig, UpdateMode};
 
@@ -112,11 +114,32 @@ impl MongoCdcSource {
 struct MongoCdcCtx {
     column_paths: Vec<FieldPath>,
     mode: UpdateMode,
+    /// Sample-derived schema for `spec.table`. Mongo is schemaless —
+    /// `None` means sampling failed and downstream consumers must fall
+    /// back through `as_schema_provider() -> None`. See
+    /// [`MongoSourceCtx::schema`] for the full contract.
+    pub schema: Option<Schema>,
 }
 
 impl SourceCtx for MongoCdcCtx {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+    fn as_schema_provider(&self) -> Option<&dyn SchemaProvider> {
+        if self.schema.is_some() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
+impl SchemaProvider for MongoCdcCtx {
+    fn schema(&self) -> &Schema {
+        // Programming-error guard — see `MongoSourceCtx::schema`.
+        self.schema
+            .as_ref()
+            .expect("schemaless ctx asked for schema — caller skipped as_schema_provider gate")
     }
 }
 
@@ -129,6 +152,23 @@ impl Source for MongoCdcSource {
     fn cancel_safe(&self) -> bool {
         // The mongodb 3.x driver is not cancellation-safe.
         false
+    }
+
+    fn body_data_type(&self) -> DataType {
+        // CDC attaches the source `bson::Document` as a
+        // `Value::Custom(BsonObjectValue)` directly on `RawRow.body`.
+        // Delete events with no full document attach an empty document
+        // so `Transform::Body` always sees a value (sinks rely on key
+        // columns for delete, not body).
+        DataType::Custom(Box::new(air_elt_commons_mongodb::types::BsonObjectType))
+    }
+
+    fn schemaless(&self) -> bool {
+        // Mongo collections accept any BSON shape — same rationale as
+        // the cursor-driven `MongoSource`. CDC raw-passthrough is not
+        // currently supported, but we still advertise the flag
+        // so the wildcard expansion gates correctly.
+        true
     }
 
     fn emits_deletes(&self) -> bool {
@@ -186,9 +226,24 @@ impl Source for MongoCdcSource {
             .iter()
             .map(|s| FieldPath::parse(s).map_err(|e| RuntimeError::Other(e.to_string())))
             .collect::<RuntimeResult<Vec<_>>>()?;
+        // Schema-on-ctx parity (sample-derived). Sampling failure
+        // is non-fatal under the schemaless-source contract — see
+        // `MongoSourceCtx::build_context`.
+        let schema = match self.describe_schema(&spec.table).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!(
+                    collection = %spec.table,
+                    error = %e,
+                    "mongo-cdc: schema sample unavailable; ctx will report schemaless"
+                );
+                None
+            }
+        };
         Ok(Arc::new(MongoCdcCtx {
             column_paths,
             mode: opts.mode,
+            schema,
         }))
     }
 
@@ -197,7 +252,7 @@ impl Source for MongoCdcSource {
         spec: &ReadSpec,
         ctx: Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
-    ) -> RuntimeResult<Batch> {
+    ) -> RuntimeResult<RawBatch> {
         let my_ctx =
             ctx.as_any()
                 .downcast_ref::<MongoCdcCtx>()
@@ -357,12 +412,18 @@ impl Source for MongoCdcSource {
                 .map(|(_, d)| d.clone())
         };
 
-        let mut out_rows: Vec<Row> = Vec::with_capacity(events.len());
+        let mut out_rows: Vec<RawRow> = Vec::with_capacity(events.len());
         for event in events {
             match event.operation_type {
                 OperationType::Insert | OperationType::Replace => {
                     if let Some(doc) = event.full_document {
-                        out_rows.push(map_row(&my_ctx.column_paths, &doc, RowOp::Upsert)?);
+                        // Cost-guarded body attach.
+                        let body = if spec.needs_body {
+                            Some(Value::Custom(Box::new(BsonObjectValue(doc.clone()))))
+                        } else {
+                            None
+                        };
+                        out_rows.push(map_row(&my_ctx.column_paths, &doc, RowOp::Upsert, body)?);
                     } else {
                         warn!(op = ?event.operation_type, "mongo-cdc: insert/replace event without fullDocument; skipping");
                     }
@@ -377,7 +438,14 @@ impl Source for MongoCdcSource {
                             .and_then(|id| lookup_by_id(&id)),
                     };
                     match doc {
-                        Some(d) => out_rows.push(map_row(&my_ctx.column_paths, &d, RowOp::Upsert)?),
+                        Some(d) => {
+                            let body = if spec.needs_body {
+                                Some(Value::Custom(Box::new(BsonObjectValue(d.clone()))))
+                            } else {
+                                None
+                            };
+                            out_rows.push(map_row(&my_ctx.column_paths, &d, RowOp::Upsert, body)?);
+                        }
                         None => {
                             warn!(
                                 "mongo-cdc: update event without retrievable fullDocument; skipping (a delete event will follow)"
@@ -386,8 +454,25 @@ impl Source for MongoCdcSource {
                     }
                 }
                 OperationType::Delete => {
+                    // CDC delete events carry only the `documentKey`,
+                    // not the deleted document. We still attach an
+                    // empty `Value::Custom(BsonObjectValue(empty))`
+                    // when `needs_body=true` so `Transform::Body` never
+                    // sees a missing value — body content for delete
+                    // rows is harmless because sinks key off the
+                    // `op = Delete` route, not the body.
                     let key_doc = event.document_key.unwrap_or_default();
-                    out_rows.push(map_row(&my_ctx.column_paths, &key_doc, RowOp::Delete)?);
+                    let body = if spec.needs_body {
+                        Some(Value::Custom(Box::new(BsonObjectValue(Document::new()))))
+                    } else {
+                        None
+                    };
+                    out_rows.push(map_row(
+                        &my_ctx.column_paths,
+                        &key_doc,
+                        RowOp::Delete,
+                        body,
+                    )?);
                 }
                 OperationType::Drop
                 | OperationType::Rename
@@ -426,15 +511,24 @@ impl Source for MongoCdcSource {
             }
         });
 
-        Ok(Batch {
+        Ok(RawBatch {
             rows: out_rows,
             next_cursor,
         })
     }
 
-    async fn sample(&self, spec: &ReadSpec, n: usize) -> RuntimeResult<Vec<Row>> {
-        // CDC streams are open-ended; sampling-validation needs static
-        // rows. Use the same `$sample` path as the regular mongo source.
+    async fn sample(
+        &self,
+        spec: &ReadSpec,
+        _ctx: Arc<dyn SourceCtx>,
+        n: usize,
+    ) -> RuntimeResult<RawBatch> {
+        // CDC streams are open-ended: the default `sample` impl
+        // (which delegates to `read_batch`) would block on the change
+        // stream until `operation_timeout` fires, returning nothing.
+        // Override to read the watched collection's current state via
+        // `aggregate([{ $sample: ...}])` so sampling-validation gets
+        // representative rows for the conversion-plan probe.
         let coll = self.collection(&spec.table)?;
         let docs = sampling::sample_documents(&coll, n, self.operation_timeout).await?;
         let column_paths: Vec<FieldPath> = spec
@@ -442,15 +536,37 @@ impl Source for MongoCdcSource {
             .iter()
             .map(|s| FieldPath::parse(s).map_err(|e| RuntimeError::Other(e.to_string())))
             .collect::<RuntimeResult<_>>()?;
-        sampling::rows_from_documents(&docs, &column_paths)
-    }
-
-    async fn sample_fresh(&self, spec: &ReadSpec, n: usize) -> RuntimeResult<Vec<Row>> {
-        self.sample(spec, n).await
+        // The shared helper returns a pre-Transform `Vec<Row>`; the
+        // runner applies the Transform program afterwards. Wrap into a
+        // `RawBatch` (`body` omitted — sampling never flexes the
+        // body-fold path).
+        let rows = sampling::rows_from_documents(docs, &column_paths)?;
+        let raw_rows = rows
+            .into_iter()
+            .map(|r| RawRow {
+                values: r.values,
+                body: None,
+                op: r.op,
+            })
+            .collect();
+        Ok(RawBatch {
+            rows: raw_rows,
+            next_cursor: None,
+        })
     }
 }
 
-fn map_row(paths: &[FieldPath], doc: &Document, op: RowOp) -> RuntimeResult<Row> {
+/// Build a `RawRow` from a change-stream document. `body` is attached
+/// when the flow has body targets (cost-guarded by the caller). For
+/// delete events the caller passes
+/// `Some(Value::Custom(BsonObjectValue(empty Document)))` so
+/// `Transform::Body` always sees a value; non-body flows pass `None`.
+fn map_row(
+    paths: &[FieldPath],
+    doc: &Document,
+    op: RowOp,
+    body: Option<Value>,
+) -> RuntimeResult<RawRow> {
     let mut values = Vec::with_capacity(paths.len());
     for p in paths {
         let v = match path::get(doc, p) {
@@ -459,7 +575,11 @@ fn map_row(paths: &[FieldPath], doc: &Document, op: RowOp) -> RuntimeResult<Row>
         };
         values.push(v);
     }
-    Ok(Row { values, op })
+    let row = match op {
+        RowOp::Upsert => RawRow::upsert(values),
+        RowOp::Delete => RawRow::delete(values),
+    };
+    Ok(row.with_body(body))
 }
 
 fn resume_token_from_cursor(cursor: Option<&CursorState>) -> RuntimeResult<Option<ResumeToken>> {
@@ -489,6 +609,46 @@ fn resume_token_from_cursor(cursor: Option<&CursorState>) -> RuntimeResult<Optio
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    use air_elt_core::model::{Field, Schema};
+    use air_elt_core::types::DataType;
+
+    fn sample_schema() -> Schema {
+        Schema::schemaless_with_sample(vec![Field {
+            name: "_id".into(),
+            data_type: DataType::Bytes { size: Some(12) },
+            nullable: false,
+        }])
+    }
+
+    #[test]
+    fn ctx_with_schema_advertises_provider() {
+        // Schema-on-ctx parity for mongo-cdc — same contract as
+        // the regular MongoSource ctx: schema present → SchemaProvider
+        // surfaces, schema None → None.
+        let ctx = MongoCdcCtx {
+            column_paths: vec![],
+            mode: UpdateMode::PostImage,
+            schema: Some(sample_schema()),
+        };
+        let dyn_ctx: &dyn SourceCtx = &ctx;
+        let provider = dyn_ctx
+            .as_schema_provider()
+            .expect("schema present → provider Some");
+        assert_eq!(provider.schema().fields().len(), 1);
+        assert_eq!(provider.schema().fields()[0].name, "_id");
+    }
+
+    #[test]
+    fn ctx_without_schema_returns_none_provider() {
+        let ctx = MongoCdcCtx {
+            column_paths: vec![],
+            mode: UpdateMode::PostImage,
+            schema: None,
+        };
+        let dyn_ctx: &dyn SourceCtx = &ctx;
+        assert!(dyn_ctx.as_schema_provider().is_none());
+    }
 
     #[test]
     fn flow_options_parse_post_image() {

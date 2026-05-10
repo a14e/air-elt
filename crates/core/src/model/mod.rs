@@ -1,11 +1,16 @@
 pub mod context;
 pub mod cursor;
 pub mod flow_state;
+pub mod raw;
 pub mod schema;
 pub mod spec;
 
-pub use context::{SinkCtx, SourceCtx};
+pub use context::{SchemaProvider, SinkCtx, SourceCtx};
 pub use cursor::{CursorFieldValue, CursorState};
-pub use flow_state::{AssembledFlow, ConversionPlan, CursorPersistence, FlowState};
-pub use schema::{Field, Schema};
+pub use flow_state::{
+    AssembledFlow, ColumnConversionPlan, CursorPersistence, DerivedPlans, FlowState,
+    build_derived_plans, build_derived_plans_from_expanded,
+};
+pub use raw::{RawBatch, RawRow};
+pub use schema::{Field, Schema, SchemaKind};
 pub use spec::{Batch, ReadSpec, Row, RowOp, WriteReport, WriteSpec};

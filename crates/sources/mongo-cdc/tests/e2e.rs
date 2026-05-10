@@ -65,6 +65,7 @@ fn cdc_spec(table: &str, limit: usize, mode: &str) -> ReadSpec {
         cursor_order: CursorOrder::Asc,
         limit,
         source_options: opts,
+        needs_body: false,
     }
 }
 
@@ -455,7 +456,7 @@ async fn cdc_to_pg_sink_round_trip_with_inserts_and_deletes() {
     // batch carries exactly two Delete rows.
     assert_eq!(batch.rows.len(), 2);
     assert!(batch.rows.iter().all(|r| r.op == RowOp::Delete));
-    sink.write_batch(&write_spec, sink_ctx, &batch)
+    sink.write_batch(&write_spec, sink_ctx, batch.into_batch(), false)
         .await
         .expect("mixed batch");
 
@@ -535,7 +536,7 @@ async fn resume_token_round_trips_through_pg_storage_with_reopen() {
 
     let token_json = serde_json::to_value(&cursor).expect("serialise");
     storage
-        .save_resume_token("flow_a", &token_json)
+        .save_resume_token("flow_a", &token_json, false)
         .await
         .expect("save");
 
@@ -665,7 +666,7 @@ async fn cdc_to_mysql_sink_round_trip_with_inserts_and_deletes() {
         .read_batch(&read_spec, src_ctx, Some(&cursor))
         .await
         .expect("read");
-    sink.write_batch(&write_spec, sink_ctx, &batch)
+    sink.write_batch(&write_spec, sink_ctx, batch.into_batch(), false)
         .await
         .expect("mixed batch");
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users_mc")
@@ -731,7 +732,7 @@ async fn cdc_to_mongo_sink_round_trip_with_inserts_and_deletes() {
         .read_batch(&read_spec, src_ctx, Some(&cursor))
         .await
         .expect("read");
-    sink.write_batch(&write_spec, sink_ctx, &batch)
+    sink.write_batch(&write_spec, sink_ctx, batch.into_batch(), false)
         .await
         .expect("mixed batch");
 
@@ -949,3 +950,90 @@ fn swap_mysql_credentials(url: &str, user: &str, pwd: &str) -> String {
 // unit test (it would require flooding writes against a small-oplog
 // node), so we drop the test rather than ship a flaky one. The
 // happy-path resume is exercised by `cdc_to_pg_sink_round_trip_…`.
+
+/// Body-fill cost guard — CDC arm. With `needs_body=true` upsert
+/// events (insert / replace / update post-image) must populate
+/// `RawRow.body` with the post-image as a
+/// `Value::Custom(BsonObjectValue(Document))`. Delete events also
+/// carry an (empty) `Value::Custom(BsonObjectValue(Document::new()))`
+/// so `Transform::Body` always sees a value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cdc_attaches_body_for_upsert_when_needs_body_set() {
+    let mongo = mongo_rs_pool().await;
+    let coll_name = "raw_users";
+    let coll = mongo
+        .client
+        .database(&mongo.database)
+        .collection::<Document>(coll_name);
+    coll.insert_one(doc! { "_id": 0, "name": "seed" })
+        .await
+        .expect("seed");
+    enable_pre_post_images(&mongo, coll_name).await;
+
+    let source = cdc_source(&mongo).await;
+    let mut spec = cdc_spec(coll_name, 2, "post-image");
+    spec.needs_body = true;
+    let ctx = source.build_context(&spec).await.expect("ctx");
+
+    let cursor = capture_pbrt(&coll).await;
+    coll.insert_one(doc! { "_id": 1, "name": "alice", "extra": 7_i32 })
+        .await
+        .unwrap();
+    coll.delete_one(doc! { "_id": 1 }).await.unwrap();
+
+    let batch = source
+        .read_batch(&spec, ctx, Some(&cursor))
+        .await
+        .expect("read");
+    assert!(!batch.rows.is_empty());
+    for row in &batch.rows {
+        let v = row
+            .body
+            .clone()
+            .expect("needs_body=true must attach a body on every CDC row");
+        assert!(
+            matches!(v, air_elt_core::types::Value::Custom(_)),
+            "expected Value::Custom(BsonObjectValue), got {v:?}"
+        );
+    }
+}
+
+/// Cost-guard regression at the CDC source: with `needs_body=false`
+/// upsert events do NOT populate `RawRow.body`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cdc_skips_body_for_upsert_when_needs_body_unset() {
+    let mongo = mongo_rs_pool().await;
+    let coll_name = "no_raw_users";
+    let coll = mongo
+        .client
+        .database(&mongo.database)
+        .collection::<Document>(coll_name);
+    coll.insert_one(doc! { "_id": 0, "name": "seed" })
+        .await
+        .expect("seed");
+    enable_pre_post_images(&mongo, coll_name).await;
+
+    let source = cdc_source(&mongo).await;
+    let spec = cdc_spec(coll_name, 1, "post-image");
+    assert!(
+        !spec.needs_body,
+        "default cdc_spec must have needs_body=false"
+    );
+    let ctx = source.build_context(&spec).await.expect("ctx");
+
+    let cursor = capture_pbrt(&coll).await;
+    coll.insert_one(doc! { "_id": 1, "name": "alice" })
+        .await
+        .unwrap();
+
+    let batch = source
+        .read_batch(&spec, ctx, Some(&cursor))
+        .await
+        .expect("read");
+    assert_eq!(batch.rows.len(), 1);
+    assert_eq!(batch.rows[0].op, RowOp::Upsert);
+    assert!(
+        batch.rows[0].body.is_none(),
+        "needs_body=false must leave RawRow.body=None (cost guard)"
+    );
+}

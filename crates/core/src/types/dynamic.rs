@@ -50,6 +50,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use crate::error::JsonEncodeError;
 use crate::types::convert::ConvertError;
 use crate::types::convert::context::ConversionContext;
 use crate::types::data_type::DataType;
@@ -71,6 +72,16 @@ pub trait DynType: fmt::Debug + Send + Sync + 'static {
     /// Whether values of this type can serve as a cursor field. Default
     /// `false`; implementations override to opt in.
     fn can_be_cursor(&self) -> bool {
+        false
+    }
+
+    /// Whether values of this type are document/object-shaped. The
+    /// Transform compiler uses this to validate that a source's
+    /// `body_data_type()` produces an object — the body-fold ops
+    /// (`Body`) require an object value to absorb. Default `false`;
+    /// override to `true` on document-shaped custom types
+    /// (e.g. `BsonObjectType`).
+    fn is_object(&self) -> bool {
         false
     }
 
@@ -132,12 +143,31 @@ pub trait DynValue: fmt::Debug + Send + Sync + 'static {
     /// `Any` access for downcasting in connector code.
     fn as_any(&self) -> &dyn Any;
 
+    /// Owning `Any` access for moving the inner concrete value out of a
+    /// `Box<dyn DynValue>` without cloning. Connectors that own the
+    /// payload (raw passthrough sinks) call `Box::<dyn Any>::downcast`
+    /// on the result and `*box_t` to recover the typed value. The
+    /// default unimplemented signature would force every impl to spell
+    /// `Box::new(*self)` — every concrete type can do that uniformly,
+    /// so we keep it as a required method.
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
+
     /// Equality with another opaque value. Implementations typically
     /// downcast via `as_any` and compare concrete fields.
     fn eq_dyn(&self, other: &dyn DynValue) -> bool;
 
     /// Deep-clone behind a `Box<dyn DynValue>`.
     fn clone_box(&self) -> Box<dyn DynValue>;
+
+    /// Encode this value as a `serde_json::Value` for the JSON
+    /// auto-pack path (`*:body` mapping). Default returns
+    /// `JsonEncodeError::Variant("to_json not implemented")` — every
+    /// custom type that participates in JSON-pack must override.
+    fn to_json(&self) -> Result<serde_json::Value, JsonEncodeError> {
+        Err(JsonEncodeError::Variant(
+            "to_json not implemented".to_string(),
+        ))
+    }
 }
 
 // ---- Box<dyn DynType> trait plumbing -----------------------------------

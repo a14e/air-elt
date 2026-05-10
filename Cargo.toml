@@ -83,6 +83,7 @@ sha2 = "0.10.9"
 mockall = "0.14.0"
 quick-xml = "0.39.2"
 base64 = "0.22.1"
+hex = "0.4.3"
 
 [profile.release]
 lto = "thin"

@@ -223,3 +223,286 @@ strategy = "overwrite"
 
     pg.pool.close().await;
 }
+
+/// Wildcard mapping (`mapping = ["*"]`) end-to-end with a relational
+/// source and a schemaless mongo sink. The sink exposes no schema, so
+/// expansion falls back to the **source** schema and
+/// produces a column-by-name passthrough.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_to_mongo_wildcard_source_schema_fallback() {
+    let pg = pg_pool().await;
+    let mongo = mongo_pool().await;
+
+    let src_schema = format!("{}_wild", pg.schema);
+    let dst_db = format!("{}_wild", mongo.database);
+
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{src_schema}\".items (
+                    id BIGINT NOT NULL,
+                    name TEXT,
+                    created_at TIMESTAMPTZ NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let base = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+    let insert = format!(
+        "INSERT INTO \"{src_schema}\".items (id, name, created_at) \
+         VALUES ($1, $2, $3)"
+    );
+    // 3 rows, including one with NULL `name` to exercise nullable
+    // passthrough under wildcard expansion.
+    let rows: [(i64, Option<&str>); 3] = [(1, Some("alpha")), (2, None), (3, Some("gamma"))];
+    for (i, (id, name)) in rows.iter().enumerate() {
+        sqlx::query(&insert)
+            .bind(id)
+            .bind(*name)
+            .bind(base + chrono::Duration::seconds(i as i64))
+            .execute(&pg.pool)
+            .await
+            .unwrap();
+    }
+
+    let pg_url = pg.url_with_search_path();
+    let mongo_url = mongo.url.clone();
+
+    let config_toml = format!(
+        r#"
+[[sources]]
+name = "pg_src"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[sinks]]
+name = "mongo_sink"
+type = "mongodb"
+config = {{ url = "{mongo_url}", database = "{dst_db}" }}
+
+[[storages]]
+name = "pg_state"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[flow.items]
+source = "pg_src"
+sink = "mongo_sink"
+storage = "pg_state"
+from = "{src_schema}.items"
+to = "items"
+batch-limit = 8
+
+mapping = ["*"]
+
+cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
+"#,
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
+
+    let sink = mongo
+        .client
+        .database(&dst_db)
+        .collection::<bson::Document>("items");
+    let mut cursor = sink.find(doc! {}).sort(doc! { "id": 1 }).await.unwrap();
+    let mut got = Vec::new();
+    while let Some(d) = cursor.try_next().await.unwrap() {
+        got.push(d);
+    }
+    assert_eq!(got.len(), 3, "wildcard expansion landed all 3 rows");
+
+    // Field types per BSON: id → Int64, name → String|Null (absent on NULL),
+    // created_at → DateTime.
+    for (i, doc) in got.iter().enumerate() {
+        let id = doc
+            .get("id")
+            .unwrap_or_else(|| panic!("row {i} missing id"));
+        assert!(
+            matches!(id, bson::Bson::Int64(_)),
+            "row {i} id must be BSON Int64, got {id:?}"
+        );
+
+        let created = doc
+            .get("created_at")
+            .unwrap_or_else(|| panic!("row {i} missing created_at"));
+        assert!(
+            matches!(created, bson::Bson::DateTime(_)),
+            "row {i} created_at must be BSON DateTime, got {created:?}"
+        );
+    }
+
+    assert_eq!(got[0].get_i64("id").unwrap(), 1);
+    assert_eq!(got[1].get_i64("id").unwrap(), 2);
+    assert_eq!(got[2].get_i64("id").unwrap(), 3);
+
+    assert_eq!(got[0].get_str("name").unwrap(), "alpha");
+    // SQL NULL → missing key (per existing pg→mongo sink contract).
+    assert!(
+        got[1].get("name").is_none(),
+        "row 2 → NULL name must be absent, got {:?}",
+        got[1].get("name")
+    );
+    assert_eq!(got[2].get_str("name").unwrap(), "gamma");
+
+    // Sanity: cursor advanced through wildcard-expanded mapping.
+    let cursors: Vec<(String, serde_json::Value)> =
+        sqlx::query_as("SELECT flow, state FROM air_elt_cursors")
+            .fetch_all(&pg.pool)
+            .await
+            .unwrap();
+    assert_eq!(cursors.len(), 1);
+    assert_eq!(cursors[0].0, "items");
+    let parsed: air_elt_core::model::CursorState =
+        serde_json::from_value(cursors[0].1.clone()).unwrap();
+    assert_eq!(parsed.fields.len(), 1);
+    assert_eq!(parsed.fields[0].name, "id");
+    assert_eq!(parsed.fields[0].value, Value::Int64(3));
+
+    pg.pool.close().await;
+}
+
+/// `*:body` pack across the pg → mongo seam. The pg source populates
+/// `RawRow.body` with `Value::Json` (the canonical body type); the
+/// body conversion plan on this flow is identity (`Json → Json`), so
+/// the value reaches the mongo sink as
+/// `Value::Json(serde_json::Value::Object(...))` and the sink writes
+/// it as a `Bson::Document`.
+///
+/// Pinning this contract here protects the cross-vendor body path
+/// even though the PG source's hook is the trait default — a future
+/// regression that breaks the body conversion plan for the
+/// `Json → Json` arm would surface as a runtime panic in
+/// `bind_value_separated` analogues, or as the body silently being
+/// dropped on the mongo sink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_to_mongo_body_pack_routes_body_through() {
+    let pg = pg_pool().await;
+    let mongo = mongo_pool().await;
+
+    let src_schema = format!("{}_body", pg.schema);
+    let dst_db = format!("{}_body", mongo.database);
+
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{src_schema}\".events (
+                    id   BIGINT NOT NULL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    score INT NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+    let insert =
+        format!("INSERT INTO \"{src_schema}\".events (id, name, score) VALUES ($1, $2, $3)");
+    for (id, name, score) in [(1_i64, "alpha", 10_i32), (2, "beta", 20)] {
+        sqlx::query(&insert)
+            .bind(id)
+            .bind(name)
+            .bind(score)
+            .execute(&pg.pool)
+            .await
+            .unwrap();
+    }
+
+    let pg_url = pg.url_with_search_path();
+    let mongo_url = mongo.url.clone();
+
+    let config_toml = format!(
+        r#"
+[[sources]]
+name = "pg_src"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[sinks]]
+name = "mongo_sink"
+type = "mongodb"
+config = {{ url = "{mongo_url}", database = "{dst_db}" }}
+
+[[storages]]
+name = "pg_state"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[flow.events]
+source = "pg_src"
+sink = "mongo_sink"
+storage = "pg_state"
+from = "{src_schema}.events"
+to = "events"
+batch-limit = 8
+
+mapping = [
+    {{ from = "id", to = "id" }},
+    "*:body",
+]
+
+cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
+"#,
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
+
+    let sink = mongo
+        .client
+        .database(&dst_db)
+        .collection::<bson::Document>("events");
+    let mut cursor = sink.find(doc! {}).sort(doc! { "id": 1 }).await.unwrap();
+    let mut got = Vec::new();
+    while let Some(d) = cursor.try_next().await.unwrap() {
+        got.push(d);
+    }
+    assert_eq!(got.len(), 2);
+
+    for (i, expected_id) in [1_i64, 2].iter().enumerate() {
+        assert_eq!(got[i].get_i64("id").unwrap(), *expected_id);
+        let body = got[i]
+            .get_document("body")
+            .unwrap_or_else(|_| panic!("row {i}: body must land as a BSON Document"));
+        // The packed body carries every source field.
+        assert_eq!(
+            body.get_i64("id").unwrap(),
+            *expected_id,
+            "row {i}: body.id must mirror the direct id"
+        );
+        assert!(
+            body.get_str("name").is_ok(),
+            "row {i}: body.name must be a string"
+        );
+        let score = body.get("score").expect("body.score present");
+        // serde_json → bson maps integers to Int32 or Int64 depending
+        // on the underlying Number; just assert numeric.
+        assert!(
+            score
+                .as_i64()
+                .or_else(|| score.as_i32().map(i64::from))
+                .is_some(),
+            "row {i}: body.score must be numeric, got {score:?}"
+        );
+    }
+
+    pg.pool.close().await;
+}

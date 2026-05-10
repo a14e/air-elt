@@ -25,6 +25,26 @@ use air_elt_core::types::{DataType, Value};
 use crate::types::{PgHllType, PgHllValue};
 
 pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Value, dt: &DataType) {
+    // Fraud-detector (anti-shortcut #6): SQL sinks can only consume
+    // canonical `Value::*` variants (incl. `Value::Json`). Custom row
+    // payloads (e.g. `mongodb.bson_object`) must be matrix-converted to
+    // `Value::Json` BEFORE reaching bind. Postgres has one legitimate
+    // exception — `postgresql.hll`, which is bound natively below. Any
+    // other Custom value reaching this function is a missing matrix
+    // conversion and would otherwise fall through to `unreachable!()`
+    // at runtime. Trip loudly in debug builds; release behaviour is
+    // unchanged (the existing `unreachable!()` arm still fires).
+    #[cfg(debug_assertions)]
+    {
+        if let Value::Custom(c) = v {
+            let kind = c.dyn_type().kind();
+            if kind != PgHllType::KIND {
+                panic!(
+                    "SQL sink received unexpected Value::Custom(kind={kind}); matrix conversion to Json missing"
+                );
+            }
+        }
+    }
     match v {
         Value::Null => match dt {
             DataType::Int64 => {
@@ -154,5 +174,88 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use air_elt_core::error::JsonEncodeError;
+    use air_elt_core::types::convert::ConvertError;
+    use air_elt_core::types::convert::context::ConversionContext;
+    use air_elt_core::types::dynamic::{DynType, DynValue};
+    use sqlx::QueryBuilder;
+    use std::any::Any;
+
+    /// Stub Custom type that is NOT the pg-only `postgresql.hll`
+    /// exception — used to verify the debug_assert trips.
+    #[derive(Debug)]
+    struct StubType;
+
+    impl DynType for StubType {
+        fn kind(&self) -> &'static str {
+            "test.unknown_custom"
+        }
+        fn can_convert_to(&self, _t: &DataType, _trunc: bool) -> bool {
+            false
+        }
+        fn can_construct_from(&self, _t: &DataType, _trunc: bool) -> bool {
+            false
+        }
+        fn convert(
+            &self,
+            _v: Value,
+            _t: &DataType,
+            _ctx: &ConversionContext,
+        ) -> Result<Value, ConvertError> {
+            unreachable!()
+        }
+        fn construct(
+            &self,
+            _v: Value,
+            _t: &DataType,
+            _ctx: &ConversionContext,
+        ) -> Result<Value, ConvertError> {
+            unreachable!()
+        }
+        fn clone_box(&self) -> Box<dyn DynType> {
+            Box::new(StubType)
+        }
+    }
+
+    #[derive(Debug)]
+    struct StubValue;
+
+    impl DynValue for StubValue {
+        fn dyn_type(&self) -> Box<dyn DynType> {
+            Box::new(StubType)
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+            self
+        }
+        fn eq_dyn(&self, _other: &dyn DynValue) -> bool {
+            false
+        }
+        fn clone_box(&self) -> Box<dyn DynValue> {
+            Box::new(StubValue)
+        }
+        fn to_json(&self) -> Result<serde_json::Value, JsonEncodeError> {
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "SQL sink received unexpected Value::Custom")]
+    fn debug_assert_trips_on_unknown_custom() {
+        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new("SELECT ");
+        let mut sep = qb.separated(", ");
+        let v = Value::Custom(Box::new(StubValue));
+        let dt = DataType::Custom(Box::new(StubType));
+        bind_value_separated(&mut sep, &v, &dt);
     }
 }

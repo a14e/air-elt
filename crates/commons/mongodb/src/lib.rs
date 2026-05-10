@@ -19,4 +19,7 @@ pub mod sampling;
 pub mod types;
 pub mod version;
 
-pub use types::{MongoJsType, MongoJsValue, MongoObjectIdType, MongoObjectIdValue};
+pub use types::{
+    BsonObjectType, BsonObjectValue, MongoJsType, MongoJsValue, MongoObjectIdType,
+    MongoObjectIdValue,
+};

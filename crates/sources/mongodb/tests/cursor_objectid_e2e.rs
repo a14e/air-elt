@@ -50,6 +50,7 @@ async fn cursor_objectid_paginates() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 2,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
     let ctx = source.build_context(&spec).await.expect("ctx");
     let batch1 = source

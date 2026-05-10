@@ -47,7 +47,10 @@ async fn writes_native_uuid_column_to_mariadb() {
         next_cursor: None,
     };
     let ctx = sink.build_context(&spec).await.expect("ctx");
-    let report = sink.write_batch(&spec, ctx, &batch).await.expect("write");
+    let report = sink
+        .write_batch(&spec, ctx, batch, false)
+        .await
+        .expect("write");
     assert_eq!(report.rows_written, 1);
 
     // Read back through the source decoder via raw bytes (MariaDB returns
