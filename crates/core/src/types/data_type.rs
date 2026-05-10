@@ -125,6 +125,18 @@ impl DataType {
             _ => true,
         }
     }
+
+    /// Whether this type is document/object-shaped. Required by the
+    /// Transform compiler for `Body` ops — only object-shaped source
+    /// bodies can be absorbed. `Json` is hard-coded to `true`; custom
+    /// types delegate to [`DynType::is_object`].
+    pub fn is_object(&self) -> bool {
+        match self {
+            DataType::Json => true,
+            DataType::Custom(t) => t.is_object(),
+            _ => false,
+        }
+    }
 }
 
 impl Eq for DataType {}

@@ -8,11 +8,11 @@
 //! `column_paths`.
 //!
 //! Used by:
-//! * `air-elt-source-mongodb::MongoSource::describe_schema` /
-//!   `sample_fresh`
+//! * `air-elt-source-mongodb::MongoSource::describe_schema`
 //! * `air-elt-source-mongo-cdc::MongoCdcSource::describe_schema` /
 //!   `sample`. CDC has no static "snapshot" — sampling-validation
-//!   uses the underlying collection directly.
+//!   uses the underlying collection directly via this helper because
+//!   `read_batch` would block on the open change stream.
 
 use std::time::Duration;
 
@@ -68,14 +68,14 @@ pub async fn describe_collection_schema(
 /// Missing paths produce `Value::Null`; rows are emitted with the
 /// default `RowOp::Upsert` (sampling-validation never uses `op`).
 pub fn rows_from_documents(
-    docs: &[Document],
+    docs: Vec<Document>,
     column_paths: &[FieldPath],
 ) -> RuntimeResult<Vec<Row>> {
     let mut rows = Vec::with_capacity(docs.len());
     for d in docs {
         let mut values = Vec::with_capacity(column_paths.len());
         for p in column_paths {
-            let v = match path::get(d, p) {
+            let v = match path::get(&d, p) {
                 Some(b) => bson_value::from_bson(b)?,
                 None => Value::Null,
             };
@@ -84,4 +84,22 @@ pub fn rows_from_documents(
         rows.push(Row::upsert(values));
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use bson::doc;
+
+    #[test]
+    fn rows_from_documents_basic() {
+        let docs = vec![doc! { "a": 1_i32, "b": "x" }, doc! { "a": 2_i32, "b": "y" }];
+        let path_a = FieldPath::parse("a").unwrap();
+        let rows = rows_from_documents(docs, &[path_a]).unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.values.len(), 1);
+        }
+    }
 }

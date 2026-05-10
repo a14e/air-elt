@@ -28,6 +28,8 @@
 use air_elt_app::App;
 use air_elt_commons_testing::mongo::mongo_pool;
 use air_elt_commons_testing::mysql::mysql_pool;
+use air_elt_core::model::cursor::CursorState;
+use air_elt_core::types::value::Value;
 use bson::doc;
 use chrono::{DateTime, TimeZone, Utc};
 use sqlx::Executor;
@@ -259,7 +261,22 @@ flow:
         .await
         .unwrap()
         .expect("cursor saved");
-    assert!(cursor_doc.get("cursor").is_some());
+    // Cursor is stored as a JSON string under field `cursor`. Parse it
+    // back into `CursorState` and assert the exact tail value rather than
+    // a presence probe — the seed inserted `_id` 1..=5, ascending, so
+    // the saved cursor must point at `_id = 5` (the last row processed).
+    let cursor_json = cursor_doc
+        .get_str("cursor")
+        .expect("cursor field is a string");
+    let cursor_state: CursorState =
+        serde_json::from_str(cursor_json).expect("cursor JSON parses as CursorState");
+    assert_eq!(cursor_state.fields.len(), 1, "single cursor field `_id`");
+    assert_eq!(cursor_state.fields[0].name, "_id");
+    assert_eq!(
+        cursor_state.fields[0].value,
+        Value::Int64(5),
+        "cursor must point at the last `_id` processed"
+    );
 
     mysql.pool.close().await;
 }

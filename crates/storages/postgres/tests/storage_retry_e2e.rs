@@ -50,7 +50,7 @@ async fn cockroach_save_cursor_handles_serialization_retry() {
                     name: "id".into(),
                     value: Value::Int64((w * 1000 + i) as i64),
                 }]);
-                storage.save_cursor(flow, &state).await?;
+                storage.save_cursor(flow, &state, false).await?;
             }
             Ok::<_, air_elt_core::error::RuntimeError>(())
         }));

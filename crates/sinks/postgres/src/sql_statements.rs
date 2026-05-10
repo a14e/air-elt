@@ -27,6 +27,30 @@ pub fn probe_insert_where_false(table: &str, columns: &[String]) -> RuntimeResul
     ))
 }
 
+/// `INSERT INTO "schema"."t" ("c1","c2") SELECT * FROM (` — caller
+/// appends a `push_values` loop emitting `VALUES ($1,$2),($3,$4),...`
+/// with the row payloads, then [`DRY_RUN_INSERT_SUFFIX`]. Final form is
+/// `INSERT INTO "schema"."t" ("c1","c2") SELECT * FROM (VALUES ($1,$2),($3,$4)) AS sub WHERE false`.
+/// This is the dry-run form: the planner parses, type-checks every
+/// bind, and the `WHERE false` filter prevents any rows from reaching
+/// the table.
+pub fn dry_run_insert_prefix(table: &str, columns: &[String]) -> RuntimeResult<String> {
+    let quoted_table = quote_qualified(table)?;
+    let cols = quote_columns(columns)?;
+    Ok(format!(
+        "INSERT INTO {quoted_table} ({cols}) SELECT * FROM ("
+    ))
+}
+
+/// Closing fragment that pairs with [`dry_run_insert_prefix`].
+pub const DRY_RUN_INSERT_SUFFIX: &str = ") AS sub WHERE false";
+
+/// `DELETE FROM "schema"."t" WHERE ("k1","k2") IN (` followed by the
+/// caller-pushed values then [`DRY_RUN_DELETE_SUFFIX`]. The trailing
+/// `AND false` short-circuits the delete after type-checking but
+/// before any row is touched.
+pub const DRY_RUN_DELETE_SUFFIX: &str = ") AND false";
+
 /// INSERT statement consumed by `QueryBuilder::push_values`; caller appends `VALUES ...`.
 ///
 /// The same SQL is emitted for both Postgres and CockroachDB. Cockroach's

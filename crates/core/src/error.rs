@@ -202,6 +202,60 @@ pub enum ValidationError {
         sink_type: DataType,
         detail: String,
     },
+
+    #[error(
+        "flow {flow:?}: wildcard mapping ('*' / '*:*') requires a schema on at least one side, \
+         but neither source nor sink exposed one and raw passthrough is unavailable"
+    )]
+    WildcardWithoutSchema { flow: String },
+
+    #[error(
+        "flow {flow:?}: wildcard expansion produced {count} columns which exceeds the 4096-column cap"
+    )]
+    WildcardUniverseTooLarge { flow: String, count: usize },
+
+    #[error(
+        "flow {flow:?}: wildcard expansion against the sink schema requires source column {column:?}, \
+         but the source schema does not contain it and the sink column is NOT NULL"
+    )]
+    WildcardMissingNonNullableSource { flow: String, column: String },
+
+    #[error(
+        "flow {flow:?}: cursor.fields cannot be set on a raw-passthrough wildcard flow — \
+         declare explicit cursor columns alongside the wildcard or remove cursor.fields"
+    )]
+    CursorRequiresExplicitFields { flow: String },
+
+    #[error(
+        "flow {flow:?}: conflict.key entry {key:?} cannot resolve under raw-passthrough wildcard — \
+         declare explicit mapping entries for the key columns"
+    )]
+    ConflictKeyNotInMapping { flow: String, key: String },
+}
+
+/// Errors produced by `value_to_json` and the source-side body-fill
+/// path.
+///
+/// A sibling of [`TypeError`] — JSON encoding has its own contract
+/// (depth cap, size cap, custom-type delegation) and folding it into
+/// `TypeError` would muddle the variant set used by the matrix.
+#[derive(Debug, Error)]
+pub enum JsonEncodeError {
+    /// A `Value` variant that has no JSON encoding rule, or a custom
+    /// type whose `DynValue::to_json` default fired.
+    #[error("json encode failure: {0}")]
+    Variant(String),
+
+    /// Recursive `Value::Json` payload deeper than `MAX_JSON_DEPTH`
+    /// (see `crate::types::json_encode::MAX_JSON_DEPTH`).
+    #[error("json encode depth exceeded the configured cap")]
+    DepthExceeded,
+
+    /// A `DynValue::to_json` impl returned an error. Wraps the inner
+    /// reason as a string — the trait method does not enforce a
+    /// concrete error type.
+    #[error("custom value to_json failed: {0}")]
+    CustomFailed(String),
 }
 
 #[derive(Debug, Error)]
@@ -248,6 +302,32 @@ pub enum RuntimeError {
 
     #[error("invalid identifier: {0}")]
     Identifier(#[from] IdentifierError),
+
+    /// Validation error surfaced at runtime — typically from
+    /// `rebuild_derived` when live schemas reveal a constraint that the
+    /// pre-flight pipeline could not see (e.g. a column that vanished
+    /// between snapshots). Distinct from config-time validation: it is
+    /// raised by the runner, not the loader. Preserves the
+    /// `ValidationError` variant + source chain for telemetry.
+    #[error("validation: {0}")]
+    Validation(#[from] ValidationError),
+
+    #[error("json encode error: {0}")]
+    JsonEncode(#[from] JsonEncodeError),
+
+    /// A derived-plan invariant was violated at runtime — the validation
+    /// pipeline / expansion stage was supposed to guarantee the
+    /// condition. Carries an operator-facing detail string. Distinct
+    /// from `Other` so logs and telemetry can spot upstream-build bugs
+    /// without text-matching.
+    #[error("derived plan invariant: {detail}")]
+    DerivedPlanInvariant { detail: String },
+
+    /// `FlowState::derived` was queried before the runner called
+    /// `rebuild_derived` — pure state-machine invariant, never expected
+    /// to surface to operators in normal operation.
+    #[error("flow {flow:?}: derived plans not built — call rebuild_derived first")]
+    DerivedPlansNotBuilt { flow: String },
 
     #[error("{0}")]
     Other(String),

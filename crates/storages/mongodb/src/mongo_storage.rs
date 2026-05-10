@@ -142,8 +142,16 @@ impl Storage for MongoStorage {
         false
     }
 
-    async fn save_cursor(&self, flow: &str, state: &CursorState) -> RuntimeResult<()> {
+    async fn save_cursor(
+        &self,
+        flow: &str,
+        state: &CursorState,
+        dry_run: bool,
+    ) -> RuntimeResult<()> {
         let cursor_json = serde_json::to_string(state).map_err(RuntimeError::from)?;
+        if dry_run {
+            return Ok(());
+        }
         let coll = self.coll();
         let opts = ReplaceOptions::builder().upsert(Some(true)).build();
         coll.replace_one(
@@ -180,8 +188,16 @@ impl Storage for MongoStorage {
         Ok(Some(parsed))
     }
 
-    async fn save_resume_token(&self, flow: &str, token: &serde_json::Value) -> RuntimeResult<()> {
+    async fn save_resume_token(
+        &self,
+        flow: &str,
+        token: &serde_json::Value,
+        dry_run: bool,
+    ) -> RuntimeResult<()> {
         let token_json = serde_json::to_string(token).map_err(RuntimeError::from)?;
+        if dry_run {
+            return Ok(());
+        }
         let opts = ReplaceOptions::builder().upsert(Some(true)).build();
         self.resume_tokens()
             .replace_one(

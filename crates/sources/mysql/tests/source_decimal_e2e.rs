@@ -76,6 +76,7 @@ async fn decimal_zero_scale_decoded_as_bigint_and_decimal() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 10,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
     let ctx = source.build_context(&spec).await.unwrap();
     let batch = source.read_batch(&spec, ctx, None).await.unwrap();
@@ -174,6 +175,7 @@ async fn unsigned_int_columns_round_trip() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 10,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
     let ctx = source.build_context(&spec).await.unwrap();
     let batch = source.read_batch(&spec, ctx, None).await.unwrap();

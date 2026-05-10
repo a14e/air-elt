@@ -26,7 +26,7 @@ async fn save_and_load_cursor_roundtrip() {
         name: "id".into(),
         value: Value::Int64(42),
     }]);
-    storage.save_cursor("flow_x", &state).await.unwrap();
+    storage.save_cursor("flow_x", &state, false).await.unwrap();
 
     let loaded = storage
         .load_cursor("flow_x")
@@ -39,7 +39,7 @@ async fn save_and_load_cursor_roundtrip() {
         name: "id".into(),
         value: Value::Int64(99),
     }]);
-    storage.save_cursor("flow_x", &state2).await.unwrap();
+    storage.save_cursor("flow_x", &state2, false).await.unwrap();
     let loaded2 = storage
         .load_cursor("flow_x")
         .await
@@ -48,6 +48,53 @@ async fn save_and_load_cursor_roundtrip() {
     assert_eq!(loaded2.fields[0].value, Value::Int64(99));
 
     handle.client.clone().shutdown().await;
+}
+
+/// Dry-run path for `save_cursor` / `save_resume_token`: must succeed
+/// without persisting a doc; the follow-up non-dry-run call commits.
+/// Locks the T6 contract for the Mongo storage backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_cursor_and_resume_token_dry_run_skip_writes() {
+    let handle = mongo_pool().await;
+    let storage = MongoStorage::connect(MongoStorageConfig {
+        url: handle.url.clone(),
+        database: Some(handle.database.clone()),
+        ..Default::default()
+    })
+    .await
+    .expect("connect");
+    storage.migrate().await.expect("migrate");
+
+    let flow = "flow_dry";
+    let state = CursorState::new(vec![CursorFieldValue {
+        name: "id".into(),
+        value: Value::Int64(7),
+    }]);
+
+    storage.save_cursor(flow, &state, true).await.unwrap();
+    assert!(
+        storage.load_cursor(flow).await.unwrap().is_none(),
+        "dry-run save_cursor must not persist a doc"
+    );
+
+    storage.save_cursor(flow, &state, false).await.unwrap();
+    assert_eq!(storage.load_cursor(flow).await.unwrap().unwrap(), state);
+
+    let token = serde_json::json!({ "_data": "82DRY" });
+    storage.save_resume_token(flow, &token, true).await.unwrap();
+    assert!(
+        storage.load_resume_token(flow).await.unwrap().is_none(),
+        "dry-run save_resume_token must not persist a doc"
+    );
+
+    storage
+        .save_resume_token(flow, &token, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.load_resume_token(flow).await.unwrap().unwrap(),
+        token
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -68,14 +115,20 @@ async fn resume_token_round_trip_and_reopen() {
     assert!(storage.load_resume_token("flow_a").await.unwrap().is_none());
 
     let token = serde_json::json!({ "_data": "82AABB" });
-    storage.save_resume_token("flow_a", &token).await.unwrap();
+    storage
+        .save_resume_token("flow_a", &token, false)
+        .await
+        .unwrap();
     assert_eq!(
         storage.load_resume_token("flow_a").await.unwrap().unwrap(),
         token
     );
 
     let token2 = serde_json::json!({ "_data": "82CCDD" });
-    storage.save_resume_token("flow_a", &token2).await.unwrap();
+    storage
+        .save_resume_token("flow_a", &token2, false)
+        .await
+        .unwrap();
     assert_eq!(
         storage.load_resume_token("flow_a").await.unwrap().unwrap(),
         token2

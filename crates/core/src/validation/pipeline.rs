@@ -11,12 +11,14 @@ use crate::config::model::ComponentConfig;
 use crate::config::model::RootConfig;
 use crate::config::validation::SamplingConfig;
 use crate::error::{RuntimeError, ValidationError};
-use crate::mapping::{self, ColumnMapping};
-use crate::model::{AssembledFlow, ConversionPlan, FlowState, ReadSpec, WriteSpec};
+use crate::mapping::{self, ColumnMapping, DirectMapping};
+use crate::model::{
+    AssembledFlow, ColumnConversionPlan, DerivedPlans, FlowState, ReadSpec, Schema, WriteSpec,
+};
 use crate::registry::Registry;
 use crate::traits::{Sink, Source, Storage};
 use crate::types::{ConversionContext, DataType};
-use crate::validation::{checks, sampling};
+use crate::validation::checks;
 
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -147,31 +149,59 @@ pub async fn assemble(
                 });
             }
         } else if flow.cursor.fields.is_empty() {
-            return Err(ValidationError::AccessFailed {
-                component: "flow",
-                name: flow_name.clone(),
-                source: Box::new(RuntimeError::Other(format!(
-                    "flow {flow_name:?}: source kind {kind:?} requires non-empty `cursor.fields`"
-                ))),
-            });
+            // Raw-passthrough flows (`mapping = ["*"]` with both sides
+            // schemaless) deliberately reject `cursor.fields` —
+            // there are no direct columns to cursor on. Detect
+            // that shape pre-`mapping::build` so a legitimate raw flow
+            // doesn't trip this kind-level guard. The actual rejection
+            // of any *non-empty* `cursor.fields` for raw flows happens
+            // in `validate_flow` after expansion (see
+            // `CursorRequiresExplicitFields`); here we only need to
+            // permit the empty-fields case.
+            let raw_passthrough_eligible = source.schemaless()
+                && sink.schemaless()
+                && flow.mapping.iter().any(|m| {
+                    matches!(m, crate::config::model::MappingRule::Shorthand(s) if s == "*" || s == "*:*")
+                });
+            if !raw_passthrough_eligible {
+                return Err(ValidationError::AccessFailed {
+                    component: "flow",
+                    name: flow_name.clone(),
+                    source: Box::new(RuntimeError::Other(format!(
+                        "flow {flow_name:?}: source kind {kind:?} requires non-empty `cursor.fields`"
+                    ))),
+                });
+            }
         }
 
-        let mappings = mapping::build(flow).map_err(|e| ValidationError::AccessFailed {
+        let rules = mapping::build(flow).map_err(|e| ValidationError::AccessFailed {
             component: "mapping",
             name: flow_name.clone(),
             source: Box::new(RuntimeError::Config(e)),
         })?;
 
+        // Pre-fill ReadSpec/WriteSpec columns from the *direct* rules
+        // visible at assemble time. Wildcard / json-pack rules are
+        // expanded later in `validate_flow` once schemas are available;
+        // at that point the spec columns are overwritten with the
+        // expanded shape. For all-direct flows the assemble-time
+        // shape is final.
+        let (read_columns, write_columns) = derive_direct_columns(&rules);
         let read_spec = ReadSpec {
-            columns: mappings.iter().map(|m| m.from.clone()).collect(),
+            columns: read_columns,
             table: flow.from.clone(),
             cursor_fields: flow.cursor.fields.clone(),
             cursor_order: flow.cursor.order,
             limit: flow.batch_limit,
             source_options: flow.source.options(),
+            // Default. Body presence is only known post-expansion;
+            // `build_derived_plans_from_expanded` overwrites this
+            // flag on the derived `read_spec` once it sees the
+            // expanded mapping's json-pack targets.
+            needs_body: false,
         };
         let write_spec = WriteSpec {
-            columns: mappings.iter().map(|m| m.to.clone()).collect(),
+            columns: write_columns,
             table: flow.to.clone(),
             conflict: flow.conflict.clone(),
         };
@@ -187,7 +217,7 @@ pub async fn assemble(
             source,
             sink,
             storage,
-            mappings,
+            rules,
             read_spec,
             write_spec,
             interval,
@@ -205,6 +235,22 @@ pub async fn assemble(
     }
 
     Ok(flows)
+}
+
+/// Pull `from` / `to` columns from the rules' `Direct` entries only.
+/// Wildcard / Body rules contribute nothing pre-expansion — those
+/// flows have their spec columns rewritten in `validate_flow` once
+/// schemas are introspected.
+fn derive_direct_columns(rules: &[ColumnMapping]) -> (Vec<String>, Vec<String>) {
+    let mut from_cols = Vec::new();
+    let mut to_cols = Vec::new();
+    for rule in rules {
+        if let ColumnMapping::Direct { from, to, .. } = rule {
+            from_cols.push(from.clone());
+            to_cols.push(to.clone());
+        }
+    }
+    (from_cols, to_cols)
 }
 
 /// I/O validation: access checks, schema introspection, type compatibility,
@@ -264,7 +310,7 @@ async fn validate_source_group(
 ) -> Result<Vec<(usize, FlowState)>, ValidationError> {
     let mut out = Vec::with_capacity(flows.len());
     for (idx, flow) in flows {
-        let state = validate_one(flow).await?;
+        let state = validate_flow(flow).await?;
         out.push((idx, state));
     }
     Ok(out)
@@ -279,9 +325,9 @@ async fn validate_source_group(
 /// schema introspection.
 fn passthrough_plans(
     flow_name: &str,
-    mappings: &[ColumnMapping],
-) -> Result<Vec<ConversionPlan>, ValidationError> {
-    mappings
+    direct: &[DirectMapping],
+) -> Result<Vec<ColumnConversionPlan>, ValidationError> {
+    direct
         .iter()
         .map(|m| {
             if m.default_literal.is_some() {
@@ -290,11 +336,7 @@ fn passthrough_plans(
                     column: m.from.clone(),
                 });
             }
-            // Why: passthrough doesn't narrow, so `truncate` is a no-op
-            // when fields_check is off. Forcing `truncate = false` keeps
-            // the plan `is_identity()`, which lets the runner short-
-            // circuit per-cell convert.
-            Ok(ConversionPlan {
+            Ok(ColumnConversionPlan {
                 source: DataType::Json,
                 sink: DataType::Json,
                 ctx: ConversionContext::passthrough(),
@@ -303,9 +345,189 @@ fn passthrough_plans(
         .collect()
 }
 
-async fn validate_one(flow: AssembledFlow) -> Result<FlowState, ValidationError> {
+/// Read source schema either from the (already-built) ctx or by direct
+/// introspection. Used by `validate_flow`. We always go via
+/// `describe_schema` here because at the point this runs the ctx is not
+/// yet built — building ctx requires the final ReadSpec.columns, which
+/// in turn requires expansion against the schema. The runner uses the
+/// ctx-cached schema later on its hot path.
+async fn fetch_source_schema(flow: &AssembledFlow) -> Result<Schema, ValidationError> {
+    flow.source
+        .describe_schema(&flow.read_spec.table)
+        .await
+        .map_err(|e| ValidationError::AccessFailed {
+            component: "source:schema",
+            name: flow.name.clone(),
+            source: Box::new(e),
+        })
+}
+
+async fn fetch_sink_schema(flow: &AssembledFlow) -> Result<Schema, ValidationError> {
+    flow.sink
+        .describe_schema(&flow.write_spec.table)
+        .await
+        .map_err(|e| ValidationError::AccessFailed {
+            component: "sink:schema",
+            name: flow.name.clone(),
+            source: Box::new(e),
+        })
+}
+
+/// Drive sampling-validation through the production [`FlowRunner`]
+/// path with `dry_run = true`. The runner reuses
+/// [`Source::sample`] in place of `read_batch`, threads `dry_run`
+/// through to sink writes (parsed but not committed) and storage
+/// cursor saves (skipped). The same pack → convert → write pipeline
+/// the live tick exercises runs here, so any drift between sampling
+/// and runtime would surface in this call.
+///
+/// `flow.read_spec.limit` is overridden to `size` so the sample probe
+/// pulls the configured row count regardless of the user-declared
+/// `batch-limit`.
+async fn run_sampling_via_tick(
+    flow: &AssembledFlow,
+    derived: &DerivedPlans,
+    size: usize,
+) -> Result<(), ValidationError> {
+    let mut sample_flow = flow.clone();
+    sample_flow.read_spec.limit = size;
+    // Mirror the read_spec override into the cached derived plans so
+    // the runner's per-tick clone of `derived().read_spec` carries the
+    // sampling-sized limit. `derived.write_spec` is unchanged.
+    let mut sample_derived = derived.clone();
+    sample_derived.read_spec.limit = size;
+
+    let state = FlowState::new(sample_flow, sample_derived);
+    crate::flow::runner::FlowRunner::run_sample_probe(state)
+        .await
+        .map_err(|e| ValidationError::SamplingFailed {
+            flow: flow.name.clone(),
+            row_index: 0,
+            field: "<sampling>".into(),
+            source_type: DataType::Json,
+            sink_type: DataType::Json,
+            detail: e.to_string(),
+        })?;
+    Ok(())
+}
+
+async fn validate_flow(mut flow: AssembledFlow) -> Result<FlowState, ValidationError> {
     info!(flow = %flow.name, "validating flow");
 
+    // ---- expansion ---------------------------------------------------
+    // For wildcard / json-pack flows we need schemas before we can
+    // finalise the ReadSpec / WriteSpec column lists. Direct-only flows
+    // already have those filled in by `assemble`.
+    let src_schemaless = flow.source.schemaless();
+    let dst_schemaless = flow.sink.schemaless();
+    let raw_passthrough_eligible = flow
+        .rules
+        .iter()
+        .any(|r| matches!(r, ColumnMapping::Wildcard))
+        && src_schemaless
+        && dst_schemaless;
+    let needs_schemas = flow.fields_check
+        && !raw_passthrough_eligible
+        && flow
+            .rules
+            .iter()
+            .any(|r| matches!(r, ColumnMapping::Wildcard | ColumnMapping::Body { .. }));
+
+    // Body / wildcard expansion against a schemaless source needs the
+    // sample-derived schema — without it `expand` cannot enumerate the
+    // source columns the body payload draws from. The describe_schema
+    // hook on each schemaless connector samples its data plane (Mongo:
+    // `$sample` + per-field type folding); fetching it here lets the
+    // body branch see a `SchemalessWithSample` Schema rather than the
+    // sample-less `Schemaless` arm.
+    let needs_source_sample = needs_schemas
+        && src_schemaless
+        && flow
+            .rules
+            .iter()
+            .any(|r| matches!(r, ColumnMapping::Body { .. }));
+
+    let (src_schema, dst_schema): (Option<Schema>, Option<Schema>) = if needs_schemas {
+        let src = if src_schemaless {
+            if needs_source_sample {
+                Some(fetch_source_schema(&flow).await?)
+            } else {
+                None
+            }
+        } else {
+            Some(fetch_source_schema(&flow).await?)
+        };
+        let dst = if dst_schemaless {
+            None
+        } else {
+            Some(fetch_sink_schema(&flow).await?)
+        };
+        // Wildcard / json-pack against a fully schemaless source where
+        // the sink does have a schema is allowed — we use the sink as
+        // the universe (mongo source → pg sink direction). The
+        // wildcard-only-no-schema case is caught by `expand`.
+        (src, dst)
+    } else {
+        (None, None)
+    };
+
+    // Collapse `(schemaless flag, optional schema)` into a `Schema`
+    // whose `SchemaKind` discriminates the three expansion arms. A
+    // schemaless source whose sample schema we just fetched (for body
+    // expansion) collapses to `SchemalessWithSample` so `expand` sees
+    // the carried fields.
+    let src_state: Schema = match (src_schemaless, src_schema.clone()) {
+        (false, Some(s)) => s,
+        (true, Some(s)) => Schema::schemaless_with_sample(s.fields().to_vec()),
+        (true, None) | (false, None) => Schema::schemaless(),
+    };
+    let dst_state: Schema = match (dst_schemaless, dst_schema.clone()) {
+        (false, Some(s)) => s,
+        (true, _) | (false, None) => Schema::schemaless(),
+    };
+
+    let expanded = mapping::expand(
+        &flow.rules,
+        &src_state,
+        &dst_state,
+        src_schemaless,
+        dst_schemaless,
+        &flow.name,
+    )?;
+
+    // Schemaless-both `["*"]` raw-passthrough invariants: the lowered
+    // shape is direct=[], body=Some({_root}), so cursor.fields and
+    // conflict.key cannot resolve to any direct column. Detect that
+    // shape (no direct columns + a single body target named `_root`)
+    // and reject explicit cursor / conflict configuration up front.
+    let is_root_passthrough = expanded.direct.is_empty()
+        && expanded.body.as_ref().is_some_and(|b| {
+            b.targets.len() == 1 && b.targets[0] == crate::mapping::ROOT_BODY_TARGET
+        });
+    if is_root_passthrough {
+        if !flow.read_spec.cursor_fields.is_empty() {
+            return Err(ValidationError::CursorRequiresExplicitFields {
+                flow: flow.name.clone(),
+            });
+        }
+        if let Some(conflict) = &flow.write_spec.conflict
+            && let Some(first) = conflict.key.first()
+        {
+            return Err(ValidationError::ConflictKeyNotInMapping {
+                flow: flow.name.clone(),
+                key: first.clone(),
+            });
+        }
+    }
+
+    // Rewrite spec columns from the expanded shape. Every direct
+    // mapping contributes both a source column and a sink column;
+    // packs append their target. Helpers on `ExpandedMapping` are
+    // shared with the runner-side rebuild path.
+    flow.read_spec.columns = expanded.read_columns();
+    flow.write_spec.columns = expanded.write_columns();
+
+    // ---- access probes -----------------------------------------------
     if flow.access_check {
         flow.storage
             .validate_access()
@@ -335,12 +557,6 @@ async fn validate_one(flow: AssembledFlow) -> Result<FlowState, ValidationError>
                 name: flow.name.clone(),
                 source: Box::new(e),
             })?;
-        // Why: insert-only `validate_access` does not exercise the DELETE
-        // SQL/operation a CDC flow will eventually issue. Pre-flight it
-        // here so a missing DELETE privilege surfaces at validate-time
-        // instead of on the first delete batch. Gated on `conflict.is_some()`
-        // because the sink's delete path is keyed on conflict.key — without
-        // it the runner would refuse the Delete row anyway.
         if flow.source.emits_deletes() && flow.write_spec.conflict.is_some() {
             flow.sink
                 .validate_delete_access(&flow.write_spec)
@@ -355,53 +571,33 @@ async fn validate_one(flow: AssembledFlow) -> Result<FlowState, ValidationError>
         info!(flow = %flow.name, "validation.inserts disabled — skipping sink write probe");
     }
 
-    let conversions: Vec<ConversionPlan> = if flow.fields_check {
-        let src_schema = flow
-            .source
-            .describe_schema(&flow.read_spec.table)
-            .await
-            .map_err(|e| ValidationError::AccessFailed {
-                component: "source:schema",
-                name: flow.name.clone(),
-                source: Box::new(e),
-            })?;
-        let dst_schema = if flow.sink.schemaless() {
-            // Schemaless sinks (MongoDB) inherit the source's declared
-            // types so the matrix check is a no-op identity. Nullability
-            // is set to `true` (the sink can always accept a missing
-            // value).
-            crate::model::Schema::new(
-                flow.mappings
-                    .iter()
-                    .filter_map(|m| {
-                        src_schema
-                            .find(&m.from)
-                            .map(|src_field| crate::model::Field {
-                                name: m.to.clone(),
-                                data_type: src_field.data_type.clone(),
-                                nullable: true,
-                            })
-                    })
-                    .collect(),
-            )
-        } else {
-            flow.sink
-                .describe_schema(&flow.write_spec.table)
-                .await
-                .map_err(|e| ValidationError::AccessFailed {
-                    component: "sink:schema",
-                    name: flow.name.clone(),
-                    source: Box::new(e),
-                })?
+    // ---- post-expansion checks + derived-plan build ----------------
+    // For `fields_check = true` we need both schemas to run the
+    // validation-only checks (matrix, cursor type, JSON-pack target
+    // type, subset checks) and then delegate plan construction to
+    // `build_derived_plans` — the single source of truth shared with
+    // the runner-side rebuild path.
+    let derived = if flow.fields_check {
+        let src_schema_full = match src_schema {
+            Some(s) => s,
+            None => fetch_source_schema(&flow).await?,
+        };
+        let dst_schema_full = match dst_schema {
+            Some(s) => s,
+            None if flow.sink.schemaless() => {
+                // Schemaless sink — derived inside `build_derived_plans`
+                // from the source schema. We still need a dst schema
+                // here for the JSON-pack target type check + subset
+                // checks below; build the same one the helper would.
+                Schema::default()
+            }
+            None => fetch_sink_schema(&flow).await?,
         };
 
-        checks::check_cursor(&flow.name, &src_schema, &flow.read_spec.cursor_fields)?;
-        // Cursor type guard. After `check_cursor` has confirmed every
-        // cursor field is present in the source schema, reject any
-        // type that has no total order (`Json` / `Xml` / `Union`) or
-        // any `Custom` descriptor whose `can_be_cursor` is false.
+        // Cursor presence + cursor-typability.
+        checks::check_cursor(&flow.name, &src_schema_full, &flow.read_spec.cursor_fields)?;
         for field_name in &flow.read_spec.cursor_fields {
-            if let Some(field) = src_schema.find(field_name)
+            if let Some(field) = src_schema_full.find(field_name)
                 && !field.data_type.can_be_cursor()
             {
                 return Err(ValidationError::CursorTypeUnsupported {
@@ -410,68 +606,145 @@ async fn validate_one(flow: AssembledFlow) -> Result<FlowState, ValidationError>
                 });
             }
         }
-        checks::check_mapping(&src_schema, &dst_schema, &flow.mappings)?;
 
-        let flow_name = flow.name.clone();
-        flow.mappings
-            .iter()
-            .map(|m| {
-                let src_field =
-                    src_schema
-                        .find(&m.from)
-                        .ok_or_else(|| ValidationError::MissingField {
-                            side: "source",
-                            field: m.from.clone(),
-                        })?;
-                let sink_dt = dst_schema
-                    .find(&m.to)
-                    .map(|f| f.data_type.clone())
-                    .ok_or_else(|| ValidationError::MissingField {
-                        side: "sink",
-                        field: m.to.clone(),
+        if !is_root_passthrough {
+            // Run the matrix on direct mappings (schemaless sinks
+            // bypass the matrix — no real dst schema to narrow against).
+            if !flow.sink.schemaless() {
+                checks::check_mapping(&src_schema_full, &dst_schema_full, &expanded.direct)?;
+
+                // Body / wildcard-pack target type check — every body
+                // target sink column must accept the source's body
+                // `DataType` (Json for relational sources, Json for
+                // mongo too — the Custom `BsonObjectValue` wrapping
+                // happens at apply time, validation operates on the
+                // canonical pivot). Schemaless sinks (Mongo) bypass
+                // this branch (no real dst schema).
+                let carrier = flow.source.body_data_type();
+                for target in expanded.body.as_ref().into_iter().flat_map(|p| &p.targets) {
+                    let sink_field = dst_schema_full.find(target).ok_or_else(|| {
+                        ValidationError::MissingField {
+                            side: "sink",
+                            field: target.clone(),
+                        }
                     })?;
-                // `default` on a NOT NULL source column is meaningless —
-                // reject at validate time before the runner ever sees it.
-                if m.default_literal.is_some() && !src_field.nullable {
-                    return Err(ValidationError::DefaultOnNotNullSource {
-                        flow: flow_name.clone(),
-                        column: m.from.clone(),
+                    if !crate::types::matrix::is_compatible(
+                        carrier.clone(),
+                        sink_field.data_type.clone(),
+                    ) {
+                        return Err(ValidationError::IncompatibleTypes {
+                            field: target.clone(),
+                            from: carrier.clone(),
+                            to: sink_field.data_type.clone(),
+                            source: crate::error::TypeError::UnsupportedCast {
+                                from: carrier.clone(),
+                                to: sink_field.data_type.clone(),
+                            },
+                        });
+                    }
+                }
+            }
+
+            // cursor.fields ⊆ direct.from.
+            let direct_from: ahash::AHashSet<&str> =
+                expanded.direct.iter().map(|d| d.from.as_str()).collect();
+            for cf in &flow.read_spec.cursor_fields {
+                if !direct_from.contains(cf.as_str()) {
+                    return Err(ValidationError::MissingCursorField {
+                        flow: flow.name.clone(),
+                        field: cf.clone(),
                     });
                 }
-                let parsed_default = match &m.default_literal {
-                    Some(lit) => Some(crate::types::default_value::parse(lit, &sink_dt).map_err(
-                        |e| ValidationError::DefaultParse {
-                            flow: flow_name.clone(),
-                            column: m.from.clone(),
-                            source: e,
-                        },
-                    )?),
-                    None => None,
-                };
-                let mut ctx = ConversionContext::passthrough();
-                ctx.truncate = m.truncate;
-                ctx.default = parsed_default;
-                Ok(ConversionPlan {
-                    source: src_field.data_type.clone(),
-                    sink: sink_dt,
-                    ctx,
-                })
-            })
-            .collect::<Result<_, ValidationError>>()?
+            }
+            // conflict.key ⊆ direct.to (or any body target).
+            if let Some(conflict) = &flow.write_spec.conflict {
+                let direct_to: ahash::AHashSet<&str> =
+                    expanded.direct.iter().map(|d| d.to.as_str()).collect();
+                let pack_targets: ahash::AHashSet<&str> = expanded
+                    .body
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|p| p.targets.iter())
+                    .map(|s| s.as_str())
+                    .collect();
+                for k in &conflict.key {
+                    let in_direct = direct_to.contains(k.as_str());
+                    let in_body = pack_targets.contains(k.as_str());
+                    if !in_direct && !in_body {
+                        return Err(ValidationError::ConflictKeyNotInMapping {
+                            flow: flow.name.clone(),
+                            key: k.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // batch_limit × column_count ≤ 60_000 (post-expansion).
+        let pack_cols = expanded.body.as_ref().map(|p| p.targets.len()).unwrap_or(0);
+        let total_cols = expanded.direct.len() + pack_cols;
+        let product = flow.read_spec.limit.saturating_mul(total_cols);
+        if product > 60_000 {
+            return Err(ValidationError::AccessFailed {
+                component: "flow",
+                name: flow.name.clone(),
+                source: Box::new(RuntimeError::Other(format!(
+                    "flow {:?}: batch-limit ({}) × mapping cols ({}) = {} exceeds 60000",
+                    flow.name, flow.read_spec.limit, total_cols, product
+                ))),
+            });
+        }
+
+        // Single source of truth for plan construction. Pass
+        // `dst_schema = None` for schemaless sinks so the helper
+        // synthesises the same shape the runner-side rebuild does.
+        // We already paid the `mapping::expand` cost above for the
+        // raw-passthrough invariants and spec-column rewrite, so go
+        // through the `_from_expanded` variant to avoid double-expand.
+        let dst_for_build = if flow.sink.schemaless() {
+            None
+        } else {
+            Some(&dst_schema_full)
+        };
+        crate::model::flow_state::build_derived_plans_from_expanded(
+            &flow,
+            &expanded,
+            Some(&src_schema_full),
+            dst_for_build,
+            dst_schemaless,
+        )?
     } else {
         info!(
             flow = %flow.name,
             "validation.fields disabled — skipping schema introspection; conversions are passthrough"
         );
-        passthrough_plans(&flow.name, &flow.mappings)?
+        // No schemas available — build passthrough plans inline so we
+        // skip default_literal parsing (the helper would need a sink
+        // type to parse defaults against).
+        let conversions = passthrough_plans(&flow.name, &expanded.direct)?;
+        let mut read_spec = flow.read_spec.clone();
+        read_spec.needs_body = expanded.body.is_some();
+        let body_data_type = flow.source.body_data_type();
+        let transform = crate::transform::compile_to_transform(
+            &expanded,
+            body_data_type,
+            &conversions,
+            &[],
+            &read_spec.columns,
+        )?;
+        DerivedPlans {
+            read_spec,
+            write_spec: flow.write_spec.clone(),
+            transform,
+        }
     };
 
     if let SamplingConfig::Enabled { size } = flow.sampling {
-        sampling::run(&flow, &conversions, size).await?;
+        run_sampling_via_tick(&flow, &derived, size).await?;
     }
 
     info!(flow = %flow.name, "flow validated");
-    Ok(FlowState::new(flow, conversions))
+    Ok(FlowState::new(flow, derived))
 }
 
 #[cfg(test)]
@@ -483,6 +756,7 @@ mod tests {
     use crate::config::model::CursorOrder;
     use crate::config::validation::SamplingConfig;
     use crate::error::ValidationError;
+    use crate::flow::test_utils::{default_source_mock, raw_passthrough_source_mock};
     use crate::mapping::ColumnMapping;
     use crate::model::{AssembledFlow, ReadSpec, WriteSpec};
     use crate::traits::{MockSink, MockSource, MockStorage};
@@ -494,25 +768,27 @@ mod tests {
         source: MockSource,
         sink: MockSink,
         storage: MockStorage,
-        mappings: Vec<ColumnMapping>,
+        rules: Vec<ColumnMapping>,
         fields_check: bool,
     ) -> AssembledFlow {
+        let (read_columns, write_columns) = derive_direct_columns(&rules);
         AssembledFlow {
             name: "test".into(),
             source: Arc::new(source),
             sink: Arc::new(sink),
             storage: Arc::new(storage),
-            mappings,
+            rules,
             read_spec: ReadSpec {
-                columns: vec!["a".into()],
+                columns: read_columns,
                 table: "t".into(),
                 cursor_fields: vec!["a".into()],
                 cursor_order: CursorOrder::Asc,
                 limit: 1,
                 source_options: toml::Table::new(),
+                needs_body: false,
             },
             write_spec: WriteSpec {
-                columns: vec!["a".into()],
+                columns: write_columns,
                 table: "t".into(),
                 conflict: None,
             },
@@ -526,39 +802,40 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fields_check_false_skips_describe_schema() {
-        // Operator scenario: a brand-new Mongo collection with zero
-        // documents. Sample-based inference would fail on it, so the
-        // operator opts into `fields = false`. The contract proven
-        // here — describe_schema is *not* invoked — is exactly what
-        // makes that scenario safe; an end-to-end test against an
-        // empty collection would only re-verify the same mock count.
-        let mut source = MockSource::new();
-        source.expect_name().return_const("src".to_string());
-        // Critical: introspection must NOT run.
-        source.expect_describe_schema().times(0);
-        let mut sink = MockSink::new();
-        sink.expect_describe_schema().times(0);
-        // With fields_check=false the sink's schemaless() is never
-        // queried — assert that explicitly to catch future regressions.
-        sink.expect_schemaless().times(0);
-        let storage = MockStorage::new();
-
-        let mappings = vec![ColumnMapping {
-            from: "a".into(),
-            to: "a".into(),
+    fn rule_direct(from: &str, to: &str) -> ColumnMapping {
+        ColumnMapping::Direct {
+            from: from.into(),
+            to: to.into(),
             truncate: false,
             default_literal: None,
-        }];
-        let flow = flow_with(source, sink, storage, mappings, false);
+        }
+    }
 
-        let state = validate_one(flow).await.unwrap();
-        assert_eq!(state.conversions.len(), 1);
-        let plan = &state.conversions[0];
-        assert_eq!(plan.source, DataType::Json);
-        assert_eq!(plan.sink, DataType::Json);
-        assert!(plan.is_identity());
+    fn rule_direct_with_default(from: &str, to: &str, default: toml::Value) -> ColumnMapping {
+        ColumnMapping::Direct {
+            from: from.into(),
+            to: to.into(),
+            truncate: false,
+            default_literal: Some(default),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fields_check_false_skips_describe_schema() {
+        let mut source = default_source_mock();
+        source.expect_name().return_const("src".to_string());
+        source.expect_describe_schema().times(0);
+        let mut sink = MockSink::new();
+        sink.expect_schemaless().return_const(false);
+        sink.expect_describe_schema().times(0);
+        let storage = MockStorage::new();
+
+        let rules = vec![rule_direct("a", "a")];
+        let flow = flow_with(source, sink, storage, rules, false);
+
+        let state = validate_flow(flow).await.unwrap();
+        let derived = state.derived().unwrap();
+        assert_eq!(derived.transform.cols.len(), 1);
     }
 
     fn flow_with_inserts_and_conflict(
@@ -567,13 +844,8 @@ mod tests {
         storage: MockStorage,
         conflict: Option<crate::config::conflict::ConflictConfig>,
     ) -> AssembledFlow {
-        let mappings = vec![ColumnMapping {
-            from: "a".into(),
-            to: "a".into(),
-            truncate: false,
-            default_literal: None,
-        }];
-        let mut flow = flow_with(source, sink, storage, mappings, false);
+        let rules = vec![rule_direct("a", "a")];
+        let mut flow = flow_with(source, sink, storage, rules, false);
         flow.inserts_check = true;
         flow.write_spec.conflict = conflict;
         flow
@@ -581,10 +853,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delete_probe_invoked_when_source_emits_deletes_and_conflict_set() {
-        let mut source = MockSource::new();
+        let mut source = default_source_mock();
         source.expect_name().return_const("src".to_string());
         source.expect_emits_deletes().return_const(true);
         let mut sink = MockSink::new();
+        sink.expect_schemaless().return_const(false);
         sink.expect_validate_access().times(1).returning(|_| Ok(()));
         sink.expect_validate_delete_access()
             .times(1)
@@ -599,15 +872,16 @@ mod tests {
                 strategy: crate::config::conflict::ConflictStrategy::Overwrite,
             }),
         );
-        validate_one(flow).await.unwrap();
+        validate_flow(flow).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delete_probe_skipped_when_source_does_not_emit_deletes() {
-        let mut source = MockSource::new();
+        let mut source = default_source_mock();
         source.expect_name().return_const("src".to_string());
         source.expect_emits_deletes().return_const(false);
         let mut sink = MockSink::new();
+        sink.expect_schemaless().return_const(false);
         sink.expect_validate_access().times(1).returning(|_| Ok(()));
         sink.expect_validate_delete_access().times(0);
         let storage = MockStorage::new();
@@ -620,28 +894,26 @@ mod tests {
                 strategy: crate::config::conflict::ConflictStrategy::Overwrite,
             }),
         );
-        validate_one(flow).await.unwrap();
+        validate_flow(flow).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delete_probe_skipped_without_conflict_block() {
-        let mut source = MockSource::new();
+        let mut source = default_source_mock();
         source.expect_name().return_const("src".to_string());
-        // emits_deletes may or may not be queried — sink-side gating
-        // is the conflict.is_some() check. We only assert
-        // validate_delete_access is not called.
         source.expect_emits_deletes().return_const(true);
         let mut sink = MockSink::new();
+        sink.expect_schemaless().return_const(false);
         sink.expect_validate_access().times(1).returning(|_| Ok(()));
         sink.expect_validate_delete_access().times(0);
         let storage = MockStorage::new();
         let flow = flow_with_inserts_and_conflict(source, sink, storage, None);
-        validate_one(flow).await.unwrap();
+        validate_flow(flow).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fields_check_false_with_default_rejected() {
-        let mut source = MockSource::new();
+        let mut source = default_source_mock();
         source.expect_name().return_const("src".to_string());
         source.expect_describe_schema().times(0);
         let mut sink = MockSink::new();
@@ -649,15 +921,14 @@ mod tests {
         sink.expect_schemaless().return_const(false);
         let storage = MockStorage::new();
 
-        let mappings = vec![ColumnMapping {
-            from: "a".into(),
-            to: "a".into(),
-            truncate: false,
-            default_literal: Some(toml::Value::String("x".into())),
-        }];
-        let flow = flow_with(source, sink, storage, mappings, false);
+        let rules = vec![rule_direct_with_default(
+            "a",
+            "a",
+            toml::Value::String("x".into()),
+        )];
+        let flow = flow_with(source, sink, storage, rules, false);
 
-        let res = validate_one(flow).await;
+        let res = validate_flow(flow).await;
         let err = match res {
             Ok(_) => panic!("expected DefaultRequiresFields, got Ok"),
             Err(e) => e,
@@ -716,30 +987,23 @@ mod tests {
             data_type: cursor_field_type,
             nullable: false,
         }]);
-        let mut source = MockSource::new();
+        let mut source = default_source_mock();
         source.expect_name().return_const("src".to_string());
         source
             .expect_describe_schema()
             .returning(move |_| Ok(src_schema.clone()));
         let mut sink = MockSink::new();
-        // Schemaless mongo-style: sink schema is derived from the
-        // source schema, so describe_schema is never called.
         sink.expect_schemaless().return_const(true);
         let storage = MockStorage::new();
 
-        let mappings = vec![ColumnMapping {
-            from: "a".into(),
-            to: "a".into(),
-            truncate: false,
-            default_literal: None,
-        }];
-        flow_with(source, sink, storage, mappings, true)
+        let rules = vec![rule_direct("a", "a")];
+        flow_with(source, sink, storage, rules, true)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cursor_guard_rejects_json_field() {
         let flow = flow_for_cursor_test(DataType::Json);
-        let res = validate_one(flow).await;
+        let res = validate_flow(flow).await;
         let err = match res {
             Ok(_) => panic!("expected CursorTypeUnsupported, got Ok"),
             Err(e) => e,
@@ -753,7 +1017,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cursor_guard_rejects_xml_field() {
         let flow = flow_for_cursor_test(DataType::Xml);
-        let res = validate_one(flow).await;
+        let res = validate_flow(flow).await;
         let err = match res {
             Ok(_) => panic!("expected CursorTypeUnsupported, got Ok"),
             Err(e) => e,
@@ -767,7 +1031,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cursor_guard_rejects_union_field() {
         let flow = flow_for_cursor_test(DataType::Union(vec![DataType::Int32, DataType::Int64]));
-        let res = validate_one(flow).await;
+        let res = validate_flow(flow).await;
         let err = match res {
             Ok(_) => panic!("expected CursorTypeUnsupported, got Ok"),
             Err(e) => e,
@@ -781,19 +1045,207 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cursor_guard_accepts_int64_field() {
         let flow = flow_for_cursor_test(DataType::Int64);
-        validate_one(flow).await.expect("Int64 cursor should pass");
+        validate_flow(flow).await.expect("Int64 cursor should pass");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cursor_guard_rejects_custom_without_can_be_cursor() {
         let flow = flow_for_cursor_test(DataType::Custom(Box::new(NonCursorCustom)));
-        let res = validate_one(flow).await;
+        let res = validate_flow(flow).await;
         let err = match res {
             Ok(_) => panic!("expected CursorTypeUnsupported, got Ok"),
             Err(e) => e,
         };
         assert!(
             matches!(err, ValidationError::CursorTypeUnsupported { .. }),
+            "got {err:?}"
+        );
+    }
+
+    // ---- Wildcard / json-pack pipeline integration ----------------
+
+    /// `cursor.fields=["id"]` + expanded universe lacking `id` →
+    /// `MissingCursorField` post-expansion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wildcard_cursor_missing_after_expansion() {
+        let src_schema = Schema::new(vec![Field {
+            name: "name".into(),
+            data_type: DataType::Text { size: None },
+            nullable: false,
+        }]);
+        let mut source = default_source_mock();
+        source.expect_name().return_const("src".to_string());
+        source
+            .expect_describe_schema()
+            .returning(move |_| Ok(src_schema.clone()));
+        let mut sink = MockSink::new();
+        sink.expect_schemaless().return_const(true);
+        let storage = MockStorage::new();
+        let mut flow = flow_with(source, sink, storage, vec![ColumnMapping::Wildcard], true);
+        flow.read_spec.cursor_fields = vec!["id".into()];
+        let err = validate_flow(flow).await.unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::MissingCursorField { field, .. } if field == "id"),
+            "got {err:?}"
+        );
+    }
+
+    /// `batch_limit=200 × 301 cols → 60_000` violation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_limit_times_cols_post_expansion() {
+        let fields: Vec<Field> = (0..301)
+            .map(|i| Field {
+                name: format!("c{i}"),
+                data_type: DataType::Int32,
+                nullable: false,
+            })
+            .collect();
+        let schema = Schema::new(fields);
+        let mut source = default_source_mock();
+        source.expect_name().return_const("src".to_string());
+        let cloned = schema.clone();
+        source
+            .expect_describe_schema()
+            .returning(move |_| Ok(cloned.clone()));
+        let mut sink = MockSink::new();
+        sink.expect_schemaless().return_const(true);
+        let storage = MockStorage::new();
+        let mut flow = flow_with(source, sink, storage, vec![ColumnMapping::Wildcard], true);
+        flow.read_spec.cursor_fields = vec!["c0".into()];
+        flow.read_spec.limit = 200;
+        let err = validate_flow(flow).await.unwrap_err();
+        // 200 * 301 = 60_200 > 60_000.
+        let msg = err.to_string();
+        assert!(msg.contains("60200"), "got {msg}");
+    }
+
+    /// Body target column whose type the matrix refuses for the body
+    /// `DataType::Json`. Pre-Step-6 this surfaced as a dedicated
+    /// `JsonPackTargetNotJson` variant; the body type check
+    /// now runs through `matrix::is_compatible(Json, sink_target)` and
+    /// surfaces as the standard `IncompatibleTypes`. Pick a sink type
+    /// the matrix actively rejects (`Int32`) — the matrix admits
+    /// `Json → Text { size: None }` as a widening, so a Text sink is no
+    /// longer a counter-example here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn body_target_not_json() {
+        let src_schema = Schema::new(vec![Field {
+            name: "a".into(),
+            data_type: DataType::Int32,
+            nullable: false,
+        }]);
+        let dst_schema = Schema::new(vec![Field {
+            name: "body".into(),
+            data_type: DataType::Int32,
+            nullable: false,
+        }]);
+        let mut source = default_source_mock();
+        source.expect_name().return_const("src".to_string());
+        let s = src_schema.clone();
+        source
+            .expect_describe_schema()
+            .returning(move |_| Ok(s.clone()));
+        let mut sink = MockSink::new();
+        sink.expect_schemaless().return_const(false);
+        let d = dst_schema.clone();
+        sink.expect_describe_schema()
+            .returning(move |_| Ok(d.clone()));
+        let storage = MockStorage::new();
+        let mut flow = flow_with(
+            source,
+            sink,
+            storage,
+            vec![ColumnMapping::Body { to: "body".into() }],
+            true,
+        );
+        flow.read_spec.cursor_fields = vec!["a".into()];
+        let err = validate_flow(flow).await.unwrap_err();
+        // Body target type check now flows through the standard
+        // matrix: `Json → Text` is rejected as `IncompatibleTypes`.
+        assert!(
+            matches!(
+                err,
+                ValidationError::IncompatibleTypes { ref field, .. } if field == "body"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// Raw passthrough + cursor.fields → error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_passthrough_with_cursor_rejected() {
+        let mut source = raw_passthrough_source_mock();
+        source.expect_name().return_const("src".to_string());
+        let mut sink = MockSink::new();
+        sink.expect_schemaless().return_const(true);
+        let storage = MockStorage::new();
+        let mut flow = flow_with(source, sink, storage, vec![ColumnMapping::Wildcard], true);
+        flow.read_spec.cursor_fields = vec!["id".into()];
+        let err = validate_flow(flow).await.unwrap_err();
+        assert!(
+            matches!(err, ValidationError::CursorRequiresExplicitFields { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// Raw passthrough + conflict.key → error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_passthrough_with_conflict_rejected() {
+        let mut source = raw_passthrough_source_mock();
+        source.expect_name().return_const("src".to_string());
+        let mut sink = MockSink::new();
+        sink.expect_schemaless().return_const(true);
+        let storage = MockStorage::new();
+        let mut flow = flow_with(source, sink, storage, vec![ColumnMapping::Wildcard], true);
+        flow.read_spec.cursor_fields = vec![];
+        flow.write_spec.conflict = Some(crate::config::conflict::ConflictConfig {
+            key: vec!["id".into()],
+            strategy: crate::config::conflict::ConflictStrategy::Overwrite,
+        });
+        let err = validate_flow(flow).await.unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::ConflictKeyNotInMapping { key, .. } if key == "id"),
+            "got {err:?}"
+        );
+    }
+
+    /// Explicit long-form mapping where source column is missing →
+    /// today's `MissingField` (not the wildcard null-inject).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_missing_source_uses_missing_field() {
+        let src_schema = Schema::new(vec![Field {
+            name: "a".into(),
+            data_type: DataType::Int32,
+            nullable: false,
+        }]);
+        let dst_schema = Schema::new(vec![Field {
+            name: "b".into(),
+            data_type: DataType::Int32,
+            nullable: true,
+        }]);
+        let mut source = default_source_mock();
+        source.expect_name().return_const("src".to_string());
+        let s = src_schema.clone();
+        source
+            .expect_describe_schema()
+            .returning(move |_| Ok(s.clone()));
+        let mut sink = MockSink::new();
+        sink.expect_schemaless().return_const(false);
+        let d = dst_schema.clone();
+        sink.expect_describe_schema()
+            .returning(move |_| Ok(d.clone()));
+        let storage = MockStorage::new();
+        let mut flow = flow_with(
+            source,
+            sink,
+            storage,
+            vec![rule_direct("missing", "b")],
+            true,
+        );
+        flow.read_spec.cursor_fields = vec![];
+        let err = validate_flow(flow).await.unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::MissingField { side: "source", field, .. } if field == "missing"),
             "got {err:?}"
         );
     }

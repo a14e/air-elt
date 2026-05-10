@@ -21,6 +21,14 @@ pub enum RowOp {
     Delete,
 }
 
+/// A sink-bound row produced by the Transform interpreter.
+///
+/// `values` carries one canonical [`Value`] per `WriteSpec.columns`
+/// slot — the order of values matches the order of declared sink
+/// columns. The schemaless raw-passthrough flow (mongo→mongo `["*"]`)
+/// lowers to a Transform with a single `Body` op writing one
+/// `Value::Custom(BsonObjectValue)`; mongo sink recognises that shape
+/// and writes the BSON document at root.
 #[derive(Debug, Clone, Default)]
 pub struct Row {
     pub values: Vec<Value>,
@@ -68,6 +76,28 @@ pub struct ReadSpec {
     /// (e.g. mongo-cdc's `mode`) deserialize this into their own
     /// typed struct in `build_context`.
     pub source_options: toml::Table,
+    /// `true` when the flow has at least one body target — sources
+    /// populate `body: Option<Value>` on each
+    /// [`crate::model::raw::RawRow`] so the Transform interpreter can
+    /// fold body columns at native fidelity.
+    /// Defaults to `false`; flipped on by
+    /// `flow_state::build_derived_plans_from_expanded` when expansion
+    /// produces a `body` block.
+    pub needs_body: bool,
+}
+
+impl Default for ReadSpec {
+    fn default() -> Self {
+        Self {
+            columns: Vec::new(),
+            table: String::new(),
+            cursor_fields: Vec::new(),
+            cursor_order: crate::config::model::CursorOrder::Asc,
+            limit: 0,
+            source_options: toml::Table::new(),
+            needs_body: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -79,4 +109,30 @@ pub struct WriteSpec {
     /// gates `Delete` row support: sinks reject Delete rows when this
     /// is `None` (no key to target).
     pub conflict: Option<crate::config::conflict::ConflictConfig>,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_spec_default_needs_body_is_false() {
+        let spec = ReadSpec::default();
+        assert!(!spec.needs_body);
+    }
+
+    #[test]
+    fn upsert_constructor_sets_op() {
+        let row = Row::upsert(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)]);
+        assert_eq!(row.op, RowOp::Upsert);
+        assert_eq!(row.values.len(), 3);
+    }
+
+    #[test]
+    fn delete_constructor_sets_op() {
+        let row = Row::delete(vec![Value::Int32(7)]);
+        assert_eq!(row.op, RowOp::Delete);
+        assert_eq!(row.values, vec![Value::Int32(7)]);
+    }
 }

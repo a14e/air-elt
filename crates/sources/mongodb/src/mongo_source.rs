@@ -19,16 +19,20 @@ use async_trait::async_trait;
 use bson::{Bson, Document, doc};
 use futures::stream::TryStreamExt;
 use mongodb::{Client, Collection, options::FindOptions};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use air_elt_commons_mongodb::client::{PoolSettings, connect, database_from_url};
+use air_elt_commons_mongodb::types::BsonObjectValue;
 use air_elt_commons_mongodb::{bson_value, identifier, path, sampling};
 use air_elt_core::config::model::CursorOrder;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::mapping::FieldPath;
-use air_elt_core::model::{Batch, CursorFieldValue, CursorState, ReadSpec, Row, Schema, SourceCtx};
+use air_elt_core::model::raw::{RawBatch, RawRow};
+use air_elt_core::model::{
+    CursorFieldValue, CursorState, ReadSpec, Schema, SchemaProvider, SourceCtx,
+};
 use air_elt_core::traits::Source;
-use air_elt_core::types::Value;
+use air_elt_core::types::{DataType, Value};
 
 use crate::config::MongoSourceConfig;
 
@@ -100,11 +104,41 @@ struct MongoSourceCtx {
     column_paths: Vec<FieldPath>,
     cursor_paths: Vec<FieldPath>,
     cursor_in_columns: Vec<Option<usize>>,
+    /// Sample-derived schema for `spec.table`. Mongo collections have
+    /// no authoritative schema, so this field is `None` whenever
+    /// sampling fails (collection empty, $sample unsupported on the
+    /// deployment, etc.). The schemaless-source contract (see
+    /// `Source::schemaless`) explicitly allows downstream consumers to
+    /// proceed without a schema — the wildcard-expansion path
+    /// uses the `as_schema_provider()` indirection to discover whether
+    /// this ctx actually has one.
+    pub schema: Option<Schema>,
 }
 
 impl SourceCtx for MongoSourceCtx {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+    fn as_schema_provider(&self) -> Option<&dyn SchemaProvider> {
+        // Only advertise as a provider when sampling produced a schema.
+        // Without this gate `SchemaProvider::schema()` would have to
+        // return `Option<&Schema>` and pollute every other ctx's impl.
+        if self.schema.is_some() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
+impl SchemaProvider for MongoSourceCtx {
+    fn schema(&self) -> &Schema {
+        // Guarded by `as_schema_provider`: callers that reach this
+        // method went through `Option<&dyn SchemaProvider>` first, so
+        // `None` here is a programming error elsewhere.
+        self.schema
+            .as_ref()
+            .expect("schemaless ctx asked for schema — caller skipped as_schema_provider gate")
     }
 }
 
@@ -120,6 +154,21 @@ impl Source for MongoSource {
         // inconsistent. The runner therefore spawns + detaches our
         // calls instead of wrapping them in `tokio::time::timeout`.
         false
+    }
+
+    fn schemaless(&self) -> bool {
+        // Mongo collections accept any BSON shape — no authoritative
+        // column schema. The wildcard expansion uses this flag
+        // (together with `Sink::schemaless`) to admit raw passthrough.
+        true
+    }
+
+    fn body_data_type(&self) -> DataType {
+        // Mongo attaches the source `bson::Document` as a
+        // `Value::Custom(BsonObjectValue)` directly on `RawRow.body`
+        // when the flow has body targets — `BsonObjectType::is_object()`
+        // is `true` so the Transform compiler accepts it.
+        DataType::Custom(Box::new(air_elt_commons_mongodb::types::BsonObjectType))
     }
 
     async fn validate_access(&self, spec: &ReadSpec) -> RuntimeResult<()> {
@@ -175,10 +224,27 @@ impl Source for MongoSource {
             .iter()
             .map(|cp| spec.columns.iter().position(|c| c == &cp.to_string()))
             .collect();
+        // Sample-derive the schema for schema-on-ctx parity with
+        // the SQL connectors. Mongo is schemaless: a sampling failure
+        // (empty collection, $sample disabled, ...) is not fatal here —
+        // we just leave the ctx without a schema and let downstream
+        // consumers fall back through `as_schema_provider() -> None`.
+        let schema = match self.describe_schema(&spec.table).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!(
+                    collection = %spec.table,
+                    error = %e,
+                    "mongodb: schema sample unavailable; ctx will report schemaless"
+                );
+                None
+            }
+        };
         Ok(Arc::new(MongoSourceCtx {
             column_paths,
             cursor_paths,
             cursor_in_columns,
+            schema,
         }))
     }
 
@@ -187,7 +253,7 @@ impl Source for MongoSource {
         spec: &ReadSpec,
         ctx: Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
-    ) -> RuntimeResult<Batch> {
+    ) -> RuntimeResult<RawBatch> {
         let my_ctx =
             ctx.as_any()
                 .downcast_ref::<MongoSourceCtx>()
@@ -213,7 +279,34 @@ impl Source for MongoSource {
             .await
             .map_err(RuntimeError::backend)?;
 
-        let mut out_rows: Vec<Row> = Vec::with_capacity(spec.limit);
+        // Raw passthrough mode: wildcard expansion against a
+        // schemaless-both flow leaves `spec.columns` empty (no per-
+        // column projection) and `spec.cursor_fields` empty (raw
+        // passthrough is incompatible with column-based cursors —
+        // enforced at validation time). Emit one `RawRow` per document
+        // carrying the whole document on `body` as
+        // `Value::Custom(BsonObjectValue(...))`; the Transform
+        // interpreter folds it into `Row::passthrough(BsonObjectValue)`
+        // for the mongo sink fast path.
+        if spec.columns.is_empty() {
+            let mut rows: Vec<RawRow> = Vec::with_capacity(spec.limit);
+            while let Some(d) = find_cursor
+                .try_next()
+                .await
+                .map_err(RuntimeError::backend)?
+            {
+                rows.push(
+                    RawRow::upsert(Vec::new())
+                        .with_body(Some(Value::Custom(Box::new(BsonObjectValue(d))))),
+                );
+            }
+            return Ok(RawBatch {
+                rows,
+                next_cursor: None,
+            });
+        }
+
+        let mut out_rows: Vec<RawRow> = Vec::with_capacity(spec.limit);
         let mut last_cursor_values: Option<Vec<Value>> = None;
 
         while let Some(d) = find_cursor
@@ -241,7 +334,15 @@ impl Source for MongoSource {
                 cursor_values.push(value);
             }
             last_cursor_values = Some(cursor_values);
-            out_rows.push(Row::upsert(values));
+            // Cost-guarded body attach: the Transform interpreter's
+            // `Body` op consumes the `Value::Custom(BsonObjectValue)`.
+            // Non-body flows skip the move entirely.
+            let body = if spec.needs_body {
+                Some(Value::Custom(Box::new(BsonObjectValue(d))))
+            } else {
+                None
+            };
+            out_rows.push(RawRow::upsert(values).with_body(body));
         }
 
         let next_cursor = last_cursor_values.map(|values| {
@@ -256,26 +357,10 @@ impl Source for MongoSource {
                 .collect();
             CursorState::new(fields)
         });
-        Ok(Batch {
+        Ok(RawBatch {
             rows: out_rows,
             next_cursor,
         })
-    }
-
-    async fn sample_fresh(&self, spec: &ReadSpec, n: usize) -> RuntimeResult<Vec<Row>> {
-        // Random representative slice via `aggregate([{ $sample: ...}])`
-        // — complements the cursor-ordered head produced by the default
-        // `sample` impl. Sampling-validation unions both before running
-        // the conversion plan.
-        let coll = self.collection(&spec.table)?;
-        let docs = sampling::sample_documents(&coll, n, self.operation_timeout).await?;
-        let column_paths: Vec<FieldPath> = spec
-            .columns
-            .iter()
-            .map(|s| FieldPath::parse(s).map_err(|e| RuntimeError::Other(e.to_string())))
-            .collect::<RuntimeResult<_>>()?;
-        let rows = sampling::rows_from_documents(&docs, &column_paths)?;
-        Ok(rows)
     }
 }
 
@@ -376,6 +461,51 @@ fn build_sort(cursor_paths: &[FieldPath], order: CursorOrder) -> Document {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    use air_elt_core::model::{Field, Schema};
+    use air_elt_core::types::DataType;
+
+    fn sample_schema() -> Schema {
+        Schema::new(vec![Field {
+            name: "id".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+        }])
+    }
+
+    #[test]
+    fn ctx_with_schema_advertises_provider() {
+        // Schema-on-ctx: when sampling produced a schema, the
+        // mongo source ctx must expose it through `as_schema_provider`
+        // — same parity contract as PgSourceCtx / MySqlSourceCtx.
+        let ctx = MongoSourceCtx {
+            column_paths: vec![],
+            cursor_paths: vec![],
+            cursor_in_columns: vec![],
+            schema: Some(sample_schema()),
+        };
+        let dyn_ctx: &dyn SourceCtx = &ctx;
+        let provider = dyn_ctx
+            .as_schema_provider()
+            .expect("schema present → provider Some");
+        assert_eq!(provider.schema().fields().len(), 1);
+        assert_eq!(provider.schema().fields()[0].name, "id");
+    }
+
+    #[test]
+    fn ctx_without_schema_returns_none_provider() {
+        // Schemaless-source contract: sampling failure is allowed.
+        // The ctx must NOT advertise as a SchemaProvider in that case
+        // — otherwise the `schema()` method would have to lie.
+        let ctx = MongoSourceCtx {
+            column_paths: vec![],
+            cursor_paths: vec![],
+            cursor_in_columns: vec![],
+            schema: None,
+        };
+        let dyn_ctx: &dyn SourceCtx = &ctx;
+        assert!(dyn_ctx.as_schema_provider().is_none());
+    }
 
     #[test]
     fn build_filter_initial_is_empty() {

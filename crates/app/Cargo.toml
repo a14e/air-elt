@@ -20,6 +20,7 @@ path = "src/main.rs"
 [dependencies]
 air-elt-core = { workspace = true }
 air-elt-commons = { workspace = true }
+air-elt-commons-mongodb = { workspace = true }
 air-elt-source-postgres = { workspace = true }
 air-elt-source-mysql = { workspace = true }
 air-elt-sink-postgres = { workspace = true }

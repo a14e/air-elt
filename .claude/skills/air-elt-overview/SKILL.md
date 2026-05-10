@@ -49,17 +49,27 @@ The `postgres` connector crates are also reused as the **CockroachDB** backend, 
 
 ## Validation pipeline
 
-Two stages. **Assemble** (no I/O): looks up components by name, builds them through factories, derives `ReadSpec`/`WriteSpec`. **Validate** (I/O): runs access probes, schema introspection, the type matrix, and optionally sampling.
+Two stages. **Assemble** (no I/O): looks up components by name, builds them through factories, derives `ReadSpec`/`WriteSpec` and compiles the per-flow Transform program. **Validate** (I/O): runs access probes, schema introspection, the type matrix, and optionally sampling.
 
 The pipeline groups assembled flows by `Source::name()` and runs them through `futures::join_all` — one async worker per source, sequential within. The CLI prints `running validation in N workers` at start. Output ordering is deterministic: results are sorted back into config order.
 
-The flow-level `[flow.<name>.validation]` block exposes four toggles: `access`, `fields`, `inserts` (default `true`) and `sampling` (per-backend default — Mongo enabled at size 100, SQL disabled). Sampling-validation pulls rows via `Source::sample` (cursor-driven) and `Source::sample_fresh` (random, Mongo only) and runs every non-identity `ConversionPlan` against them.
+The flow-level `[flow.<name>.validation]` block exposes four toggles: `access`, `fields`, `inserts` (default `true`) and `sampling` (per-backend default — Mongo enabled at size 100, SQL disabled). Sampling-validation pulls rows via `Source::sample` (cursor-driven by default; CDC sources override with `$sample` since their `read_batch` would block) and runs the compiled Transform against them.
+
+## Three-layer pipeline (Source → Transform → Sink)
+
+Data moves through three explicit layers with disjoint responsibilities:
+
+1. **Source** emits `RawBatch { rows: Vec<RawRow> }`. Each `RawRow` carries `values: Vec<Value>`, an optional `body: Option<Value>` and `op: RowOp`. Sources populate `body` only when `ReadSpec.needs_body == true`: relational sources fill `Value::Json(build_body_json(...))` (see `air_elt_core::transform::build_body_json`); Mongo wraps the document as `Value::Custom(BsonObjectValue)`.
+2. **Transform** is a pure interpreter at `crates/core/src/transform/`. The IR is closed: `TransformOp::{ Take { source_index }, Body, Convert { input, plan } }`. `Transform::apply(raw) -> Batch` runs the program. The compile step caches an identity short-circuit when every column is `Take{i}` for `i in 0..len`. An "absorb-when-last" optimisation moves the value from the last reference to a given `Take{i}` slot or the `Body` payload; earlier references clone.
+3. **Sink** consumes the resulting `Batch { rows: Vec<Row { values, op }> }` via `write_batch`. Sinks no longer perform per-cell conversion or body packing — Transform produced the final shape.
+
+Validation-time hooks: `Source::body_data_type() -> DataType` (default `Json`; Mongo overrides to `DataType::Custom(BsonObjectType)`), and `DynType::is_object() -> bool` (default `false`; `BsonObjectType` overrides to `true`). The Transform compiler uses these to type-check `Body` sources and to permit the schemaless raw-passthrough fast path.
 
 ## Type model — canonical pivot, N+N matrix
 
 Each source maps `native → DataType` on read, each sink maps `DataType → native` on write. This gives N+N mappings instead of N×N. The internal type set covers integers (signed + unsigned for MySQL/MariaDB UNSIGNED columns), floats, `BigInt { width }` and `Decimal { precision, scale }` for SQL `numeric`, sized `Text`/`Bytes`, `Date`, `Timestamp` (UTC), `Uuid`, `Json`, `Xml`. Nullability is a property of `Field`, not of `DataType` — `Value::Null` carries "no data".
 
-Compatibility is checked at validation time by `core::types::matrix::is_compatible` (lossless) or `is_compatible_with_truncate` (when a mapping has `truncate=true`). Reverse paths (`BigInt/Decimal → Int*`, `Float ↔ BigInt/Decimal`) are deliberately rejected without `truncate`. Runtime per-cell conversion happens in `core::types::convert`; the runner skips identity columns.
+Compatibility is checked at validation time by `core::types::matrix::is_compatible` (lossless) or `is_compatible_with_truncate` (when a mapping has `truncate=true`). Reverse paths (`BigInt/Decimal → Int*`, `Float ↔ BigInt/Decimal`) are deliberately rejected without `truncate`. Runtime per-cell conversion happens inside the Transform layer via `TransformOp::Convert` carrying a `ColumnConversionPlan`; identity columns lower to a bare `Take` (no convert).
 
 Schemaless sinks (Mongo) opt out of the matrix narrowing check — `Sink::schemaless() == true` makes the pipeline derive the sink schema from the source's declared types.
 

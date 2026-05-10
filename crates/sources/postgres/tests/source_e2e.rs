@@ -50,6 +50,7 @@ async fn describe_and_read_with_cursor() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 3,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
 
     source
@@ -140,6 +141,7 @@ async fn read_with_nullable_cursor() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 2,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
 
     let ctx = source.build_context(&spec).await.expect("build_context");
@@ -226,6 +228,7 @@ async fn cockroach_read_batch_smoke() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 10,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
 
     source
@@ -289,6 +292,7 @@ async fn cockroach_null_cursor_lexicographic_two_keys() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 2,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
 
     let ctx = source.build_context(&spec).await.expect("build_context");

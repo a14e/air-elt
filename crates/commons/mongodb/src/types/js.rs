@@ -22,6 +22,7 @@
 
 use std::any::Any;
 
+use air_elt_core::error::JsonEncodeError;
 use air_elt_core::types::convert::ConvertError;
 use air_elt_core::types::convert::context::ConversionContext;
 use air_elt_core::types::data_type::DataType;
@@ -127,6 +128,9 @@ impl DynValue for MongoJsValue {
     fn as_any(&self) -> &dyn Any {
         self
     }
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
 
     fn eq_dyn(&self, other: &dyn DynValue) -> bool {
         other
@@ -138,6 +142,13 @@ impl DynValue for MongoJsValue {
 
     fn clone_box(&self) -> Box<dyn DynValue> {
         Box::new(self.clone())
+    }
+
+    /// JSON auto-pack encoding: emit the code body verbatim as a JSON
+    /// string. Mongo wire format would distinguish JS code from a
+    /// plain string; the JSON-pack pipeline does not.
+    fn to_json(&self) -> Result<serde_json::Value, JsonEncodeError> {
+        Ok(serde_json::Value::String(self.0.clone()))
     }
 }
 
@@ -312,6 +323,13 @@ mod tests {
         assert!(t.can_construct_from(&DataType::Bytes { size: None }, false));
         assert!(t.can_construct_from(&DataType::Bytes { size: Some(8) }, false));
         assert!(!t.can_construct_from(&DataType::Int32, false));
+    }
+
+    #[test]
+    fn dyn_value_to_json_emits_code_string() {
+        let v = MongoJsValue("function () { return 1; }".into());
+        let j = DynValue::to_json(&v).unwrap();
+        assert_eq!(j, serde_json::json!("function () { return 1; }"));
     }
 
     #[test]

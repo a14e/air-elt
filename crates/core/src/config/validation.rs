@@ -37,7 +37,7 @@ pub struct ValidationConfig {
     /// Gates schema introspection (`describe_schema` on source and
     /// sink), `check_cursor`, and `check_mapping`. With `fields = false`
     /// no introspection runs: the validator builds identity passthrough
-    /// `ConversionPlan`s (`Json → Json`) directly from the mapping, so
+    /// `ColumnConversionPlan`s (`Json → Json`) directly from the mapping, so
     /// the runner ships values through untouched. `truncate` becomes a
     /// no-op (passthrough doesn't narrow); `default` is rejected
     /// (`DefaultRequiresFields`) because parsing a default literal

@@ -50,7 +50,7 @@ async fn migrate_and_upsert_cursor() {
         value: Value::Int64(42),
     }]);
     storage
-        .save_cursor(flow, &state)
+        .save_cursor(flow, &state, false)
         .await
         .expect("save_cursor");
     assert_eq!(storage.load_cursor(flow).await.unwrap().unwrap(), state);
@@ -59,7 +59,10 @@ async fn migrate_and_upsert_cursor() {
         name: "id".into(),
         value: Value::Int64(43),
     }]);
-    storage.save_cursor(flow, &state2).await.expect("upsert");
+    storage
+        .save_cursor(flow, &state2, false)
+        .await
+        .expect("upsert");
     assert_eq!(
         storage.load_cursor(flow).await.unwrap().unwrap().fields[0].value,
         Value::Int64(43)
@@ -122,7 +125,7 @@ async fn cursor_roundtrip_all_value_variants() {
             value: value.clone(),
         }]);
         storage
-            .save_cursor(flow, &state)
+            .save_cursor(flow, &state, false)
             .await
             .unwrap_or_else(|e| panic!("save {flow}: {e}"));
         let loaded = storage
@@ -149,7 +152,7 @@ async fn resume_token_round_trip_and_reopen() {
 
     let token = serde_json::json!({ "_data": "82AABB", "extra": [1, 2] });
     storage
-        .save_resume_token("flow_a", &token)
+        .save_resume_token("flow_a", &token, false)
         .await
         .expect("save");
     let loaded = storage
@@ -161,7 +164,10 @@ async fn resume_token_round_trip_and_reopen() {
 
     // Upsert path: save again with a different value.
     let token2 = serde_json::json!({ "_data": "82CCDD" });
-    storage.save_resume_token("flow_a", &token2).await.unwrap();
+    storage
+        .save_resume_token("flow_a", &token2, false)
+        .await
+        .unwrap();
     assert_eq!(
         storage.load_resume_token("flow_a").await.unwrap().unwrap(),
         token2
@@ -182,6 +188,59 @@ async fn resume_token_round_trip_and_reopen() {
             .unwrap()
             .is_none(),
         "unknown flow after reopen → None"
+    );
+
+    handle.pool.close().await;
+}
+
+/// Dry-run path for `save_cursor` / `save_resume_token`: the call must
+/// succeed without writing a row, then a subsequent non-dry-run call
+/// must commit. Locks the T6 contract that `dry_run = true` skips the
+/// network execute on Postgres storage.
+#[tokio::test]
+async fn save_cursor_and_resume_token_dry_run_skip_writes() {
+    let handle = pg_pool().await;
+    let storage = make_storage(&handle).await;
+    storage.migrate().await.expect("migrate");
+
+    let flow = "flow_dry";
+    let state = CursorState::new(vec![CursorFieldValue {
+        name: "id".into(),
+        value: Value::Int64(7),
+    }]);
+
+    storage
+        .save_cursor(flow, &state, true)
+        .await
+        .expect("dry-run save_cursor");
+    assert!(
+        storage.load_cursor(flow).await.unwrap().is_none(),
+        "dry-run save_cursor must not persist a row"
+    );
+
+    storage
+        .save_cursor(flow, &state, false)
+        .await
+        .expect("real save_cursor");
+    assert_eq!(storage.load_cursor(flow).await.unwrap().unwrap(), state);
+
+    let token = serde_json::json!({ "_data": "82DRY" });
+    storage
+        .save_resume_token(flow, &token, true)
+        .await
+        .expect("dry-run save_resume_token");
+    assert!(
+        storage.load_resume_token(flow).await.unwrap().is_none(),
+        "dry-run save_resume_token must not persist a row"
+    );
+
+    storage
+        .save_resume_token(flow, &token, false)
+        .await
+        .expect("real save_resume_token");
+    assert_eq!(
+        storage.load_resume_token(flow).await.unwrap().unwrap(),
+        token
     );
 
     handle.pool.close().await;
@@ -208,14 +267,14 @@ async fn cockroach_migrate_and_save_load_round_trip() {
         value: Value::Int64(101),
     }]);
     storage
-        .save_cursor(flow, &state)
+        .save_cursor(flow, &state, false)
         .await
         .expect("cockroach save_cursor");
     assert_eq!(storage.load_cursor(flow).await.unwrap().unwrap(), state);
 
     let token = serde_json::json!({ "_data": "82AABB" });
     storage
-        .save_resume_token(flow, &token)
+        .save_resume_token(flow, &token, false)
         .await
         .expect("cockroach save_resume_token");
     assert_eq!(

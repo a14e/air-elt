@@ -48,6 +48,7 @@ fn cdc_spec(table: &str, limit: usize) -> ReadSpec {
         cursor_order: CursorOrder::Asc,
         limit,
         source_options: opts,
+        needs_body: false,
     }
 }
 

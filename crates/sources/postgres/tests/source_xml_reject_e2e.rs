@@ -47,6 +47,7 @@ async fn postgres_accepts_xml_column_at_validate_access() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 10,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
 
     // PG dialect: XML is fine. The helper inside validate_access must not

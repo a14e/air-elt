@@ -16,7 +16,7 @@
 //! doc had a present non-null value. Treating inferred fields as
 //! nullable trades a tiny precision loss in `check_mapping` for
 //! soundness — the matrix accepts `nullable_src → nullable_sink`, and
-//! the Mongo sink is schemaless so `validate_one` rebuilds `dst_schema`
+//! the Mongo sink is schemaless so `validate_flow` rebuilds `dst_schema`
 //! with `nullable: true` regardless.
 //!
 //! Allocation profile: leaf paths and types are collected into a
@@ -166,7 +166,7 @@ pub fn infer_schema_from_sample(docs: &[Document]) -> Result<Schema, InferenceEr
             path: "<root>".into(),
         });
     }
-    Ok(Schema::new(fields))
+    Ok(Schema::schemaless_with_sample(fields))
 }
 
 /// Merge the set of types observed for a single field across the
@@ -266,10 +266,10 @@ mod tests {
     use bson::doc;
 
     fn find<'a>(s: &'a Schema, name: &str) -> &'a Field {
-        s.fields
+        s.fields()
             .iter()
             .find(|f| f.name == name)
-            .unwrap_or_else(|| panic!("field {name:?} not in schema {:?}", s.fields))
+            .unwrap_or_else(|| panic!("field {name:?} not in schema {:?}", s.fields()))
     }
 
     #[test]
@@ -360,13 +360,13 @@ mod tests {
         // At least one field whose data_type is Json must exist —
         // the deep-cut subtree.
         let has_json = s
-            .fields
+            .fields()
             .iter()
             .any(|f| matches!(f.data_type, DataType::Json));
         assert!(
             has_json,
             "expected at least one Json-typed cutoff leaf, got {:?}",
-            s.fields
+            s.fields()
         );
     }
 
@@ -396,9 +396,9 @@ mod tests {
         );
         assert!(f.nullable);
         assert!(
-            !s.fields.iter().any(|f| f.name == "x.y"),
+            !s.fields().iter().any(|f| f.name == "x.y"),
             "nested children must not be emitted alongside the parent leaf, got {:?}",
-            s.fields
+            s.fields()
         );
     }
 
@@ -411,7 +411,7 @@ mod tests {
         let s = infer_schema_from_sample(&docs).unwrap();
         let f = find(&s, "x");
         assert_eq!(f.data_type, DataType::Json);
-        assert!(!s.fields.iter().any(|f| f.name == "x.y"));
+        assert!(!s.fields().iter().any(|f| f.name == "x.y"));
     }
 
     #[test]
@@ -481,7 +481,7 @@ mod tests {
     fn multiple_top_level_fields_emitted() {
         let docs = vec![doc! { "a": 1_i32, "b": "x" }, doc! { "a": 2_i32, "b": "y" }];
         let s = infer_schema_from_sample(&docs).unwrap();
-        assert_eq!(s.fields.len(), 2);
+        assert_eq!(s.fields().len(), 2);
         assert_eq!(find(&s, "a").data_type, DataType::Int32);
         assert_eq!(find(&s, "b").data_type, DataType::Text { size: None });
     }

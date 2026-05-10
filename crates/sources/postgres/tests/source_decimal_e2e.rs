@@ -73,6 +73,7 @@ async fn numeric_zero_scale_decoded_as_bigint() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 10,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
     let ctx = source.build_context(&spec).await.unwrap();
     let batch = source.read_batch(&spec, ctx, None).await.unwrap();
@@ -141,6 +142,7 @@ async fn cockroach_decimal_round_trip() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 10,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
     let ctx = source.build_context(&spec).await.unwrap();
     let batch = source.read_batch(&spec, ctx, None).await.unwrap();

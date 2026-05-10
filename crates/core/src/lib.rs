@@ -5,6 +5,7 @@ pub mod mapping;
 pub mod model;
 pub mod registry;
 pub mod traits;
+pub mod transform;
 pub mod types;
 pub mod validation;
 

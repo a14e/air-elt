@@ -10,14 +10,19 @@ use air_elt_commons_pg::pool;
 use air_elt_commons_pg::retry::with_serialization_retry;
 use air_elt_commons_pg::sink_bind::bind_value_separated;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
-use air_elt_core::model::{Batch, Row as CoreRow, RowOp, Schema, SinkCtx, WriteReport, WriteSpec};
+use air_elt_core::model::{
+    Batch, Row as CoreRow, RowOp, Schema, SchemaProvider, SinkCtx, WriteReport, WriteSpec,
+};
 use air_elt_core::traits::Sink;
 use air_elt_core::types::{DataType, Value};
 
 use crate::config::model::PgSinkConfig;
 use crate::sql_statements as sql;
 
-struct PgSinkCtx {
+pub struct PgSinkCtx {
+    /// Authoritative sink-side schema for `spec.table`. Populated once
+    /// in `build_context`.
+    pub schema: Schema,
     column_types: Vec<DataType>,
     insert_statement: String,
     /// `ON CONFLICT (...) DO ...` suffix derived from the flow's
@@ -44,6 +49,15 @@ struct DeletePlan {
 impl SinkCtx for PgSinkCtx {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+    fn as_schema_provider(&self) -> Option<&dyn SchemaProvider> {
+        Some(self)
+    }
+}
+
+impl SchemaProvider for PgSinkCtx {
+    fn schema(&self) -> &Schema {
+        &self.schema
     }
 }
 
@@ -153,7 +167,7 @@ impl Sink for PgSink {
     }
 
     async fn build_context(&self, spec: &WriteSpec) -> RuntimeResult<Arc<dyn SinkCtx>> {
-        let schema = air_elt_commons_pg::schema::fetch_schema(&self.pool, &spec.table).await?;
+        let schema = self.describe_schema(&spec.table).await?;
         let column_types: Vec<DataType> = spec
             .columns
             .iter()
@@ -189,6 +203,7 @@ impl Sink for PgSink {
             None => None,
         };
         Ok(Arc::new(PgSinkCtx {
+            schema,
             column_types,
             insert_statement,
             conflict_suffix,
@@ -198,14 +213,26 @@ impl Sink for PgSink {
 
     async fn write_batch(
         &self,
-        _spec: &WriteSpec,
+        spec: &WriteSpec,
         ctx: Arc<dyn SinkCtx>,
-        batch: &Batch,
+        batch: Batch,
+        dry_run: bool,
     ) -> RuntimeResult<WriteReport> {
         if batch.rows.is_empty() {
             return Ok(WriteReport { rows_written: 0 });
         }
         let pg_ctx = ctx.downcast_ref_to::<PgSinkCtx>()?;
+        if dry_run {
+            // Dry-run path: same SQL shape as production (planner parses
+            // every bind, types are checked) but the `WHERE false` /
+            // `AND false` predicates short-circuit before any row is
+            // touched. C20 derived rebuild semantics are unchanged —
+            // `dry_run` is per-call and never affects schema lifecycle.
+            self.write_upsert_batch_dry(pg_ctx, spec, &batch.rows)
+                .await?;
+            self.write_delete_batch_dry(pg_ctx, &batch.rows).await?;
+            return Ok(WriteReport { rows_written: 0 });
+        }
         // Order matters within a CDC batch: insert(id=42) followed
         // by delete(id=42) must apply upserts first; doing deletes
         // first would let the insert recreate the row we just removed.
@@ -293,6 +320,92 @@ impl PgSink {
             Ok(result.rows_affected())
         })
         .await
+    }
+}
+
+impl PgSink {
+    async fn write_upsert_batch_dry(
+        &self,
+        pg_ctx: &PgSinkCtx,
+        spec: &WriteSpec,
+        rows: &[CoreRow],
+    ) -> RuntimeResult<()> {
+        if !rows.iter().any(is_upsert) {
+            return Ok(());
+        }
+        let column_types_ref = &pg_ctx.column_types;
+        let prefix = sql::dry_run_insert_prefix(&spec.table, &spec.columns)?;
+        with_serialization_retry(self.dialect, || async {
+            let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(&prefix);
+            qb.push_values(rows.iter().filter(|r| is_upsert(r)), |mut tuple, row| {
+                for (value, dt) in row.values.iter().zip(column_types_ref.iter()) {
+                    bind_value_separated(&mut tuple, value, dt);
+                }
+            });
+            qb.push(sql::DRY_RUN_INSERT_SUFFIX);
+            // Append the same ON CONFLICT clause the production builder uses,
+            // so a misconfigured conflict.key (unknown column, unquoted reserved
+            // word, etc.) surfaces during validate=true rather than on first real write.
+            if !pg_ctx.conflict_suffix.is_empty() {
+                qb.push(&pg_ctx.conflict_suffix);
+            }
+            debug!(sql = %qb.sql(), "pg insert batch (dry-run)");
+            qb.build()
+                .execute(&self.pool)
+                .await
+                .map_err(RuntimeError::backend)?;
+            Ok(0u64)
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn write_delete_batch_dry(
+        &self,
+        pg_ctx: &PgSinkCtx,
+        rows: &[CoreRow],
+    ) -> RuntimeResult<()> {
+        if !rows.iter().any(is_delete) {
+            return Ok(());
+        }
+        let plan = pg_ctx.delete.as_ref().ok_or_else(|| {
+            RuntimeError::Other(
+                "postgres sink received Delete row but no [flow.<x>.conflict] block \
+                 configured — Delete requires a key"
+                    .into(),
+            )
+        })?;
+        let key_indices = &plan.key_indices;
+        let column_types_ref = &pg_ctx.column_types;
+        with_serialization_retry(self.dialect, || async {
+            let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(&plan.prefix);
+            if key_indices.len() == 1 {
+                let mut sep = qb.separated(", ");
+                let i = key_indices[0];
+                let dt = &column_types_ref[i];
+                for row in rows.iter().filter(|r| is_delete(r)) {
+                    let v = row.values.get(i).unwrap_or(&Value::Null);
+                    bind_value_separated(&mut sep, v, dt);
+                }
+            } else {
+                qb.push_tuples(rows.iter().filter(|r| is_delete(r)), |mut tuple, row| {
+                    for &i in key_indices {
+                        let dt = &column_types_ref[i];
+                        let v = row.values.get(i).unwrap_or(&Value::Null);
+                        bind_value_separated(&mut tuple, v, dt);
+                    }
+                });
+            }
+            qb.push(sql::DRY_RUN_DELETE_SUFFIX);
+            debug!(sql = %qb.sql(), "pg delete batch (dry-run)");
+            qb.build()
+                .execute(&self.pool)
+                .await
+                .map_err(RuntimeError::backend)?;
+            Ok(0u64)
+        })
+        .await?;
+        Ok(())
     }
 }
 

@@ -32,6 +32,7 @@ use std::any::Any;
 use bson::oid::ObjectId;
 use chrono::{TimeZone, Utc};
 
+use air_elt_core::error::JsonEncodeError;
 use air_elt_core::types::convert::ConvertError;
 use air_elt_core::types::convert::context::ConversionContext;
 use air_elt_core::types::data_type::DataType;
@@ -212,6 +213,9 @@ impl DynValue for MongoObjectIdValue {
     fn as_any(&self) -> &dyn Any {
         self
     }
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
 
     fn eq_dyn(&self, other: &dyn DynValue) -> bool {
         other
@@ -223,6 +227,12 @@ impl DynValue for MongoObjectIdValue {
 
     fn clone_box(&self) -> Box<dyn DynValue> {
         Box::new(self.clone())
+    }
+
+    /// JSON auto-pack encoding: 24-char lowercase hex, matching the
+    /// canonical `Text` projection.
+    fn to_json(&self) -> Result<serde_json::Value, JsonEncodeError> {
+        Ok(serde_json::Value::String(self.to_hex()))
     }
 }
 
@@ -549,6 +559,13 @@ mod tests {
         let c: Box<dyn DynValue> = Box::new(MongoObjectIdValue(c_bytes));
         assert!(a.eq_dyn(&*b));
         assert!(!a.eq_dyn(&*c));
+    }
+
+    #[test]
+    fn dyn_value_to_json_emits_24_char_hex() {
+        let v = MongoObjectIdValue(sample_oid());
+        let j = DynValue::to_json(&v).unwrap();
+        assert_eq!(j, serde_json::json!("654f10800102030405000001"));
     }
 
     #[test]

@@ -71,7 +71,7 @@ async fn cockroach_retries_on_serialization_failure() {
                 rows: vec![CoreRow::upsert(vec![Value::Int64(1), Value::Int64(n)])],
                 next_cursor: None,
             };
-            sink.write_batch(&spec, ctx, &batch).await
+            sink.write_batch(&spec, ctx, batch, false).await
         }));
     }
 

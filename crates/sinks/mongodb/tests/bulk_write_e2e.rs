@@ -45,7 +45,7 @@ async fn round_trip_overwrite(sink: MongoSink, db: &str, client: &mongodb::Clien
         next_cursor: None,
     };
     let report_a = sink
-        .write_batch(&spec, ctx.clone(), &batch_a)
+        .write_batch(&spec, ctx.clone(), batch_a, false)
         .await
         .unwrap();
     assert_eq!(report_a.rows_written, 3, "first batch: 3 upserts");
@@ -58,7 +58,7 @@ async fn round_trip_overwrite(sink: MongoSink, db: &str, client: &mongodb::Clien
             .collect(),
         next_cursor: None,
     };
-    let report_b = sink.write_batch(&spec, ctx, &batch_b).await.unwrap();
+    let report_b = sink.write_batch(&spec, ctx, batch_b, false).await.unwrap();
     assert_eq!(report_b.rows_written, 3, "second batch: 3 replacements");
 
     let coll = client.database(db).collection::<bson::Document>("items");
@@ -133,7 +133,7 @@ async fn round_trip_overwrite_compound_key(sink: MongoSink, db: &str, client: &m
         next_cursor: None,
     };
     let report_a = sink
-        .write_batch(&spec, ctx.clone(), &batch_a)
+        .write_batch(&spec, ctx.clone(), batch_a, false)
         .await
         .unwrap();
     assert_eq!(report_a.rows_written, 2, "two upserts via compound key");
@@ -147,7 +147,7 @@ async fn round_trip_overwrite_compound_key(sink: MongoSink, db: &str, client: &m
         ])],
         next_cursor: None,
     };
-    let report_b = sink.write_batch(&spec, ctx, &batch_b).await.unwrap();
+    let report_b = sink.write_batch(&spec, ctx, batch_b, false).await.unwrap();
     assert_eq!(report_b.rows_written, 1, "one matched replacement");
 
     let coll = client
@@ -205,7 +205,7 @@ async fn bulk_write_object_id_lands_as_bson_object_id() {
             .collect(),
         next_cursor: None,
     };
-    let report = sink.write_batch(&spec, ctx, &batch).await.unwrap();
+    let report = sink.write_batch(&spec, ctx, batch, false).await.unwrap();
     assert_eq!(report.rows_written, 3);
 
     let coll = handle

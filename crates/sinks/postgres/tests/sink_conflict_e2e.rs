@@ -87,7 +87,10 @@ async fn overwrite_replaces_existing_rows() {
     let s = spec(&handle, ConflictStrategy::Overwrite);
     let ctx = sink.build_context(&s).await.expect("build_context");
     let payload = batch(&[(1, "fresh-1"), (2, "fresh-2"), (3, "fresh-3")]);
-    let report = sink.write_batch(&s, ctx, &payload).await.expect("write");
+    let report = sink
+        .write_batch(&s, ctx, payload, false)
+        .await
+        .expect("write");
     assert_eq!(report.rows_written, 3);
 
     let rows = fetch_labels(&handle.pool).await;
@@ -115,7 +118,9 @@ async fn ignore_preserves_existing_rows() {
     let s = spec(&handle, ConflictStrategy::Ignore);
     let ctx = sink.build_context(&s).await.expect("build_context");
     let payload = batch(&[(1, "drop-1"), (2, "drop-2"), (3, "drop-3")]);
-    sink.write_batch(&s, ctx, &payload).await.expect("write");
+    sink.write_batch(&s, ctx, payload, false)
+        .await
+        .expect("write");
 
     let rows = fetch_labels(&handle.pool).await;
     assert_eq!(rows.len(), 3);
@@ -166,7 +171,9 @@ async fn cockroach_overwrite_single_key_via_on_conflict_do_update() {
         ])],
         next_cursor: None,
     };
-    sink.write_batch(&s, ctx.clone(), &first).await.unwrap();
+    sink.write_batch(&s, ctx.clone(), first, false)
+        .await
+        .unwrap();
 
     let second = Batch {
         rows: vec![CoreRow::upsert(vec![
@@ -175,7 +182,7 @@ async fn cockroach_overwrite_single_key_via_on_conflict_do_update() {
         ])],
         next_cursor: None,
     };
-    sink.write_batch(&s, ctx, &second).await.unwrap();
+    sink.write_batch(&s, ctx, second, false).await.unwrap();
 
     let row: (i64, String) = sqlx::query_as("SELECT id, name FROM items WHERE id = 1")
         .fetch_one(&handle.pool)
@@ -213,7 +220,9 @@ async fn cockroach_overwrite_two_key_uses_on_conflict() {
         ])],
         next_cursor: None,
     };
-    sink.write_batch(&s, ctx.clone(), &first).await.unwrap();
+    sink.write_batch(&s, ctx.clone(), first, false)
+        .await
+        .unwrap();
 
     let second = Batch {
         rows: vec![CoreRow::upsert(vec![
@@ -223,7 +232,7 @@ async fn cockroach_overwrite_two_key_uses_on_conflict() {
         ])],
         next_cursor: None,
     };
-    sink.write_batch(&s, ctx, &second).await.unwrap();
+    sink.write_batch(&s, ctx, second, false).await.unwrap();
 
     let row: (i64, i64, String) =
         sqlx::query_as("SELECT a, b, name FROM pairs WHERE a = 1 AND b = 1")
@@ -261,7 +270,9 @@ async fn cockroach_ignore_does_nothing() {
         ])],
         next_cursor: None,
     };
-    sink.write_batch(&s, ctx.clone(), &first).await.unwrap();
+    sink.write_batch(&s, ctx.clone(), first, false)
+        .await
+        .unwrap();
 
     let second = Batch {
         rows: vec![CoreRow::upsert(vec![
@@ -270,7 +281,7 @@ async fn cockroach_ignore_does_nothing() {
         ])],
         next_cursor: None,
     };
-    sink.write_batch(&s, ctx, &second).await.unwrap();
+    sink.write_batch(&s, ctx, second, false).await.unwrap();
 
     let row: (i64, String) = sqlx::query_as("SELECT id, name FROM keepers WHERE id = 1")
         .fetch_one(&handle.pool)
@@ -308,8 +319,10 @@ async fn cockroach_pk_only_table_overwrite_falls_back_to_do_nothing() {
         rows: vec![CoreRow::upsert(vec![Value::Int64(1)])],
         next_cursor: None,
     };
-    sink.write_batch(&s, ctx.clone(), &row).await.unwrap();
-    sink.write_batch(&s, ctx, &row).await.unwrap();
+    sink.write_batch(&s, ctx.clone(), row.clone(), false)
+        .await
+        .unwrap();
+    sink.write_batch(&s, ctx, row, false).await.unwrap();
 
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pk_only")
         .fetch_one(&handle.pool)
@@ -329,10 +342,12 @@ async fn overwrite_is_idempotent_on_rerun() {
     let ctx = sink.build_context(&s).await.expect("build_context");
     let payload = batch(&[(1, "v1"), (2, "v2")]);
 
-    sink.write_batch(&s, ctx.clone(), &payload)
+    sink.write_batch(&s, ctx.clone(), payload.clone(), false)
         .await
         .expect("first");
-    sink.write_batch(&s, ctx, &payload).await.expect("rerun");
+    sink.write_batch(&s, ctx, payload, false)
+        .await
+        .expect("rerun");
 
     let rows = fetch_labels(&handle.pool).await;
     assert_eq!(rows.len(), 2, "re-run must not duplicate");

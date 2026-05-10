@@ -94,7 +94,7 @@ async fn hll_round_trip_through_sink_and_source() {
         next_cursor: None,
     };
     let ctx = sink.build_context(&spec).await.unwrap();
-    let report = sink.write_batch(&spec, ctx, &batch).await.unwrap();
+    let report = sink.write_batch(&spec, ctx, batch, false).await.unwrap();
     assert_eq!(report.rows_written, 2);
 
     // ---- source path ---------------------------------------------------
@@ -115,6 +115,7 @@ async fn hll_round_trip_through_sink_and_source() {
         cursor_order: air_elt_core::config::model::CursorOrder::Asc,
         limit: 10,
         source_options: toml::Table::new(),
+        needs_body: false,
     };
 
     let read_ctx = source.build_context(&read_spec).await.unwrap();
