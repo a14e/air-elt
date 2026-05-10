@@ -323,12 +323,6 @@ pub enum RuntimeError {
     #[error("derived plan invariant: {detail}")]
     DerivedPlanInvariant { detail: String },
 
-    /// `FlowState::derived` was queried before the runner called
-    /// `rebuild_derived` — pure state-machine invariant, never expected
-    /// to surface to operators in normal operation.
-    #[error("flow {flow:?}: derived plans not built — call rebuild_derived first")]
-    DerivedPlansNotBuilt { flow: String },
-
     #[error("{0}")]
     Other(String),
 }

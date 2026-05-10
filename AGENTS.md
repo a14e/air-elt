@@ -26,7 +26,8 @@ After a compaction, assume skills are not loaded — load them again before star
 * Agent tasks live in `agent_tasks/`.
 * If Docker is unavailable, check podman; prefer podman.
 * Delete every temporary file you create.
-* After every change, run `cargo fmt` and `cargo clippy --all-targets --workspace -- -D warnings`.
+* After every change, run `cargo fmt` and `cargo clippy --all-targets --workspace -- -D warnings`. and MANDATORY after
+  completing each task. that is, after local tests you must run full tests
 * You may skip plan steps only with the user's consent.
 * **(Mandatory)** After completing every task, run validator agents — this is non-negotiable, not opt-in. Skipping is allowed only with the user's explicit consent for the specific task.
 * **(Mandatory)** Pick as many validator agents as possible; exclude only those clearly untouched. If touched indirectly — invoke them. Run independent agents in parallel.

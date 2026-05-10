@@ -13,4 +13,6 @@ pub use flow_state::{
 };
 pub use raw::{RawBatch, RawRow};
 pub use schema::{Field, Schema, SchemaKind};
-pub use spec::{Batch, ReadSpec, Row, RowOp, WriteReport, WriteSpec};
+pub use spec::{
+    Batch, ConfigReadSpec, ConfigWriteSpec, ReadSpec, Row, RowOp, WriteReport, WriteSpec,
+};

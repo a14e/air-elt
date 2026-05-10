@@ -111,6 +111,29 @@ pub struct WriteSpec {
     pub conflict: Option<crate::config::conflict::ConflictConfig>,
 }
 
+/// Schema-independent half of [`ReadSpec`]. Carries everything that's
+/// final at config-assembly time — table, cursor, batch limit, per-
+/// source options. `columns` and `needs_body` are deliberately absent
+/// because they depend on schema introspection and live on the
+/// post-expansion [`ReadSpec`] inside `DerivedPlans`.
+#[derive(Debug, Clone)]
+pub struct ConfigReadSpec {
+    pub table: String,
+    pub cursor_fields: Vec<String>,
+    pub cursor_order: crate::config::model::CursorOrder,
+    pub limit: usize,
+    pub source_options: toml::Table,
+}
+
+/// Schema-independent half of [`WriteSpec`]. `columns` is absent — it
+/// depends on expansion and lives on the post-expansion [`WriteSpec`]
+/// inside `DerivedPlans`.
+#[derive(Debug, Clone)]
+pub struct ConfigWriteSpec {
+    pub table: String,
+    pub conflict: Option<crate::config::conflict::ConflictConfig>,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

@@ -38,3 +38,5 @@ ryuk-start-*.lock
 
 proposals.md
 for-future-ignore-that
+
+.claude/worktrees

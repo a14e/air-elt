@@ -71,7 +71,6 @@ impl FlowRunner {
                         );
                         self.source_ctx = None;
                         self.sink_ctx = None;
-                        self.flow.invalidate_derived();
                     }
                     error!(
                         flow = %self.flow.name,
@@ -107,65 +106,84 @@ impl FlowRunner {
         runner.tick(true).await.map(|_| ())
     }
 
-    async fn ensure_contexts(&mut self) -> RuntimeResult<()> {
-        if self.source_ctx.is_none() {
-            self.source_ctx = Some(self.flow.source.build_context(&self.flow.read_spec).await?);
-        }
-        if self.sink_ctx.is_none() {
-            self.sink_ctx = Some(self.flow.sink.build_context(&self.flow.write_spec).await?);
-        }
-        Ok(())
-    }
-
-    /// Ensure the flow's `DerivedPlans` are present, rebuilding them
-    /// from live schemas when they were cleared on a prior backend
-    /// error. Pulls schemas exclusively via `SchemaProvider` on the
-    /// just-built ctxs — every production ctx now impls the trait
-    /// (mongo schemaless ctxs return `None` from
-    /// `as_schema_provider()` when sample-derived schema is genuinely
-    /// unavailable, which `expand` already handles).
-    async fn ensure_derived(&mut self) -> RuntimeResult<()> {
-        if self.flow.has_derived() {
+    /// Ensure both source/sink ctxs are built and that `DerivedPlans`
+    /// have been refreshed against the live ctx-side schemas after any
+    /// ctx (re)build. `DerivedPlans` is always populated (constructed
+    /// at validation time), so this only rebuilds derived when at least
+    /// one ctx had to be (re)built — typically after a backend-error
+    /// ctx drop. Schemas are pulled exclusively via `SchemaProvider`
+    /// on the just-built ctxs.
+    async fn ensure_built(&mut self) -> RuntimeResult<()> {
+        if self.source_ctx.is_some() && self.sink_ctx.is_some() {
             return Ok(());
         }
-        let src_schemaless = self.flow.source.schemaless();
-        let dst_schemaless = self.flow.sink.schemaless();
-        let src_schema: Option<Schema> = self
-            .source_ctx
-            .as_ref()
-            .and_then(|c| c.as_schema_provider())
-            .map(|p| p.schema().clone());
-        let dst_schema: Option<Schema> = self
-            .sink_ctx
-            .as_ref()
-            .and_then(|c| c.as_schema_provider())
-            .map(|p| p.schema().clone());
+        let rebuild_needed = self.source_ctx.is_none() || self.sink_ctx.is_none();
+        if self.source_ctx.is_none() {
+            self.source_ctx = Some(
+                self.flow
+                    .source
+                    .build_context(&self.flow.derived().read_spec)
+                    .await?,
+            );
+        }
+        if self.sink_ctx.is_none() {
+            self.sink_ctx = Some(
+                self.flow
+                    .sink
+                    .build_context(&self.flow.derived().write_spec)
+                    .await?,
+            );
+        }
+        if rebuild_needed {
+            let src_schemaless = self.flow.source.schemaless();
+            let dst_schemaless = self.flow.sink.schemaless();
+            let src_schema: Option<Schema> = self
+                .source_ctx
+                .as_ref()
+                .and_then(|c| c.as_schema_provider())
+                .map(|p| p.schema().clone());
+            let dst_schema: Option<Schema> = self
+                .sink_ctx
+                .as_ref()
+                .and_then(|c| c.as_schema_provider())
+                .map(|p| p.schema().clone());
 
-        // Collapse the (schemaless, schema) pair into a `Schema` whose
-        // `SchemaKind` discriminates fixed / schemaless / schemaless-
-        // with-sample. A schemaless connector with a populated ctx-side
-        // schema is a *sample* — expose it via `Schema::schemaless_with_sample`
-        // so wildcard-only schemaless-both flows still hit the
-        // raw-passthrough fast path (which deliberately ignores the sample).
-        let src_state: Schema = match (src_schemaless, src_schema) {
-            (false, Some(s)) => s,
-            (true, Some(s)) => Schema::schemaless_with_sample(s.fields().to_vec()),
-            (true, None) => Schema::schemaless(),
-            // Non-schemaless connector with no schema available — the
-            // ctx provider returned None. Treat as Schemaless so expand
-            // surfaces `WildcardWithoutSchema` rather than panicking;
-            // this path is only reachable when the connector is
-            // misbehaving.
-            (false, None) => Schema::schemaless(),
-        };
-        let dst_state: Schema = match (dst_schemaless, dst_schema) {
-            (false, Some(s)) => s,
-            (true, Some(s)) => Schema::schemaless_with_sample(s.fields().to_vec()),
-            (true, None) => Schema::schemaless(),
-            (false, None) => Schema::schemaless(),
-        };
+            // Collapse the (schemaless, schema) pair into a `Schema` whose
+            // `SchemaKind` discriminates fixed / schemaless / schemaless-
+            // with-sample. A schemaless connector with a populated ctx-side
+            // schema is a *sample* — expose it via `Schema::schemaless_with_sample`
+            // so wildcard-only schemaless-both flows still hit the
+            // raw-passthrough fast path (which deliberately ignores the sample).
+            //
+            // An *empty* sample (mongo sink's `describe_schema` returns
+            // `Schema::schemaless()` with no fields) carries no useful
+            // info — collapse it to plain `Schemaless` so `build_derived_plans`
+            // synthesises the dst schema from the source side instead of
+            // trying to look up columns in the empty sample.
+            let src_state: Schema = match (src_schemaless, src_schema) {
+                (false, Some(s)) => s,
+                (true, Some(s)) if !s.fields().is_empty() => {
+                    Schema::schemaless_with_sample(s.fields().to_vec())
+                }
+                (true, _) => Schema::schemaless(),
+                // Non-schemaless connector with no schema available — the
+                // ctx provider returned None. Treat as Schemaless so expand
+                // surfaces `WildcardWithoutSchema` rather than panicking;
+                // this path is only reachable when the connector is
+                // misbehaving.
+                (false, None) => Schema::schemaless(),
+            };
+            let dst_state: Schema = match (dst_schemaless, dst_schema) {
+                (false, Some(s)) => s,
+                (true, Some(s)) if !s.fields().is_empty() => {
+                    Schema::schemaless_with_sample(s.fields().to_vec())
+                }
+                (true, _) => Schema::schemaless(),
+                (false, None) => Schema::schemaless(),
+            };
 
-        self.flow.rebuild_derived(&src_state, &dst_state)?;
+            self.flow.rebuild_derived(&src_state, &dst_state)?;
+        }
         Ok(())
     }
 
@@ -218,8 +236,7 @@ impl FlowRunner {
             info!(flow = %self.flow.name, has_cursor = self.cursor.is_some(), "flow started");
         }
 
-        self.ensure_contexts().await?;
-        self.ensure_derived().await?;
+        self.ensure_built().await?;
 
         if *self.shutdown.borrow() {
             info!(flow = %self.flow.name, "shutdown signalled");
@@ -228,7 +245,7 @@ impl FlowRunner {
 
         // The derived plans cache the post-expansion `ReadSpec`. Clone
         // it once and move the clone into the spawned future.
-        let read_spec = self.flow.derived()?.read_spec.clone();
+        let read_spec = self.flow.derived().read_spec.clone();
 
         // Arc-shared context: runner keeps its clone in self.source_ctx,
         // future holds another. On async cancellation only the future's
@@ -237,14 +254,14 @@ impl FlowRunner {
         let src_ctx = self
             .source_ctx
             .as_ref()
-            .expect("ensured by ensure_contexts")
+            .expect("ensured by ensure_built")
             .clone();
         let source = self.flow.source.clone();
         let cursor = self.cursor.clone();
         let cancel_safe = source.cancel_safe();
         // Pull the lowered Transform program once outside the spawned
         // future so the borrow on `derived` doesn't straddle the await.
-        let transform = self.flow.derived()?.transform.clone();
+        let transform = self.flow.derived().transform.clone();
 
         // dry_run path: sampling validation routes through the same
         // tick. `Source::sample` returns a pre-Transform `RawBatch`;
@@ -304,7 +321,7 @@ impl FlowRunner {
             return Ok(false);
         }
         self.write_and_commit(batch, dry_run).await?;
-        if batch_size < self.flow.read_spec.limit && matches!(self.mode, RunMode::Once) {
+        if batch_size < self.flow.derived().read_spec.limit && matches!(self.mode, RunMode::Once) {
             return Ok(true);
         }
         Ok(false)
@@ -314,11 +331,11 @@ impl FlowRunner {
         let sink_ctx = self
             .sink_ctx
             .as_ref()
-            .expect("ensured by ensure_contexts")
+            .expect("ensured by ensure_built")
             .clone();
         let sink = self.flow.sink.clone();
         // Cached on `DerivedPlans`; clone-once for the spawned future.
-        let write_spec = self.flow.derived()?.write_spec.clone();
+        let write_spec = self.flow.derived().write_spec.clone();
         // Capture next_cursor before moving the batch into the sink —
         // the cursor save below outlives the write call.
         let next_cursor = batch.next_cursor.clone();
@@ -437,7 +454,6 @@ fn should_drop_ctx_on(err: &RuntimeError) -> bool {
         | RuntimeError::SchemaColumnMissing { .. }
         | RuntimeError::Identifier(_)
         | RuntimeError::DerivedPlanInvariant { .. }
-        | RuntimeError::DerivedPlansNotBuilt { .. }
         | RuntimeError::Other(_) => false,
     }
 }
@@ -687,6 +703,10 @@ mod tests {
         // interrupted the subsequent backoff sleep.
         let mut source = crate::traits::MockSource::new();
         source.expect_cancel_safe().return_const(true);
+        source.expect_schemaless().return_const(false);
+        source
+            .expect_body_data_type()
+            .returning(|| crate::types::DataType::Json);
         source
             .expect_build_context()
             .returning(|_| Ok(Arc::new(UnitSourceCtx)));
@@ -713,6 +733,10 @@ mod tests {
         // `with_spawn_detach` branch end-to-end.
         let mut source = crate::traits::MockSource::new();
         source.expect_cancel_safe().return_const(false);
+        source.expect_schemaless().return_const(false);
+        source
+            .expect_body_data_type()
+            .returning(|| crate::types::DataType::Json);
         source
             .expect_build_context()
             .returning(|_| Ok(Arc::new(UnitSourceCtx)));
@@ -837,6 +861,10 @@ mod tests {
 
         let mut source = crate::traits::MockSource::new();
         source.expect_cancel_safe().return_const(true);
+        source.expect_schemaless().return_const(false);
+        source
+            .expect_body_data_type()
+            .returning(|| crate::types::DataType::Json);
         let bc = build_calls.clone();
         source.expect_build_context().returning(move |_| {
             bc.fetch_add(1, Ordering::SeqCst);
@@ -874,6 +902,10 @@ mod tests {
 
         let mut source = crate::traits::MockSource::new();
         source.expect_cancel_safe().return_const(true);
+        source.expect_schemaless().return_const(false);
+        source
+            .expect_body_data_type()
+            .returning(|| crate::types::DataType::Json);
         let bc = build_calls.clone();
         source.expect_build_context().returning(move |_| {
             bc.fetch_add(1, Ordering::SeqCst);
@@ -943,11 +975,10 @@ mod tests {
         });
 
         let flow = test_flow(source, mock_sink_ok(), mock_storage_ok());
-        // Pre-state: derived populated by `new_unchecked` so the first
-        // tick's `ensure_derived` short-circuits; the second tick (after
-        // the backend error invalidates derived AND drops the ctx)
-        // must rebuild via `build_context`.
-        assert!(flow.has_derived());
+        // Pre-state: derived is always populated (`FlowState::new`
+        // requires it). After the backend error the runner drops the
+        // ctx Arcs; the next tick must call `build_context` again — that
+        // call is what this test verifies.
         let (tx, rx) = watch::channel(false);
         let handle =
             tokio::spawn(async move { FlowRunner::new(flow, RunMode::Daemon, rx).run().await });

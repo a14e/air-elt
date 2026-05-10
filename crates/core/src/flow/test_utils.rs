@@ -6,8 +6,8 @@ use crate::config::model::CursorOrder;
 use crate::error::RuntimeError;
 use crate::model::raw::{RawBatch, RawRow};
 use crate::model::{
-    AssembledFlow, CursorFieldValue, CursorState, Field, FlowState, ReadSpec, Schema,
-    SchemaProvider, SinkCtx, SourceCtx, WriteReport, WriteSpec,
+    AssembledFlow, ConfigReadSpec, ConfigWriteSpec, CursorFieldValue, CursorState, DerivedPlans,
+    Field, FlowState, ReadSpec, Schema, SchemaProvider, SinkCtx, SourceCtx, WriteReport, WriteSpec,
 };
 use crate::traits::{MockSink, MockSource, MockStorage};
 use crate::types::DataType;
@@ -233,6 +233,29 @@ pub fn test_flow_named(
             truncate: false,
             default_literal: None,
         }],
+        config_read_spec: ConfigReadSpec {
+            table: "public.t".into(),
+            cursor_fields: vec!["id".into()],
+            cursor_order: CursorOrder::Asc,
+            limit: 1,
+            source_options: toml::Table::new(),
+        },
+        config_write_spec: ConfigWriteSpec {
+            table: "public.t".into(),
+            conflict: None,
+        },
+        interval: Duration::from_millis(10),
+        query_timeout: Duration::from_secs(5),
+        sampling: crate::config::validation::SamplingConfig::Disabled,
+        access_check: true,
+        fields_check: true,
+        inserts_check: true,
+        cursor_persistence: crate::model::CursorPersistence::ColumnCursor,
+    };
+    let derived = DerivedPlans {
+        transform: crate::transform::Transform::new(vec![crate::transform::TransformOp::Take {
+            source_index: 0,
+        }]),
         read_spec: ReadSpec {
             columns: vec!["id".into()],
             table: "public.t".into(),
@@ -247,15 +270,8 @@ pub fn test_flow_named(
             table: "public.t".into(),
             conflict: None,
         },
-        interval: Duration::from_millis(10),
-        query_timeout: Duration::from_secs(5),
-        sampling: crate::config::validation::SamplingConfig::Disabled,
-        access_check: true,
-        fields_check: true,
-        inserts_check: true,
-        cursor_persistence: crate::model::CursorPersistence::ColumnCursor,
     };
-    FlowState::new_unchecked(assembled, Vec::new())
+    FlowState::new(assembled, derived)
 }
 
 pub fn test_flow(source: MockSource, sink: MockSink, storage: MockStorage) -> FlowState {

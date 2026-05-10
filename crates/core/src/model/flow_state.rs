@@ -3,21 +3,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::validation::SamplingConfig;
-use crate::error::{RuntimeError, ValidationError};
+use crate::error::ValidationError;
 use crate::mapping::{self, ColumnMapping, DirectMapping, ExpandedMapping};
-use crate::model::{ReadSpec, Schema, WriteSpec};
+use crate::model::{ConfigReadSpec, ConfigWriteSpec, ReadSpec, Schema, WriteSpec};
 use crate::traits::{Sink, Source, Storage};
 use crate::types::{ConversionContext, DataType};
 
-/// A flow with its components built and specs derived from config, but
+/// A flow with its components built and config-time specs derived, but
 /// without I/O validation yet. Returned by `validation::pipeline::assemble`.
 /// Cannot be passed to the runner — call `validate` first to obtain a
 /// `FlowState`.
 ///
 /// `rules` carries the normalised mapping (post-shorthand, pre-schema
 /// expansion). The wildcard fan-out and body-pack synthesis run at
-/// validate time inside `mapping::expand`. The resulting `read_spec` /
-/// `write_spec` columns are populated from the expanded direct vector.
+/// validate time inside `mapping::expand` and produce the final
+/// `ReadSpec` / `WriteSpec` stored on [`DerivedPlans`]. The
+/// `config_*_spec` fields below carry only the schema-independent parts
+/// of those specs (table, cursor, limit, etc.) so callers that need
+/// `columns` / `needs_body` reach for the derived spec instead.
 #[derive(Clone)]
 pub struct AssembledFlow {
     pub name: String,
@@ -27,8 +30,8 @@ pub struct AssembledFlow {
     pub sink: Arc<dyn Sink>,
     pub storage: Arc<dyn Storage>,
     pub rules: Vec<ColumnMapping>,
-    pub read_spec: ReadSpec,
-    pub write_spec: WriteSpec,
+    pub config_read_spec: ConfigReadSpec,
+    pub config_write_spec: ConfigWriteSpec,
     pub interval: Duration,
     pub query_timeout: Duration,
     /// Operator-resolved sampling-validation decision (after applying
@@ -83,9 +86,9 @@ impl ColumnConversionPlan {
 /// Derived per-flow runtime plans rebuilt together with schema.
 ///
 /// Constructed by [`FlowState::rebuild_derived`] from the static rules
-/// stashed on `AssembledFlow` plus the live source/sink schemas. Cleared
-/// on backend errors (alongside the ctx Arcs) so the next tick rebuilds
-/// against fresh schemas.
+/// stashed on `AssembledFlow` plus the live source/sink schemas. Holds
+/// the only fully-populated [`ReadSpec`] / [`WriteSpec`] in the system —
+/// the post-expansion shape every connector consumes.
 #[derive(Clone)]
 pub struct DerivedPlans {
     /// Lowered Transform IR program built from the expanded mapping
@@ -107,74 +110,35 @@ pub struct DerivedPlans {
 
 /// Validated flow ready for execution. Owned exclusively by a single
 /// `FlowRunner`; concurrent access is not part of the contract — each
-/// `tokio::spawn(...)` moves a fresh `FlowState`. The `derived` plans
-/// are kept inside `Option` so the runner can drop them on
-/// `RuntimeError::Backend` (paired with ctx drop) and rebuild the next
-/// tick after `build_context` populates fresh schemas.
+/// `tokio::spawn(...)` moves a fresh `FlowState`. `derived` is always
+/// populated: the runner rebuilds it in-place on `RuntimeError::Backend`
+/// (paired with ctx rebuild) via [`Self::rebuild_derived`].
 #[derive(Clone)]
 pub struct FlowState {
     inner: AssembledFlow,
-    derived: Option<DerivedPlans>,
+    derived: DerivedPlans,
 }
 
 impl FlowState {
-    /// Internal constructor — called from `validation::pipeline::validate`
-    /// after schema introspection produces the conversions vector.
-    pub(crate) fn new(inner: AssembledFlow, derived: DerivedPlans) -> Self {
-        Self {
-            inner,
-            derived: Some(derived),
-        }
+    /// Constructor — called from `validation::pipeline::validate`
+    /// after schema introspection produces the derived plans.
+    pub fn new(inner: AssembledFlow, derived: DerivedPlans) -> Self {
+        Self { inner, derived }
     }
 
-    /// Bypasses validation. Test-only — lives behind `cfg(test)` to keep
-    /// the type discipline for production callers.
-    #[cfg(test)]
-    pub fn new_unchecked(inner: AssembledFlow, _conversions: Vec<ColumnConversionPlan>) -> Self {
-        let read_spec = inner.read_spec.clone();
-        let write_spec = inner.write_spec.clone();
-        Self {
-            inner,
-            derived: Some(DerivedPlans {
-                read_spec,
-                write_spec,
-                transform: crate::transform::Transform::new(Vec::new()),
-            }),
-        }
+    /// Borrow the derived plans. Always populated — `rebuild_derived`
+    /// overwrites in place rather than clearing.
+    pub fn derived(&self) -> &DerivedPlans {
+        &self.derived
     }
 
-    /// Borrow the derived plans. Errors when derived has been cleared
-    /// by a prior `invalidate_derived()` and not yet rebuilt — the
-    /// caller is expected to call `rebuild_derived(...)` first.
-    pub fn derived(&self) -> Result<&DerivedPlans, RuntimeError> {
-        self.derived
-            .as_ref()
-            .ok_or_else(|| RuntimeError::DerivedPlansNotBuilt {
-                flow: self.inner.name.clone(),
-            })
-    }
-
-    /// Drop the cached derived plans. Paired with the runner's ctx-drop
-    /// on `RuntimeError::Backend` so the next tick rebuilds against the
-    /// fresh schemas exposed by the rebuilt ctx.
-    pub fn invalidate_derived(&mut self) {
-        self.derived = None;
-    }
-
-    /// `true` iff [`derived`] currently holds plans. Used by the runner
-    /// to decide whether to call `rebuild_derived` after building the
-    /// ctxs on a fresh tick.
-    pub fn has_derived(&self) -> bool {
-        self.derived.is_some()
-    }
-
-    /// Rebuild derived plans from the live schemas. Replaces whatever
-    /// is currently in `derived` (`Some` or `None`). Re-runs the
+    /// Rebuild derived plans from the live schemas. Re-runs the
     /// expansion + per-column conversion plan build using the rules
-    /// stored on `AssembledFlow`.
+    /// stored on `AssembledFlow`. Called by the runner after a backend
+    /// error / fresh ctx build to pick up any schema drift since the
+    /// last successful tick.
     pub fn rebuild_derived(&mut self, src: &Schema, dst: &Schema) -> Result<(), ValidationError> {
-        let plans = build_derived_plans(&self.inner, src, dst)?;
-        self.derived = Some(plans);
+        self.derived = build_derived_plans(&self.inner, src, dst)?;
         Ok(())
     }
 }
@@ -245,19 +209,29 @@ pub fn build_derived_plans_from_expanded(
         effective_dst,
         dst_schemaless,
     )?;
-    let mut read_spec = flow.read_spec.clone();
-    read_spec.columns = expanded.read_columns();
-    // The source attaches `RawRow.body` only when the flow has a body
-    // target — the cost-guard tells it whether to pay per row.
-    read_spec.needs_body = expanded.body.is_some();
-    let mut write_spec = flow.write_spec.clone();
-    write_spec.columns = expanded.write_columns();
+    let columns = expanded.read_columns();
+    let read_spec = ReadSpec {
+        columns: columns.clone(),
+        table: flow.config_read_spec.table.clone(),
+        cursor_fields: flow.config_read_spec.cursor_fields.clone(),
+        cursor_order: flow.config_read_spec.cursor_order,
+        limit: flow.config_read_spec.limit,
+        source_options: flow.config_read_spec.source_options.clone(),
+        // The source attaches `RawRow.body` only when the flow has a body
+        // target — the cost-guard tells it whether to pay per row.
+        needs_body: expanded.body.is_some(),
+    };
+    let write_spec = WriteSpec {
+        columns: expanded.write_columns(),
+        table: flow.config_write_spec.table.clone(),
+        conflict: flow.config_write_spec.conflict.clone(),
+    };
     let transform = crate::transform::compile_to_transform(
         expanded,
         body_data_type,
         &conversions,
         &body_conversions,
-        &read_spec.columns,
+        &columns,
     )?;
     Ok(DerivedPlans {
         read_spec,
@@ -351,7 +325,7 @@ fn build_conversions(
         let src = src_schema.ok_or_else(|| ValidationError::AccessFailed {
             component: "source:schema",
             name: flow_name.clone(),
-            source: Box::new(RuntimeError::Other(format!(
+            source: Box::new(crate::error::RuntimeError::Other(format!(
                 "rebuild_derived: missing source schema for direct mapping {from:?} → {to:?}"
             ))),
         })?;
@@ -426,7 +400,6 @@ impl std::fmt::Debug for FlowState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlowState")
             .field("name", &self.inner.name)
-            .field("has_derived", &self.derived.is_some())
             .finish()
     }
 }
@@ -437,7 +410,7 @@ mod tests {
     use super::*;
     use crate::config::model::CursorOrder;
     use crate::mapping::ColumnMapping;
-    use crate::model::{Field, ReadSpec, Schema, WriteSpec};
+    use crate::model::{Field, Schema};
     use crate::traits::{MockSink, MockSource, MockStorage};
 
     fn assembled(rules: Vec<ColumnMapping>) -> AssembledFlow {
@@ -453,17 +426,14 @@ mod tests {
             sink: Arc::new(sink),
             storage: Arc::new(MockStorage::new()),
             rules,
-            read_spec: ReadSpec {
-                columns: Vec::new(),
+            config_read_spec: ConfigReadSpec {
                 table: "t".into(),
                 cursor_fields: Vec::new(),
                 cursor_order: CursorOrder::Asc,
                 limit: 1,
                 source_options: toml::Table::new(),
-                needs_body: false,
             },
-            write_spec: WriteSpec {
-                columns: Vec::new(),
+            config_write_spec: ConfigWriteSpec {
                 table: "t".into(),
                 conflict: None,
             },
@@ -490,10 +460,10 @@ mod tests {
         )
     }
 
-    /// `rebuild_derived` populates derived; `invalidate_derived` clears
-    /// it; `derived()` errors when cleared.
+    /// `rebuild_derived` overwrites in place; `derived()` always returns
+    /// the current plans.
     #[test]
-    fn rebuild_then_invalidate_then_access_errors() {
+    fn rebuild_overwrites_in_place() {
         let flow = assembled(vec![ColumnMapping::Direct {
             from: "a".into(),
             to: "a".into(),
@@ -507,16 +477,10 @@ mod tests {
         )
         .unwrap();
         let mut state = FlowState::new(flow, initial);
-        assert!(state.has_derived());
-        state.invalidate_derived();
-        assert!(!state.has_derived());
-        assert!(state.derived().is_err());
-
         let src = schema(&[("a", DataType::Int32, false)]);
         let dst = schema(&[("a", DataType::Int32, false)]);
         state.rebuild_derived(&src, &dst).unwrap();
-        assert!(state.has_derived());
-        let derived = state.derived().unwrap();
+        let derived = state.derived();
         assert_eq!(derived.transform.cols.len(), 1);
         assert_eq!(derived.read_spec.columns, vec!["a".to_string()]);
         assert_eq!(derived.write_spec.columns, vec!["a".to_string()]);

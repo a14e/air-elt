@@ -68,3 +68,15 @@ In this case all fields of the source structure will be copied into a JSON objec
 That is, multi-level verification of requirements is expected before implementation. Run the requirement-validator agents after you have collected the necessary information — give them a digest and let them validate.
 
 After collecting requirements, draft the plan and then iterate on it.
+
+# Follow-ups (deferred)
+
+* Group fields on `AssembledFlow` (source-side / sink-side / runtime) for
+  readability — currently it's a flat bag of ~14 fields mixing schema-
+  independent config, runtime knobs, and validation toggles.
+* After grouping, eliminate the redundant per-tick `read_spec` / `write_spec`
+  clones in `FlowRunner::tick` (`runner.rs:231`, `runner.rs:321`). Each tick
+  currently clones the cached spec out of `DerivedPlans` only because the
+  borrow on `derived` straddles an `.await`. Options to explore: move the
+  spec into an `Arc<ReadSpec>` so cloning the Arc is cheap, or restructure
+  the spawn so the borrow doesn't cross the await.
