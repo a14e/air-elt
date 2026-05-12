@@ -16,6 +16,7 @@ use crate::types::dynamic::DynValue;
 pub enum Value {
     Null,
     Bool(bool),
+    Int8(i8),
     Int16(i16),
     Int32(i32),
     Int64(i64),
@@ -58,6 +59,7 @@ impl Clone for Value {
         match self {
             Value::Null => Value::Null,
             Value::Bool(b) => Value::Bool(*b),
+            Value::Int8(n) => Value::Int8(*n),
             Value::Int16(n) => Value::Int16(*n),
             Value::Int32(n) => Value::Int32(*n),
             Value::Int64(n) => Value::Int64(*n),
@@ -86,6 +88,7 @@ impl PartialEq for Value {
         match (self, other) {
             (Null, Null) => true,
             (Bool(a), Bool(b)) => a == b,
+            (Int8(a), Int8(b)) => a == b,
             (Int16(a), Int16(b)) => a == b,
             (Int32(a), Int32(b)) => a == b,
             (Int64(a), Int64(b)) => a == b,
@@ -136,6 +139,7 @@ impl Serialize for Value {
                 m.end()
             }
             Value::Bool(b) => emit(serializer, "bool", b),
+            Value::Int8(n) => emit(serializer, "int8", n),
             Value::Int16(n) => emit(serializer, "int16", n),
             Value::Int32(n) => emit(serializer, "int32", n),
             Value::Int64(n) => emit(serializer, "int64", n),
@@ -223,6 +227,7 @@ impl<'de> Visitor<'de> for ValueVisitor {
         match tag.as_str() {
             "null" => Ok(Value::Null),
             "bool" => decode(v).map(Value::Bool),
+            "int8" => decode(v).map(Value::Int8),
             "int16" => decode(v).map(Value::Int16),
             "int32" => decode(v).map(Value::Int32),
             "int64" => decode(v).map(Value::Int64),
@@ -259,6 +264,7 @@ impl<'de> Visitor<'de> for ValueVisitor {
                 &[
                     "null",
                     "bool",
+                    "int8",
                     "int16",
                     "int32",
                     "int64",
@@ -315,6 +321,7 @@ mod tests {
                 Value::Bool(true),
                 serde_json::json!({"type":"bool","value":true}),
             ),
+            (Value::Int8(7), serde_json::json!({"type":"int8","value":7})),
             (
                 Value::Int16(7),
                 serde_json::json!({"type":"int16","value":7}),

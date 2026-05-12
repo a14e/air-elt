@@ -17,6 +17,7 @@ pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, Co
         Int64 => Ok(Value::Int64(sat_bigint_to_i64(&b))),
         Int32 => Ok(Value::Int32(sat_bigint_to_i32(&b))),
         Int16 => Ok(Value::Int16(sat_bigint_to_i16(&b))),
+        Int8 => Ok(Value::Int8(sat_bigint_to_i8(&b))),
         UInt64 => Ok(Value::UInt64(sat_bigint_to_u64(&b))),
         UInt32 => Ok(Value::UInt32(sat_bigint_to_u32(&b))),
         UInt16 => Ok(Value::UInt16(sat_bigint_to_u16(&b))),

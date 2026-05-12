@@ -7,7 +7,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::model::{
-    Batch, CursorFieldValue, CursorPersistence, CursorState, FlowState, Schema, SinkCtx, SourceCtx,
+    Batch, CursorFieldValue, CursorPersistence, CursorState, FlowState, RowOp, Schema, SinkCtx,
+    SourceCtx,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,7 +274,7 @@ impl FlowRunner {
             let f = async move { source.sample(&read_spec, src_ctx, n).await };
             let raw = run_op(&self.flow, "sample", f, cancel_safe, &mut self.shutdown).await?;
             let batch = transform.apply(raw)?;
-            return self.finish_tick(batch).await;
+            return self.finish_tick(batch, true).await;
         }
 
         // Production read path: source emits `RawBatch`; Transform
@@ -289,23 +290,13 @@ impl FlowRunner {
 
         let batch = transform.apply(raw)?;
 
-        self.finish_tick_inner(batch, dry_run).await
+        self.finish_tick(batch, dry_run).await
     }
 
     /// Drain phase shared between the dry-run and production paths.
     /// Pulled out so the dry-run early-return can reuse it without
     /// duplicating the empty-batch / write / interval-sleep dance.
-    async fn finish_tick(&mut self, batch: Batch) -> Result<bool, RuntimeError> {
-        // Dry-run finalisation: storages skip persistence, so we only
-        // need to forward the batch to the sink with `dry_run=true`.
-        self.finish_tick_inner(batch, true).await
-    }
-
-    async fn finish_tick_inner(
-        &mut self,
-        batch: Batch,
-        dry_run: bool,
-    ) -> Result<bool, RuntimeError> {
+    async fn finish_tick(&mut self, batch: Batch, dry_run: bool) -> Result<bool, RuntimeError> {
         let batch_size = batch.rows.len();
         if batch_size == 0 {
             if matches!(self.mode, RunMode::Once) {
@@ -327,7 +318,7 @@ impl FlowRunner {
         Ok(false)
     }
 
-    async fn write_and_commit(&mut self, batch: Batch, dry_run: bool) -> RuntimeResult<()> {
+    async fn write_and_commit(&mut self, mut batch: Batch, dry_run: bool) -> RuntimeResult<()> {
         let sink_ctx = self
             .sink_ctx
             .as_ref()
@@ -339,6 +330,26 @@ impl FlowRunner {
         // Capture next_cursor before moving the batch into the sink —
         // the cursor save below outlives the write call.
         let next_cursor = batch.next_cursor.clone();
+        // Append-only sinks (ClickHouse) drop deletes pre-write — the
+        // sink will never observe a `RowOp::Delete`. Cursor still
+        // advances over the dropped events.
+        if !sink.supports_deletes() {
+            let before = batch.rows.len();
+            batch.rows.retain(|r| r.op != RowOp::Delete);
+            let dropped = before - batch.rows.len();
+            if dropped > 0 {
+                debug!(
+                    flow = %self.flow.name,
+                    deletes_dropped = dropped,
+                    "sink does not support deletes — dropping delete rows"
+                );
+            }
+            if batch.rows.is_empty() {
+                // Still need to advance the cursor below; skip the sink
+                // call entirely (no rows to write).
+                return self.commit_cursor(next_cursor, dry_run).await;
+            }
+        }
         let cancel_safe = sink.cancel_safe();
         let fut = async move {
             sink.write_batch(&write_spec, sink_ctx, batch, dry_run)
@@ -366,7 +377,15 @@ impl FlowRunner {
             "batch written"
         );
 
-        if let Some(next) = &next_cursor {
+        self.commit_cursor(next_cursor, dry_run).await
+    }
+
+    async fn commit_cursor(
+        &mut self,
+        next_cursor: Option<CursorState>,
+        dry_run: bool,
+    ) -> RuntimeResult<()> {
+        if let Some(next) = next_cursor {
             let storage = self.flow.storage.clone();
             let flow_name = self.flow.name.clone();
             let cancel_safe = storage.cancel_safe();
@@ -385,7 +404,7 @@ impl FlowRunner {
                     .await
                 }
                 CursorPersistence::ResumeToken => {
-                    let token_json = extract_resume_token(next)?;
+                    let token_json = extract_resume_token(&next)?;
                     let fut = async move {
                         storage
                             .save_resume_token(&flow_name, &token_json, dry_run)
@@ -405,7 +424,7 @@ impl FlowRunner {
                 error!(flow = %self.flow.name, error = %e, "cursor save failed; flow will abort to avoid drift");
                 return Err(e);
             }
-            self.cursor = Some(next.clone());
+            self.cursor = Some(next);
         } else {
             warn!(
                 flow = %self.flow.name,
@@ -662,6 +681,7 @@ mod tests {
         let mut sink = crate::traits::MockSink::new();
         sink.expect_cancel_safe().return_const(true);
         sink.expect_schemaless().return_const(false);
+        sink.expect_supports_deletes().return_const(true);
         sink.expect_build_context()
             .returning(|_| Ok(Arc::new(UnitSinkCtx)));
         let sd = saw_dry.clone();
@@ -1046,6 +1066,7 @@ mod tests {
         let mut sink = crate::traits::MockSink::new();
         sink.expect_cancel_safe().return_const(true);
         sink.expect_schemaless().return_const(false);
+        sink.expect_supports_deletes().return_const(true);
         sink.expect_build_context()
             .returning(|_| Ok(Arc::new(UnitSinkCtx)));
         let cap = captured.clone();
@@ -1072,6 +1093,158 @@ mod tests {
         let rows = captured.lock().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values, vec![Value::Int64(42)]);
+    }
+
+    /// When the sink declares `supports_deletes() == false`, the runner
+    /// must filter `RowOp::Delete` rows out before `write_batch`. Verify
+    /// that the sink only sees the Upsert.
+    #[tokio::test(start_paused = true)]
+    async fn no_delete_sink_filters_delete_rows_pre_write() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let captured: std::sync::Arc<Mutex<Vec<crate::model::Row>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let read_calls = std::sync::Arc::new(AtomicU32::new(0));
+
+        let mut source = crate::flow::test_utils::default_source_mock();
+        source.expect_cancel_safe().return_const(true);
+        source
+            .expect_build_context()
+            .returning(|_| Ok(Arc::new(UnitSourceCtx)));
+        let rc = read_calls.clone();
+        source.expect_read_batch().returning(move |_, _, _| {
+            let n = rc.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok(crate::model::raw::RawBatch {
+                    rows: vec![
+                        crate::model::raw::RawRow::upsert(vec![Value::Int64(1)]),
+                        // Delete event from a hypothetical CDC source.
+                        crate::model::raw::RawRow {
+                            values: vec![Value::Int64(2)],
+                            body: None,
+                            op: crate::model::RowOp::Delete,
+                        },
+                    ],
+                    next_cursor: Some(crate::model::CursorState::new(vec![
+                        crate::model::CursorFieldValue {
+                            name: "id".into(),
+                            value: Value::Int64(2),
+                        },
+                    ])),
+                })
+            } else {
+                Ok(crate::model::raw::RawBatch::default())
+            }
+        });
+
+        let mut sink = crate::traits::MockSink::new();
+        sink.expect_cancel_safe().return_const(true);
+        sink.expect_schemaless().return_const(false);
+        // Append-only sink: runner must drop deletes.
+        sink.expect_supports_deletes().return_const(false);
+        sink.expect_build_context()
+            .returning(|_| Ok(Arc::new(UnitSinkCtx)));
+        let cap = captured.clone();
+        sink.expect_write_batch()
+            .returning(move |_, _ctx, batch, _dry| {
+                cap.lock()
+                    .unwrap()
+                    .extend(batch.rows.iter().map(|r| crate::model::Row {
+                        values: r.values.clone(),
+                        op: r.op,
+                    }));
+                Ok(crate::model::WriteReport {
+                    rows_written: batch.rows.len() as u64,
+                })
+            });
+
+        let flow = test_flow(source, sink, mock_storage_ok());
+        let (_tx, rx) = watch::channel(false);
+        FlowRunner::new(flow, RunMode::Once, rx)
+            .run()
+            .await
+            .expect("flow runs");
+
+        let rows = captured.lock().unwrap();
+        assert_eq!(rows.len(), 1, "delete row must be filtered pre-write");
+        assert_eq!(rows[0].op, crate::model::RowOp::Upsert);
+        assert_eq!(rows[0].values, vec![Value::Int64(1)]);
+    }
+
+    /// When a batch consists entirely of delete rows and the sink
+    /// declares `supports_deletes() == false`, the runner must NOT call
+    /// `write_batch` at all — but it must still commit the cursor so
+    /// the flow doesn't get stuck re-reading the same range forever.
+    #[tokio::test(start_paused = true)]
+    async fn no_delete_sink_all_deletes_skips_write_but_commits_cursor() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let read_calls = std::sync::Arc::new(AtomicU32::new(0));
+        let saved_cursors: std::sync::Arc<Mutex<Vec<crate::model::CursorState>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+
+        let mut source = crate::flow::test_utils::default_source_mock();
+        source.expect_cancel_safe().return_const(true);
+        source
+            .expect_build_context()
+            .returning(|_| Ok(Arc::new(UnitSourceCtx)));
+        let rc = read_calls.clone();
+        source.expect_read_batch().returning(move |_, _, _| {
+            let n = rc.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok(crate::model::raw::RawBatch {
+                    rows: vec![crate::model::raw::RawRow {
+                        values: vec![Value::Int64(7)],
+                        body: None,
+                        op: crate::model::RowOp::Delete,
+                    }],
+                    next_cursor: Some(crate::model::CursorState::new(vec![
+                        crate::model::CursorFieldValue {
+                            name: "id".into(),
+                            value: Value::Int64(7),
+                        },
+                    ])),
+                })
+            } else {
+                Ok(crate::model::raw::RawBatch::default())
+            }
+        });
+
+        let mut sink = crate::traits::MockSink::new();
+        sink.expect_cancel_safe().return_const(true);
+        sink.expect_schemaless().return_const(false);
+        sink.expect_supports_deletes().return_const(false);
+        sink.expect_build_context()
+            .returning(|_| Ok(Arc::new(UnitSinkCtx)));
+        // The whole point: write_batch must not be invoked.
+        sink.expect_write_batch().times(0);
+
+        let mut storage = crate::traits::MockStorage::new();
+        storage.expect_cancel_safe().return_const(true);
+        storage.expect_load_cursor().returning(|_| Ok(None));
+        let sc = saved_cursors.clone();
+        storage
+            .expect_save_cursor()
+            .returning(move |_, state, _dry| {
+                sc.lock().unwrap().push(state.clone());
+                Ok(())
+            });
+
+        let flow = test_flow(source, sink, storage);
+        let (_tx, rx) = watch::channel(false);
+        FlowRunner::new(flow, RunMode::Once, rx)
+            .run()
+            .await
+            .expect("flow runs");
+
+        let saves = saved_cursors.lock().unwrap();
+        assert_eq!(
+            saves.len(),
+            1,
+            "cursor must advance past the delete-only batch"
+        );
     }
 
     #[tokio::test(start_paused = true)]

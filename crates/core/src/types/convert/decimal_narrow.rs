@@ -36,6 +36,10 @@ pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, Co
             let b = bigdecimal_to_bigint_truncating(&d);
             Ok(Value::Int16(sat_bigint_to_i16(&b)))
         }
+        Int8 => {
+            let b = bigdecimal_to_bigint_truncating(&d);
+            Ok(Value::Int8(sat_bigint_to_i8(&b)))
+        }
         UInt64 => {
             let b = bigdecimal_to_bigint_truncating(&d);
             Ok(Value::UInt64(sat_bigint_to_u64(&b)))

@@ -51,6 +51,8 @@ pub fn parse(literal: &toml::Value, sink: &DataType) -> Result<Value, DefaultPar
         DataType::Bytes { size } => parse_bytes(literal, *size),
         DataType::Text { size } => parse_text(literal, *size),
         DataType::Bool => parse_bool(literal),
+        DataType::Int8 => parse_signed(literal, sink, i8::MIN as i64, i8::MAX as i64)
+            .map(|n| Value::Int8(n as i8)),
         DataType::Int16 => parse_signed(literal, sink, i16::MIN as i64, i16::MAX as i64)
             .map(|n| Value::Int16(n as i16)),
         DataType::Int32 => parse_signed(literal, sink, i32::MIN as i64, i32::MAX as i64)

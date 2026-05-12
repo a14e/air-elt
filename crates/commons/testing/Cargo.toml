@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 mongodb = { workspace = true }
 bson = { workspace = true }
 sha2 = { workspace = true }
+reqwest = { workspace = true }
 
 [lints]
 workspace = true

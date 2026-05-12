@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use air_elt_core::registry::Registry;
+use air_elt_sink_clickhouse::ChSinkFactory;
 use air_elt_sink_mongodb::MongoSinkFactory;
 use air_elt_sink_mysql::MySqlSinkFactory;
 use air_elt_sink_postgres::PgSinkFactory;
@@ -33,5 +34,10 @@ pub fn build_registry() -> Registry {
     registry.register_source("mongo-cdc", Arc::new(MongoCdcSourceFactory));
     registry.register_sink("mongodb", Arc::new(MongoSinkFactory));
     registry.register_storage("mongodb", Arc::new(MongoStorageFactory));
+    // ClickHouse — sink only. The sink declares `supports_deletes() = false`
+    // so the runner drops `RowOp::Delete` rows pre-write and CDC sources
+    // (e.g. `mongo-cdc`) may pair with it without a mandatory
+    // `[flow.x.conflict]` block (append-only ingest).
+    registry.register_sink("clickhouse", Arc::new(ChSinkFactory));
     registry
 }

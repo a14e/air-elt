@@ -73,10 +73,11 @@ pub fn decode_column(row: &PgRow, index: usize, data_type: DataType) -> RuntimeR
             None => Ok(Value::Null),
             Some(d) => Ok(Value::Decimal(d)),
         },
-        // Postgres has no unsigned int columns — these `DataType` variants
-        // exist only on the MySQL/MariaDB side. The pg source schema
-        // introspector never emits them, so this arm is structurally
+        // Postgres has no unsigned int columns and no int1 — these `DataType`
+        // variants exist only on the MySQL/MariaDB side. The pg source schema
+        // introspector never emits them, so these arms are structurally
         // unreachable.
+        DataType::Int8 => unreachable!("postgres has no int1 (signed 8-bit) type"),
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
             unreachable!("postgres has no unsigned integer types")
         }
@@ -126,6 +127,8 @@ pub fn bind_cursor_value<'q>(
     match value {
         Value::Null => null_bind::bind_typed_null(query, dt),
         Value::Bool(b) => query.bind(*b),
+        // Postgres has no int1; widen to i16.
+        Value::Int8(n) => query.bind(*n as i16),
         Value::Int16(n) => query.bind(*n),
         Value::Int32(n) => query.bind(*n),
         Value::Int64(n) => query.bind(*n),

@@ -30,6 +30,8 @@ pub fn bind_typed_null<'q>(
     match dt {
         DataType::Int64 => query.bind::<Option<i64>>(None),
         DataType::Bool => query.bind::<Option<bool>>(None),
+        // Postgres has no int1 type; bind as int2 (i16).
+        DataType::Int8 => query.bind::<Option<i16>>(None),
         DataType::Int16 => query.bind::<Option<i16>>(None),
         DataType::Int32 => query.bind::<Option<i32>>(None),
         DataType::Float32 => query.bind::<Option<f32>>(None),

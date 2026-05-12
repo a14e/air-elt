@@ -35,6 +35,9 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
             DataType::Bool => {
                 sep.push_bind::<Option<bool>>(None);
             }
+            DataType::Int8 => {
+                sep.push_bind::<Option<i8>>(None);
+            }
             DataType::Int16 => {
                 sep.push_bind::<Option<i16>>(None);
             }
@@ -93,6 +96,9 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
         },
         Value::Bool(b) => {
             sep.push_bind(*b);
+        }
+        Value::Int8(n) => {
+            sep.push_bind(*n);
         }
         Value::Int16(n) => {
             sep.push_bind(*n);

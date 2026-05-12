@@ -1,0 +1,35 @@
+[config]
+include = ["flows"]
+
+# Append-only CDC ingest from MongoDB → ClickHouse. The CH sink declares
+# `supports_deletes() = false`, so:
+#
+# * the runner silently drops `RowOp::Delete` events before they reach
+#   ClickHouse (MergeTree has no cheap DELETE);
+# * the `[flow.users.conflict]` block is OPTIONAL — usually mandatory
+#   for `mongo-cdc` sources because they emit Upsert/Delete, but with
+#   a no-delete sink we accept the append-only shape and stream every
+#   CDC event as a fresh INSERT row.
+#
+# Storage stays on Postgres (or another supported backend) because
+# ClickHouse is not a great fit for resume-token state.
+
+[secrets]
+MONGO_SRC_URL = "mongodb://localhost:27017/?replicaSet=rs0&directConnection=true"
+CLICKHOUSE_URL = "http://localhost:8123"
+PG_STATE_URL = "postgres://postgres:postgres@localhost:5432/state"
+
+[[sources]]
+name = "mongo_cdc"
+type = "mongo-cdc"
+config = { url = "${MONGO_SRC_URL}", database = "appdb", max-await-time = "1s" }
+
+[[sinks]]
+name = "clickhouse_sink"
+type = "clickhouse"
+config = { url = "${CLICKHOUSE_URL}", database = "analytics" }
+
+[[storages]]
+name = "pg_state"
+type = "postgres"
+config = { url = "${PG_STATE_URL}" }

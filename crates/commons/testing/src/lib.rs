@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod clickhouse;
 pub mod cockroach;
 pub mod filelock;
 pub mod mariadb;

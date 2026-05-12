@@ -1,0 +1,22 @@
+[flow.users]
+source = { name = "mongo_cdc", mode = "lookup-on-update" }
+sink = "clickhouse_sink"
+storage = "pg_state"
+
+from = "users"
+to = "user_events"
+
+batch-limit = 500
+
+mapping = [
+    { from = "_id", to = "id" },
+    { from = "name", to = "name" },
+    { from = "email", to = "email" },
+]
+
+# NB: no `[flow.users.conflict]` block. The CH sink declares
+# `supports_deletes() = false`, so the validation pipeline does NOT
+# require a conflict key for the CDC source — the runner streams every
+# CDC event as a fresh INSERT into `user_events`. If you want
+# overwrite semantics on a CH ReplacingMergeTree, declare the conflict
+# block explicitly; the sink will still drop delete events.

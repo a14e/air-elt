@@ -17,6 +17,7 @@ pub fn bind_typed_null<'q>(
 ) -> Query<'q, MySql, MySqlArguments> {
     match dt {
         DataType::Bool => query.bind::<Option<bool>>(None),
+        DataType::Int8 => query.bind::<Option<i8>>(None),
         DataType::Int16 => query.bind::<Option<i16>>(None),
         DataType::Int32 => query.bind::<Option<i32>>(None),
         DataType::Int64 => query.bind::<Option<i64>>(None),

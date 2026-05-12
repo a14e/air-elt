@@ -53,6 +53,10 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
             DataType::Bool => {
                 sep.push_bind::<Option<bool>>(None);
             }
+            DataType::Int8 => {
+                // Postgres has no int1 type; bind as int2 (i16).
+                sep.push_bind::<Option<i16>>(None);
+            }
             DataType::Int16 => {
                 sep.push_bind::<Option<i16>>(None);
             }
@@ -109,6 +113,10 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
         },
         Value::Bool(b) => {
             sep.push_bind(*b);
+        }
+        Value::Int8(n) => {
+            // Postgres has no int1 type; widen to int2 (i16) automatically.
+            sep.push_bind(*n as i16);
         }
         Value::Int16(n) => {
             sep.push_bind(*n);

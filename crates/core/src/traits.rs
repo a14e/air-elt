@@ -135,6 +135,21 @@ pub trait Sink: Send + Sync {
     fn cancel_safe(&self) -> bool {
         true
     }
+
+    /// `false` for append-only sinks whose engine has no cheap
+    /// `DELETE`/`UPDATE` (notably ClickHouse MergeTree). When this is
+    /// `false`:
+    /// * the runner drops every `Row { op: Delete }` from each batch
+    ///   before calling `write_batch` — the sink will never observe a
+    ///   delete row;
+    /// * the validation pipeline skips `validate_delete_access` for
+    ///   this sink, even if the source emits deletes;
+    /// * CDC sources may omit the otherwise-mandatory `[flow.<x>.conflict]`
+    ///   block (append-only ingest: every CDC event becomes a plain
+    ///   INSERT, deletes are silently dropped).
+    fn supports_deletes(&self) -> bool {
+        true
+    }
 }
 
 #[cfg_attr(test, mockall::automock)]

@@ -139,13 +139,19 @@ pub async fn assemble(
                     ))),
                 });
             }
-            if flow.conflict.is_none() {
+            // Append-only sinks (`supports_deletes() == false`) make
+            // the `[flow.x.conflict]` block optional for CDC sources:
+            // deletes get filtered pre-write inside the runner, so the
+            // sink only ever sees inserts. Without a conflict block
+            // we accept plain INSERT per CDC event — append-only ingest.
+            if flow.conflict.is_none() && sink.supports_deletes() {
                 return Err(ValidationError::AccessFailed {
                     component: "flow",
                     name: flow_name.clone(),
                     source: Box::new(RuntimeError::Other(format!(
                         "flow {flow_name:?}: source kind {kind:?} requires a `[flow.{flow_name}.conflict]` \
-                         block — cdc emits Upsert/Delete which need a key"
+                         block — cdc emits Upsert/Delete which need a key (unless the sink declares \
+                         `supports_deletes = false`, in which case append-only ingest is allowed)"
                     ))),
                 });
             }
@@ -542,7 +548,10 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
                 name: flow.name.clone(),
                 source: Box::new(e),
             })?;
-        if flow.source.emits_deletes() && flow.config_write_spec.conflict.is_some() {
+        if flow.source.emits_deletes()
+            && flow.config_write_spec.conflict.is_some()
+            && flow.sink.supports_deletes()
+        {
             flow.sink
                 .validate_delete_access(&probe_write_spec)
                 .await
@@ -856,6 +865,7 @@ mod tests {
         source.expect_emits_deletes().return_const(true);
         let mut sink = MockSink::new();
         sink.expect_schemaless().return_const(false);
+        sink.expect_supports_deletes().return_const(true);
         sink.expect_validate_access().times(1).returning(|_| Ok(()));
         sink.expect_validate_delete_access()
             .times(1)
@@ -880,6 +890,7 @@ mod tests {
         source.expect_emits_deletes().return_const(false);
         let mut sink = MockSink::new();
         sink.expect_schemaless().return_const(false);
+        sink.expect_supports_deletes().return_const(true);
         sink.expect_validate_access().times(1).returning(|_| Ok(()));
         sink.expect_validate_delete_access().times(0);
         let storage = MockStorage::new();
@@ -902,10 +913,38 @@ mod tests {
         source.expect_emits_deletes().return_const(true);
         let mut sink = MockSink::new();
         sink.expect_schemaless().return_const(false);
+        sink.expect_supports_deletes().return_const(true);
         sink.expect_validate_access().times(1).returning(|_| Ok(()));
         sink.expect_validate_delete_access().times(0);
         let storage = MockStorage::new();
         let flow = flow_with_inserts_and_conflict(source, sink, storage, None);
+        validate_flow(flow).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_probe_skipped_when_sink_does_not_support_deletes() {
+        // Source emits deletes AND a conflict block is set, but the
+        // sink declares `supports_deletes() == false`. The runner will
+        // drop delete rows before write_batch, so no delete-access
+        // probe should fire on the sink.
+        let mut source = default_source_mock();
+        source.expect_name().return_const("src".to_string());
+        source.expect_emits_deletes().return_const(true);
+        let mut sink = MockSink::new();
+        sink.expect_schemaless().return_const(false);
+        sink.expect_supports_deletes().return_const(false);
+        sink.expect_validate_access().times(1).returning(|_| Ok(()));
+        sink.expect_validate_delete_access().times(0);
+        let storage = MockStorage::new();
+        let flow = flow_with_inserts_and_conflict(
+            source,
+            sink,
+            storage,
+            Some(crate::config::conflict::ConflictConfig {
+                key: vec!["a".into()],
+                strategy: crate::config::conflict::ConflictStrategy::Overwrite,
+            }),
+        );
         validate_flow(flow).await.unwrap();
     }
 

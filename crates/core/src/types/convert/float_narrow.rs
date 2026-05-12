@@ -30,6 +30,9 @@ pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, Co
         Int16 => sat_f64_to_i16(n)
             .map(Value::Int16)
             .ok_or(ConvertError::Overflow { dst: dst.clone() }),
+        Int8 => sat_f64_to_i8(n)
+            .map(Value::Int8)
+            .ok_or(ConvertError::Overflow { dst: dst.clone() }),
         UInt64 => sat_f64_to_u64(n)
             .map(Value::UInt64)
             .ok_or(ConvertError::Overflow { dst: dst.clone() }),

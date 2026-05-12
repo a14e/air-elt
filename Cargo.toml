@@ -8,6 +8,7 @@ members = [
     "crates/commons/mysql",
     "crates/commons/testing",
     "crates/commons/mongodb",
+    "crates/commons/clickhouse",
     "crates/sources/postgres",
     "crates/sources/mysql",
     "crates/sources/mongodb",
@@ -15,6 +16,7 @@ members = [
     "crates/sinks/postgres",
     "crates/sinks/mysql",
     "crates/sinks/mongodb",
+    "crates/sinks/clickhouse",
     "crates/storages/postgres",
     "crates/storages/mysql",
     "crates/storages/mongodb",
@@ -45,6 +47,8 @@ air-elt-source-mongodb = { path = "crates/sources/mongodb", version = "0.1.0" }
 air-elt-source-mongo-cdc = { path = "crates/sources/mongo-cdc", version = "0.1.0" }
 air-elt-sink-mongodb = { path = "crates/sinks/mongodb", version = "0.1.0" }
 air-elt-storage-mongodb = { path = "crates/storages/mongodb", version = "0.1.0" }
+air-elt-commons-clickhouse = { path = "crates/commons/clickhouse", version = "0.1.0" }
+air-elt-sink-clickhouse = { path = "crates/sinks/clickhouse", version = "0.1.0" }
 
 ahash = "0.8.12"
 tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "test-util"] }
@@ -67,7 +71,7 @@ chrono = { version = "0.4.44", features = ["serde"] }
 uuid = { version = "1.23.1", features = ["v4", "serde"] }
 futures = "0.3.32"
 testcontainers = { version = "0.27.3", features = ["reusable-containers"] }
-testcontainers-modules = { version = "0.15.0", features = ["postgres", "mysql", "mariadb", "mongo"] }
+testcontainers-modules = { version = "0.15.0", features = ["postgres", "mysql", "mariadb", "mongo", "clickhouse"] }
 # Direct bollard dep for the few places we drive the docker daemon
 # without going through testcontainers (force-removing a stale ryuk
 # between handshake retries). Pin matches testcontainers' transitive
@@ -84,6 +88,8 @@ mockall = "0.14.0"
 quick-xml = "0.39.2"
 base64 = "0.22.1"
 hex = "0.4.3"
+reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
+lz4_flex = "0.11.5"
 
 [profile.release]
 lto = "thin"

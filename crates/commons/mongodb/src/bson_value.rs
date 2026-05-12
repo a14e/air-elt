@@ -124,6 +124,7 @@ pub fn to_bson(v: &Value) -> RuntimeResult<Bson> {
     Ok(match v {
         Value::Null => Bson::Null,
         Value::Bool(b) => Bson::Boolean(*b),
+        Value::Int8(n) => Bson::Int32(i32::from(*n)),
         Value::Int16(n) => Bson::Int32(i32::from(*n)),
         Value::Int32(n) => Bson::Int32(*n),
         Value::Int64(n) => Bson::Int64(*n),

@@ -57,6 +57,7 @@ fn encode_value_at_depth(v: &Value, depth: usize) -> Result<serde_json::Value, J
     let out = match v {
         Value::Null => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Int8(n) => serde_json::Value::from(*n),
         Value::Int16(n) => serde_json::Value::from(*n),
         Value::Int32(n) => serde_json::Value::from(*n),
         Value::Int64(n) => serde_json::Value::from(*n),

@@ -158,7 +158,11 @@ pub fn to_internal(
 ) -> DataType {
     match mysql {
         MySqlType::Bool => DataType::Bool,
-        MySqlType::TinyInt | MySqlType::SmallInt => DataType::Int16,
+        // MySQL `tinyint` (signed, not tinyint(1)) is 1 byte: i8::MIN..=i8::MAX.
+        // `Int8` is the precise canonical type; Int16 was previously used but
+        // would waste a byte and misrepresent the actual range.
+        MySqlType::TinyInt => DataType::Int8,
+        MySqlType::SmallInt => DataType::Int16,
         MySqlType::MediumInt | MySqlType::Int => DataType::Int32,
         MySqlType::BigInt => DataType::Int64,
         MySqlType::TinyIntUnsigned => DataType::UInt8,
@@ -242,6 +246,11 @@ mod tests {
     fn tinyint_other_widths_are_int() {
         assert_eq!(parse("tinyint", "tinyint(4)"), Some(MySqlType::TinyInt));
         assert_eq!(parse("tinyint", "tinyint"), Some(MySqlType::TinyInt));
+        // TinyInt (signed, not tinyint(1)) maps to Int8, not Int16.
+        assert_eq!(
+            to_internal(MySqlType::TinyInt, None, None, None),
+            DataType::Int8
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ use crate::types::dynamic::DynType;
 #[derive(Debug, Clone, PartialEq)]
 pub enum DataType {
     Bool,
+    Int8,
     Int16,
     Int32,
     Int64,
@@ -149,6 +150,7 @@ impl Hash for DataType {
         std::mem::discriminant(self).hash(state);
         match self {
             DataType::Bool
+            | DataType::Int8
             | DataType::Int16
             | DataType::Int32
             | DataType::Int64
@@ -217,26 +219,27 @@ impl Ord for DataType {
 fn variant_order(d: &DataType) -> u8 {
     match d {
         DataType::Bool => 0,
-        DataType::Int16 => 1,
-        DataType::Int32 => 2,
-        DataType::Int64 => 3,
-        DataType::UInt8 => 4,
-        DataType::UInt16 => 5,
-        DataType::UInt32 => 6,
-        DataType::UInt64 => 7,
-        DataType::Float32 => 8,
-        DataType::Float64 => 9,
-        DataType::BigInt { .. } => 10,
-        DataType::Decimal { .. } => 11,
-        DataType::Text { .. } => 12,
-        DataType::Bytes { .. } => 13,
-        DataType::Date => 14,
-        DataType::Timestamp => 15,
-        DataType::Uuid => 16,
-        DataType::Json => 17,
-        DataType::Xml => 18,
-        DataType::Union(_) => 19,
-        DataType::Custom(_) => 20,
+        DataType::Int8 => 1,
+        DataType::Int16 => 2,
+        DataType::Int32 => 3,
+        DataType::Int64 => 4,
+        DataType::UInt8 => 5,
+        DataType::UInt16 => 6,
+        DataType::UInt32 => 7,
+        DataType::UInt64 => 8,
+        DataType::Float32 => 9,
+        DataType::Float64 => 10,
+        DataType::BigInt { .. } => 11,
+        DataType::Decimal { .. } => 12,
+        DataType::Text { .. } => 13,
+        DataType::Bytes { .. } => 14,
+        DataType::Date => 15,
+        DataType::Timestamp => 16,
+        DataType::Uuid => 17,
+        DataType::Json => 18,
+        DataType::Xml => 19,
+        DataType::Union(_) => 20,
+        DataType::Custom(_) => 21,
     }
 }
 
@@ -244,6 +247,7 @@ impl std::fmt::Display for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DataType::Bool => f.write_str("bool"),
+            DataType::Int8 => f.write_str("int8"),
             DataType::Int16 => f.write_str("int16"),
             DataType::Int32 => f.write_str("int32"),
             DataType::Int64 => f.write_str("int64"),
@@ -315,6 +319,7 @@ impl Serialize for DataType {
     {
         match self {
             DataType::Bool => serializer.serialize_str("bool"),
+            DataType::Int8 => serializer.serialize_str("int8"),
             DataType::Int16 => serializer.serialize_str("int16"),
             DataType::Int32 => serializer.serialize_str("int32"),
             DataType::Int64 => serializer.serialize_str("int64"),
@@ -411,6 +416,7 @@ impl<'de> Visitor<'de> for DataTypeVisitor {
     fn visit_str<E: de::Error>(self, v: &str) -> Result<DataType, E> {
         match v {
             "bool" => Ok(DataType::Bool),
+            "int8" => Ok(DataType::Int8),
             "int16" => Ok(DataType::Int16),
             "int32" => Ok(DataType::Int32),
             "int64" => Ok(DataType::Int64),
@@ -432,6 +438,7 @@ impl<'de> Visitor<'de> for DataTypeVisitor {
                 other,
                 &[
                     "bool",
+                    "int8",
                     "int16",
                     "int32",
                     "int64",
@@ -594,6 +601,7 @@ mod tests {
     fn serde_binary_compat_per_variant() {
         let cases: Vec<(DataType, serde_json::Value)> = vec![
             (DataType::Bool, serde_json::json!("bool")),
+            (DataType::Int8, serde_json::json!("int8")),
             (DataType::Int16, serde_json::json!("int16")),
             (DataType::Int32, serde_json::json!("int32")),
             (DataType::Int64, serde_json::json!("int64")),
