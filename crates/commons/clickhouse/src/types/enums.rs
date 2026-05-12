@@ -56,7 +56,7 @@ macro_rules! impl_enum_dyn_type {
                 self
             }
 
-            fn kind(&self) -> &'static str {
+            fn kind(&self) -> &str {
                 Self::KIND
             }
 

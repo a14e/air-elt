@@ -19,14 +19,13 @@ use crate::config::model::ChSinkConfig;
 use crate::sql_statements as sql;
 
 /// Per-flow sink context. Caches the column shape (post-mapping
-/// expansion) and the INSERT-header SQL that will be sent with each
-/// batch.
+/// expansion) and the INSERT SQL that will be sent with each batch.
 pub struct ChSinkCtx {
     pub schema: Schema,
     /// `Field`s for each mapped sink column in `WriteSpec.columns`
     /// order. Used by the RowBinary encoder.
     columns: Vec<Field>,
-    insert_header: String,
+    insert_sql: String,
 }
 
 impl SinkCtx for ChSinkCtx {
@@ -128,11 +127,11 @@ impl Sink for ChSink {
                 })?;
             columns.push(f.clone());
         }
-        let insert_header = sql::insert_row_binary_header(&spec.table, &spec.columns)?;
+        let insert_sql = sql::insert_row_binary_sql(&spec.table, &spec.columns)?;
         Ok(Arc::new(ChSinkCtx {
             schema,
             columns,
-            insert_header,
+            insert_sql,
         }))
     }
 
@@ -148,24 +147,21 @@ impl Sink for ChSink {
         }
         let ch_ctx = ctx.downcast_ref_to::<ChSinkCtx>()?;
         if dry_run {
-            // We've already exercised the type/permission shape during
-            // `validate_access` via the zero-row probe. There is no
-            // transactional rollback in CH, so we deliberately skip the
-            // real INSERT in dry-run.
+            // Use EXPLAIN INSERT to validate column names, types, and
+            // the RowBinary format without actually inserting.
+            let explain_sql = format!("EXPLAIN {}", ch_ctx.insert_sql);
+            self.client
+                .query_text(&explain_sql)
+                .await
+                .map_err(RuntimeError::backend)?;
             return Ok(WriteReport { rows_written: 0 });
         }
         // Runner pre-filters Delete rows when `supports_deletes() = false`.
         // Defensive check: skip Deletes if they ever reach the sink.
-        let upserts: Vec<&_> = batch
-            .rows
-            .iter()
-            .filter(|r| r.op == RowOp::Upsert)
-            .collect();
-        if upserts.is_empty() {
-            return Ok(WriteReport { rows_written: 0 });
-        }
-        let mut body: Vec<u8> = Vec::with_capacity(upserts.len() * ch_ctx.columns.len() * 8);
-        for row in &upserts {
+        let mut body: Vec<u8> = Vec::with_capacity(batch.rows.len() * ch_ctx.columns.len() * 8);
+        let mut rows_written: u64 = 0;
+        for row in batch.rows.iter().filter(|r| r.op == RowOp::Upsert) {
+            rows_written += 1;
             for (i, field) in ch_ctx.columns.iter().enumerate() {
                 let v = row
                     .values
@@ -174,17 +170,18 @@ impl Sink for ChSink {
                 encode_value(&mut body, field, v).map_err(RuntimeError::backend)?;
             }
         }
+        if rows_written == 0 {
+            return Ok(WriteReport { rows_written: 0 });
+        }
         debug!(
-            rows = upserts.len(),
+            rows = rows_written,
             bytes = body.len(),
             "clickhouse row-binary insert"
         );
         self.client
-            .insert_row_binary(&ch_ctx.insert_header, body)
+            .insert_row_binary(&ch_ctx.insert_sql, body)
             .await
             .map_err(RuntimeError::backend)?;
-        Ok(WriteReport {
-            rows_written: upserts.len() as u64,
-        })
+        Ok(WriteReport { rows_written })
     }
 }

@@ -58,7 +58,7 @@ impl DynType for BsonObjectType {
         self
     }
 
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         Self::KIND
     }
 

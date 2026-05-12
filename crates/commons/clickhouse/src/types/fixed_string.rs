@@ -33,7 +33,7 @@ impl DynType for ChFixedStringType {
         self
     }
 
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         Self::KIND
     }
 

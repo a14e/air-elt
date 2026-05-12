@@ -26,7 +26,10 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
         if let Value::Custom(c) = v {
             panic!(
                 "SQL sink received unexpected Value::Custom(kind={}); matrix conversion to Json missing",
-                c.dyn_type().kind()
+                {
+                    let dt = c.dyn_type();
+                    dt.kind().to_string()
+                }
             );
         }
     }
@@ -179,7 +182,7 @@ mod tests {
             self
         }
 
-        fn kind(&self) -> &'static str {
+        fn kind(&self) -> &str {
             "test.unknown_custom"
         }
         fn can_convert_to(&self, _t: &DataType, _trunc: bool) -> bool {

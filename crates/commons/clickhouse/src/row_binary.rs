@@ -27,7 +27,9 @@
 //! [1]: https://clickhouse.com/docs/en/interfaces/formats/#rowbinary
 
 use std::io::Write;
+use std::sync::LazyLock;
 
+use chrono::NaiveDate;
 use num_bigint::BigInt;
 use thiserror::Error;
 
@@ -75,6 +77,9 @@ pub enum EncodeError {
     EnumUnknown { column: String, name: String },
 }
 
+static UNIX_EPOCH: LazyLock<NaiveDate> =
+    LazyLock::new(|| NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch literal"));
+
 /// Encode a single value for a field into the RowBinary stream.
 pub fn encode_value(out: &mut Vec<u8>, field: &Field, value: &Value) -> Result<(), EncodeError> {
     if field.nullable {
@@ -91,15 +96,6 @@ pub fn encode_value(out: &mut Vec<u8>, field: &Field, value: &Value) -> Result<(
         });
     }
     encode_typed(out, &field.name, &field.data_type, value)
-}
-
-fn encode_typed(
-    out: &mut Vec<u8>,
-    column: &str,
-    dt: &DataType,
-    value: &Value,
-) -> Result<(), EncodeError> {
-    encode_typed_impl(out, column, dt, value)
 }
 
 /// Encode a single typed element, optionally writing a 1-byte NULL flag
@@ -125,10 +121,10 @@ fn encode_typed_nullable(
             got: "Null",
         });
     }
-    encode_typed_impl(out, column, dt, value)
+    encode_typed(out, column, dt, value)
 }
 
-fn encode_typed_impl(
+fn encode_typed(
     out: &mut Vec<u8>,
     column: &str,
     dt: &DataType,
@@ -209,9 +205,7 @@ fn encode_typed_impl(
         },
         DataType::Date => match value {
             Value::Date(d) => {
-                use chrono::NaiveDate;
-                let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch literal");
-                let days = (*d - epoch).num_days();
+                let days = (*d - *UNIX_EPOCH).num_days();
                 let days_u16 = u16::try_from(days).map_err(|_| EncodeError::OutOfRange {
                     column: column.to_string(),
                     value: d.to_string(),
@@ -579,10 +573,18 @@ fn encode_decimal(
     let effective_scale = scale.unwrap_or(0) as i64;
     let effective_precision = precision.unwrap_or(38);
 
-    // Rescale the BigDecimal to the target scale, then extract the
-    // integer mantissa (coefficient * 10^(current_scale - target_scale)).
-    let scaled = d.with_scale_round(effective_scale, bigdecimal::RoundingMode::Down);
-    let (mantissa, _exp) = scaled.as_bigint_and_exponent();
+    // Avoid BigDecimal::with_scale_round allocation when the value is
+    // already at the target scale (the common case — pipeline normalises
+    // decimal scales at the schema boundary).
+    let (mantissa, current_scale) = d.as_bigint_and_exponent();
+    let mantissa = if current_scale == effective_scale {
+        mantissa
+    } else {
+        drop(mantissa);
+        let scaled = d.with_scale_round(effective_scale, bigdecimal::RoundingMode::Down);
+        let (m, _) = scaled.as_bigint_and_exponent();
+        m
+    };
 
     let width = decimal_width(effective_precision);
     encode_bigint_le(out, column, &mantissa, width, "Decimal")

@@ -573,7 +573,7 @@ mod tests {
                 self
             }
 
-            fn kind(&self) -> &'static str {
+            fn kind(&self) -> &str {
                 "test.objecty"
             }
             fn is_object(&self) -> bool {

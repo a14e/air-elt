@@ -38,8 +38,8 @@
 //!   `Decimal256` — `Decimal { precision, scale }`.
 //! * Numeric, `String`, `UUID`, `Date`, `Date32`, `Bool`, `JSON`,
 //!   `Object('json')` — canonical pivots.
-//! * `Point` / `Ring` / `Polygon` / `MultiPolygon` — `Json` (GeoJSON
-//!   shape).
+//! * `Point` / `Ring` / `Polygon` / `MultiPolygon` — **rejected**: these
+//!   have specific Tuple/Array-based RowBinary layouts, not text JSON.
 
 use thiserror::Error;
 
@@ -96,14 +96,33 @@ pub fn parse_type(input: &str) -> Result<ParsedType, ParseError> {
     })
 }
 
+const MAX_PARSE_DEPTH: usize = 64;
+
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+        Self {
+            input,
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    fn enter(&mut self) -> Result<(), ParseError> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(ParseError::Unsupported("type nesting too deep".to_string()));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth -= 1;
     }
 
     fn rest(&self) -> &'a str {
@@ -171,10 +190,11 @@ impl<'a> Parser<'a> {
 
     /// Parse the outermost type, unwrapping Nullable and LowCardinality.
     fn parse_outer(&mut self) -> Result<(DataType, bool), ParseError> {
+        self.enter()?;
         self.skip_ws();
         let snapshot = self.pos;
         let name = self.read_ident();
-        match name.as_str() {
+        let result = match name.as_str() {
             "Nullable" => {
                 self.expect('(')?;
                 let (inner, _) = self.parse_outer()?;
@@ -197,7 +217,9 @@ impl<'a> Parser<'a> {
                 let dt = self.parse_named()?;
                 Ok((dt, false))
             }
-        }
+        };
+        self.leave();
+        result
     }
 
     /// Parse a single (possibly composite) named type at the current
@@ -315,10 +337,12 @@ impl<'a> Parser<'a> {
             }
             "AggregateFunction" | "SimpleAggregateFunction" => {
                 let (fn_name, args) = self.parse_aggregate_args(&name)?;
+                let kind = ChAggregateStateType::kind_for_fn(&fn_name);
                 Ok(DataType::Custom(Box::new(ChAggregateStateType {
                     fn_name,
                     arg_types: args,
                     simple: name == "SimpleAggregateFunction",
+                    kind,
                 })))
             }
             "Array" => {
@@ -354,9 +378,12 @@ impl<'a> Parser<'a> {
                     element_nullable: false,
                 })))
             }
-            // Geo types are tuples/arrays under the hood — JSON pivot.
+            // Geo types are tuples/arrays under the hood with specific
+            // RowBinary layouts (e.g. Point = Tuple(Float64, Float64)).
+            // Text-encoded JSON is not wire-compatible — reject until
+            // proper binary layout support is added.
             "Point" | "Ring" | "Polygon" | "MultiPolygon" | "LineString" | "MultiLineString" => {
-                Ok(DataType::Json)
+                Err(ParseError::Unsupported(name))
             }
             // Generic catch-all for parametric types we don't model:
             // skip args if present and reject.
@@ -374,7 +401,7 @@ impl<'a> Parser<'a> {
                 found: self.peek().map(|c| c.to_string()).unwrap_or_default(),
             });
         }
-        let mut depth: i32 = 1;
+        let mut depth: usize = 1;
         let mut in_str = false;
         while depth > 0 {
             let Some(c) = self.peek() else {
@@ -682,7 +709,7 @@ impl<'a> Parser<'a> {
     /// closing paren. Returns the raw substring.
     fn consume_one_arg(&mut self) -> Result<String, ParseError> {
         let start = self.pos;
-        let mut depth: i32 = 0;
+        let mut depth: usize = 0;
         let mut in_str = false;
         while let Some(c) = self.peek() {
             if in_str {
@@ -886,9 +913,15 @@ mod tests {
             _ => panic!("expected Custom(Tuple), got {named_tuple:?}"),
         }
 
-        // Geo types still map to Json.
-        assert_eq!(parse("Point").data_type, DataType::Json);
-        assert_eq!(parse("MultiPolygon").data_type, DataType::Json);
+        // Geo types are rejected — they have specific binary layouts.
+        assert!(matches!(
+            parse_type("Point"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_type("MultiPolygon"),
+            Err(ParseError::Unsupported(_))
+        ));
 
         // Nested(name String, age Int32) → Array(Tuple(name String, age Int32))
         let nested = parse("Nested(name String, age Int32)").data_type;

@@ -16,7 +16,7 @@ use air_elt_core::types::default_value::DefaultParseError;
 use air_elt_core::types::dynamic::{DynType, DynValue};
 use air_elt_core::types::value::Value;
 
-use super::array::{json_to_value, value_to_json};
+use super::array::{json_to_typed_value, value_to_json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChTupleType {
@@ -35,7 +35,7 @@ impl DynType for ChTupleType {
         self
     }
 
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         Self::KIND
     }
 
@@ -112,7 +112,14 @@ impl DynType for ChTupleType {
                         });
                     }
                 };
-                let fields: Vec<Value> = json_array.into_iter().map(json_to_value).collect();
+                let fields: Vec<Value> = json_array
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, j)| {
+                        let (dt, _) = self.fields.get(i).unwrap_or(&(DataType::Json, false));
+                        json_to_typed_value(j, dt)
+                    })
+                    .collect();
                 Ok(Value::Custom(Box::new(ChTupleValue { fields })))
             }
             DataType::Custom(t) if t.kind() == Self::KIND => Ok(value),

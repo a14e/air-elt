@@ -64,7 +64,7 @@ pub trait DynType: fmt::Debug + Send + Sync + 'static {
     fn as_any(&self) -> &dyn Any;
 
     /// Stable identity in `"<vendor>.<type>"` form. See module docs.
-    fn kind(&self) -> &'static str;
+    fn kind(&self) -> &str;
 
     /// Human-readable label used by `DataType: Display`. Defaults to
     /// `kind()`.
@@ -252,7 +252,7 @@ mod tests {
             self
         }
 
-        fn kind(&self) -> &'static str {
+        fn kind(&self) -> &str {
             "test.type_a"
         }
         fn can_convert_to(&self, _t: &DataType, _trunc: bool) -> bool {
@@ -297,7 +297,7 @@ mod tests {
             self
         }
 
-        fn kind(&self) -> &'static str {
+        fn kind(&self) -> &str {
             "test.type_b"
         }
         fn can_convert_to(&self, _t: &DataType, _trunc: bool) -> bool {

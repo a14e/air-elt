@@ -227,7 +227,7 @@ mod tests {
             self
         }
 
-        fn kind(&self) -> &'static str {
+        fn kind(&self) -> &str {
             "stub.t"
         }
         fn can_convert_to(&self, _: &crate::types::DataType, _: bool) -> bool {

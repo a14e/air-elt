@@ -19,7 +19,7 @@ use air_elt_core::types::value::Value;
 /// Re-use the JSON helpers from the array module (they live at crate
 /// scope).  We import directly rather than via `super::array` to avoid
 /// a circular public-module dependency.
-use super::array::{json_to_value, value_to_json};
+use super::array::{json_to_typed_value, value_to_json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChMapType {
@@ -40,7 +40,7 @@ impl DynType for ChMapType {
         self
     }
 
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         Self::KIND
     }
 
@@ -120,14 +120,15 @@ impl DynType for ChMapType {
                     .into_iter()
                     .map(|pair| match pair {
                         serde_json::Value::Array(mut a) if a.len() == 2 => {
-                            // SAFETY: `a.len() == 2` ensures two `pop()`s succeed.
-                            let val = json_to_value(a.pop().expect("len==2"));
-                            let key = json_to_value(a.pop().expect("len==2"));
-                            (key, val)
+                            let val = json_to_typed_value(a.remove(1), &self.value);
+                            let key = json_to_typed_value(a.remove(0), &self.key);
+                            Ok((key, val))
                         }
-                        _ => (Value::Null, Value::Null),
+                        _ => Err(ConvertError::ValueShapeMismatch {
+                            src: DataType::Json,
+                        }),
                     })
-                    .collect();
+                    .collect::<Result<_, _>>()?;
                 Ok(Value::Custom(Box::new(ChMapValue { entries })))
             }
             DataType::Custom(t) if t.kind() == Self::KIND => Ok(value),

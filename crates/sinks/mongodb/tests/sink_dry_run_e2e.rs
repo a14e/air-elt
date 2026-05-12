@@ -143,7 +143,7 @@ impl DynType for StubType {
         self
     }
 
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         "test.unknown_custom"
     }
     fn can_convert_to(&self, _t: &DataType, _trunc: bool) -> bool {

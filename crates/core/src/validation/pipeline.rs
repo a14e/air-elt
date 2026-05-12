@@ -993,7 +993,7 @@ mod tests {
             self
         }
 
-        fn kind(&self) -> &'static str {
+        fn kind(&self) -> &str {
             "test.non_cursor"
         }
         fn can_convert_to(&self, _t: &DataType, _trunc: bool) -> bool {

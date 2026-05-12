@@ -1304,7 +1304,7 @@ mod tests {
             self
         }
 
-        fn kind(&self) -> &'static str {
+        fn kind(&self) -> &str {
             "test.dispatch"
         }
         fn can_convert_to(&self, target: &DataType, _trunc: bool) -> bool {

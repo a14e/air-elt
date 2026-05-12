@@ -37,7 +37,8 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
     #[cfg(debug_assertions)]
     {
         if let Value::Custom(c) = v {
-            let kind = c.dyn_type().kind();
+            let dt = c.dyn_type();
+            let kind = dt.kind();
             if kind != PgHllType::KIND {
                 panic!(
                     "SQL sink received unexpected Value::Custom(kind={kind}); matrix conversion to Json missing"
@@ -178,7 +179,10 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
             } else {
                 unreachable!(
                     "postgres sink received unsupported custom value kind {:?}",
-                    v.dyn_type().kind()
+                    {
+                        let dt = v.dyn_type();
+                        dt.kind().to_string()
+                    }
                 )
             }
         }
@@ -206,7 +210,7 @@ mod tests {
             self
         }
 
-        fn kind(&self) -> &'static str {
+        fn kind(&self) -> &str {
             "test.unknown_custom"
         }
         fn can_convert_to(&self, _t: &DataType, _trunc: bool) -> bool {

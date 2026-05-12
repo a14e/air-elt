@@ -29,6 +29,7 @@ The codebase favours clarity over cleverness. Code is read far more often than w
   approach
 - Do not use abbreviations or acronyms except for commonly accepted ones. Use commonly accepted abbreviations only when
   other alternatives are unwieldy
+- Do not use Box::leak in production code
 
 ## Timeouts and cancellation safety
 

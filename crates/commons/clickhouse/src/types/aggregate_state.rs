@@ -12,6 +12,8 @@
 //! [`kind_for_fn`] so that telemetry can distinguish TDigest from
 //! DDSketch from Uniq states without parsing the type-string twice.
 //! The function name component is snake_case'd from the CH camelCase.
+//! The kind string is stored on the struct — no allocations at
+//! trait-method time, no `Box::leak`.
 
 use std::any::Any;
 
@@ -39,6 +41,8 @@ pub struct ChAggregateStateType {
     /// `true` for `SimpleAggregateFunction(fn, T)` (state == T value);
     /// `false` for the standard `AggregateFunction`.
     pub simple: bool,
+    /// Pre-computed `kind()` string — `"clickhouse.aggregate.<snake_fn>"`.
+    pub kind: String,
 }
 
 impl ChAggregateStateType {
@@ -48,27 +52,9 @@ impl ChAggregateStateType {
     /// twice — a rename has to flow through the compiler.
     pub const KIND_PREFIX: &'static str = "clickhouse.aggregate.";
 
-    /// `kind()` produces a stable interned string. We can't allocate at
-    /// trait-method time, so we leak the formatted kind into a
-    /// `'static` via [`String::leak`] at first observation per
-    /// process. Variants per function are bounded by the number of CH
-    /// aggregate functions an operator uses, so the leak is negligible.
-    fn kind_static(&self) -> &'static str {
-        use std::sync::Mutex;
-
-        use ahash::AHashMap;
-        use std::sync::OnceLock;
-
-        static REGISTRY: OnceLock<Mutex<AHashMap<String, &'static str>>> = OnceLock::new();
-        let key = format!("{}{}", Self::KIND_PREFIX, camel_to_snake(&self.fn_name));
-        let map = REGISTRY.get_or_init(|| Mutex::new(AHashMap::new()));
-        let mut guard = map.lock().expect("registry poisoned");
-        if let Some(s) = guard.get(&key) {
-            return s;
-        }
-        let leaked: &'static str = Box::leak(key.clone().into_boxed_str());
-        guard.insert(key, leaked);
-        leaked
+    /// Build the kind string from a CH function name.
+    pub fn kind_for_fn(fn_name: &str) -> String {
+        format!("{}{}", Self::KIND_PREFIX, camel_to_snake(fn_name))
     }
 }
 
@@ -92,8 +78,8 @@ impl DynType for ChAggregateStateType {
         self
     }
 
-    fn kind(&self) -> &'static str {
-        self.kind_static()
+    fn kind(&self) -> &str {
+        &self.kind
     }
 
     fn display(&self) -> String {
@@ -174,6 +160,7 @@ impl DynValue for ChAggregateStateValue {
             fn_name: self.fn_name.clone(),
             arg_types: Vec::new(),
             simple: false,
+            kind: ChAggregateStateType::kind_for_fn(&self.fn_name),
         })
     }
 

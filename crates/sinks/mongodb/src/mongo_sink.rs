@@ -580,7 +580,10 @@ fn build_docs(
 /// shape of mongo→mongo `["*"]` raw passthrough.
 fn is_bson_object_value(v: &Value) -> bool {
     match v {
-        Value::Custom(inner) => inner.dyn_type().kind() == BsonObjectType::KIND,
+        Value::Custom(inner) => {
+            let dt = inner.dyn_type();
+            dt.kind() == BsonObjectType::KIND
+        }
         _ => false,
     }
 }

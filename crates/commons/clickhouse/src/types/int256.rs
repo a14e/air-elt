@@ -32,7 +32,7 @@ impl DynType for ChInt256Type {
         self
     }
 
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         Self::KIND
     }
 
@@ -167,7 +167,7 @@ impl DynType for ChUInt256Type {
         self
     }
 
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         Self::KIND
     }
 

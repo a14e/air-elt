@@ -41,29 +41,15 @@ pub struct ClickHouseTestHandle {
 
 impl ClickHouseTestHandle {
     /// Run an arbitrary SQL statement against the sandbox database.
-    pub async fn exec(&self, sql: &str) -> reqwest::Result<String> {
-        let resp = self
-            .http
-            .post(&self.url)
-            .query(&[("database", self.database.as_str())])
-            .body(sql.to_string())
-            .send()
-            .await?
-            .error_for_status()?;
-        resp.text().await
+    /// On error, the returned `String` is the CH error body (code + message).
+    pub async fn exec(&self, sql: &str) -> Result<String, String> {
+        exec_impl(&self.http, &self.url, Some(&self.database), sql).await
     }
 
     /// Run a SQL statement and return the response body as text.
     /// Bypasses the sandbox database (caller must qualify identifiers).
-    pub async fn exec_root(&self, sql: &str) -> reqwest::Result<String> {
-        let resp = self
-            .http
-            .post(&self.url)
-            .body(sql.to_string())
-            .send()
-            .await?
-            .error_for_status()?;
-        resp.text().await
+    pub async fn exec_root(&self, sql: &str) -> Result<String, String> {
+        exec_impl(&self.http, &self.url, None, sql).await
     }
 }
 
@@ -90,6 +76,30 @@ impl Drop for ClickHouseTestHandle {
     }
 }
 
+async fn exec_impl(
+    http: &reqwest::Client,
+    url: &str,
+    database: Option<&str>,
+    sql: &str,
+) -> Result<String, String> {
+    let mut req = http.post(url);
+    if let Some(db) = database {
+        req = req.query(&[("database", db)]);
+    }
+    let resp = req
+        .body(sql.to_string())
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    if status.is_success() {
+        Ok(body)
+    } else {
+        Err(body)
+    }
+}
+
 async fn clickhouse_base_url() -> &'static String {
     CLICKHOUSE_BASE_URL
         .get_or_init(|| async move {
@@ -109,6 +119,8 @@ async fn clickhouse_base_url() -> &'static String {
             info!("ensuring shared clickhouse container (reuse=Always, ryuk-managed)");
             let start_lock = crate::filelock::acquire_lock("clickhouse");
             let container = ClickHouseImage::default()
+                .with_tag("24.8") // match CI — cf. ci.yml:210
+                .with_env_var("CLICKHOUSE_SKIP_USER_SETUP", "1")
                 .with_label(KIND_LABEL_KEY, KIND_LABEL_VALUE)
                 .with_label(sk, sv)
                 .with_reuse(ReuseDirective::Always)

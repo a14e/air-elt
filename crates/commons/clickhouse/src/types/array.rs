@@ -34,7 +34,7 @@ impl DynType for ChArrayType {
         self
     }
 
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> &str {
         Self::KIND
     }
 
@@ -106,7 +106,10 @@ impl DynType for ChArrayType {
                         });
                     }
                 };
-                let elements: Vec<Value> = json_array.into_iter().map(json_to_value).collect();
+                let elements: Vec<Value> = json_array
+                    .into_iter()
+                    .map(|j| json_to_typed_value(j, &self.element))
+                    .collect();
                 Ok(Value::Custom(Box::new(ChArrayValue {
                     element_type: self.element.clone(),
                     elements,
@@ -185,22 +188,44 @@ pub(super) fn value_to_json(v: &Value) -> Result<serde_json::Value, JsonEncodeEr
 }
 
 pub(super) fn json_to_value(j: serde_json::Value) -> Value {
+    json_to_typed_value(j, &DataType::Json)
+}
+
+/// Convert a JSON value to the canonical `Value` variant dictated by
+/// `target`. For `DataType::Json` (the generic pivot) this is the legacy
+/// best-effort mapping. For concrete CH types (Int8, UInt64, etc.) the
+/// JSON number is narrowed to the exact target width.
+pub(super) fn json_to_typed_value(j: serde_json::Value, target: &DataType) -> Value {
     match j {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
-                    Value::Int32(i as i32)
+        serde_json::Value::Number(n) => match target {
+            DataType::Int8 => Value::Int8(n.as_i64().map(|i| i as i8).unwrap_or(0)),
+            DataType::Int16 => Value::Int16(n.as_i64().map(|i| i as i16).unwrap_or(0)),
+            DataType::Int32 => Value::Int32(n.as_i64().map(|i| i as i32).unwrap_or(0)),
+            DataType::Int64 => Value::Int64(n.as_i64().unwrap_or(0)),
+            DataType::UInt8 => Value::UInt8(n.as_u64().map(|i| i as u8).unwrap_or(0)),
+            DataType::UInt16 => Value::UInt16(n.as_u64().map(|i| i as u16).unwrap_or(0)),
+            DataType::UInt32 => Value::UInt32(n.as_u64().map(|i| i as u32).unwrap_or(0)),
+            DataType::UInt64 => Value::UInt64(n.as_u64().unwrap_or(0)),
+            DataType::Float32 => Value::Float32(n.as_f64().map(|f| f as f32).unwrap_or(0.0)),
+            DataType::Float64 => Value::Float64(n.as_f64().unwrap_or(0.0)),
+            _ => {
+                // Fall back to integer/float heuristics for types
+                // that don't have a direct JSON-number mapping.
+                if let Some(i) = n.as_i64() {
+                    if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                        Value::Int32(i as i32)
+                    } else {
+                        Value::Int64(i)
+                    }
+                } else if let Some(f) = n.as_f64() {
+                    Value::Float64(f)
                 } else {
-                    Value::Int64(i)
+                    Value::Text(n.to_string())
                 }
-            } else if let Some(f) = n.as_f64() {
-                Value::Float64(f)
-            } else {
-                Value::Text(n.to_string())
             }
-        }
+        },
         serde_json::Value::String(s) => Value::Text(s),
         serde_json::Value::Array(arr) => {
             let elements: Vec<Value> = arr.into_iter().map(json_to_value).collect();
@@ -257,5 +282,81 @@ mod tests {
         let json_val = ty.convert(val.clone(), &DataType::Json, &ctx).unwrap();
         let roundtripped = ty.construct(json_val, &DataType::Json, &ctx).unwrap();
         assert_eq!(val, roundtripped);
+    }
+
+    #[test]
+    fn array_cross_canonical_preserves_int8_element() {
+        let ty = ChArrayType {
+            element: DataType::Int8,
+            element_nullable: false,
+        };
+        let val = Value::Custom(Box::new(ChArrayValue {
+            element_type: DataType::Int8,
+            elements: vec![Value::Int8(7), Value::Int8(-3)],
+        }));
+        let ctx = ConversionContext::default();
+        let json_val = ty.convert(val.clone(), &DataType::Json, &ctx).unwrap();
+        let roundtripped = ty.construct(json_val, &DataType::Json, &ctx).unwrap();
+        assert_eq!(
+            val, roundtripped,
+            "Int8 elements must survive JSON roundtrip"
+        );
+    }
+
+    #[test]
+    fn array_cross_canonical_preserves_uint64_element() {
+        let ty = ChArrayType {
+            element: DataType::UInt64,
+            element_nullable: false,
+        };
+        let val = Value::Custom(Box::new(ChArrayValue {
+            element_type: DataType::UInt64,
+            elements: vec![Value::UInt64(3_000_000_000)],
+        }));
+        let ctx = ConversionContext::default();
+        let json_val = ty.convert(val.clone(), &DataType::Json, &ctx).unwrap();
+        let roundtripped = ty.construct(json_val, &DataType::Json, &ctx).unwrap();
+        assert_eq!(
+            val, roundtripped,
+            "UInt64 elements must survive JSON roundtrip"
+        );
+    }
+
+    #[test]
+    fn array_cross_canonical_preserves_text_elements() {
+        let ty = ChArrayType {
+            element: DataType::Text { size: None },
+            element_nullable: false,
+        };
+        let val = Value::Custom(Box::new(ChArrayValue {
+            element_type: DataType::Text { size: None },
+            elements: vec![Value::Text("hello".into()), Value::Text("world".into())],
+        }));
+        let ctx = ConversionContext::default();
+        let json_val = ty.convert(val.clone(), &DataType::Json, &ctx).unwrap();
+        let roundtripped = ty.construct(json_val, &DataType::Json, &ctx).unwrap();
+        assert_eq!(
+            val, roundtripped,
+            "Text elements must survive JSON roundtrip"
+        );
+    }
+
+    #[test]
+    fn array_cross_canonical_preserves_bool_elements() {
+        let ty = ChArrayType {
+            element: DataType::Bool,
+            element_nullable: false,
+        };
+        let val = Value::Custom(Box::new(ChArrayValue {
+            element_type: DataType::Bool,
+            elements: vec![Value::Bool(true), Value::Bool(false)],
+        }));
+        let ctx = ConversionContext::default();
+        let json_val = ty.convert(val.clone(), &DataType::Json, &ctx).unwrap();
+        let roundtripped = ty.construct(json_val, &DataType::Json, &ctx).unwrap();
+        assert_eq!(
+            val, roundtripped,
+            "Bool elements must survive JSON roundtrip"
+        );
     }
 }

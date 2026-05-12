@@ -90,7 +90,8 @@ pub fn to_bson_owned(v: Value) -> RuntimeResult<Bson> {
     match v {
         Value::Json(j) => bson::to_bson(&j).map_err(RuntimeError::backend),
         Value::Custom(inner) => {
-            let kind = inner.dyn_type().kind();
+            let dt = inner.dyn_type();
+            let kind = dt.kind();
             // Try the owned downcasts first — these move the payload
             // out of the box. Fall back to the borrowed encoder for
             // the remaining custom kinds.
@@ -172,7 +173,10 @@ pub fn to_bson(v: &Value) -> RuntimeResult<Bson> {
             } else {
                 return Err(RuntimeError::Other(format!(
                     "unsupported Value::Custom kind for mongo encoder: {:?}",
-                    inner.dyn_type().kind()
+                    {
+                        let dt = inner.dyn_type();
+                        dt.kind().to_string()
+                    }
                 )));
             }
         }
@@ -485,7 +489,7 @@ mod tests {
                 self
             }
 
-            fn kind(&self) -> &'static str {
+            fn kind(&self) -> &str {
                 "test.unknown"
             }
             fn can_be_cursor(&self) -> bool {

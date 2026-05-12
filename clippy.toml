@@ -1,0 +1,10 @@
+# Methods forbidden across the workspace. Intentional memory leaks
+# (Box::leak, String::leak, etc.) are banned in production code.
+disallowed-methods = [
+    "std::boxed::Box::leak",
+    "alloc::boxed::Box::leak",
+    "alloc::string::String::leak",
+    "std::string::String::leak",
+    "std::vec::Vec::leak",
+    "alloc::vec::Vec::leak",
+]

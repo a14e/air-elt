@@ -529,7 +529,7 @@ mod tests {
             self
         }
 
-        fn kind(&self) -> &'static str {
+        fn kind(&self) -> &str {
             "test.cursorable"
         }
         fn can_be_cursor(&self) -> bool {
@@ -573,7 +573,7 @@ mod tests {
             self
         }
 
-        fn kind(&self) -> &'static str {
+        fn kind(&self) -> &str {
             "test.non_cursorable"
         }
         fn can_convert_to(&self, _t: &DataType, _trunc: bool) -> bool {

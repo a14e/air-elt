@@ -123,3 +123,6 @@ unwrap_used = "deny"
 # nudging it past the 128-byte threshold. Errors are not hot-path —
 # the rare allocation cost is preferable to boxing every variant.
 result_large_err = "allow"
+	# Forbid Box::leak — intentional memory leaks are prohibited in
+	# production code. Method names configured in clippy.toml.
+	disallowed_methods = "deny"

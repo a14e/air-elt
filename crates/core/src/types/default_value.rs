@@ -969,7 +969,7 @@ mod tests {
             self
         }
 
-        fn kind(&self) -> &'static str {
+        fn kind(&self) -> &str {
             "test.stub_custom"
         }
         fn can_convert_to(&self, _t: &DataType, _truncate: bool) -> bool {
