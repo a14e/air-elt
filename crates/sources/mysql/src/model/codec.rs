@@ -15,6 +15,9 @@ pub fn decode_column(row: &MySqlRow, index: usize, data_type: DataType) -> Runti
             // MySQL `tinyint(1)` decodes as bool via sqlx.
             nullable::<bool>(row, index).map(|o| o.map(Value::Bool).unwrap_or(Value::Null))
         }
+        DataType::Int8 => {
+            nullable::<i8>(row, index).map(|o| o.map(Value::Int8).unwrap_or(Value::Null))
+        }
         DataType::Int16 => {
             nullable::<i16>(row, index).map(|o| o.map(Value::Int16).unwrap_or(Value::Null))
         }
@@ -129,6 +132,7 @@ pub fn bind_cursor_value<'q>(
     match value {
         Value::Null => null_bind::bind_typed_null(query, dt),
         Value::Bool(b) => query.bind(*b),
+        Value::Int8(n) => query.bind(*n),
         Value::Int16(n) => query.bind(*n),
         Value::Int32(n) => query.bind(*n),
         Value::Int64(n) => query.bind(*n),

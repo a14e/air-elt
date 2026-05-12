@@ -118,9 +118,40 @@ pub fn convert(
             _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
+        // ---- Int8 widening --------------------------------------------
+        (DataType::Int8, DataType::Int16) => match value {
+            Value::Int8(n) => Ok(Value::Int16(n as i16)),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Int8, DataType::Int32) => match value {
+            Value::Int8(n) => Ok(Value::Int32(n as i32)),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Int8, DataType::Int64) => match value {
+            Value::Int8(n) => Ok(Value::Int64(n as i64)),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Int8, DataType::Float32) => match value {
+            Value::Int8(n) => Ok(Value::Float32(n as f32)),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Int8, DataType::Float64) => match value {
+            Value::Int8(n) => Ok(Value::Float64(n as f64)),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Int8, DataType::BigInt { .. }) => match value {
+            Value::Int8(n) => Ok(Value::BigInt(BigInt::from(n))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Int8, DataType::Decimal { .. }) => match value {
+            Value::Int8(n) => Ok(Value::Decimal(BigDecimal::from(n as i64))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+
         // ---- Int / UInt ↔ Bool (existing) -----------------------------
-        (DataType::Int16 | DataType::Int32 | DataType::Int64, DataType::Bool) => {
+        (DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64, DataType::Bool) => {
             let n: i64 = match value {
+                Value::Int8(n) => n as i64,
                 Value::Int16(n) => n as i64,
                 Value::Int32(n) => n as i64,
                 Value::Int64(n) => n,
@@ -155,6 +186,10 @@ pub fn convert(
         },
         (DataType::Bool, DataType::UInt64) => match value {
             Value::Bool(b) => Ok(Value::UInt64(b as u64)),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Bool, DataType::Int8) => match value {
+            Value::Bool(b) => Ok(Value::Int8(b as i8)),
             _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
         (DataType::Bool, DataType::Int16) => match value {
@@ -208,6 +243,7 @@ pub fn convert(
         | (DataType::Float64, DataType::Int64)
         | (DataType::Float64, DataType::Int32)
         | (DataType::Float64, DataType::Int16)
+        | (DataType::Float64, DataType::Int8)
         | (DataType::Float64, DataType::UInt64)
         | (DataType::Float64, DataType::UInt32)
         | (DataType::Float64, DataType::UInt16)
@@ -337,18 +373,23 @@ pub fn convert(
         },
 
         // ---- Integer narrowing (signed/unsigned/cross-sign) ------------
-        (DataType::Int64, DataType::Int32 | DataType::Int16)
-        | (DataType::Int32, DataType::Int16)
+        (DataType::Int64, DataType::Int32 | DataType::Int16 | DataType::Int8)
+        | (DataType::Int32, DataType::Int16 | DataType::Int8)
+        | (DataType::Int16, DataType::Int8)
         | (DataType::UInt64, DataType::UInt32 | DataType::UInt16 | DataType::UInt8)
         | (DataType::UInt32, DataType::UInt16 | DataType::UInt8)
         | (DataType::UInt16, DataType::UInt8)
         | (
-            DataType::Int16 | DataType::Int32 | DataType::Int64,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64,
         )
-        | (DataType::UInt64, DataType::Int64 | DataType::Int32 | DataType::Int16)
-        | (DataType::UInt32, DataType::Int32 | DataType::Int16)
-        | (DataType::UInt16, DataType::Int16) => {
+        | (
+            DataType::UInt64,
+            DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
+        )
+        | (DataType::UInt32, DataType::Int32 | DataType::Int16 | DataType::Int8)
+        | (DataType::UInt16, DataType::Int16 | DataType::Int8)
+        | (DataType::UInt8, DataType::Int8) => {
             require_truncate(ctx, src, dst)?;
             int_narrow::convert(value, src, dst)
         }
@@ -359,6 +400,7 @@ pub fn convert(
             DataType::Int64
             | DataType::Int32
             | DataType::Int16
+            | DataType::Int8
             | DataType::UInt64
             | DataType::UInt32
             | DataType::UInt16
@@ -375,6 +417,7 @@ pub fn convert(
             | DataType::Int64
             | DataType::Int32
             | DataType::Int16
+            | DataType::Int8
             | DataType::UInt64
             | DataType::UInt32
             | DataType::UInt16
@@ -487,6 +530,7 @@ fn concrete_type_of(value: &Value) -> Option<DataType> {
     match value {
         Value::Null => None,
         Value::Bool(_) => Some(DataType::Bool),
+        Value::Int8(_) => Some(DataType::Int8),
         Value::Int16(_) => Some(DataType::Int16),
         Value::Int32(_) => Some(DataType::Int32),
         Value::Int64(_) => Some(DataType::Int64),
@@ -1256,7 +1300,11 @@ mod tests {
     struct DispatchTestType;
 
     impl DynType for DispatchTestType {
-        fn kind(&self) -> &'static str {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn kind(&self) -> &str {
             "test.dispatch"
         }
         fn can_convert_to(&self, target: &DataType, _trunc: bool) -> bool {

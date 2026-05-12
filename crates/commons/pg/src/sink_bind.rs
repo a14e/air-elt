@@ -37,7 +37,8 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
     #[cfg(debug_assertions)]
     {
         if let Value::Custom(c) = v {
-            let kind = c.dyn_type().kind();
+            let dt = c.dyn_type();
+            let kind = dt.kind();
             if kind != PgHllType::KIND {
                 panic!(
                     "SQL sink received unexpected Value::Custom(kind={kind}); matrix conversion to Json missing"
@@ -52,6 +53,10 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
             }
             DataType::Bool => {
                 sep.push_bind::<Option<bool>>(None);
+            }
+            DataType::Int8 => {
+                // Postgres has no int1 type; bind as int2 (i16).
+                sep.push_bind::<Option<i16>>(None);
             }
             DataType::Int16 => {
                 sep.push_bind::<Option<i16>>(None);
@@ -109,6 +114,10 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
         },
         Value::Bool(b) => {
             sep.push_bind(*b);
+        }
+        Value::Int8(n) => {
+            // Postgres has no int1 type; widen to int2 (i16) automatically.
+            sep.push_bind(*n as i16);
         }
         Value::Int16(n) => {
             sep.push_bind(*n);
@@ -170,7 +179,10 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
             } else {
                 unreachable!(
                     "postgres sink received unsupported custom value kind {:?}",
-                    v.dyn_type().kind()
+                    {
+                        let dt = v.dyn_type();
+                        dt.kind().to_string()
+                    }
                 )
             }
         }
@@ -194,7 +206,11 @@ mod tests {
     struct StubType;
 
     impl DynType for StubType {
-        fn kind(&self) -> &'static str {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn kind(&self) -> &str {
             "test.unknown_custom"
         }
         fn can_convert_to(&self, _t: &DataType, _trunc: bool) -> bool {

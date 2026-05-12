@@ -59,11 +59,13 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
     }
 
     match (source_t, sink_t) {
-        // Integer widening
+        // Integer widening: Int8 → Int16/32/64 lossless
+        (Int8, Int16) | (Int8, Int32) | (Int8, Int64) => true,
         (Int16, Int32) | (Int16, Int64) | (Int32, Int64) => true,
         // Float widening
         (Float32, Float64) => true,
         // Int-to-float widening (lossless mantissa fits)
+        (Int8, Float32) | (Int8, Float64) => true,
         (Int16, Float32) | (Int16, Float64) | (Int32, Float64) => true,
 
         // Text size widening: Text(a) → Text(b)
@@ -80,8 +82,8 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
         (Bytes { size: a }, Uuid) => a.is_none_or(|n| n >= 16),
 
         // Int ↔ Bool runtime coercion
-        (Int16 | Int32 | Int64, Bool) => true,
-        (Bool, Int16 | Int32 | Int64) => true,
+        (Int8 | Int16 | Int32 | Int64, Bool) => true,
+        (Bool, Int8 | Int16 | Int32 | Int64) => true,
 
         // Unsigned widening: each step climbs one width. UInt8 also fits any
         // wider signed; UInt16 fits Int32+/Int64; UInt32 fits Int64. UInt64
@@ -105,12 +107,13 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
         (Bool, UInt8 | UInt16 | UInt32 | UInt64) => true,
 
         // Fixed-width int → BigInt: always lossless.
-        (Int16 | Int32 | Int64, BigInt { .. }) => true,
+        (Int8 | Int16 | Int32 | Int64, BigInt { .. }) => true,
         // BigInt → BigInt: only widen (target unbounded, or wider).
         (BigInt { width: a }, BigInt { width: b }) => fits_size(a, b),
 
         // Int → Decimal: ok when target precision-scale ≥ source digit width,
-        // or target unbounded.
+        // or target unbounded. Int8 max is 127 → 3 decimal digits.
+        (Int8, Decimal { precision, scale }) => decimal_fits_int_digits(precision, scale, 3),
         (Int16, Decimal { precision, scale }) => decimal_fits_int_digits(precision, scale, 5),
         (Int32, Decimal { precision, scale }) => decimal_fits_int_digits(precision, scale, 10),
         (Int64, Decimal { precision, scale }) => decimal_fits_int_digits(precision, scale, 19),
@@ -213,22 +216,24 @@ pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool
         (Bytes { .. }, Bytes { .. }) => true,
         // Signed → smaller signed, signed → unsigned (sat-to-zero), unsigned
         // → smaller unsigned, unsigned → smaller signed.
-        (Int64, Int32 | Int16 | UInt64 | UInt32 | UInt16 | UInt8) => true,
-        (Int32, Int16 | UInt64 | UInt32 | UInt16 | UInt8) => true,
-        (Int16, UInt64 | UInt32 | UInt16 | UInt8) => true,
-        (UInt64, UInt32 | UInt16 | UInt8 | Int64 | Int32 | Int16) => true,
-        (UInt32, UInt16 | UInt8 | Int32 | Int16) => true,
-        (UInt16, UInt8 | Int16) => true,
+        (Int64, Int32 | Int16 | Int8 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        (Int32, Int16 | Int8 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        (Int16, Int8 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        (Int8, UInt64 | UInt32 | UInt16 | UInt8) => true,
+        (UInt64, UInt32 | UInt16 | UInt8 | Int64 | Int32 | Int16 | Int8) => true,
+        (UInt32, UInt16 | UInt8 | Int32 | Int16 | Int8) => true,
+        (UInt16, UInt8 | Int16 | Int8) => true,
+        (UInt8, Int8) => true,
         // Float narrowing.
         (Float64, Float32) => true,
-        (Float64, Int64 | Int32 | Int16 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        (Float64, Int64 | Int32 | Int16 | Int8 | UInt64 | UInt32 | UInt16 | UInt8) => true,
         // BigInt narrowing.
         (BigInt { .. }, BigInt { .. }) => true,
-        (BigInt { .. }, Int64 | Int32 | Int16 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        (BigInt { .. }, Int64 | Int32 | Int16 | Int8 | UInt64 | UInt32 | UInt16 | UInt8) => true,
         // Decimal narrowing.
         (Decimal { .. }, Decimal { .. }) => true,
         (Decimal { .. }, BigInt { .. }) => true,
-        (Decimal { .. }, Int64 | Int32 | Int16 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        (Decimal { .. }, Int64 | Int32 | Int16 | Int8 | UInt64 | UInt32 | UInt16 | UInt8) => true,
         // Json → Text(n).
         (Json, Text { size: Some(_) }) => true,
         // Xml → Text(n).
@@ -323,8 +328,9 @@ pub fn is_narrowing(source_t: DataType, sink_t: DataType) -> bool {
     }
     matches!(
         (source_t, sink_t),
-        (Int32, Int16)
-            | (Int64, Int16)
+        (Int32, Int16 | Int8)
+            | (Int16, Int8)
+            | (Int64, Int16 | Int8)
             | (Int64, Int32)
             | (Float64, Float32)
             | (Float32, Int16)
@@ -341,15 +347,20 @@ pub fn is_narrowing(source_t: DataType, sink_t: DataType) -> bool {
             | (UInt64, UInt16)
             | (UInt64, UInt32)
             // Signed → unsigned (sign loss) is also narrowing.
+            | (Int8, UInt8 | UInt16 | UInt32 | UInt64)
             | (Int16, UInt8 | UInt16 | UInt32 | UInt64)
             | (Int32, UInt8 | UInt16 | UInt32 | UInt64)
             | (Int64, UInt8 | UInt16 | UInt32 | UInt64)
+            // Unsigned → smaller signed also narrowing.
+            | (UInt8, Int8)
     )
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::any::Any;
+
     use super::*;
 
     const TEXT: DataType = DataType::text();
@@ -1066,7 +1077,11 @@ mod tests {
     struct BytesyType;
 
     impl DynType for BytesyType {
-        fn kind(&self) -> &'static str {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn kind(&self) -> &str {
             "test.bytesy"
         }
         fn can_convert_to(&self, target: &DataType, _truncate: bool) -> bool {

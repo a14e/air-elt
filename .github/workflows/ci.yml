@@ -108,6 +108,7 @@ jobs:
       AIR_ELT_TEST_MONGO_LEGACY_URL: "mongodb://localhost:27018"
       AIR_ELT_TEST_MONGO_RS_URL: "mongodb://localhost:27019/?replicaSet=rs0&directConnection=true"
       AIR_ELT_TEST_COCKROACHDB_URL: "postgres://root@localhost:26257/defaultdb?sslmode=disable"
+      AIR_ELT_TEST_CLICKHOUSE_URL: "http://localhost:8123"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -193,6 +194,28 @@ jobs:
           done
           echo "cockroach did not become ready in 30s"
           docker logs cockroach || true
+          exit 1
+      - name: Start ClickHouse single-node
+        # GHA `services:` cannot append a custom CMD; the official CH
+        # image's default ENTRYPOINT spins up `clickhouse-server` which
+        # is already what we want. We poll the `/ping` HTTP endpoint
+        # rather than relying on a log marker so the container can be
+        # any 24.x tag without re-tuning the wait. Pattern mirrors the
+        # cockroach / mongo-rs steps above.
+        run: |
+          set -euo pipefail
+          docker run -d --name clickhouse -p 8123:8123 -p 9000:9000 \
+            --tmpfs /var/lib/clickhouse:rw,size=512m \
+            -e CLICKHOUSE_SKIP_USER_SETUP=1 \
+            clickhouse/clickhouse-server:24.8
+          for i in $(seq 1 60); do
+            if curl -fs http://localhost:8123/ping >/dev/null 2>&1; then
+              echo "clickhouse ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "clickhouse did not become ready in 60s"
+          docker logs clickhouse || true
           exit 1
       - name: cargo test
         run: cargo test --workspace --all-targets

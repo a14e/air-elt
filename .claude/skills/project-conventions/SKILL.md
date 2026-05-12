@@ -31,7 +31,7 @@ All dynamic SQL identifiers must go through these helpers. Raw `format!` quoting
 - **`air_elt_commons_mysql::identifier`** — mysql quoting (backtick).
 - **`IdentifierError → RuntimeError`** via `impl From` in `core::error` — use `?` directly.
 
-Source-side type resolution lives in `commons-pg::pg_type` / `commons-mysql::mysql_type` (native ↔ canonical `DataType`). Notable quirks: pg accepts `timestamptz` only (naive `timestamp` rejected); mysql `tinyint(1)` → `Bool`, other tinyints → `Int16`, `datetime` rejected (only `timestamp` accepted, UTC).
+Source-side type resolution lives in `commons-pg::pg_type` / `commons-mysql::mysql_type` (native ↔ canonical `DataType`). Notable quirks: pg accepts `timestamptz` only (naive `timestamp` rejected); mysql `tinyint(1)` → `Bool`, other signed tinyints → `Int8` (was `Int16` before AIR-22), `datetime` rejected (only `timestamp` accepted, UTC).
 
 NULL binding goes through `commons-pg::null_bind` / `commons-mysql::null_bind` (extracted helper) on the source side. On the sink side use **`commons-pg::sink_bind::bind_value_separated`** / **`commons-mysql::sink_bind::bind_value_separated`** for binding a `Value` inside a sqlx `Separated` chain. They are shared between the insert (`push_values`) and delete (`push_tuples` for the `(c1,c2) IN ((...))` predicate) paths — do not reimplement per-Value-variant binding inline.
 
@@ -61,11 +61,40 @@ Mongo has no SQL surface, so `commons-mongodb` ships its own helper set:
 - **`commons-mongodb::infer`** — sample-based schema inference. Folds per-field types; widens `int32 + int64` → `Int64`, `int + float` → `Float64`.
 - **`commons-mongodb::sampling`** — `sample_documents` / `describe_collection_schema` / `rows_from_documents`. Shared between the `mongodb` and `mongo-cdc` sources. New mongo-shaped sources should call these instead of duplicating `$sample` aggregation pipelines.
 
+## ClickHouse helpers
+
+ClickHouse is sink-only today; `commons-clickhouse` carries the helpers shared with any future CH source. Reuse these — do not roll up ad-hoc HTTP / type-parsing per call site.
+
+- **`commons-clickhouse::client`** — `reqwest::Client` wrapper plus `ChClientConfig` (URL, database, user, password, `PoolSettings`). `ping()`, `query_text()`, `insert_row_binary()`. We use `reqwest` directly rather than the `clickhouse` 0.13 crate because that crate's typed `Client::insert::<T: Row>` API doesn't fit dynamic `Vec<Value>` batches.
+- **`commons-clickhouse::identifier`** — backtick quoting (CH shares MySQL's backtick syntax). `quote_ident`, `quote_qualified`, `quote_columns`, `split_qualified`.
+- **`commons-clickhouse::ch_type_parser`** — recursive parser for `system.columns.type` strings. Returns `ParsedType { data_type, nullable }`. `Nullable(T)` strips onto the `nullable` flag; `LowCardinality(T)` strips transparently. Composite shapes (`Array`, `Tuple`, `Map`, `Nested`, geo) map onto `DataType::Json`.
+- **`commons-clickhouse::schema`** — `fetch_schema(client, table)` runs `SELECT name, type FROM system.columns … FORMAT JSON` and folds the result into a canonical `Schema`.
+- **`commons-clickhouse::row_binary`** — `encode_value(out, &Field, &Value)` writes one column-cell into a `RowBinary` byte buffer. Handles `Nullable` flag bytes, UTF-8 string LEB128 length prefix, CH's mixed-endian UUID layout, Date as `u16` days, DateTime as `u32` seconds (UTC, no TZ), `Decimal` as fixed-width signed LE (width by precision: ≤9=i32, ≤18=i64, ≤38=i128, ≤76=i256).
+- **`commons-clickhouse::types`** — the CH `DynType`/`DynValue` registry:
+  - `aggregate_state` — `ChAggregateStateType { fn_name, arg_types, simple }` + opaque-bytes `ChAggregateStateValue`. `kind()` is `clickhouse.aggregate.<snake_fn>` (leak-interned at first observation per process — bounded by user-declared columns).
+  - `ip` — `ChIpv4Type` / `ChIpv6Type` + `ChIpv4Value(Ipv4Addr)` / `ChIpv6Value(Ipv6Addr)`. Cross-canonical to/from `Text`.
+  - `fixed_string` — `ChFixedStringType { size }` + bytes carrier. Cross-canonical to/from `Bytes(N)`.
+  - `enum_` — `ChEnum8Type` / `ChEnum16Type` (variants table) + `ChEnumValue { name }`. Cross-canonical to/from `Text` (variant name).
+  - `int128` — `ChInt128Type` / `ChUInt128Type` + `ChInt128Value(i128)` / `ChUInt128Value(u128)`. 16-byte LE. Cross-canonical to/from `BigInt`.
+  - `int256` — `ChInt256Type` / `ChUInt256Type` + `ChInt256Value { le_bytes: [u8; 32] }` / `ChUInt256Value { le_bytes: [u8; 32] }`. 32-byte LE two's-complement. Cross-canonical to/from `BigInt`. Helpers: `bigint_to_le32`, `le32_to_bigint`, `biguint_to_le32`.
+
+**Custom `kind` values shipped**: `clickhouse.ipv4`, `clickhouse.ipv6`, `clickhouse.fixed_string`, `clickhouse.enum8`, `clickhouse.enum16`, `clickhouse.int128`, `clickhouse.uint128`, `clickhouse.int256`, `clickhouse.uint256`, `clickhouse.aggregate.<fn>` (e.g. `clickhouse.aggregate.quantiles_t_digest`, `clickhouse.aggregate.quantiles_d_d_sketch`).
+
+## Sink::supports_deletes (append-only ingest)
+
+`Sink::supports_deletes() -> bool` (default `true`). ClickHouse sink overrides to `false`. Three behavioural consequences:
+
+1. **Runner**: `FlowRunner::write_and_commit` filters out `RowOp::Delete` rows pre-write when the sink declares no-delete. If the batch becomes empty after filtering, the cursor still advances (via `commit_cursor`) and the sink is not called.
+2. **Validation pipeline**: `validate_delete_access` is gated on `source.emits_deletes() && conflict.is_some() && sink.supports_deletes()` — the probe is skipped against append-only sinks regardless of source/conflict shape.
+3. **Assemble**: the otherwise-mandatory `[flow.<name>.conflict]` block for CDC sources (`mongo-cdc`) becomes optional when the sink declares no-delete. Append-only ingest: every CDC event lands as a plain INSERT.
+
+Future no-delete sinks (e.g. an append-only event-store backend) should override this method and inherit all three behaviours without further changes.
+
 ## Type model and the N+N matrix
 
 Canonical types are the only pivot — connectors do NOT introduce parallel enums. Each connector maps `native → DataType` on read and `DataType → native` on write.
 
-- **`core::types::{DataType, Value}`** — the type enums. `Text`/`Bytes` carry `size: Option<u32>` (None = unbounded). `BigInt { width }` covers integer-only `numeric(p, 0)` (carrying `num_bigint::BigInt`); `Decimal { precision, scale }` covers fractional `numeric(p, s>0)` (carrying `bigdecimal::BigDecimal`). Unsigned variants exist solely for MySQL/MariaDB UNSIGNED columns — pg never produces them.
+- **`core::types::{DataType, Value}`** — the type enums. `Text`/`Bytes` carry `size: Option<u32>` (None = unbounded). `BigInt { width }` covers integer-only `numeric(p, 0)` (carrying `num_bigint::BigInt`); `Decimal { precision, scale }` covers fractional `numeric(p, s>0)` (carrying `bigdecimal::BigDecimal`). `Int8` is the canonical signed 8-bit pivot (from MySQL tinyint and ClickHouse Int8). Unsigned variants exist solely for MySQL/MariaDB UNSIGNED columns — pg never produces them.
 - **`core::types::matrix`** — validation-time width check. `is_compatible` is the lossless matrix; `is_compatible_with_truncate` widens to admit narrowing arms when a mapping has `truncate=true`. Reverse paths (`BigInt/Decimal → Int*`, `Float ↔ BigInt/Decimal`) are deliberately rejected by the lossless matrix.
 - **`core::types::convert`** — runtime per-cell dispatcher (`convert(value, src, dst, &ctx)`). Identity / pure-widening pairs return the value unchanged. Connectors must NOT implement these conversions themselves; the Transform layer wraps a `ColumnConversionPlan` in `TransformOp::Convert` and dispatches via `convert` at apply time.
 - **`core::types::default_value::parse`** — parses a TOML default literal against the sink `DataType`. Bytes columns require a typed prefix (`hex:` / `base64:` / `utf8:` / `bin:`).

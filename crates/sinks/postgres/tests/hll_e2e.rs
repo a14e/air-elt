@@ -133,7 +133,13 @@ async fn hll_round_trip_through_sink_and_source() {
                 hll.0, sketch_bytes,
                 "HLL bytes must round-trip byte-for-byte"
             );
-            assert_eq!(v.dyn_type().kind(), PgHllType.kind());
+            assert_eq!(
+                {
+                    let dt = v.dyn_type();
+                    dt.kind().to_string()
+                },
+                PgHllType.kind()
+            );
         }
         other => panic!("expected Value::Custom(PgHllValue), got {other:?}"),
     }

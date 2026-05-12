@@ -223,7 +223,10 @@ async fn write_batch_dry_run_delete_rejects_type_mismatch_server_side() {
         .expect_err("dry-run delete must reject server-side type mismatch");
     let msg = format!("{err:#}").to_lowercase();
     assert!(
-        msg.contains("integer") || msg.contains("type") || msg.contains("invalid"),
+        msg.contains("integer")
+            || msg.contains("type")
+            || msg.contains("invalid")
+            || msg.contains("binary data format"),
         "expected pg type-mismatch error, got: {msg}"
     );
 

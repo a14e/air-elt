@@ -178,6 +178,7 @@ pub fn mock_sink_ok() -> MockSink {
     let mut s = MockSink::new();
     s.expect_cancel_safe().return_const(true);
     s.expect_schemaless().return_const(false);
+    s.expect_supports_deletes().return_const(true);
     s.expect_describe_schema().returning(|_| {
         Ok(crate::model::Schema::new(vec![crate::model::Field {
             name: "id".into(),

@@ -26,7 +26,10 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
         if let Value::Custom(c) = v {
             panic!(
                 "SQL sink received unexpected Value::Custom(kind={}); matrix conversion to Json missing",
-                c.dyn_type().kind()
+                {
+                    let dt = c.dyn_type();
+                    dt.kind().to_string()
+                }
             );
         }
     }
@@ -34,6 +37,9 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
         Value::Null => match dt {
             DataType::Bool => {
                 sep.push_bind::<Option<bool>>(None);
+            }
+            DataType::Int8 => {
+                sep.push_bind::<Option<i8>>(None);
             }
             DataType::Int16 => {
                 sep.push_bind::<Option<i16>>(None);
@@ -93,6 +99,9 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
         },
         Value::Bool(b) => {
             sep.push_bind(*b);
+        }
+        Value::Int8(n) => {
+            sep.push_bind(*n);
         }
         Value::Int16(n) => {
             sep.push_bind(*n);
@@ -169,7 +178,11 @@ mod tests {
     struct StubType;
 
     impl DynType for StubType {
-        fn kind(&self) -> &'static str {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn kind(&self) -> &str {
             "test.unknown_custom"
         }
         fn can_convert_to(&self, _t: &DataType, _trunc: bool) -> bool {

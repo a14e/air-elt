@@ -31,7 +31,7 @@ Flat `key = "value"` map. Used by `${VAR}` expansion (env → secrets → defaul
 | Field | Type | Required | Description |
 |-------|------|:--------:|-------------|
 | `name` | string | yes | Unique identifier |
-| `type` | string | yes | Connector kind (`"postgres"`, `"cockroachdb"`, `"mysql"`, or `"mongodb"`) |
+| `type` | string | yes | Connector kind (`"postgres"`, `"cockroachdb"`, `"mysql"`, `"mongodb"`, `"mongo-cdc"` (source only), `"clickhouse"` (sink only)) |
 | `config` | table | yes | Connector-specific config (see below) |
 
 ### Postgres / CockroachDB / MySQL connector config (`config = { ... }`)
@@ -71,6 +71,36 @@ The same field set covers `[[sources]]`, `[[sinks]]`, and `[[storages]]` of `typ
 - Mapping `from` / `to` accept dot notation for nested fields (`"addr.city"`). Dot notation is forbidden for SQL connectors.
 - Cursor field set must be a single field in MVP (multi-key Mongo cursors are not yet supported).
 - Mongo collections are schemaless. The sink takes any BSON shape; validation is driven by the source's *sampled* schema (see `[flow.<name>.validation]` below).
+
+### ClickHouse sink config (`[[sinks]] type = "clickhouse"`)
+
+ClickHouse is **sink-only** today (no source, no storage). The sink declares `supports_deletes() = false`: the runner drops `RowOp::Delete` rows before `write_batch`, the validation pipeline skips `validate_delete_access`, and CDC sources may pair with it without a mandatory `[flow.<name>.conflict]` block (append-only ingest). The MergeTree family has no cheap `DELETE`/`UPDATE`; emulating deletes via `ALTER TABLE … DELETE` mutations is intentionally not supported.
+
+INSERTs use the HTTP `RowBinary` format. Authentication is over standard CH `X-ClickHouse-User` / `X-ClickHouse-Key` headers.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | string | required | HTTP endpoint URL (e.g. `http://localhost:8123`). Use `https://` for TLS. No trailing slash. |
+| `database` | string | required | Default database. Applied as `X-ClickHouse-Database`; flow `to` may still be `db.table` qualified to override per flow. |
+| `user` | string | none | Optional username. |
+| `password` | string | none | Optional password. Pair with `[secrets]` to avoid leaking it in the config file. |
+| `connect-timeout` | Duration | `"5s"` | TCP connect timeout. |
+| `acquire-timeout` | Duration | `"10s"` | Pool acquire timeout (HTTP connection reuse). |
+| `idle-timeout` | Duration | `"5m"` | Idle HTTP connection lifetime. |
+| `request-timeout` | Duration | `"30s"` | Whole-request cap (connect + send + server compute + body download). CH has no per-statement timeout exposed over HTTP. |
+| `max-connections` | u32 | 5 | HTTP pool size cap. |
+
+**Type mapping.** Native CH types are parsed from `system.columns.type`. `Nullable(T)` is stripped onto `Field.nullable`; `LowCardinality(T)` is stripped transparently. Canonical pivots: `String → Text`, `UInt*`/`Int8/16/32/64` → `UInt*`/`Int8/16/32/64`, `Float32/64 → Float32/64`, `Bool → Bool`, `Date`/`Date32 → Date`, `DateTime`/`DateTime64(N[, tz]) → Timestamp` (timezone qualifier parsed and discarded — stored UTC; TZ-aware paths land in a follow-up), `Decimal(P, S)` and `Decimal32/64/128/256(S) → Decimal{P, S}` (width selected automatically by precision — ≤9 → i32, ≤18 → i64, ≤38 → i128, ≤76 → i256 LE; value scaled by `10^S`), `UUID → Uuid`, `JSON`/`Object` → `Json`. `Int8` is a full canonical pivot — the RowBinary encoder writes it as 1 byte (two's-complement bit-cast via `i8 as u8`).
+
+**Custom types (`DataType::Custom`)**:
+- `clickhouse.ipv4` / `clickhouse.ipv6` — convert ↔ `Text` (canonical "x.x.x.x" / RFC 5952).
+- `clickhouse.fixed_string` — convert ↔ `Bytes(N)`. Non-UTF8 binary, no `Text` path.
+- `clickhouse.enum8` / `clickhouse.enum16` — convert ↔ `Text` (variant name).
+- `clickhouse.int128` / `clickhouse.uint128` — `Int128` / `UInt128` columns; 16-byte LE. Convert ↔ `BigInt`.
+- `clickhouse.int256` / `clickhouse.uint256` — `Int256` / `UInt256` columns; 32-byte LE two's-complement. Convert ↔ `BigInt`.
+- `clickhouse.aggregate.<fn>` (`AggregateFunction` / `SimpleAggregateFunction` states for `quantilesTDigest`, `quantilesDDSketch`, `uniq*`, etc.) — opaque bytes, CH↔CH only.
+
+**Structural composite types** (`Tuple`, `Array`, `Map`, `Nested`, `Point`, `Ring`, `Polygon`, `MultiPolygon`, …) are parsed as canonical `Json`. The CH server accepts JSON-encoded text for these via RowBinary; the round-trip is lossless.
 
 ### `mongo-cdc` source config (`[[sources]] type = "mongo-cdc"`)
 
@@ -112,7 +142,7 @@ strategy = "overwrite"
 
 **Constraints:**
 - `cursor.fields` is **forbidden** — pagination is the resume token, persisted via `Storage::save_resume_token` in a dedicated `air_elt_resume_tokens` table / collection (separate from `air_elt_cursors`).
-- `[flow.<name>.conflict]` is **mandatory** — change events emit `Upsert` and `Delete`, both of which need a key.
+- `[flow.<name>.conflict]` is **mandatory** — change events emit `Upsert` and `Delete`, both of which need a key. **Exception**: when the sink declares `supports_deletes() = false` (today: `clickhouse`), the conflict block becomes optional — the runner drops every `RowOp::Delete` pre-write, so the flow streams CDC events into the sink as append-only inserts.
 - Drop / rename / dropDatabase / invalidate events fail the iteration; the runner retries with the saved resume token. If the token has aged out of the oplog the operator must intervene.
 - **Bootstrap recipe**: pair `[[sources]] type = "mongo-cdc"` with a parallel `[[sources]] type = "mongodb"` snapshot flow on the same collection. After the snapshot catches up, disable it; the cdc flow keeps the table fresh — including DELETEs the snapshot source cannot observe.
 

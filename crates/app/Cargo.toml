@@ -31,6 +31,7 @@ air-elt-source-mongodb = { workspace = true }
 air-elt-source-mongo-cdc = { workspace = true }
 air-elt-sink-mongodb = { workspace = true }
 air-elt-storage-mongodb = { workspace = true }
+air-elt-sink-clickhouse = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
@@ -45,6 +46,7 @@ sqlx = { workspace = true }
 tempfile = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+bigdecimal = { workspace = true }
 mongodb = { workspace = true }
 bson = { workspace = true }
 futures = { workspace = true }

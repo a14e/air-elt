@@ -25,8 +25,20 @@ pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, Co
             Value::Int64(n) => Ok(Value::Int16(sat_i64_to_i16(n))),
             _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
+        (Int64, Int8) => match value {
+            Value::Int64(n) => Ok(Value::Int8(sat_i64_to_i8(n))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
         (Int32, Int16) => match value {
             Value::Int32(n) => Ok(Value::Int16(sat_i32_to_i16(n))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (Int32, Int8) => match value {
+            Value::Int32(n) => Ok(Value::Int8(sat_i32_to_i8(n))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (Int16, Int8) => match value {
+            Value::Int16(n) => Ok(Value::Int8(sat_i16_to_i8(n))),
             _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
@@ -105,6 +117,22 @@ pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, Co
             Value::Int16(n) => Ok(Value::UInt8(sat_i64_to_u8(n as i64))),
             _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
+        (Int8, UInt64) => match value {
+            Value::Int8(n) => Ok(Value::UInt64(sat_i8_to_u64(n))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (Int8, UInt32) => match value {
+            Value::Int8(n) => Ok(Value::UInt32(sat_i8_to_u32(n))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (Int8, UInt16) => match value {
+            Value::Int8(n) => Ok(Value::UInt16(sat_i8_to_u16(n))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (Int8, UInt8) => match value {
+            Value::Int8(n) => Ok(Value::UInt8(sat_i8_to_u8(n))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
 
         // Unsigned → signed (saturate at signed max).
         (UInt64, Int64) => match value {
@@ -129,6 +157,22 @@ pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, Co
         },
         (UInt16, Int16) => match value {
             Value::UInt16(n) => Ok(Value::Int16(sat_u16_to_i16(n))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (UInt64, Int8) => match value {
+            Value::UInt64(n) => Ok(Value::Int8(sat_u64_to_i8(n))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (UInt32, Int8) => match value {
+            Value::UInt32(n) => Ok(Value::Int8(sat_u32_to_i8(n))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (UInt16, Int8) => match value {
+            Value::UInt16(n) => Ok(Value::Int8(sat_u16_to_i8(n))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (UInt8, Int8) => match value {
+            Value::UInt8(n) => Ok(Value::Int8(sat_u8_to_i8(n))),
             _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 

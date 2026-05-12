@@ -407,6 +407,8 @@ impl std::fmt::Debug for FlowState {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::any::Any;
+
     use super::*;
     use crate::config::model::CursorOrder;
     use crate::mapping::ColumnMapping;
@@ -567,7 +569,11 @@ mod tests {
         #[derive(Debug)]
         struct ObjectyType;
         impl DynType for ObjectyType {
-            fn kind(&self) -> &'static str {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            fn kind(&self) -> &str {
                 "test.objecty"
             }
             fn is_object(&self) -> bool {

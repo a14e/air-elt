@@ -15,8 +15,53 @@ pub fn sat_i64_to_i16(n: i64) -> i16 {
     n.clamp(i16::MIN as i64, i16::MAX as i64) as i16
 }
 
+pub fn sat_i64_to_i8(n: i64) -> i8 {
+    n.clamp(i8::MIN as i64, i8::MAX as i64) as i8
+}
+
 pub fn sat_i32_to_i16(n: i32) -> i16 {
     n.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+pub fn sat_i32_to_i8(n: i32) -> i8 {
+    n.clamp(i8::MIN as i32, i8::MAX as i32) as i8
+}
+
+pub fn sat_i16_to_i8(n: i16) -> i8 {
+    n.clamp(i8::MIN as i16, i8::MAX as i16) as i8
+}
+
+pub fn sat_u8_to_i8(n: u8) -> i8 {
+    n.min(i8::MAX as u8) as i8
+}
+
+pub fn sat_u16_to_i8(n: u16) -> i8 {
+    n.min(i8::MAX as u16) as i8
+}
+
+pub fn sat_u32_to_i8(n: u32) -> i8 {
+    n.min(i8::MAX as u32) as i8
+}
+
+pub fn sat_u64_to_i8(n: u64) -> i8 {
+    n.min(i8::MAX as u64) as i8
+}
+
+/// Signed Int8 → unsigned: negative clamps to 0, positive saturates.
+pub fn sat_i8_to_u8(n: i8) -> u8 {
+    if n < 0 { 0 } else { n as u8 }
+}
+
+pub fn sat_i8_to_u16(n: i8) -> u16 {
+    if n < 0 { 0 } else { n as u16 }
+}
+
+pub fn sat_i8_to_u32(n: i8) -> u32 {
+    if n < 0 { 0 } else { n as u32 }
+}
+
+pub fn sat_i8_to_u64(n: i8) -> u64 {
+    if n < 0 { 0 } else { n as u64 }
 }
 
 pub fn sat_u64_to_u32(n: u64) -> u32 {
@@ -155,6 +200,20 @@ pub fn sat_f64_to_i16(n: f64) -> Option<i16> {
     Some(truncated as i16)
 }
 
+pub fn sat_f64_to_i8(n: f64) -> Option<i8> {
+    if n.is_nan() {
+        return None;
+    }
+    let truncated = n.trunc();
+    if truncated >= i8::MAX as f64 {
+        return Some(i8::MAX);
+    }
+    if truncated <= i8::MIN as f64 {
+        return Some(i8::MIN);
+    }
+    Some(truncated as i8)
+}
+
 pub fn sat_f64_to_u64(n: f64) -> Option<u64> {
     if n.is_nan() {
         return None;
@@ -200,6 +259,13 @@ pub fn sat_bigint_to_i16(b: &BigInt) -> i16 {
     b.to_i16().unwrap_or_else(|| match b.sign() {
         Sign::Minus => i16::MIN,
         _ => i16::MAX,
+    })
+}
+
+pub fn sat_bigint_to_i8(b: &BigInt) -> i8 {
+    b.to_i8().unwrap_or_else(|| match b.sign() {
+        Sign::Minus => i8::MIN,
+        _ => i8::MAX,
     })
 }
 

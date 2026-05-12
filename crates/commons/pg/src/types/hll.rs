@@ -39,7 +39,11 @@ impl PgHllType {
 }
 
 impl DynType for PgHllType {
-    fn kind(&self) -> &'static str {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn kind(&self) -> &str {
         Self::KIND
     }
 
@@ -239,7 +243,13 @@ mod tests {
     #[test]
     fn value_dyn_type_returns_hll_descriptor() {
         let v = PgHllValue(vec![]);
-        assert_eq!(v.dyn_type().kind(), "postgresql.hll");
+        assert_eq!(
+            {
+                let dt = v.dyn_type();
+                dt.kind().to_string()
+            },
+            "postgresql.hll"
+        );
     }
 
     #[test]

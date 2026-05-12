@@ -35,6 +35,8 @@ ryuk-start-*.lock
 /.claude/settings.json
 /.claude/agent-memory
 
+/.claude/settings2.json
+
 
 proposals.md
 for-future-ignore-that

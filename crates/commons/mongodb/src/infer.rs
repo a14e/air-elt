@@ -236,7 +236,8 @@ impl TypeKind {
     fn of(dt: &DataType) -> Self {
         match dt {
             DataType::Bool => TypeKind::Bool,
-            DataType::Int16
+            DataType::Int8
+            | DataType::Int16
             | DataType::Int32
             | DataType::Int64
             | DataType::UInt8
