@@ -17,14 +17,18 @@ use air_elt_core::types::dynamic::{DynType, DynValue};
 use air_elt_core::types::value::Value;
 
 /// Re-use the JSON helpers from the array module (they live at crate
-/// scope).  We import directly rather than via `super::array_` to avoid
+/// scope).  We import directly rather than via `super::array` to avoid
 /// a circular public-module dependency.
-use super::array_::{json_to_value, value_to_json};
+use super::array::{json_to_value, value_to_json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChMapType {
     pub key: DataType,
     pub value: DataType,
+    /// Whether the key/value types are `Nullable(...)`. Affects RowBinary
+    /// encoding: each key/value gets a 1-byte NULL flag before its payload.
+    pub key_nullable: bool,
+    pub value_nullable: bool,
 }
 
 impl ChMapType {
@@ -32,6 +36,10 @@ impl ChMapType {
 }
 
 impl DynType for ChMapType {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> &'static str {
         Self::KIND
     }
@@ -75,20 +83,14 @@ impl DynType for ChMapType {
                     })
                     .collect::<Result<_, JsonEncodeError>>()
                     .map_err(|_| ConvertError::Unsupported {
-                        src: DataType::Custom(Box::new(ChMapType {
-                            key: self.key.clone(),
-                            value: self.value.clone(),
-                        })),
+                        src: DataType::Custom(Box::new(self.clone())),
                         dst: target.clone(),
                     })?;
                 Ok(Value::Json(serde_json::Value::Array(pairs)))
             }
             DataType::Custom(t) if t.kind() == Self::KIND => Ok(value),
             _ => Err(ConvertError::Unsupported {
-                src: DataType::Custom(Box::new(ChMapType {
-                    key: self.key.clone(),
-                    value: self.value.clone(),
-                })),
+                src: DataType::Custom(Box::new(self.clone())),
                 dst: target.clone(),
             }),
         }
@@ -131,10 +133,7 @@ impl DynType for ChMapType {
             DataType::Custom(t) if t.kind() == Self::KIND => Ok(value),
             _ => Err(ConvertError::Unsupported {
                 src: src.clone(),
-                dst: DataType::Custom(Box::new(ChMapType {
-                    key: self.key.clone(),
-                    value: self.value.clone(),
-                })),
+                dst: DataType::Custom(Box::new(self.clone())),
             }),
         }
     }
@@ -160,6 +159,8 @@ impl DynValue for ChMapValue {
         Box::new(ChMapType {
             key: DataType::Json,
             value: DataType::Json,
+            key_nullable: false,
+            value_nullable: false,
         })
     }
     fn as_any(&self) -> &dyn Any {
@@ -217,6 +218,8 @@ mod tests {
         let t = ChMapType {
             key: DataType::Text { size: None },
             value: DataType::Int32,
+            key_nullable: false,
+            value_nullable: false,
         };
         assert_eq!(t.kind(), "clickhouse.map");
         assert_eq!(t.display(), "Map(text, int32)");

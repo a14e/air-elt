@@ -175,6 +175,10 @@ mod tests {
     struct StubType;
 
     impl DynType for StubType {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
         fn kind(&self) -> &'static str {
             "test.unknown_custom"
         }

@@ -511,6 +511,8 @@ impl<'de> Visitor<'de> for DataTypeVisitor {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::any::Any;
+
     use super::*;
     use crate::types::convert::ConvertError;
     use crate::types::convert::context::ConversionContext;
@@ -523,6 +525,10 @@ mod tests {
     struct TestCursorable;
 
     impl DynType for TestCursorable {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
         fn kind(&self) -> &'static str {
             "test.cursorable"
         }
@@ -563,6 +569,10 @@ mod tests {
     struct TestNonCursorable;
 
     impl DynType for TestNonCursorable {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
         fn kind(&self) -> &'static str {
             "test.non_cursorable"
         }

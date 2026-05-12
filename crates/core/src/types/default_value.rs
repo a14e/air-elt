@@ -965,6 +965,10 @@ mod tests {
     }
 
     impl crate::types::dynamic::DynType for StubCustom {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn kind(&self) -> &'static str {
             "test.stub_custom"
         }

@@ -29,12 +29,20 @@ impl ChFixedStringType {
 }
 
 impl DynType for ChFixedStringType {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> &'static str {
         Self::KIND
     }
 
     fn display(&self) -> String {
         format!("FixedString({})", self.size)
+    }
+
+    fn fixed_size(&self) -> Option<u32> {
+        Some(self.size)
     }
 
     fn can_convert_to(&self, target: &DataType, _truncate: bool) -> bool {

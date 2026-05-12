@@ -481,6 +481,10 @@ mod tests {
         #[derive(Debug, Clone)]
         struct UnknownType;
         impl DynType for UnknownType {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
             fn kind(&self) -> &'static str {
                 "test.unknown"
             }

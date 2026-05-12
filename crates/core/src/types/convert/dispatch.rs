@@ -1300,6 +1300,10 @@ mod tests {
     struct DispatchTestType;
 
     impl DynType for DispatchTestType {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
         fn kind(&self) -> &'static str {
             "test.dispatch"
         }

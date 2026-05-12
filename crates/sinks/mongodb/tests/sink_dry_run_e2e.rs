@@ -139,6 +139,10 @@ async fn raw_passthrough_dry_run_skips_writes() {
 struct StubType;
 
 impl DynType for StubType {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> &'static str {
         "test.unknown_custom"
     }

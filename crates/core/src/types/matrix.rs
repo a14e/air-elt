@@ -359,6 +359,8 @@ pub fn is_narrowing(source_t: DataType, sink_t: DataType) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::any::Any;
+
     use super::*;
 
     const TEXT: DataType = DataType::text();
@@ -1075,6 +1077,10 @@ mod tests {
     struct BytesyType;
 
     impl DynType for BytesyType {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
         fn kind(&self) -> &'static str {
             "test.bytesy"
         }

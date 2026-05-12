@@ -20,6 +20,9 @@ use air_elt_core::types::value::Value;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChArrayType {
     pub element: DataType,
+    /// Whether the element type is `Nullable(...)`. Affects RowBinary
+    /// encoding: each element gets a 1-byte NULL flag before its payload.
+    pub element_nullable: bool,
 }
 
 impl ChArrayType {
@@ -27,6 +30,10 @@ impl ChArrayType {
 }
 
 impl DynType for ChArrayType {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> &'static str {
         Self::KIND
     }
@@ -63,21 +70,17 @@ impl DynType for ChArrayType {
                 let elements: Vec<serde_json::Value> = v
                     .elements
                     .into_iter()
-                    .map(|elem| crate::types::array_::value_to_json(&elem))
+                    .map(|elem| crate::types::array::value_to_json(&elem))
                     .collect::<Result<_, _>>()
                     .map_err(|_e| ConvertError::Unsupported {
-                        src: DataType::Custom(Box::new(ChArrayType {
-                            element: self.element.clone(),
-                        })),
+                        src: DataType::Custom(Box::new(self.clone())),
                         dst: target.clone(),
                     })?;
                 Ok(Value::Json(serde_json::Value::Array(elements)))
             }
             DataType::Custom(t) if t.kind() == Self::KIND => Ok(value),
             _ => Err(ConvertError::Unsupported {
-                src: DataType::Custom(Box::new(ChArrayType {
-                    element: self.element.clone(),
-                })),
+                src: DataType::Custom(Box::new(self.clone())),
                 dst: target.clone(),
             }),
         }
@@ -112,9 +115,7 @@ impl DynType for ChArrayType {
             DataType::Custom(t) if t.kind() == Self::KIND => Ok(value),
             _ => Err(ConvertError::Unsupported {
                 src: src.clone(),
-                dst: DataType::Custom(Box::new(ChArrayType {
-                    element: self.element.clone(),
-                })),
+                dst: DataType::Custom(Box::new(self.clone())),
             }),
         }
     }
@@ -138,6 +139,7 @@ impl DynValue for ChArrayValue {
     fn dyn_type(&self) -> Box<dyn DynType> {
         Box::new(ChArrayType {
             element: self.element_type.clone(),
+            element_nullable: false,
         })
     }
     fn as_any(&self) -> &dyn Any {
@@ -225,6 +227,7 @@ mod tests {
     fn array_type_kind() {
         let t = ChArrayType {
             element: DataType::Int32,
+            element_nullable: false,
         };
         assert_eq!(t.kind(), "clickhouse.array");
         assert_eq!(t.display(), "Array(int32)");
@@ -244,6 +247,7 @@ mod tests {
     fn array_cross_canonical_roundtrip() {
         let ty = ChArrayType {
             element: DataType::Int32,
+            element_nullable: false,
         };
         let val = Value::Custom(Box::new(ChArrayValue {
             element_type: DataType::Int32,

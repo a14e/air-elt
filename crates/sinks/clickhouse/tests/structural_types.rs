@@ -12,9 +12,9 @@
 
 use std::sync::Arc;
 
-use air_elt_commons_clickhouse::types::array_::ChArrayValue;
-use air_elt_commons_clickhouse::types::map_::ChMapValue;
-use air_elt_commons_clickhouse::types::tuple_::ChTupleValue;
+use air_elt_commons_clickhouse::types::array::ChArrayValue;
+use air_elt_commons_clickhouse::types::map::ChMapValue;
+use air_elt_commons_clickhouse::types::tuple::ChTupleValue;
 use air_elt_commons_testing::clickhouse::clickhouse_handle;
 use air_elt_core::model::{Batch, Row, RowOp, WriteSpec};
 use air_elt_core::traits::Sink;

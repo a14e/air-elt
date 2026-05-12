@@ -15,7 +15,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use air_elt_commons_clickhouse::types::aggregate_state::ChAggregateStateValue;
-use air_elt_commons_clickhouse::types::enum_::ChEnumValue;
+use air_elt_commons_clickhouse::types::enums::ChEnumValue;
 use air_elt_commons_clickhouse::types::fixed_string::ChFixedStringValue;
 use air_elt_commons_clickhouse::types::ip::{ChIpv4Value, ChIpv6Value};
 use air_elt_commons_testing::clickhouse::clickhouse_handle;

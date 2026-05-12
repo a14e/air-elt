@@ -29,6 +29,10 @@ impl ChIpv4Type {
 }
 
 impl DynType for ChIpv4Type {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> &'static str {
         Self::KIND
     }
@@ -158,6 +162,10 @@ impl ChIpv6Type {
 }
 
 impl DynType for ChIpv6Type {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> &'static str {
         Self::KIND
     }

@@ -41,14 +41,14 @@ struct JsonResponse {
 }
 
 pub async fn fetch_schema(client: &ChClient, table: &str) -> Result<Schema, SchemaError> {
-    let (db_opt, tbl) = split_qualified(table)?;
+    let (db_opt, table_name) = split_qualified(table)?;
     let db = db_opt.unwrap_or_else(|| client.database().to_string());
     // Single-quote-escape (CH SQL: '' is the escape for ').
-    let db_e = db.replace('\'', "''");
-    let tbl_e = tbl.replace('\'', "''");
+    let db_escaped = db.replace('\'', "''");
+    let table_escaped = table_name.replace('\'', "''");
     let sql = format!(
         "SELECT name, type FROM system.columns \
-         WHERE database = '{db_e}' AND table = '{tbl_e}' \
+         WHERE database = '{db_escaped}' AND table = '{table_escaped}' \
          ORDER BY position FORMAT JSON"
     );
     let body = client.query_text(&sql).await?;

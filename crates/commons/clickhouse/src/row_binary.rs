@@ -20,9 +20,8 @@
 //! * IPv4 — 4 LE bytes.
 //! * IPv6 — 16 BE bytes.
 //! * Enum8 — 1-byte signed value; Enum16 — 2-byte signed LE.
-//! * Json / structural composites — JSON-encoded text (`Json` columns
-//!   accept text per CH HTTP spec; for `Tuple`/`Array`/`Map` we map to
-//!   canonical `Json` at parse time so the same encoder path applies).
+//! * Json — JSON-encoded text (`Json` columns accept text per CH
+//!   HTTP spec).
 //! * AggregateFunction states — raw bytes verbatim.
 //!
 //! [1]: https://clickhouse.com/docs/en/interfaces/formats/#rowbinary
@@ -37,14 +36,14 @@ use air_elt_core::types::data_type::DataType;
 use air_elt_core::types::value::Value;
 
 use crate::types::aggregate_state::{ChAggregateStateType, ChAggregateStateValue};
-use crate::types::array_::{ChArrayType, ChArrayValue};
-use crate::types::enum_::{ChEnum8Type, ChEnum16Type, ChEnumValue};
+use crate::types::array::{ChArrayType, ChArrayValue};
+use crate::types::enums::{ChEnum8Type, ChEnum16Type, ChEnumValue};
 use crate::types::fixed_string::{ChFixedStringType, ChFixedStringValue};
 use crate::types::int128::{ChInt128Type, ChInt128Value, ChUInt128Type, ChUInt128Value};
 use crate::types::int256::{ChInt256Type, ChInt256Value, ChUInt256Type, ChUInt256Value};
 use crate::types::ip::{ChIpv4Type, ChIpv4Value, ChIpv6Type, ChIpv6Value};
-use crate::types::map_::{ChMapType, ChMapValue};
-use crate::types::tuple_::{ChTupleType, ChTupleValue};
+use crate::types::map::{ChMapType, ChMapValue};
+use crate::types::tuple::{ChTupleType, ChTupleValue};
 
 #[derive(Debug, Error)]
 pub enum EncodeError {
@@ -95,6 +94,41 @@ pub fn encode_value(out: &mut Vec<u8>, field: &Field, value: &Value) -> Result<(
 }
 
 fn encode_typed(
+    out: &mut Vec<u8>,
+    column: &str,
+    dt: &DataType,
+    value: &Value,
+) -> Result<(), EncodeError> {
+    encode_typed_impl(out, column, dt, value)
+}
+
+/// Encode a single typed element, optionally writing a 1-byte NULL flag
+/// before the payload (used for `Nullable` elements inside `Array`, `Map`,
+/// `Tuple`).
+fn encode_typed_nullable(
+    out: &mut Vec<u8>,
+    column: &str,
+    dt: &DataType,
+    value: &Value,
+    nullable: bool,
+) -> Result<(), EncodeError> {
+    if nullable {
+        if matches!(value, Value::Null) {
+            out.push(1);
+            return Ok(());
+        }
+        out.push(0);
+    } else if matches!(value, Value::Null) {
+        return Err(EncodeError::Mismatch {
+            column: column.to_string(),
+            expected: format!("{} (NOT NULL)", display_type(dt)),
+            got: "Null",
+        });
+    }
+    encode_typed_impl(out, column, dt, value)
+}
+
+fn encode_typed_impl(
     out: &mut Vec<u8>,
     column: &str,
     dt: &DataType,
@@ -286,15 +320,17 @@ fn encode_typed(
                             expected: "FixedString".to_string(),
                             got: "Custom(non-FixedString)",
                         })?;
-                    // We don't pull `size` off the descriptor (the
-                    // `DynType` trait has no `as_any`, so a downcast
-                    // from `&Box<dyn DynType>` isn't available). The
-                    // value carries the exact `N` bytes; if the row
-                    // doesn't match the column's declared length, CH
-                    // surfaces a parse error on the HTTP response —
-                    // strictly better than the runner silently
-                    // misaligning subsequent columns.
+                    let n = t.fixed_size().unwrap_or(v.bytes.len() as u32);
+                    if v.bytes.len() > n as usize {
+                        return Err(EncodeError::FixedStringLength {
+                            n,
+                            got: v.bytes.len(),
+                        });
+                    }
                     out.extend_from_slice(&v.bytes);
+                    // Pad with zeros to exactly N bytes per CH RowBinary spec.
+                    let padding = n as usize - v.bytes.len();
+                    out.resize(out.len() + padding, 0);
                     Ok(())
                 }
                 _ => mismatch(column, dt, value),
@@ -408,9 +444,25 @@ fn encode_typed(
                             got: "Custom(non-Array)",
                         }
                     })?;
+                    let arr_ty = t.as_any().downcast_ref::<ChArrayType>().ok_or_else(|| {
+                        EncodeError::Mismatch {
+                            column: column.to_string(),
+                            expected: "Array".to_string(),
+                            got: "Custom(non-Array type)",
+                        }
+                    })?;
                     write_var_uint(out, v.elements.len() as u64);
+                    // Use schema-declared element type (not value's
+                    // element_type) so nested composite nullability
+                    // propagates correctly.
                     for elem in &v.elements {
-                        encode_typed(out, column, &v.element_type, elem)?;
+                        encode_typed_nullable(
+                            out,
+                            column,
+                            &arr_ty.element,
+                            elem,
+                            arr_ty.element_nullable,
+                        )?;
                     }
                     Ok(())
                 }
@@ -425,13 +477,27 @@ fn encode_typed(
                             got: "Custom(non-Map)",
                         }
                     })?;
+                    let map_ty = t.as_any().downcast_ref::<ChMapType>().ok_or_else(|| {
+                        EncodeError::Mismatch {
+                            column: column.to_string(),
+                            expected: "Map".to_string(),
+                            got: "Custom(non-Map type)",
+                        }
+                    })?;
                     write_var_uint(out, v.entries.len() as u64);
-                    // Map encoding: for each pair, encode key then value.
-                    // Keys/values are stored as canonical Values — encode
-                    // each with its own type derived from the value variant.
+                    // Use schema-declared key/value types (not
+                    // concrete_type()) so that nested composite
+                    // nullability propagates correctly through
+                    // recursive encode_typed_nullable calls.
                     for (key, val) in &v.entries {
-                        encode_typed(out, column, &concrete_type(key), key)?;
-                        encode_typed(out, column, &concrete_type(val), val)?;
+                        encode_typed_nullable(out, column, &map_ty.key, key, map_ty.key_nullable)?;
+                        encode_typed_nullable(
+                            out,
+                            column,
+                            &map_ty.value,
+                            val,
+                            map_ty.value_nullable,
+                        )?;
                     }
                     Ok(())
                 }
@@ -446,9 +512,21 @@ fn encode_typed(
                             got: "Custom(non-Tuple)",
                         }
                     })?;
+                    let tuple_ty = t.as_any().downcast_ref::<ChTupleType>().ok_or_else(|| {
+                        EncodeError::Mismatch {
+                            column: column.to_string(),
+                            expected: "Tuple".to_string(),
+                            got: "Custom(non-Tuple type)",
+                        }
+                    })?;
                     // Tuple: no length prefix, just field payloads in order.
-                    for field in &v.fields {
-                        encode_typed(out, column, &concrete_type(field), field)?;
+                    for (i, field) in v.fields.iter().enumerate() {
+                        let (field_dt, field_nullable) = tuple_ty
+                            .fields
+                            .get(i)
+                            .map(|(dt, n)| (dt, *n))
+                            .unwrap_or((&DataType::Json, false));
+                        encode_typed_nullable(out, column, field_dt, field, field_nullable)?;
                     }
                     Ok(())
                 }
@@ -631,39 +709,6 @@ fn value_variant(v: &Value) -> &'static str {
         Value::Uuid(_) => "Uuid",
         Value::Json(_) => "Json",
         Value::Custom(_) => "Custom",
-    }
-}
-
-/// Map a canonical `Value` variant to a `DataType` suitable for
-/// recursive `encode_typed` calls. Used by the `Map` and `Tuple`
-/// encoder arms where element types are not carried separately
-/// on the value struct.
-fn concrete_type(v: &Value) -> DataType {
-    match v {
-        Value::Null => DataType::Text { size: None },
-        Value::Bool(_) => DataType::Bool,
-        Value::Int8(_) => DataType::Int8,
-        Value::Int16(_) => DataType::Int16,
-        Value::Int32(_) => DataType::Int32,
-        Value::Int64(_) => DataType::Int64,
-        Value::UInt8(_) => DataType::UInt8,
-        Value::UInt16(_) => DataType::UInt16,
-        Value::UInt32(_) => DataType::UInt32,
-        Value::UInt64(_) => DataType::UInt64,
-        Value::Float32(_) => DataType::Float32,
-        Value::Float64(_) => DataType::Float64,
-        Value::BigInt(_) => DataType::BigInt { width: None },
-        Value::Decimal(_) => DataType::Decimal {
-            precision: None,
-            scale: None,
-        },
-        Value::Text(_) => DataType::Text { size: None },
-        Value::Bytes(_) => DataType::Bytes { size: None },
-        Value::Date(_) => DataType::Date,
-        Value::Timestamp(_) => DataType::Timestamp,
-        Value::Uuid(_) => DataType::Uuid,
-        Value::Json(_) => DataType::Json,
-        Value::Custom(c) => DataType::Custom(c.dyn_type()),
     }
 }
 
@@ -982,6 +1027,7 @@ mod tests {
         let elem_type = DataType::Int32;
         let arr_dt = DataType::Custom(Box::new(ChArrayType {
             element: elem_type.clone(),
+            element_nullable: false,
         }));
         let arr_val = Value::Custom(Box::new(ChArrayValue {
             element_type: elem_type,
@@ -1003,6 +1049,7 @@ mod tests {
         let elem_type = DataType::Text { size: None };
         let arr_dt = DataType::Custom(Box::new(ChArrayType {
             element: elem_type.clone(),
+            element_nullable: false,
         }));
         let arr_val = Value::Custom(Box::new(ChArrayValue {
             element_type: elem_type,
@@ -1014,9 +1061,33 @@ mod tests {
     }
 
     #[test]
+    fn array_nullable_element_writes_null_flag_per_element() {
+        let elem_type = DataType::Int32;
+        let arr_dt = DataType::Custom(Box::new(ChArrayType {
+            element: elem_type.clone(),
+            element_nullable: true,
+        }));
+        let arr_val = Value::Custom(Box::new(ChArrayValue {
+            element_type: elem_type,
+            elements: vec![Value::Null, Value::Int32(7)],
+        }));
+        let mut out = Vec::new();
+        encode_value(&mut out, &field("a", arr_dt, false), &arr_val).unwrap();
+        // VarUInt length = 2 → 0x02
+        assert_eq!(out[0], 2);
+        // Element 0: NULL → flag 0x01, no payload
+        assert_eq!(out[1], 1);
+        // Element 1: NOT NULL → flag 0x00, then Int32 LE 7
+        assert_eq!(out[2], 0);
+        assert_eq!(out[3], 7);
+        assert_eq!(out[6], 0);
+        assert_eq!(out.len(), 1 + 1 + 1 + 4);
+    }
+
+    #[test]
     fn tuple_encodes_fields_without_length_prefix() {
         let tuple_dt = DataType::Custom(Box::new(ChTupleType {
-            fields: vec![DataType::Int32, DataType::Bool],
+            fields: vec![(DataType::Int32, false), (DataType::Bool, false)],
         }));
         let tuple_val = Value::Custom(Box::new(ChTupleValue {
             fields: vec![Value::Int32(42), Value::Bool(true)],
@@ -1036,6 +1107,8 @@ mod tests {
         let map_dt = DataType::Custom(Box::new(ChMapType {
             key: DataType::Text { size: None },
             value: DataType::Int32,
+            key_nullable: false,
+            value_nullable: false,
         }));
         let map_val = Value::Custom(Box::new(ChMapValue {
             entries: vec![

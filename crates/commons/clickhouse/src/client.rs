@@ -82,8 +82,8 @@ impl ChClient {
         if let Some(user) = &config.user {
             insert_header(&mut headers, "X-ClickHouse-User", user)?;
         }
-        if let Some(pwd) = &config.password {
-            insert_header(&mut headers, "X-ClickHouse-Key", pwd)?;
+        if let Some(password) = &config.password {
+            insert_header(&mut headers, "X-ClickHouse-Key", password)?;
         }
         insert_header(&mut headers, "X-ClickHouse-Database", &config.database)?;
         // CH HTTP has no separate per-statement timeout — the request

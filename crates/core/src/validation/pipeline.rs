@@ -761,6 +761,7 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::any::Any;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -988,6 +989,10 @@ mod tests {
     struct NonCursorCustom;
 
     impl DynType for NonCursorCustom {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
         fn kind(&self) -> &'static str {
             "test.non_cursor"
         }

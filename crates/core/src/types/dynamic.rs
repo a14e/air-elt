@@ -60,6 +60,9 @@ use crate::types::value::Value;
 /// Connector-defined schema-side type descriptor. See module docs for the
 /// `kind()` and `eq_dyn` contracts.
 pub trait DynType: fmt::Debug + Send + Sync + 'static {
+    /// `Any` access for downcasting in connector code.
+    fn as_any(&self) -> &dyn Any;
+
     /// Stable identity in `"<vendor>.<type>"` form. See module docs.
     fn kind(&self) -> &'static str;
 
@@ -119,6 +122,13 @@ pub trait DynType: fmt::Debug + Send + Sync + 'static {
     /// — the caller wraps that as `TypeMismatch`.
     fn parse_default(&self, _literal: &toml::Value) -> Result<Option<Value>, DefaultParseError> {
         Ok(None)
+    }
+
+    /// Fixed byte-width for types that require exact lengths on the wire
+    /// (e.g. `FixedString(N)`). Returns `None` for variable-width types.
+    /// The RowBinary encoder uses this to pad or reject mismatched values.
+    fn fixed_size(&self) -> Option<u32> {
+        None
     }
 
     /// Equality between this descriptor and `other`. The default
@@ -238,6 +248,10 @@ mod tests {
     struct TestType;
 
     impl DynType for TestType {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
         fn kind(&self) -> &'static str {
             "test.type_a"
         }
@@ -279,6 +293,10 @@ mod tests {
     struct TestTypeB;
 
     impl DynType for TestTypeB {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
         fn kind(&self) -> &'static str {
             "test.type_b"
         }

@@ -16,11 +16,14 @@ use air_elt_core::types::default_value::DefaultParseError;
 use air_elt_core::types::dynamic::{DynType, DynValue};
 use air_elt_core::types::value::Value;
 
-use super::array_::{json_to_value, value_to_json};
+use super::array::{json_to_value, value_to_json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChTupleType {
-    pub fields: Vec<DataType>,
+    /// Field types with their nullability flag. `(DataType, nullable)`.
+    /// Affects RowBinary encoding: each field with `nullable=true` gets a
+    /// 1-byte NULL flag before its payload.
+    pub fields: Vec<(DataType, bool)>,
 }
 
 impl ChTupleType {
@@ -28,12 +31,16 @@ impl ChTupleType {
 }
 
 impl DynType for ChTupleType {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> &'static str {
         Self::KIND
     }
 
     fn display(&self) -> String {
-        let inner: Vec<String> = self.fields.iter().map(|f| f.to_string()).collect();
+        let inner: Vec<String> = self.fields.iter().map(|(f, _)| f.to_string()).collect();
         format!("Tuple({})", inner.join(", "))
     }
 
@@ -138,7 +145,7 @@ impl DynValue for ChTupleValue {
         // types.  The type descriptor carried on the DataType side is the
         // authoritative source.
         Box::new(ChTupleType {
-            fields: vec![DataType::Json; self.fields.len()],
+            fields: vec![(DataType::Json, false); self.fields.len()],
         })
     }
     fn as_any(&self) -> &dyn Any {
@@ -187,7 +194,10 @@ mod tests {
     #[test]
     fn tuple_type_kind() {
         let t = ChTupleType {
-            fields: vec![DataType::Int32, DataType::Text { size: None }],
+            fields: vec![
+                (DataType::Int32, false),
+                (DataType::Text { size: None }, false),
+            ],
         };
         assert_eq!(t.kind(), "clickhouse.tuple");
         assert_eq!(t.display(), "Tuple(int32, text)");

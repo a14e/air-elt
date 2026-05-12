@@ -223,6 +223,10 @@ mod tests {
     #[derive(Debug, Clone)]
     struct StubType;
     impl DynType for StubType {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
         fn kind(&self) -> &'static str {
             "stub.t"
         }

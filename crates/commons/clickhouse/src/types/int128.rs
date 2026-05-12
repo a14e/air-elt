@@ -29,6 +29,10 @@ impl ChInt128Type {
 }
 
 impl DynType for ChInt128Type {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> &'static str {
         Self::KIND
     }
@@ -167,6 +171,10 @@ impl ChUInt128Type {
 }
 
 impl DynType for ChUInt128Type {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> &'static str {
         Self::KIND
     }

@@ -88,6 +88,10 @@ fn camel_to_snake(s: &str) -> String {
 }
 
 impl DynType for ChAggregateStateType {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> &'static str {
         self.kind_static()
     }

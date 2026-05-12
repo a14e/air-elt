@@ -13,9 +13,10 @@
 //! * `LowCardinality(T)` — transparent storage hint; we strip it and
 //!   parse `T`. Round-tripping LC↔non-LC happens server-side on INSERT.
 //! * `Array(T)` / `Tuple(...)` / `Map(K, V)` / `Nested(...)` — mapped
-//!   onto canonical [`DataType::Json`]. The structural shape is faithful
-//!   to JSON, and the JSON pivot integrates with the existing mapping
-//!   matrix.
+//!   onto [`DataType::Custom`] carriers ([`ChArrayType`], [`ChMapType`],
+//!   [`ChTupleType`]). Each preserves the inner type(s) for faithful
+//!   RowBinary encoding. The JSON pivot (cross-canonical conversion)
+//!   integrates these with the existing mapping matrix.
 //! * `AggregateFunction(fn, args)` / `SimpleAggregateFunction(fn, args)`
 //!   — mapped to [`DataType::Custom`] carrying [`ChAggregateStateType`]
 //!   from the [`crate::types::aggregate_state`] module. Opaque binary
@@ -45,14 +46,18 @@ use thiserror::Error;
 use air_elt_core::types::data_type::DataType;
 
 use crate::types::aggregate_state::ChAggregateStateType;
-use crate::types::array_::ChArrayType;
-use crate::types::enum_::{ChEnum8Type, ChEnum16Type};
+use crate::types::array::ChArrayType;
+use crate::types::enums::{ChEnum8Type, ChEnum16Type};
 use crate::types::fixed_string::ChFixedStringType;
 use crate::types::int128::{ChInt128Type, ChUInt128Type};
 use crate::types::int256::{ChInt256Type, ChUInt256Type};
 use crate::types::ip::{ChIpv4Type, ChIpv6Type};
-use crate::types::map_::ChMapType;
-use crate::types::tuple_::ChTupleType;
+use crate::types::map::ChMapType;
+use crate::types::tuple::ChTupleType;
+
+/// `(DataType, nullable)`. Used throughout the parser for propagating
+/// nullability through composite type arguments.
+type TypeAndNull = (DataType, bool);
 
 /// Parsed shape of a CH column type string.
 #[derive(Debug, Clone, PartialEq)]
@@ -317,12 +322,21 @@ impl<'a> Parser<'a> {
                 })))
             }
             "Array" => {
-                let inner = self.parse_single_type_arg("Array")?;
-                Ok(DataType::Custom(Box::new(ChArrayType { element: inner })))
+                let (inner, nullable) = self.parse_single_type_arg("Array")?;
+                Ok(DataType::Custom(Box::new(ChArrayType {
+                    element: inner,
+                    element_nullable: nullable,
+                })))
             }
             "Map" => {
-                let (key, value) = self.parse_two_type_args("Map")?;
-                Ok(DataType::Custom(Box::new(ChMapType { key, value })))
+                let ((key, key_nullable), (value, value_nullable)) =
+                    self.parse_two_type_args("Map")?;
+                Ok(DataType::Custom(Box::new(ChMapType {
+                    key,
+                    value,
+                    key_nullable,
+                    value_nullable,
+                })))
             }
             "Tuple" => {
                 let fields = self.parse_type_list("Tuple")?;
@@ -335,7 +349,10 @@ impl<'a> Parser<'a> {
             "Nested" => {
                 let fields = self.parse_nested_fields()?;
                 let tuple = DataType::Custom(Box::new(ChTupleType { fields }));
-                Ok(DataType::Custom(Box::new(ChArrayType { element: tuple })))
+                Ok(DataType::Custom(Box::new(ChArrayType {
+                    element: tuple,
+                    element_nullable: false,
+                })))
             }
             // Geo types are tuples/arrays under the hood — JSON pivot.
             "Point" | "Ring" | "Polygon" | "MultiPolygon" | "LineString" | "MultiLineString" => {
@@ -383,34 +400,39 @@ impl<'a> Parser<'a> {
 
     /// Parse `(Type)` — consume `(`, parse the inner type recursively
     /// via `parse_outer` (so `Nullable`/`LowCardinality` wrappers on
-    /// the element type are handled), then consume `)`.
-    fn parse_single_type_arg(&mut self, _ctor: &str) -> Result<DataType, ParseError> {
+    /// the element type are handled), then consume `)`. Returns the
+    /// inner type with its nullability flag.
+    fn parse_single_type_arg(&mut self, _ctor: &str) -> Result<(DataType, bool), ParseError> {
         self.skip_ws();
         self.expect('(')?;
-        let (inner, _nullable) = self.parse_outer()?;
+        let (inner, nullable) = self.parse_outer()?;
         self.skip_ws();
         self.expect(')')?;
-        Ok(inner)
+        Ok((inner, nullable))
     }
 
-    /// Parse `(Type1, Type2)`.
-    fn parse_two_type_args(&mut self, _ctor: &str) -> Result<(DataType, DataType), ParseError> {
+    /// Parse `(Type1, Type2)`. Returns each type with its nullability flag.
+    fn parse_two_type_args(
+        &mut self,
+        _ctor: &str,
+    ) -> Result<(TypeAndNull, TypeAndNull), ParseError> {
         self.skip_ws();
         self.expect('(')?;
-        let (first, _) = self.parse_outer()?;
+        let first = self.parse_outer()?;
         self.skip_ws();
         self.expect(',')?;
-        let (second, _) = self.parse_outer()?;
+        let second = self.parse_outer()?;
         self.skip_ws();
         self.expect(')')?;
         Ok((first, second))
     }
 
     /// Parse `(Type1, Type2, ...)` — comma-separated type list.
-    fn parse_type_list(&mut self, _ctor: &str) -> Result<Vec<DataType>, ParseError> {
+    /// Returns each type with its nullability flag.
+    fn parse_type_list(&mut self, _ctor: &str) -> Result<Vec<(DataType, bool)>, ParseError> {
         self.skip_ws();
         self.expect('(')?;
-        let mut types = Vec::new();
+        let mut types: Vec<(DataType, bool)> = Vec::new();
         loop {
             self.skip_ws();
             if self.peek() == Some(')') {
@@ -430,35 +452,37 @@ impl<'a> Parser<'a> {
             let _first = self.read_ident();
             self.skip_ws();
             let first_is_field_name = match self.peek() {
-                // Followed by another ident starter or `(` → `first`
-                // was a field name, the actual type follows.
-                Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '(' => true,
+                // Followed by another ident starter → `first` was a
+                // field name, the actual type follows. Note: `(` is
+                // NOT included — `Nullable(`, `Array(`, etc. are
+                // type names with arguments, not field names.
+                Some(c) if c.is_ascii_alphanumeric() || c == '_' => true,
                 _ => false,
             };
             if first_is_field_name {
                 // Discard `first` (field name), parse the type.
-                let (dt, _) = self.parse_outer()?;
-                types.push(dt);
+                let (dt, nullable) = self.parse_outer()?;
+                types.push((dt, nullable));
             } else {
-                // `first` is the type name. Restore and parse via
-                // parse_named (handles `Array(...)`, `Map(...)`,
-                // `Nullable(...)`, etc.).
+                // `first` is a type name (not a field name). Restore
+                // and parse via parse_outer so that `Nullable(...)`,
+                // `LowCardinality(...)`, etc. are properly unwrapped.
                 self.pos = saved;
-                let dt = self.parse_named()?;
-                types.push(dt);
+                let (dt, nullable) = self.parse_outer()?;
+                types.push((dt, nullable));
             }
         }
         Ok(types)
     }
 
     /// Parse Nested field declarations: `(name1 Type1, name2 Type2, ...)`.
-    /// Returns the field types only — field names are discarded because
-    /// `Nested` is sugar for `Array(Tuple(...))` and the names are
-    /// presentation-only.
-    fn parse_nested_fields(&mut self) -> Result<Vec<DataType>, ParseError> {
+    /// Returns field types with nullability — field names are discarded
+    /// because `Nested` is sugar for `Array(Tuple(...))` and the names
+    /// are presentation-only.
+    fn parse_nested_fields(&mut self) -> Result<Vec<(DataType, bool)>, ParseError> {
         self.skip_ws();
         self.expect('(')?;
-        let mut types = Vec::new();
+        let mut types: Vec<(DataType, bool)> = Vec::new();
         loop {
             self.skip_ws();
             if self.peek() == Some(')') {
@@ -472,9 +496,9 @@ impl<'a> Parser<'a> {
             // Consume the field name.
             let _name = self.read_ident();
             self.skip_ws();
-            // Parse the field type.
-            let (dt, _) = self.parse_outer()?;
-            types.push(dt);
+            // Parse the field type with nullability.
+            let (dt, nullable) = self.parse_outer()?;
+            types.push((dt, nullable));
         }
         Ok(types)
     }
@@ -874,6 +898,57 @@ mod tests {
                 assert!(t.display().contains("Tuple"), "Nested should wrap Tuple");
             }
             _ => panic!("expected Custom(Array), got {nested:?}"),
+        }
+    }
+
+    #[test]
+    fn nullable_inside_composites() {
+        // Array(Nullable(Int32)) — element_nullable = true
+        let arr = parse("Array(Nullable(Int32))").data_type;
+        match &arr {
+            DataType::Custom(t) => {
+                assert_eq!(t.kind(), "clickhouse.array");
+                let arr_ty = t.as_any().downcast_ref::<ChArrayType>().unwrap();
+                assert!(arr_ty.element_nullable);
+                assert_eq!(arr_ty.element, DataType::Int32);
+            }
+            _ => panic!("expected Custom(Array), got {arr:?}"),
+        }
+
+        // Map(String, Nullable(Int32)) — value_nullable = true
+        let map = parse("Map(String, Nullable(Int32))").data_type;
+        match &map {
+            DataType::Custom(t) => {
+                assert_eq!(t.kind(), "clickhouse.map");
+                let map_ty = t.as_any().downcast_ref::<ChMapType>().unwrap();
+                assert!(!map_ty.key_nullable);
+                assert!(map_ty.value_nullable);
+            }
+            _ => panic!("expected Custom(Map), got {map:?}"),
+        }
+
+        // Tuple(Nullable(Int32), String) — first field nullable
+        let tup = parse("Tuple(Nullable(Int32), String)").data_type;
+        match &tup {
+            DataType::Custom(t) => {
+                assert_eq!(t.kind(), "clickhouse.tuple");
+                let tup_ty = t.as_any().downcast_ref::<ChTupleType>().unwrap();
+                assert!(tup_ty.fields[0].1, "first field should be nullable");
+                assert!(!tup_ty.fields[1].1, "second field should not be nullable");
+            }
+            _ => panic!("expected Custom(Tuple), got {tup:?}"),
+        }
+
+        // Tuple(a Nullable(Int32), b String) — named, first field nullable
+        let named_tup = parse("Tuple(a Nullable(Int32), b String)").data_type;
+        match &named_tup {
+            DataType::Custom(t) => {
+                assert_eq!(t.kind(), "clickhouse.tuple");
+                let tup_ty = t.as_any().downcast_ref::<ChTupleType>().unwrap();
+                assert!(tup_ty.fields[0].1, "named: first field should be nullable");
+                assert!(!tup_ty.fields[1].1);
+            }
+            _ => panic!("expected Custom(Tuple), got {named_tup:?}"),
         }
     }
 

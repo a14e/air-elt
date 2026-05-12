@@ -52,6 +52,10 @@ pub struct ChEnumValue {
 macro_rules! impl_enum_dyn_type {
     ($t:ident, $kind:expr) => {
         impl DynType for $t {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
             fn kind(&self) -> &'static str {
                 Self::KIND
             }

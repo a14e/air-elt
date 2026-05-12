@@ -44,6 +44,10 @@ impl MongoJsType {
 }
 
 impl DynType for MongoJsType {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn kind(&self) -> &'static str {
         Self::KIND
     }
