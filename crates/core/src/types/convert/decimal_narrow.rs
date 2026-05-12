@@ -6,7 +6,7 @@
 use super::error::ConvertError;
 use super::saturate::*;
 use crate::types::{DataType, Value};
-use bigdecimal::BigDecimal;
+use bigdecimal::{BigDecimal, RoundingMode};
 
 pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, ConvertError> {
     use DataType::*;
@@ -72,7 +72,7 @@ fn narrow_decimal(d: BigDecimal, precision: Option<u32>, scale: Option<u32>) -> 
         (_, Some(s)) => s as i64,
         (Some(_), None) => 0,
     };
-    let mut out = d.with_scale(target_scale);
+    let mut out = d.with_scale_round(target_scale, RoundingMode::Down);
     if let Some(p) = precision {
         let (mantissa, mantissa_scale) = out.into_bigint_and_exponent();
         // sat_bigint_to_width caps |mantissa| < 10^p — the BigDecimal's
@@ -187,5 +187,23 @@ mod tests {
             Value::BigInt(b) => assert_eq!(b.to_string(), "99999"),
             _ => panic!("expected BigInt"),
         }
+    }
+
+    /// `with_scale_round(..., Down)` must truncate toward zero, not
+    /// banker's-round.  12.3455 → scale 2 must be 12.34, not 12.35.
+    /// ClickHouse and Postgres both truncate on scale narrowing.
+    #[test]
+    fn narrow_decimal_truncates_toward_zero_not_round() {
+        let d: BigDecimal = "12.3455".parse().unwrap();
+        let out = narrow_decimal(d, Some(10), Some(2));
+        assert_eq!(out, BigDecimal::from_str("12.34").unwrap());
+    }
+
+    /// Negative values also truncate toward zero: -12.3499 → -12.34.
+    #[test]
+    fn narrow_decimal_truncates_negative_toward_zero() {
+        let d: BigDecimal = "-12.3499".parse().unwrap();
+        let out = narrow_decimal(d, Some(10), Some(2));
+        assert_eq!(out, BigDecimal::from_str("-12.34").unwrap());
     }
 }

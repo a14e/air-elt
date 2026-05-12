@@ -45,11 +45,14 @@ use thiserror::Error;
 use air_elt_core::types::data_type::DataType;
 
 use crate::types::aggregate_state::ChAggregateStateType;
+use crate::types::array_::ChArrayType;
 use crate::types::enum_::{ChEnum8Type, ChEnum16Type};
 use crate::types::fixed_string::ChFixedStringType;
 use crate::types::int128::{ChInt128Type, ChUInt128Type};
 use crate::types::int256::{ChInt256Type, ChUInt256Type};
 use crate::types::ip::{ChIpv4Type, ChIpv6Type};
+use crate::types::map_::ChMapType;
+use crate::types::tuple_::ChTupleType;
 
 /// Parsed shape of a CH column type string.
 #[derive(Debug, Clone, PartialEq)]
@@ -313,12 +316,26 @@ impl<'a> Parser<'a> {
                     simple: name == "SimpleAggregateFunction",
                 })))
             }
-            // Structural composites mapped onto Json.
-            "Array" | "Tuple" | "Map" | "Nested" => {
-                if has_args {
-                    self.skip_balanced_parens()?;
-                }
-                Ok(DataType::Json)
+            "Array" => {
+                let inner = self.parse_single_type_arg("Array")?;
+                Ok(DataType::Custom(Box::new(ChArrayType { element: inner })))
+            }
+            "Map" => {
+                let (key, value) = self.parse_two_type_args("Map")?;
+                Ok(DataType::Custom(Box::new(ChMapType { key, value })))
+            }
+            "Tuple" => {
+                let fields = self.parse_type_list("Tuple")?;
+                Ok(DataType::Custom(Box::new(ChTupleType { fields })))
+            }
+            // Nested(name1 Type1, ...) is CH syntactic sugar for
+            // Array(Tuple(name1 Type1, ...)).  The column names inside
+            // a Nested declaration are presentation-only — RowBinary
+            // encodes the same wire layout as Array(Tuple(...)).
+            "Nested" => {
+                let fields = self.parse_nested_fields()?;
+                let tuple = DataType::Custom(Box::new(ChTupleType { fields }));
+                Ok(DataType::Custom(Box::new(ChArrayType { element: tuple })))
             }
             // Geo types are tuples/arrays under the hood — JSON pivot.
             "Point" | "Ring" | "Polygon" | "MultiPolygon" | "LineString" | "MultiLineString" => {
@@ -362,6 +379,80 @@ impl<'a> Parser<'a> {
             self.pos += c.len_utf8();
         }
         Ok(())
+    }
+
+    /// Parse `(Type)` — consume `(`, parse the inner type recursively
+    /// via `parse_outer` (so `Nullable`/`LowCardinality` wrappers on
+    /// the element type are handled), then consume `)`.
+    fn parse_single_type_arg(&mut self, _ctor: &str) -> Result<DataType, ParseError> {
+        self.skip_ws();
+        self.expect('(')?;
+        let (inner, _nullable) = self.parse_outer()?;
+        self.skip_ws();
+        self.expect(')')?;
+        Ok(inner)
+    }
+
+    /// Parse `(Type1, Type2)`.
+    fn parse_two_type_args(&mut self, _ctor: &str) -> Result<(DataType, DataType), ParseError> {
+        self.skip_ws();
+        self.expect('(')?;
+        let (first, _) = self.parse_outer()?;
+        self.skip_ws();
+        self.expect(',')?;
+        let (second, _) = self.parse_outer()?;
+        self.skip_ws();
+        self.expect(')')?;
+        Ok((first, second))
+    }
+
+    /// Parse `(Type1, Type2, ...)` — comma-separated type list.
+    fn parse_type_list(&mut self, _ctor: &str) -> Result<Vec<DataType>, ParseError> {
+        self.skip_ws();
+        self.expect('(')?;
+        let mut types = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(')') {
+                self.bump(')');
+                break;
+            }
+            if !types.is_empty() {
+                self.expect(',')?;
+                self.skip_ws();
+            }
+            let (dt, _) = self.parse_outer()?;
+            types.push(dt);
+        }
+        Ok(types)
+    }
+
+    /// Parse Nested field declarations: `(name1 Type1, name2 Type2, ...)`.
+    /// Returns the field types only — field names are discarded because
+    /// `Nested` is sugar for `Array(Tuple(...))` and the names are
+    /// presentation-only.
+    fn parse_nested_fields(&mut self) -> Result<Vec<DataType>, ParseError> {
+        self.skip_ws();
+        self.expect('(')?;
+        let mut types = Vec::new();
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(')') {
+                self.bump(')');
+                break;
+            }
+            if !types.is_empty() {
+                self.expect(',')?;
+                self.skip_ws();
+            }
+            // Consume the field name.
+            let _name = self.read_ident();
+            self.skip_ws();
+            // Parse the field type.
+            let (dt, _) = self.parse_outer()?;
+            types.push(dt);
+        }
+        Ok(types)
     }
 
     fn parse_single_uint_arg(&mut self, ctor: &str) -> Result<u32, ParseError> {
@@ -708,18 +799,48 @@ mod tests {
     }
 
     #[test]
-    fn composites_map_to_json() {
-        assert_eq!(parse("Array(String)").data_type, DataType::Json);
-        assert_eq!(
-            parse("Map(String, Array(UInt64))").data_type,
-            DataType::Json
-        );
-        assert_eq!(
-            parse("Tuple(String, Int32, Float64)").data_type,
-            DataType::Json
-        );
+    fn composites_parse_to_custom_types() {
+        // Array(String) → Custom(ChArrayType { element: Text })
+        let arr = parse("Array(String)").data_type;
+        match &arr {
+            DataType::Custom(t) => {
+                assert_eq!(t.kind(), "clickhouse.array");
+                assert_eq!(t.display(), "Array(text)");
+            }
+            _ => panic!("expected Custom, got {arr:?}"),
+        }
+
+        // Map(String, Array(UInt64)) → nested custom types
+        let map = parse("Map(String, Array(UInt64))").data_type;
+        match &map {
+            DataType::Custom(t) => {
+                assert_eq!(t.kind(), "clickhouse.map");
+            }
+            _ => panic!("expected Custom, got {map:?}"),
+        }
+
+        // Tuple(String, Int32, Float64)
+        let tuple = parse("Tuple(String, Int32, Float64)").data_type;
+        match &tuple {
+            DataType::Custom(t) => {
+                assert_eq!(t.kind(), "clickhouse.tuple");
+            }
+            _ => panic!("expected Custom, got {tuple:?}"),
+        }
+
+        // Geo types still map to Json.
         assert_eq!(parse("Point").data_type, DataType::Json);
         assert_eq!(parse("MultiPolygon").data_type, DataType::Json);
+
+        // Nested(name String, age Int32) → Array(Tuple(name String, age Int32))
+        let nested = parse("Nested(name String, age Int32)").data_type;
+        match &nested {
+            DataType::Custom(t) => {
+                assert_eq!(t.kind(), "clickhouse.array");
+                assert!(t.display().contains("Tuple"), "Nested should wrap Tuple");
+            }
+            _ => panic!("expected Custom(Array), got {nested:?}"),
+        }
     }
 
     #[test]

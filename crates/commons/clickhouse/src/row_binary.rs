@@ -37,11 +37,14 @@ use air_elt_core::types::data_type::DataType;
 use air_elt_core::types::value::Value;
 
 use crate::types::aggregate_state::{ChAggregateStateType, ChAggregateStateValue};
+use crate::types::array_::{ChArrayType, ChArrayValue};
 use crate::types::enum_::{ChEnum8Type, ChEnum16Type, ChEnumValue};
 use crate::types::fixed_string::{ChFixedStringType, ChFixedStringValue};
 use crate::types::int128::{ChInt128Type, ChInt128Value, ChUInt128Type, ChUInt128Value};
 use crate::types::int256::{ChInt256Type, ChInt256Value, ChUInt256Type, ChUInt256Value};
 use crate::types::ip::{ChIpv4Type, ChIpv4Value, ChIpv6Type, ChIpv6Value};
+use crate::types::map_::{ChMapType, ChMapValue};
+use crate::types::tuple_::{ChTupleType, ChTupleValue};
 
 #[derive(Debug, Error)]
 pub enum EncodeError {
@@ -396,6 +399,61 @@ fn encode_typed(
                 }
                 _ => mismatch(column, dt, value),
             },
+            ChArrayType::KIND => match value {
+                Value::Custom(b) => {
+                    let v = b.as_any().downcast_ref::<ChArrayValue>().ok_or_else(|| {
+                        EncodeError::Mismatch {
+                            column: column.to_string(),
+                            expected: "Array".to_string(),
+                            got: "Custom(non-Array)",
+                        }
+                    })?;
+                    write_var_uint(out, v.elements.len() as u64);
+                    for elem in &v.elements {
+                        encode_typed(out, column, &v.element_type, elem)?;
+                    }
+                    Ok(())
+                }
+                _ => mismatch(column, dt, value),
+            },
+            ChMapType::KIND => match value {
+                Value::Custom(b) => {
+                    let v = b.as_any().downcast_ref::<ChMapValue>().ok_or_else(|| {
+                        EncodeError::Mismatch {
+                            column: column.to_string(),
+                            expected: "Map".to_string(),
+                            got: "Custom(non-Map)",
+                        }
+                    })?;
+                    write_var_uint(out, v.entries.len() as u64);
+                    // Map encoding: for each pair, encode key then value.
+                    // Keys/values are stored as canonical Values — encode
+                    // each with its own type derived from the value variant.
+                    for (key, val) in &v.entries {
+                        encode_typed(out, column, &concrete_type(key), key)?;
+                        encode_typed(out, column, &concrete_type(val), val)?;
+                    }
+                    Ok(())
+                }
+                _ => mismatch(column, dt, value),
+            },
+            ChTupleType::KIND => match value {
+                Value::Custom(b) => {
+                    let v = b.as_any().downcast_ref::<ChTupleValue>().ok_or_else(|| {
+                        EncodeError::Mismatch {
+                            column: column.to_string(),
+                            expected: "Tuple".to_string(),
+                            got: "Custom(non-Tuple)",
+                        }
+                    })?;
+                    // Tuple: no length prefix, just field payloads in order.
+                    for field in &v.fields {
+                        encode_typed(out, column, &concrete_type(field), field)?;
+                    }
+                    Ok(())
+                }
+                _ => mismatch(column, dt, value),
+            },
             other => Err(EncodeError::Unsupported {
                 column: column.to_string(),
                 ty: other.to_string(),
@@ -445,7 +503,7 @@ fn encode_decimal(
 
     // Rescale the BigDecimal to the target scale, then extract the
     // integer mantissa (coefficient * 10^(current_scale - target_scale)).
-    let scaled = d.with_scale(effective_scale);
+    let scaled = d.with_scale_round(effective_scale, bigdecimal::RoundingMode::Down);
     let (mantissa, _exp) = scaled.as_bigint_and_exponent();
 
     let width = decimal_width(effective_precision);
@@ -573,6 +631,39 @@ fn value_variant(v: &Value) -> &'static str {
         Value::Uuid(_) => "Uuid",
         Value::Json(_) => "Json",
         Value::Custom(_) => "Custom",
+    }
+}
+
+/// Map a canonical `Value` variant to a `DataType` suitable for
+/// recursive `encode_typed` calls. Used by the `Map` and `Tuple`
+/// encoder arms where element types are not carried separately
+/// on the value struct.
+fn concrete_type(v: &Value) -> DataType {
+    match v {
+        Value::Null => DataType::Text { size: None },
+        Value::Bool(_) => DataType::Bool,
+        Value::Int8(_) => DataType::Int8,
+        Value::Int16(_) => DataType::Int16,
+        Value::Int32(_) => DataType::Int32,
+        Value::Int64(_) => DataType::Int64,
+        Value::UInt8(_) => DataType::UInt8,
+        Value::UInt16(_) => DataType::UInt16,
+        Value::UInt32(_) => DataType::UInt32,
+        Value::UInt64(_) => DataType::UInt64,
+        Value::Float32(_) => DataType::Float32,
+        Value::Float64(_) => DataType::Float64,
+        Value::BigInt(_) => DataType::BigInt { width: None },
+        Value::Decimal(_) => DataType::Decimal {
+            precision: None,
+            scale: None,
+        },
+        Value::Text(_) => DataType::Text { size: None },
+        Value::Bytes(_) => DataType::Bytes { size: None },
+        Value::Date(_) => DataType::Date,
+        Value::Timestamp(_) => DataType::Timestamp,
+        Value::Uuid(_) => DataType::Uuid,
+        Value::Json(_) => DataType::Json,
+        Value::Custom(c) => DataType::Custom(c.dyn_type()),
     }
 }
 
@@ -882,5 +973,90 @@ mod tests {
         assert_eq!(out.len(), 32);
         assert_eq!(out[0], 0xFF);
         assert!(out[1..].iter().all(|&b| b == 0));
+    }
+
+    // ---- Array / Map / Tuple ----------------------------------------------
+
+    #[test]
+    fn array_encodes_var_uint_len_then_elements() {
+        let elem_type = DataType::Int32;
+        let arr_dt = DataType::Custom(Box::new(ChArrayType {
+            element: elem_type.clone(),
+        }));
+        let arr_val = Value::Custom(Box::new(ChArrayValue {
+            element_type: elem_type,
+            elements: vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)],
+        }));
+        let mut out = Vec::new();
+        encode_value(&mut out, &field("a", arr_dt, false), &arr_val).unwrap();
+        // VarUInt length = 3 → 0x03
+        assert_eq!(out[0], 3);
+        // Element 0: 1, 0, 0, 0 (i32 LE)
+        assert_eq!(out[1], 1);
+        assert_eq!(out[5], 2);
+        assert_eq!(out[9], 3);
+        assert_eq!(out.len(), 1 + 3 * 4);
+    }
+
+    #[test]
+    fn array_empty_encodes_zero_length() {
+        let elem_type = DataType::Text { size: None };
+        let arr_dt = DataType::Custom(Box::new(ChArrayType {
+            element: elem_type.clone(),
+        }));
+        let arr_val = Value::Custom(Box::new(ChArrayValue {
+            element_type: elem_type,
+            elements: vec![],
+        }));
+        let mut out = Vec::new();
+        encode_value(&mut out, &field("a", arr_dt, false), &arr_val).unwrap();
+        assert_eq!(out, vec![0]);
+    }
+
+    #[test]
+    fn tuple_encodes_fields_without_length_prefix() {
+        let tuple_dt = DataType::Custom(Box::new(ChTupleType {
+            fields: vec![DataType::Int32, DataType::Bool],
+        }));
+        let tuple_val = Value::Custom(Box::new(ChTupleValue {
+            fields: vec![Value::Int32(42), Value::Bool(true)],
+        }));
+        let mut out = Vec::new();
+        encode_value(&mut out, &field("t", tuple_dt, false), &tuple_val).unwrap();
+        // Field 0: Int32 LE 42 → [42, 0, 0, 0]
+        assert_eq!(out[0], 42);
+        // Field 1: Bool true → [1]
+        assert_eq!(out[4], 1);
+        // No VarUInt prefix — fixed 5 bytes
+        assert_eq!(out.len(), 5);
+    }
+
+    #[test]
+    fn map_encodes_var_uint_len_then_pairs() {
+        let map_dt = DataType::Custom(Box::new(ChMapType {
+            key: DataType::Text { size: None },
+            value: DataType::Int32,
+        }));
+        let map_val = Value::Custom(Box::new(ChMapValue {
+            entries: vec![
+                (Value::Text("k".into()), Value::Int32(1)),
+                (Value::Text("ey".into()), Value::Int32(2)),
+            ],
+        }));
+        let mut out = Vec::new();
+        encode_value(&mut out, &field("m", map_dt, false), &map_val).unwrap();
+        // VarUInt length = 2 → 0x02
+        assert_eq!(out[0], 2);
+        // Pair 0 key: "k" → VarUInt 1, 'k'
+        assert_eq!(out[1], 1);
+        assert_eq!(out[2], b'k');
+        // Pair 0 val: Int32 1 LE
+        assert_eq!(out[3], 1);
+        // Pair 1 key: "ey" → VarUInt 2, 'e', 'y'
+        assert_eq!(out[7], 2);
+        assert_eq!(out[8], b'e');
+        assert_eq!(out[9], b'y');
+        // Pair 1 val: Int32 2 LE
+        assert_eq!(out[10], 2);
     }
 }

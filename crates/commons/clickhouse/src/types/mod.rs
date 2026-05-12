@@ -5,8 +5,11 @@
 //! unchanged.
 
 pub mod aggregate_state;
+pub mod array_;
 pub mod enum_;
 pub mod fixed_string;
 pub mod int128;
 pub mod int256;
 pub mod ip;
+pub mod map_;
+pub mod tuple_;
