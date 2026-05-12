@@ -51,28 +51,17 @@ pub fn quote_qualified(name: &str) -> Result<String, IdentifierError> {
     Ok(out)
 }
 
-/// Quote a column list comma-joined.
+/// Quote a column list comma-joined. ClickHouse Nested sub-columns
+/// use dotted names (`items.label`, `items.qty`). The dot is part of
+/// the column name, not a db/table separator — each name is backtick-
+/// quoted as a single identifier.
 pub fn quote_columns(names: &[String]) -> Result<String, IdentifierError> {
     let mut out = String::new();
     for (i, name) in names.iter().enumerate() {
-        let segments = parse_qualified(name, QUOTE)?;
-        if segments.len() != 1 {
-            return Err(IdentifierError::TooManySegments {
-                value: name.clone(),
-                got: segments.len(),
-                max: 1,
-            });
-        }
-        let seg = &segments[0];
-        if !seg.quoted {
-            validate_segment(&seg.value)?;
-        } else if seg.value.is_empty() {
-            return Err(IdentifierError::EmptySegment);
-        }
         if i > 0 {
             out.push_str(", ");
         }
-        out.push_str(&quote_ident(&seg.value));
+        out.push_str(&quote_ident(name));
     }
     Ok(out)
 }
@@ -132,5 +121,19 @@ mod tests {
         let (db, t) = split_qualified("db.users").unwrap();
         assert_eq!(db.as_deref(), Some("db"));
         assert_eq!(t, "users");
+    }
+
+    #[test]
+    fn quote_columns_simple() {
+        let cols = &["id".into(), "name".into()];
+        assert_eq!(quote_columns(cols).unwrap(), "`id`, `name`");
+    }
+
+    #[test]
+    fn quote_columns_dotted_nested_name() {
+        // Nested sub-columns use dotted names — the dot is part of
+        // the identifier, not a db/table separator.
+        let cols = &["items.label".into(), "items.qty".into()];
+        assert_eq!(quote_columns(cols).unwrap(), "`items.label`, `items.qty`");
     }
 }

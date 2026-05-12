@@ -421,8 +421,32 @@ impl<'a> Parser<'a> {
                 self.expect(',')?;
                 self.skip_ws();
             }
-            let (dt, _) = self.parse_outer()?;
-            types.push(dt);
+            // CH Tuple fields may have optional names:
+            //   Tuple(Int32, String)          — unnamed
+            //   Tuple(a Int32, b String)      — named
+            // Strategy: save position, read the first identifier, then
+            // peek at what follows.
+            let saved = self.pos;
+            let _first = self.read_ident();
+            self.skip_ws();
+            let first_is_field_name = match self.peek() {
+                // Followed by another ident starter or `(` → `first`
+                // was a field name, the actual type follows.
+                Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '(' => true,
+                _ => false,
+            };
+            if first_is_field_name {
+                // Discard `first` (field name), parse the type.
+                let (dt, _) = self.parse_outer()?;
+                types.push(dt);
+            } else {
+                // `first` is the type name. Restore and parse via
+                // parse_named (handles `Array(...)`, `Map(...)`,
+                // `Nullable(...)`, etc.).
+                self.pos = saved;
+                let dt = self.parse_named()?;
+                types.push(dt);
+            }
         }
         Ok(types)
     }
@@ -826,6 +850,16 @@ mod tests {
                 assert_eq!(t.kind(), "clickhouse.tuple");
             }
             _ => panic!("expected Custom, got {tuple:?}"),
+        }
+
+        // Tuple(a Int32, b String) — named fields are discarded
+        let named_tuple = parse("Tuple(a Int32, b String)").data_type;
+        match &named_tuple {
+            DataType::Custom(t) => {
+                assert_eq!(t.kind(), "clickhouse.tuple");
+                assert_eq!(t.display(), "Tuple(int32, text)");
+            }
+            _ => panic!("expected Custom(Tuple), got {named_tuple:?}"),
         }
 
         // Geo types still map to Json.
