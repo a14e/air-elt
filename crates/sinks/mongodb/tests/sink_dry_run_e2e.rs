@@ -54,7 +54,7 @@ async fn write_batch_dry_run_skips_writes_then_real_run_commits() {
         .collection::<bson::Document>("dry_run_users");
 
     let report_dry = sink
-        .write_batch(&spec, ctx.clone(), make_batch(), true)
+        .write_batch(&spec, &ctx, make_batch(), true)
         .await
         .expect("dry-run write");
     assert_eq!(report_dry.rows_written, 0);
@@ -65,7 +65,7 @@ async fn write_batch_dry_run_skips_writes_then_real_run_commits() {
     );
 
     let report = sink
-        .write_batch(&spec, ctx, make_batch(), false)
+        .write_batch(&spec, &ctx, make_batch(), false)
         .await
         .expect("real write");
     assert_eq!(report.rows_written, 2);
@@ -116,7 +116,7 @@ async fn raw_passthrough_dry_run_skips_writes() {
         next_cursor: None,
     };
 
-    let report = sink.write_batch(&spec, ctx, batch, true).await.unwrap();
+    let report = sink.write_batch(&spec, &ctx, batch, true).await.unwrap();
     assert_eq!(report.rows_written, 0);
 
     let coll = handle
@@ -236,7 +236,7 @@ async fn dry_run_delete_validates_per_row_key_encoding() {
         ],
         next_cursor: None,
     };
-    sink.write_batch(&spec, ctx.clone(), seed, false)
+    sink.write_batch(&spec, &ctx, seed, false)
         .await
         .expect("seed");
 
@@ -255,7 +255,7 @@ async fn dry_run_delete_validates_per_row_key_encoding() {
         next_cursor: None,
     };
     let report = sink
-        .write_batch(&spec, ctx.clone(), dry_delete, true)
+        .write_batch(&spec, &ctx, dry_delete, true)
         .await
         .expect("dry-run delete");
     assert_eq!(report.rows_written, 0);
@@ -277,7 +277,7 @@ async fn dry_run_delete_validates_per_row_key_encoding() {
         next_cursor: None,
     };
     let err = sink
-        .write_batch(&spec, ctx.clone(), broken, true)
+        .write_batch(&spec, &ctx, broken, true)
         .await
         .expect_err("dry-run delete with unencodable key must error");
     let msg = format!("{err}");
@@ -296,7 +296,7 @@ async fn dry_run_delete_validates_per_row_key_encoding() {
         next_cursor: None,
     };
     let report = sink
-        .write_batch(&spec, ctx, real_delete, false)
+        .write_batch(&spec, &ctx, real_delete, false)
         .await
         .expect("real delete");
     assert_eq!(report.rows_written, 2);

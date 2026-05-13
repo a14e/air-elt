@@ -132,7 +132,7 @@ async fn cdc_emits_upsert_for_inserts_replace_and_delete() {
     coll.delete_one(doc! { "_id": 1 }).await.unwrap();
 
     let batch = source
-        .read_batch(&spec, ctx, Some(&cursor))
+        .read_batch(&spec, &ctx, Some(&cursor))
         .await
         .expect("read");
     // BSON int literals (`doc!{"_id": 1}`) encode as Int32, not Int64.
@@ -178,7 +178,7 @@ async fn cdc_lookup_on_update_attaches_post_image_via_find() {
         .unwrap();
 
     let batch = source
-        .read_batch(&spec, ctx, Some(&cursor))
+        .read_batch(&spec, &ctx, Some(&cursor))
         .await
         .expect("read");
     assert_eq!(batch.rows.len(), 1);
@@ -216,7 +216,7 @@ async fn cdc_lookup_on_update_skips_when_doc_deleted_between_event_and_find() {
     coll.delete_one(doc! { "_id": 9 }).await.unwrap();
 
     let batch = source
-        .read_batch(&spec, ctx, Some(&cursor))
+        .read_batch(&spec, &ctx, Some(&cursor))
         .await
         .expect("read");
     // The update event is dropped (warn-and-skip), only the delete
@@ -265,7 +265,7 @@ async fn cdc_post_image_collapses_multiple_updates_per_id() {
         .unwrap();
 
     let batch = source
-        .read_batch(&spec, ctx, Some(&cursor))
+        .read_batch(&spec, &ctx, Some(&cursor))
         .await
         .expect("read");
     assert_eq!(batch.rows.len(), 1);
@@ -311,7 +311,7 @@ async fn cdc_post_image_insert_then_delete_emits_only_delete() {
     coll.delete_one(doc! { "_id": 6 }).await.unwrap();
 
     let batch = source
-        .read_batch(&spec, ctx, Some(&cursor))
+        .read_batch(&spec, &ctx, Some(&cursor))
         .await
         .expect("read");
     assert_eq!(batch.rows.len(), 2);
@@ -362,7 +362,7 @@ async fn cdc_lookup_on_update_collapses_multiple_updates_to_single_row() {
         .unwrap();
 
     let batch = source
-        .read_batch(&spec, ctx, Some(&cursor))
+        .read_batch(&spec, &ctx, Some(&cursor))
         .await
         .expect("read");
     assert_eq!(batch.rows.len(), 1);
@@ -388,7 +388,7 @@ async fn cdc_drop_collection_surfaces_runtime_error() {
     coll.drop().await.unwrap();
 
     let err = source
-        .read_batch(&spec, ctx, Some(&cursor))
+        .read_batch(&spec, &ctx, Some(&cursor))
         .await
         .expect_err("drop must surface as RuntimeError");
     let msg = err.to_string();
@@ -448,7 +448,7 @@ async fn cdc_to_pg_sink_round_trip_with_inserts_and_deletes() {
     coll.delete_one(doc! { "_id": 12 }).await.unwrap();
 
     let batch = source
-        .read_batch(&read_spec, src_ctx, Some(&cursor))
+        .read_batch(&read_spec, &src_ctx, Some(&cursor))
         .await
         .expect("read");
     // The source dedups by `_id`, last-event-wins. insert(11) +
@@ -456,7 +456,7 @@ async fn cdc_to_pg_sink_round_trip_with_inserts_and_deletes() {
     // batch carries exactly two Delete rows.
     assert_eq!(batch.rows.len(), 2);
     assert!(batch.rows.iter().all(|r| r.op == RowOp::Delete));
-    sink.write_batch(&write_spec, sink_ctx, batch.into_batch(), false)
+    sink.write_batch(&write_spec, &sink_ctx, batch.into_batch(), false)
         .await
         .expect("mixed batch");
 
@@ -519,7 +519,7 @@ async fn resume_token_round_trips_through_pg_storage_with_reopen() {
     let cursor_before_writes = capture_pbrt(&coll).await;
     coll.insert_one(doc! { "_id": 100 }).await.unwrap();
     let batch = source
-        .read_batch(&spec, ctx, Some(&cursor_before_writes))
+        .read_batch(&spec, &ctx, Some(&cursor_before_writes))
         .await
         .expect("read");
     let cursor = batch.next_cursor.expect("resume token");
@@ -663,10 +663,10 @@ async fn cdc_to_mysql_sink_round_trip_with_inserts_and_deletes() {
     coll.delete_one(doc! { "_id": 22 }).await.unwrap();
 
     let batch = source
-        .read_batch(&read_spec, src_ctx, Some(&cursor))
+        .read_batch(&read_spec, &src_ctx, Some(&cursor))
         .await
         .expect("read");
-    sink.write_batch(&write_spec, sink_ctx, batch.into_batch(), false)
+    sink.write_batch(&write_spec, &sink_ctx, batch.into_batch(), false)
         .await
         .expect("mixed batch");
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users_mc")
@@ -729,10 +729,10 @@ async fn cdc_to_mongo_sink_round_trip_with_inserts_and_deletes() {
     src_coll.delete_one(doc! { "_id": 31 }).await.unwrap();
 
     let batch = source
-        .read_batch(&read_spec, src_ctx, Some(&cursor))
+        .read_batch(&read_spec, &src_ctx, Some(&cursor))
         .await
         .expect("read");
-    sink.write_batch(&write_spec, sink_ctx, batch.into_batch(), false)
+    sink.write_batch(&write_spec, &sink_ctx, batch.into_batch(), false)
         .await
         .expect("mixed batch");
 
@@ -982,7 +982,7 @@ async fn cdc_attaches_body_for_upsert_when_needs_body_set() {
     coll.delete_one(doc! { "_id": 1 }).await.unwrap();
 
     let batch = source
-        .read_batch(&spec, ctx, Some(&cursor))
+        .read_batch(&spec, &ctx, Some(&cursor))
         .await
         .expect("read");
     assert!(!batch.rows.is_empty());
@@ -1027,7 +1027,7 @@ async fn cdc_skips_body_for_upsert_when_needs_body_unset() {
         .unwrap();
 
     let batch = source
-        .read_batch(&spec, ctx, Some(&cursor))
+        .read_batch(&spec, &ctx, Some(&cursor))
         .await
         .expect("read");
     assert_eq!(batch.rows.len(), 1);

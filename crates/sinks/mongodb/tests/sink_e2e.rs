@@ -50,10 +50,7 @@ async fn insert_and_upsert_with_dot_notation() {
         ],
         next_cursor: None,
     };
-    let report = sink
-        .write_batch(&spec, ctx.clone(), batch, false)
-        .await
-        .unwrap();
+    let report = sink.write_batch(&spec, &ctx, batch, false).await.unwrap();
     assert_eq!(report.rows_written, 2);
 
     // Re-write same id 1 with new city — upsert path replaces it.
@@ -65,7 +62,7 @@ async fn insert_and_upsert_with_dot_notation() {
         ])],
         next_cursor: None,
     };
-    sink.write_batch(&spec, ctx, batch2, false).await.unwrap();
+    sink.write_batch(&spec, &ctx, batch2, false).await.unwrap();
 
     let coll = handle
         .client
@@ -113,7 +110,7 @@ async fn write_object_id_lands_as_bson_object_id() {
         ])],
         next_cursor: None,
     };
-    sink.write_batch(&spec, ctx, batch, false).await.unwrap();
+    sink.write_batch(&spec, &ctx, batch, false).await.unwrap();
 
     let coll = handle
         .client
@@ -161,7 +158,7 @@ async fn write_javascript_code_round_trip() {
         ])],
         next_cursor: None,
     };
-    sink.write_batch(&spec, ctx, batch, false).await.unwrap();
+    sink.write_batch(&spec, &ctx, batch, false).await.unwrap();
 
     let coll = handle
         .client

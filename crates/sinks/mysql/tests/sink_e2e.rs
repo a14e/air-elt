@@ -74,7 +74,7 @@ async fn write_batch_and_validate_access() {
     };
     let ctx = sink.build_context(&spec).await.expect("build_context");
     let report = sink
-        .write_batch(&spec, ctx, batch, false)
+        .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write");
     assert_eq!(report.rows_written, 2);
@@ -155,7 +155,7 @@ async fn all_nulls_across_data_types() {
     };
     let ctx = sink.build_context(&spec).await.expect("build_context");
     let report = sink
-        .write_batch(&spec, ctx, batch, false)
+        .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write");
     assert_eq!(report.rows_written, 1);
@@ -277,7 +277,7 @@ async fn all_types_non_null_round_trip() {
 
     let ctx = sink.build_context(&spec).await.expect("build_context");
     let report = sink
-        .write_batch(&spec, ctx, batch, false)
+        .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write");
     assert_eq!(report.rows_written, 1);

@@ -3,8 +3,6 @@
 //! NULL flag byte path round-trips both `Value::Null` and a real
 //! value through CH.
 
-use std::sync::Arc;
-
 use air_elt_commons_testing::clickhouse::clickhouse_handle;
 use air_elt_core::model::{Batch, Row, RowOp, WriteSpec};
 use air_elt_core::traits::Sink;
@@ -67,7 +65,7 @@ async fn nullable_columns_round_trip_null_and_value() {
         next_cursor: None,
     };
     let report = sink
-        .write_batch(&spec, Arc::clone(&ctx), batch, false)
+        .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
     assert_eq!(report.rows_written, 2);

@@ -97,6 +97,11 @@ async fn cockroach_base_url() -> &'static String {
                     "start-single-node",
                     "--insecure",
                     "--store=type=mem,size=1GiB",
+                    // Default cache / SQL memory pools combine to ~25% of
+                    // host RAM, which is wildly overprovisioned for tests.
+                    // Cap both so cockroach's RSS stays under ~250 MB.
+                    "--cache=128MiB",
+                    "--max-sql-memory=128MiB",
                 ])
                 .with_container_name(format!("air-elt-cockroach-{sv}"))
                 .with_label(sk, sv)

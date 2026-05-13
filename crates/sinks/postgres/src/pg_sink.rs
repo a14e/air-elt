@@ -214,7 +214,7 @@ impl Sink for PgSink {
     async fn write_batch(
         &self,
         spec: &WriteSpec,
-        ctx: Arc<dyn SinkCtx>,
+        ctx: &Arc<dyn SinkCtx>,
         batch: Batch,
         dry_run: bool,
     ) -> RuntimeResult<WriteReport> {

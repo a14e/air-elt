@@ -26,6 +26,7 @@ use air_elt_core::mapping::FieldPath;
 use air_elt_core::model::{Row, Schema};
 use air_elt_core::types::Value;
 
+use crate::task::detached;
 use crate::{bson_value, infer, path};
 
 pub async fn sample_documents(
@@ -33,20 +34,28 @@ pub async fn sample_documents(
     n: usize,
     operation_timeout: Duration,
 ) -> RuntimeResult<Vec<Document>> {
-    let pipeline = vec![doc! { "$sample": { "size": n as i64 } }];
-    let opts = AggregateOptions::builder()
-        .max_time(operation_timeout)
-        .build();
-    let mut cursor = collection
-        .aggregate(pipeline)
-        .with_options(opts)
-        .await
-        .map_err(RuntimeError::backend)?;
-    let mut out = Vec::with_capacity(n);
-    while let Some(d) = cursor.try_next().await.map_err(RuntimeError::backend)? {
-        out.push(d);
-    }
-    Ok(out)
+    // Sampling reaches the driver via `aggregate(...).await` + cursor
+    // drain — both not cancellation-safe on mongodb 3.x. Wrap in
+    // `detached` so a runner-side `with_timeout` drop never abandons
+    // the driver futures mid-await.
+    let collection = collection.clone();
+    detached(async move {
+        let pipeline = vec![doc! { "$sample": { "size": n as i64 } }];
+        let opts = AggregateOptions::builder()
+            .max_time(operation_timeout)
+            .build();
+        let mut cursor = collection
+            .aggregate(pipeline)
+            .with_options(opts)
+            .await
+            .map_err(RuntimeError::backend)?;
+        let mut out = Vec::with_capacity(n);
+        while let Some(d) = cursor.try_next().await.map_err(RuntimeError::backend)? {
+            out.push(d);
+        }
+        Ok(out)
+    })
+    .await
 }
 
 pub async fn describe_collection_schema(

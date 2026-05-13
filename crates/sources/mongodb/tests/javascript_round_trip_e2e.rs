@@ -51,7 +51,7 @@ async fn javascript_round_trips_through_mongo_to_mongo() {
     };
     let ctx = source.build_context(&read_spec).await.expect("ctx");
     let batch = source
-        .read_batch(&read_spec, ctx, None)
+        .read_batch(&read_spec, &ctx, None)
         .await
         .expect("read");
     assert_eq!(batch.rows.len(), 1);
@@ -93,7 +93,7 @@ async fn javascript_round_trips_through_mongo_to_mongo() {
         rows: vec![Row::upsert(batch.rows[0].values.clone())],
         next_cursor: None,
     };
-    sink.write_batch(&write_spec, sink_ctx, written, false)
+    sink.write_batch(&write_spec, &sink_ctx, written, false)
         .await
         .expect("write");
 

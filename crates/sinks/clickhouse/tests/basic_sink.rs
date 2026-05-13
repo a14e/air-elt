@@ -2,8 +2,6 @@
 //! one row via the sink, read it back. Also verifies that the sink
 //! drops `RowOp::Delete` rows silently — they never reach CH.
 
-use std::sync::Arc;
-
 use air_elt_commons_testing::clickhouse::clickhouse_handle;
 use air_elt_core::config::conflict::ConflictConfig;
 use air_elt_core::model::{Batch, Row, RowOp, WriteSpec};
@@ -63,7 +61,7 @@ async fn round_trip_simple_columns() {
         next_cursor: None,
     };
     let report = sink
-        .write_batch(&spec, Arc::clone(&ctx), batch, false)
+        .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
     assert_eq!(report.rows_written, 1, "delete must be filtered");

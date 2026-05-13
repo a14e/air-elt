@@ -70,7 +70,7 @@ async fn describe_and_read_with_cursor() {
     let ctx = source.build_context(&spec).await.expect("build_context");
 
     let batch = source
-        .read_batch(&spec, ctx.clone(), None)
+        .read_batch(&spec, &ctx, None)
         .await
         .expect("read_batch initial");
     assert_eq!(batch.rows.len(), 3);
@@ -80,7 +80,7 @@ async fn describe_and_read_with_cursor() {
     assert_eq!(next.fields[0].value, Value::Int64(3));
 
     let batch = source
-        .read_batch(&spec, ctx.clone(), Some(&next))
+        .read_batch(&spec, &ctx, Some(&next))
         .await
         .expect("read_batch continued");
     assert_eq!(batch.rows.len(), 2);
@@ -89,7 +89,7 @@ async fn describe_and_read_with_cursor() {
 
     let tail = batch.next_cursor.clone().unwrap();
     let empty = source
-        .read_batch(&spec, ctx, Some(&tail))
+        .read_batch(&spec, &ctx, Some(&tail))
         .await
         .expect("read_batch drained");
     assert!(empty.rows.is_empty());
@@ -147,10 +147,7 @@ async fn read_with_nullable_cursor() {
     let ctx = source.build_context(&spec).await.expect("build_context");
 
     // First batch: NULL rows come first (NULLS FIRST): (NULL,2), (NULL,4)
-    let batch = source
-        .read_batch(&spec, ctx.clone(), None)
-        .await
-        .expect("batch 1");
+    let batch = source.read_batch(&spec, &ctx, None).await.expect("batch 1");
     assert_eq!(batch.rows.len(), 2);
     assert_eq!(batch.rows[0].values[1], Value::Null);
     assert_eq!(batch.rows[0].values[0], Value::Int64(2));
@@ -168,7 +165,7 @@ async fn read_with_nullable_cursor() {
     // Second batch: cursor=(NULL,4) → null-aware path.
     // ASC + NULL cursor: col > NULL → IS NOT NULL. Gets non-null rows: (1,1), (3,3)
     let batch = source
-        .read_batch(&spec, ctx.clone(), Some(&cursor1))
+        .read_batch(&spec, &ctx, Some(&cursor1))
         .await
         .expect("batch 2");
     assert_eq!(batch.rows.len(), 2);
@@ -178,7 +175,7 @@ async fn read_with_nullable_cursor() {
     // Drain
     let cursor2 = batch.next_cursor.expect("cursor after batch 2");
     let empty = source
-        .read_batch(&spec, ctx, Some(&cursor2))
+        .read_batch(&spec, &ctx, Some(&cursor2))
         .await
         .expect("drain");
     assert!(empty.rows.is_empty());
@@ -237,7 +234,7 @@ async fn cockroach_read_batch_smoke() {
         .expect("validate_access");
     let ctx = source.build_context(&spec).await.expect("build_context");
     let batch = source
-        .read_batch(&spec, ctx, None)
+        .read_batch(&spec, &ctx, None)
         .await
         .expect("read_batch initial");
     assert_eq!(batch.rows.len(), 5);
@@ -298,10 +295,7 @@ async fn cockroach_null_cursor_lexicographic_two_keys() {
     let ctx = source.build_context(&spec).await.expect("build_context");
 
     // First batch: NULL ranks come first under ASC NULLS FIRST.
-    let batch = source
-        .read_batch(&spec, ctx.clone(), None)
-        .await
-        .expect("batch 1");
+    let batch = source.read_batch(&spec, &ctx, None).await.expect("batch 1");
     assert_eq!(batch.rows.len(), 2);
     assert_eq!(batch.rows[0].values[1], Value::Null);
     assert_eq!(batch.rows[1].values[1], Value::Null);
@@ -317,7 +311,7 @@ async fn cockroach_null_cursor_lexicographic_two_keys() {
     // Second batch: cursor=(NULL, last_id) → null-aware path picks up
     // non-null ranks 1 and 3.
     let batch = source
-        .read_batch(&spec, ctx.clone(), Some(&cursor1))
+        .read_batch(&spec, &ctx, Some(&cursor1))
         .await
         .expect("batch 2");
     assert_eq!(batch.rows.len(), 2);
@@ -329,7 +323,7 @@ async fn cockroach_null_cursor_lexicographic_two_keys() {
     // Drain.
     let cursor2 = batch.next_cursor.expect("cursor after batch 2");
     let empty = source
-        .read_batch(&spec, ctx, Some(&cursor2))
+        .read_batch(&spec, &ctx, Some(&cursor2))
         .await
         .expect("drain");
     assert!(empty.rows.is_empty());

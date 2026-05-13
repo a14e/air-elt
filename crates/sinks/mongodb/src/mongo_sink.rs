@@ -29,6 +29,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bson::{Bson, Document, doc};
@@ -38,6 +39,7 @@ use mongodb::{Client, Collection};
 use tracing::{debug, info, warn};
 
 use air_elt_commons_mongodb::client::{PoolSettings, connect, database_from_url};
+use air_elt_commons_mongodb::task::detached;
 use air_elt_commons_mongodb::types::BsonObjectType;
 use air_elt_commons_mongodb::version::{self, MongoVersion};
 use air_elt_commons_mongodb::{bson_value, identifier, path};
@@ -53,12 +55,20 @@ use crate::config::MongoSinkConfig;
 /// MongoDB duplicate-key error code; emitted on unique-index violations.
 const E11000_DUPLICATE_KEY: i32 = 11_000;
 
+/// Clone is cheap: `Client` is internally `Arc`-wrapped and the other
+/// fields are small (`String`, `MongoVersion`). Each trait method
+/// clones `self` to move into `tokio::spawn` — see `task::detached`
+/// and the cancel-safety rationale on `air_elt_commons_mongodb::client`.
+#[derive(Clone)]
 pub struct MongoSink {
     client: Client,
     database: String,
     /// Detected once at `connect()` so `write_batch` can branch on
     /// `bulk_write` availability without an extra round-trip per call.
     server_version: MongoVersion,
+    /// Per-operation cap; applied as `max_time` / `maxTimeMS` on every
+    /// server-side call. Bounds runaway server work after a detach.
+    operation_timeout: Duration,
 }
 
 impl MongoSink {
@@ -85,10 +95,11 @@ impl MongoSink {
             config.acquire_timeout,
             config.idle_timeout,
             None,
-            None,
+            config.operation_timeout,
             config.max_connections,
             config.min_connections,
         );
+        let operation_timeout = settings.statement;
         let client = connect(&config.url, settings).await?;
         let server_version = version::detect(&client).await?;
         info!(
@@ -101,12 +112,17 @@ impl MongoSink {
             client,
             database,
             server_version,
+            operation_timeout,
         })
     }
 
     fn collection(&self, name: &str) -> RuntimeResult<Collection<Document>> {
         identifier::validate_name(name).map_err(RuntimeError::from)?;
         Ok(self.client.database(&self.database).collection(name))
+    }
+
+    fn max_time_ms(&self) -> i64 {
+        i64::try_from(self.operation_timeout.as_millis()).unwrap_or(i64::MAX)
     }
 }
 
@@ -177,28 +193,38 @@ impl SchemaProvider for MongoSinkCtx {
 #[async_trait]
 impl Sink for MongoSink {
     async fn validate_access(&self, spec: &WriteSpec) -> RuntimeResult<()> {
-        self.client
-            .database(&self.database)
-            .run_command(doc! { "ping": 1 })
-            .await
-            .map_err(RuntimeError::backend)?;
-        // Probe write privilege via insert+delete of a sentinel doc.
+        let client = self.client.clone();
+        let database = self.database.clone();
         let coll = self.collection(&spec.table)?;
-        let sentinel = doc! {
-            "_air_elt_probe": true,
-            "_air_elt_probe_at": bson::DateTime::now(),
-        };
-        let res = coll
-            .insert_one(sentinel)
-            .await
-            .map_err(RuntimeError::backend)?;
-        let id = res.inserted_id;
-        let _ = coll
-            .delete_one(doc! { "_id": id })
-            .await
-            .map_err(RuntimeError::backend)?;
-        info!(collection = %spec.table, "mongodb sink access validated");
-        Ok(())
+        let table = spec.table.clone();
+        let max_time_ms = self.max_time_ms();
+        detached(async move {
+            client
+                .database(&database)
+                .run_command(doc! { "ping": 1, "maxTimeMS": max_time_ms })
+                .await
+                .map_err(RuntimeError::backend)?;
+            // Probe write privilege via insert+delete of a sentinel doc.
+            // mongodb 3.6 does not expose `max_time` on the typed
+            // `insert_one`/`delete_one` builders; the server-side cap
+            // comes from the connection's `connect_timeout` and the
+            // run-time `task::detached` bound. Documented gap.
+            let sentinel = doc! {
+                "_air_elt_probe": true,
+                "_air_elt_probe_at": bson::DateTime::now(),
+            };
+            let res = coll
+                .insert_one(sentinel)
+                .await
+                .map_err(RuntimeError::backend)?;
+            let id = res.inserted_id;
+            coll.delete_one(doc! { "_id": id })
+                .await
+                .map_err(RuntimeError::backend)?;
+            info!(collection = %table, "mongodb sink access validated");
+            Ok(())
+        })
+        .await
     }
 
     async fn validate_delete_access(&self, spec: &WriteSpec) -> RuntimeResult<()> {
@@ -212,12 +238,16 @@ impl Sink for MongoSink {
         // for parity with the SQL backends and to log the explicit
         // DELETE-path check.
         let coll = self.collection(&spec.table)?;
-        let empty: Vec<Bson> = Vec::new();
-        coll.delete_many(doc! { "_id": { "$in": empty } })
-            .await
-            .map_err(RuntimeError::backend)?;
-        info!(collection = %spec.table, "mongodb sink delete access validated");
-        Ok(())
+        let table = spec.table.clone();
+        detached(async move {
+            let empty: Vec<Bson> = Vec::new();
+            coll.delete_many(doc! { "_id": { "$in": empty } })
+                .await
+                .map_err(RuntimeError::backend)?;
+            info!(collection = %table, "mongodb sink delete access validated");
+            Ok(())
+        })
+        .await
     }
 
     async fn describe_schema(&self, _table: &str) -> RuntimeResult<Schema> {
@@ -266,83 +296,82 @@ impl Sink for MongoSink {
         true
     }
 
-    fn cancel_safe(&self) -> bool {
-        // The `mongodb` 3.x Rust driver is not cancellation-safe —
-        // see `MongoSource::cancel_safe` for the full rationale.
-        false
-    }
-
     async fn write_batch(
         &self,
         spec: &WriteSpec,
-        ctx: Arc<dyn SinkCtx>,
+        ctx: &Arc<dyn SinkCtx>,
         batch: Batch,
         dry_run: bool,
     ) -> RuntimeResult<WriteReport> {
-        let my_ctx =
-            ctx.as_any()
-                .downcast_ref::<MongoSinkCtx>()
-                .ok_or(RuntimeError::ContextMismatch {
-                    expected: "MongoSinkCtx",
-                })?;
         if batch.rows.is_empty() {
             return Ok(WriteReport::default());
         }
         let coll = self.collection(&spec.table)?;
-        if dry_run {
-            // Dry-run path: build the same docs we would write, then
-            // ship them via `replaceOne(filter={$expr:false}, doc, upsert=false)`.
-            // The server parses every BSON document (catching schema /
-            // identifier / encoding bugs at the wire level) but the
-            // never-matching filter combined with `upsert=false` means
-            // matchedCount=0, modifiedCount=0, no mutation. Asymmetry to
-            // document: collection-level `$jsonSchema` validators run
-            // only when a write actually changes a document, so
-            // validator-rejection bugs will *not* surface in dry-run —
-            // they remain visible only on the real production path.
-            self.write_dry_run(my_ctx, spec, &coll, batch.rows).await?;
-            return Ok(WriteReport::default());
-        }
-
-        // Order matters within a CDC batch: insert(_id=42) followed
-        // by delete(_id=42) must apply upsert first; delete-first
-        // would let the upsert recreate the row we just removed.
-        let mut total_written: u64 = 0;
-        // Split the owned rows by op so each branch consumes its half
-        // by value — `into_columns` and the raw-passthrough fast-path
-        // can both move payloads without cloning.
-        let mut upsert_rows: Vec<air_elt_core::model::Row> = Vec::new();
-        let mut delete_rows: Vec<air_elt_core::model::Row> = Vec::new();
-        for row in batch.rows {
-            match row.op {
-                RowOp::Upsert => upsert_rows.push(row),
-                RowOp::Delete => delete_rows.push(row),
+        let me = self.clone();
+        let ctx = Arc::clone(ctx);
+        let table = spec.table.clone();
+        detached(async move {
+            let my_ctx = ctx.as_any().downcast_ref::<MongoSinkCtx>().ok_or(
+                RuntimeError::ContextMismatch {
+                    expected: "MongoSinkCtx",
+                },
+            )?;
+            if dry_run {
+                // Dry-run path: build the same docs we would write, then
+                // ship them via `replaceOne(filter={$expr:false}, doc, upsert=false)`.
+                // The server parses every BSON document (catching schema /
+                // identifier / encoding bugs at the wire level) but the
+                // never-matching filter combined with `upsert=false` means
+                // matchedCount=0, modifiedCount=0, no mutation. Asymmetry to
+                // document: collection-level `$jsonSchema` validators run
+                // only when a write actually changes a document, so
+                // validator-rejection bugs will *not* surface in dry-run —
+                // they remain visible only on the real production path.
+                me.write_dry_run(my_ctx, &table, &coll, batch.rows).await?;
+                return Ok(WriteReport::default());
             }
-        }
-        if !upsert_rows.is_empty() {
-            total_written += self
-                .write_upsert_rows(my_ctx, &coll, spec, upsert_rows)
-                .await?;
-        }
 
-        if !delete_rows.is_empty() {
-            let keys = match &my_ctx.plan {
-                UpsertPlan::Overwrite { keys } => keys.as_slice(),
-                _ => {
-                    return Err(RuntimeError::Other(
-                        "mongodb sink received Delete row but flow has no \
-                         [flow.<x>.conflict] block (or strategy=ignore) — \
-                         Delete needs an overwrite key to target documents"
-                            .into(),
-                    ));
+            // Order matters within a CDC batch: insert(_id=42) followed
+            // by delete(_id=42) must apply upsert first; delete-first
+            // would let the upsert recreate the row we just removed.
+            let mut total_written: u64 = 0;
+            // Split the owned rows by op so each branch consumes its half
+            // by value — `into_columns` and the raw-passthrough fast-path
+            // can both move payloads without cloning.
+            let mut upsert_rows: Vec<air_elt_core::model::Row> = Vec::new();
+            let mut delete_rows: Vec<air_elt_core::model::Row> = Vec::new();
+            for row in batch.rows {
+                match row.op {
+                    RowOp::Upsert => upsert_rows.push(row),
+                    RowOp::Delete => delete_rows.push(row),
                 }
-            };
-            total_written +=
-                write_delete_many(&coll, delete_rows, keys, my_ctx.id_fast_path).await?;
-        }
-        Ok(WriteReport {
-            rows_written: total_written,
+            }
+            if !upsert_rows.is_empty() {
+                total_written += me
+                    .write_upsert_rows(my_ctx, &coll, &table, upsert_rows)
+                    .await?;
+            }
+
+            if !delete_rows.is_empty() {
+                let keys = match &my_ctx.plan {
+                    UpsertPlan::Overwrite { keys } => keys.as_slice(),
+                    _ => {
+                        return Err(RuntimeError::Other(
+                            "mongodb sink received Delete row but flow has no \
+                             [flow.<x>.conflict] block (or strategy=ignore) — \
+                             Delete needs an overwrite key to target documents"
+                                .into(),
+                        ));
+                    }
+                };
+                total_written +=
+                    write_delete_many(&coll, delete_rows, keys, my_ctx.id_fast_path).await?;
+            }
+            Ok(WriteReport {
+                rows_written: total_written,
+            })
         })
+        .await
     }
 }
 
@@ -355,7 +384,7 @@ impl MongoSink {
     async fn write_dry_run(
         &self,
         my_ctx: &MongoSinkCtx,
-        spec: &WriteSpec,
+        table: &str,
         coll: &Collection<Document>,
         rows: Vec<air_elt_core::model::Row>,
     ) -> RuntimeResult<()> {
@@ -369,7 +398,7 @@ impl MongoSink {
         }
         if !upsert_rows.is_empty() {
             let docs = build_docs(my_ctx, upsert_rows)?;
-            self.dry_run_replace(spec, docs).await?;
+            self.dry_run_replace(table, docs).await?;
         }
         if !delete_rows.is_empty() {
             // Mirror the production filter shape so per-row keys flow
@@ -403,12 +432,12 @@ impl MongoSink {
         Ok(())
     }
 
-    async fn dry_run_replace(&self, spec: &WriteSpec, docs: Vec<Document>) -> RuntimeResult<()> {
+    async fn dry_run_replace(&self, table: &str, docs: Vec<Document>) -> RuntimeResult<()> {
         debug!(rows = docs.len(), "mongodb dry-run replaceOne never-match");
         if self.server_version.supports_bulk_write() {
             let ns = mongodb::Namespace {
                 db: self.database.clone(),
-                coll: spec.table.clone(),
+                coll: table.to_string(),
             };
             let mut models: Vec<mongodb::options::WriteModel> = Vec::with_capacity(docs.len());
             for d in docs {
@@ -420,6 +449,13 @@ impl MongoSink {
                     .build();
                 models.push(model.into());
             }
+            // `Client::bulk_write` (8.0+) has no per-call `max_time`
+            // typed builder in mongodb 3.6 — the corresponding option
+            // arrived later. Server still honours `maxTimeMS` if
+            // present in the command body, but the typed action does
+            // not surface it. Cap stays on the connection-level
+            // settings (`PoolSettings::statement`) until the driver
+            // exposes it; documented gap.
             self.client
                 .bulk_write(models)
                 .ordered(false)
@@ -439,9 +475,10 @@ impl MongoSink {
             });
         }
         let cmd = doc! {
-            "update": &spec.table,
+            "update": table,
             "updates": updates,
             "ordered": false,
+            "maxTimeMS": self.max_time_ms(),
         };
         let res = self
             .client
@@ -459,7 +496,7 @@ impl MongoSink {
         &self,
         my_ctx: &MongoSinkCtx,
         coll: &Collection<Document>,
-        spec: &WriteSpec,
+        table: &str,
         rows: Vec<air_elt_core::model::Row>,
     ) -> RuntimeResult<u64> {
         let docs = build_docs(my_ctx, rows)?;
@@ -479,7 +516,7 @@ impl MongoSink {
                     write_upsert_bulk(
                         &self.client,
                         &self.database,
-                        &spec.table,
+                        table,
                         docs,
                         keys,
                         my_ctx.id_fast_path,
@@ -489,10 +526,11 @@ impl MongoSink {
                     write_upsert_via_update(
                         &self.client,
                         &self.database,
-                        &spec.table,
+                        table,
                         docs,
                         keys,
                         my_ctx.id_fast_path,
+                        self.max_time_ms(),
                     )
                     .await?
                 }
@@ -747,6 +785,7 @@ async fn write_upsert_via_update(
     docs: Vec<Document>,
     keys: &[UpsertKey],
     id_fast_path: bool,
+    max_time_ms: i64,
 ) -> RuntimeResult<u64> {
     debug!(
         rows = docs.len(),
@@ -765,6 +804,7 @@ async fn write_upsert_via_update(
         "update": collection,
         "updates": updates,
         "ordered": false,
+        "maxTimeMS": max_time_ms,
     };
     let res = client
         .database(database)

@@ -16,6 +16,7 @@ pub mod infer;
 pub mod key_bson;
 pub mod path;
 pub mod sampling;
+pub mod task;
 pub mod types;
 pub mod version;
 

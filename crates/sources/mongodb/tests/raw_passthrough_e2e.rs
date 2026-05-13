@@ -51,7 +51,7 @@ async fn read_batch_raw_mode_emits_bson_object_rows() {
 
     let ctx = source.build_context(&spec).await.expect("build_context");
     let batch = source
-        .read_batch(&spec, ctx, None)
+        .read_batch(&spec, &ctx, None)
         .await
         .expect("read_batch");
 
@@ -125,7 +125,7 @@ async fn read_batch_attaches_body_when_needs_body_set() {
 
     let ctx = source.build_context(&spec).await.expect("build_context");
     let batch = source
-        .read_batch(&spec, ctx, None)
+        .read_batch(&spec, &ctx, None)
         .await
         .expect("read_batch");
 
@@ -189,7 +189,7 @@ async fn read_batch_skips_body_when_needs_body_unset() {
 
     let ctx = source.build_context(&spec).await.expect("build_context");
     let batch = source
-        .read_batch(&spec, ctx, None)
+        .read_batch(&spec, &ctx, None)
         .await
         .expect("read_batch");
 

@@ -94,7 +94,7 @@ async fn hll_round_trip_through_sink_and_source() {
         next_cursor: None,
     };
     let ctx = sink.build_context(&spec).await.unwrap();
-    let report = sink.write_batch(&spec, ctx, batch, false).await.unwrap();
+    let report = sink.write_batch(&spec, &ctx, batch, false).await.unwrap();
     assert_eq!(report.rows_written, 2);
 
     // ---- source path ---------------------------------------------------
@@ -119,7 +119,10 @@ async fn hll_round_trip_through_sink_and_source() {
     };
 
     let read_ctx = source.build_context(&read_spec).await.unwrap();
-    let read_batch = source.read_batch(&read_spec, read_ctx, None).await.unwrap();
+    let read_batch = source
+        .read_batch(&read_spec, &read_ctx, None)
+        .await
+        .unwrap();
     assert_eq!(read_batch.rows.len(), 2);
 
     // Row 1: the HLL sketch round-trips byte-exact.

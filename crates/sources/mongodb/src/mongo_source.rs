@@ -22,6 +22,7 @@ use mongodb::{Client, Collection, options::FindOptions};
 use tracing::{debug, info, warn};
 
 use air_elt_commons_mongodb::client::{PoolSettings, connect, database_from_url};
+use air_elt_commons_mongodb::task::detached;
 use air_elt_commons_mongodb::types::BsonObjectValue;
 use air_elt_commons_mongodb::{bson_value, identifier, path, sampling};
 use air_elt_core::config::model::CursorOrder;
@@ -52,10 +53,10 @@ pub struct MongoSource {
     name: String,
     /// Per-operation cap, applied via `*Options::max_time` on every
     /// driver call that supports it (Find, Aggregate, FindOne, …).
-    /// Server-enforced — bounds runaway work even when the runner
-    /// detaches the spawned future after a client-side shutdown /
-    /// timeout (the `mongodb` 3.x driver is not cancellation-safe;
-    /// see `Source::cancel_safe`).
+    /// Server-enforced — bounds runaway work even when the adapter
+    /// detaches its spawned driver future after the runner's
+    /// client-side shutdown / timeout (the `mongodb` 3.x driver is not
+    /// cancellation-safe; see `task::detached`).
     operation_timeout: Duration,
 }
 
@@ -148,14 +149,6 @@ impl Source for MongoSource {
         &self.name
     }
 
-    fn cancel_safe(&self) -> bool {
-        // The `mongodb` 3.x Rust driver is not cancellation-safe —
-        // dropping a future mid-await can leave driver internals
-        // inconsistent. The runner therefore spawns + detaches our
-        // calls instead of wrapping them in `tokio::time::timeout`.
-        false
-    }
-
     fn schemaless(&self) -> bool {
         // Mongo collections accept any BSON shape — no authoritative
         // column schema. The wildcard expansion uses this flag
@@ -175,23 +168,28 @@ impl Source for MongoSource {
         // Ping + a tiny `find().limit(1)` against the target collection to
         // confirm read access. We avoid `count` because some deployments
         // disallow it on shared-tier clusters.
-        self.client
-            .database(&self.database)
-            .run_command(doc! { "ping": 1 })
-            .await
-            .map_err(RuntimeError::backend)?;
+        let client = self.client.clone();
+        let database = self.database.clone();
         let coll = self.collection(&spec.table)?;
         let opts = FindOptions::builder()
             .limit(Some(1))
             .max_time(self.operation_timeout)
             .build();
-        let _ = coll
-            .find(doc! {})
-            .with_options(opts)
-            .await
-            .map_err(RuntimeError::backend)?;
-        info!(collection = %spec.table, "mongodb source access validated");
-        Ok(())
+        let table = spec.table.clone();
+        detached(async move {
+            client
+                .database(&database)
+                .run_command(doc! { "ping": 1 })
+                .await
+                .map_err(RuntimeError::backend)?;
+            coll.find(doc! {})
+                .with_options(opts)
+                .await
+                .map_err(RuntimeError::backend)?;
+            info!(collection = %table, "mongodb source access validated");
+            Ok(())
+        })
+        .await
     }
 
     async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema> {
@@ -251,7 +249,7 @@ impl Source for MongoSource {
     async fn read_batch<'a>(
         &self,
         spec: &ReadSpec,
-        ctx: Arc<dyn SourceCtx>,
+        ctx: &Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
     ) -> RuntimeResult<RawBatch> {
         let my_ctx =
@@ -264,103 +262,118 @@ impl Source for MongoSource {
 
         let filter = build_filter(&my_ctx.cursor_paths, spec.cursor_order, cursor)?;
         let sort_doc = build_sort(&my_ctx.cursor_paths, spec.cursor_order);
-        let limit = i64::try_from(spec.limit).map_err(|_| {
+        let limit_i64 = i64::try_from(spec.limit).map_err(|_| {
             RuntimeError::Other(format!("batch_limit {} does not fit in i64", spec.limit))
         })?;
         let opts = FindOptions::builder()
             .sort(sort_doc)
-            .limit(Some(limit))
+            .limit(Some(limit_i64))
             .max_time(self.operation_timeout)
             .build();
         debug!(filter = ?filter, "mongodb read_batch");
-        let mut find_cursor = coll
-            .find(filter)
-            .with_options(opts)
-            .await
-            .map_err(RuntimeError::backend)?;
 
-        // Raw passthrough mode: wildcard expansion against a
-        // schemaless-both flow leaves `spec.columns` empty (no per-
-        // column projection) and `spec.cursor_fields` empty (raw
-        // passthrough is incompatible with column-based cursors —
-        // enforced at validation time). Emit one `RawRow` per document
-        // carrying the whole document on `body` as
-        // `Value::Custom(BsonObjectValue(...))`; the Transform
-        // interpreter folds it into `Row::passthrough(BsonObjectValue)`
-        // for the mongo sink fast path.
-        if spec.columns.is_empty() {
-            let mut rows: Vec<RawRow> = Vec::with_capacity(spec.limit);
+        // Bump the Arc once at the spawn boundary — that's the single
+        // place that actually needs owned-ctx. Inside the spawn we
+        // downcast to read by reference, so per-field Vec clones are
+        // unnecessary.
+        let ctx = Arc::clone(ctx);
+        let cursor_fields = spec.cursor_fields.clone();
+        let columns_empty = spec.columns.is_empty();
+        let limit = spec.limit;
+        let needs_body = spec.needs_body;
+
+        detached(async move {
+            let my_ctx = ctx.as_any().downcast_ref::<MongoSourceCtx>().ok_or(
+                RuntimeError::ContextMismatch {
+                    expected: "MongoSourceCtx",
+                },
+            )?;
+            let mut find_cursor = coll
+                .find(filter)
+                .with_options(opts)
+                .await
+                .map_err(RuntimeError::backend)?;
+
+            // Raw passthrough mode: wildcard expansion against a
+            // schemaless-both flow leaves `spec.columns` empty (no per-
+            // column projection) and `spec.cursor_fields` empty (raw
+            // passthrough is incompatible with column-based cursors —
+            // enforced at validation time). Emit one `RawRow` per document
+            // carrying the whole document on `body` as
+            // `Value::Custom(BsonObjectValue(...))`; the Transform
+            // interpreter folds it into `Row::passthrough(BsonObjectValue)`
+            // for the mongo sink fast path.
+            if columns_empty {
+                let mut rows: Vec<RawRow> = Vec::with_capacity(limit);
+                while let Some(d) = find_cursor
+                    .try_next()
+                    .await
+                    .map_err(RuntimeError::backend)?
+                {
+                    rows.push(
+                        RawRow::upsert(Vec::new())
+                            .with_body(Some(Value::Custom(Box::new(BsonObjectValue(d))))),
+                    );
+                }
+                return Ok(RawBatch {
+                    rows,
+                    next_cursor: None,
+                });
+            }
+
+            let mut out_rows: Vec<RawRow> = Vec::with_capacity(limit);
+            let mut last_cursor_values: Option<Vec<Value>> = None;
+
             while let Some(d) = find_cursor
                 .try_next()
                 .await
                 .map_err(RuntimeError::backend)?
             {
-                rows.push(
-                    RawRow::upsert(Vec::new())
-                        .with_body(Some(Value::Custom(Box::new(BsonObjectValue(d))))),
-                );
-            }
-            return Ok(RawBatch {
-                rows,
-                next_cursor: None,
-            });
-        }
-
-        let mut out_rows: Vec<RawRow> = Vec::with_capacity(spec.limit);
-        let mut last_cursor_values: Option<Vec<Value>> = None;
-
-        while let Some(d) = find_cursor
-            .try_next()
-            .await
-            .map_err(RuntimeError::backend)?
-        {
-            let mut values = Vec::with_capacity(my_ctx.column_paths.len());
-            for p in &my_ctx.column_paths {
-                let v = match path::get(&d, p) {
-                    Some(b) => bson_value::from_bson(b)?,
-                    None => Value::Null,
-                };
-                values.push(v);
-            }
-            let mut cursor_values = Vec::with_capacity(my_ctx.cursor_paths.len());
-            for (i, cp) in my_ctx.cursor_paths.iter().enumerate() {
-                let value = match my_ctx.cursor_in_columns[i] {
-                    Some(idx) => values[idx].clone(),
-                    None => match path::get(&d, cp) {
+                let mut values = Vec::with_capacity(my_ctx.column_paths.len());
+                for p in &my_ctx.column_paths {
+                    let v = match path::get(&d, p) {
                         Some(b) => bson_value::from_bson(b)?,
                         None => Value::Null,
-                    },
+                    };
+                    values.push(v);
+                }
+                let mut cursor_values = Vec::with_capacity(my_ctx.cursor_paths.len());
+                for (i, cp) in my_ctx.cursor_paths.iter().enumerate() {
+                    let value = match my_ctx.cursor_in_columns[i] {
+                        Some(idx) => values[idx].clone(),
+                        None => match path::get(&d, cp) {
+                            Some(b) => bson_value::from_bson(b)?,
+                            None => Value::Null,
+                        },
+                    };
+                    cursor_values.push(value);
+                }
+                last_cursor_values = Some(cursor_values);
+                // Cost-guarded body attach: the Transform interpreter's
+                // `Body` op consumes the `Value::Custom(BsonObjectValue)`.
+                // Non-body flows skip the move entirely.
+                let body = if needs_body {
+                    Some(Value::Custom(Box::new(BsonObjectValue(d))))
+                } else {
+                    None
                 };
-                cursor_values.push(value);
+                out_rows.push(RawRow::upsert(values).with_body(body));
             }
-            last_cursor_values = Some(cursor_values);
-            // Cost-guarded body attach: the Transform interpreter's
-            // `Body` op consumes the `Value::Custom(BsonObjectValue)`.
-            // Non-body flows skip the move entirely.
-            let body = if spec.needs_body {
-                Some(Value::Custom(Box::new(BsonObjectValue(d))))
-            } else {
-                None
-            };
-            out_rows.push(RawRow::upsert(values).with_body(body));
-        }
 
-        let next_cursor = last_cursor_values.map(|values| {
-            let fields = spec
-                .cursor_fields
-                .iter()
-                .zip(values)
-                .map(|(name, value)| CursorFieldValue {
-                    name: name.clone(),
-                    value,
-                })
-                .collect();
-            CursorState::new(fields)
-        });
-        Ok(RawBatch {
-            rows: out_rows,
-            next_cursor,
+            let next_cursor = last_cursor_values.map(|values| {
+                let fields = cursor_fields
+                    .into_iter()
+                    .zip(values)
+                    .map(|(name, value)| CursorFieldValue { name, value })
+                    .collect();
+                CursorState::new(fields)
+            });
+            Ok(RawBatch {
+                rows: out_rows,
+                next_cursor,
+            })
         })
+        .await
     }
 }
 

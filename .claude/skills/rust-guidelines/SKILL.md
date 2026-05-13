@@ -33,11 +33,8 @@ The codebase favours clarity over cleverness. Code is read far more often than w
 
 ## Timeouts and cancellation safety
 
-- When wrapping a future in `tokio::time::timeout` or `tokio::select!`, verify the underlying driver/protocol supports
-  cancellation without leaving inconsistent state. If a driver is not cancellation-safe, document the risk and consider `spawn` +
-  `abort` instead of `select!`.
-- The `mongodb` 3.x Rust driver is **not** cancellation-safe — dropping its futures mid-await can leave driver internals
-  inconsistent. The flow runner enforces this via `Source/Sink/Storage::cancel_safe()` (default `true`);
+- Connector adapters own cancel-safety, not the runner. The runner only wraps each call in `tokio::time::timeout` + a shutdown `select!`.
+- For drivers that are not cancellation-safe (notably `mongodb` 3.x — dropping a future mid-await can leave driver internals inconsistent), wrap the driver call in `air_elt_commons_mongodb::task::detached`. It spawns the work on the runtime so dropping the outer future does not cancel the driver future.
 
 ## Logging and errors
 

@@ -88,14 +88,6 @@ impl Sink for ChSink {
         false
     }
 
-    fn cancel_safe(&self) -> bool {
-        // `reqwest` futures are cancel-safe — the underlying connection
-        // is managed by the HTTP pool, not the dropped future. Default
-        // would also be `true`; we override explicitly to document the
-        // posture (matches the sqlx-backed sinks).
-        true
-    }
-
     async fn validate_access(&self, spec: &WriteSpec) -> RuntimeResult<()> {
         // Liveness probe.
         self.client.ping().await.map_err(RuntimeError::backend)?;
@@ -142,7 +134,7 @@ impl Sink for ChSink {
     async fn write_batch(
         &self,
         _spec: &WriteSpec,
-        ctx: Arc<dyn SinkCtx>,
+        ctx: &Arc<dyn SinkCtx>,
         batch: Batch,
         dry_run: bool,
     ) -> RuntimeResult<WriteReport> {

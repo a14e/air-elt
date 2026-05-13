@@ -55,7 +55,7 @@ async fn write_batch_dry_run_skips_writes_then_real_run_commits() {
     // Dry-run: SQL parses + binds, but `WHERE false` keeps the table
     // empty and the report reads zero rows written.
     let report_dry = sink
-        .write_batch(&spec, ctx.clone(), make_batch(), true)
+        .write_batch(&spec, &ctx, make_batch(), true)
         .await
         .expect("dry-run write");
     assert_eq!(report_dry.rows_written, 0);
@@ -70,7 +70,7 @@ async fn write_batch_dry_run_skips_writes_then_real_run_commits() {
 
     // Real run: same batch lands two rows.
     let report = sink
-        .write_batch(&spec, ctx, make_batch(), false)
+        .write_batch(&spec, &ctx, make_batch(), false)
         .await
         .expect("real write");
     assert_eq!(report.rows_written, 2);
@@ -128,7 +128,7 @@ async fn write_batch_dry_run_rejects_type_mismatch_server_side() {
     };
 
     let err = sink
-        .write_batch(&spec, ctx, bad_batch, true)
+        .write_batch(&spec, &ctx, bad_batch, true)
         .await
         .expect_err("dry-run must reject server-side type mismatch");
     let msg = format!("{err:#}");
@@ -196,7 +196,7 @@ async fn write_batch_dry_run_delete_rejects_type_mismatch_server_side() {
         next_cursor: None,
     };
     let report_ok = sink
-        .write_batch(&spec, ctx.clone(), mixed_ok, true)
+        .write_batch(&spec, &ctx, mixed_ok, true)
         .await
         .expect("mixed dry-run");
     assert_eq!(report_ok.rows_written, 0);
@@ -218,7 +218,7 @@ async fn write_batch_dry_run_delete_rejects_type_mismatch_server_side() {
         next_cursor: None,
     };
     let err = sink
-        .write_batch(&spec, ctx, bad_delete, true)
+        .write_batch(&spec, &ctx, bad_delete, true)
         .await
         .expect_err("dry-run delete must reject server-side type mismatch");
     let msg = format!("{err:#}").to_lowercase();
@@ -283,7 +283,7 @@ async fn write_batch_dry_run_delete_preserves_then_real_run_deletes() {
         ],
         next_cursor: None,
     };
-    sink.write_batch(&spec, ctx.clone(), seed, false)
+    sink.write_batch(&spec, &ctx, seed, false)
         .await
         .expect("seed upsert");
     let count_seeded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dry_run_del_seeded_t")
@@ -301,7 +301,7 @@ async fn write_batch_dry_run_delete_preserves_then_real_run_deletes() {
         next_cursor: None,
     };
     let report_dry = sink
-        .write_batch(&spec, ctx.clone(), make_delete(), true)
+        .write_batch(&spec, &ctx, make_delete(), true)
         .await
         .expect("dry-run delete");
     assert_eq!(report_dry.rows_written, 0);
@@ -316,7 +316,7 @@ async fn write_batch_dry_run_delete_preserves_then_real_run_deletes() {
 
     // Real delete: same batch removes both rows.
     let report_real = sink
-        .write_batch(&spec, ctx, make_delete(), false)
+        .write_batch(&spec, &ctx, make_delete(), false)
         .await
         .expect("real delete");
     assert_eq!(report_real.rows_written, 2);
@@ -380,7 +380,7 @@ async fn write_batch_dry_run_rejects_bad_conflict_key_server_side() {
     };
 
     let err = sink
-        .write_batch(&spec, ctx, batch, true)
+        .write_batch(&spec, &ctx, batch, true)
         .await
         .expect_err("dry-run must reject bad ON CONFLICT key server-side");
     let msg = format!("{err:#}").to_lowercase();

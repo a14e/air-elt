@@ -95,7 +95,6 @@ pub fn one_row_batch() -> RawBatch {
 pub fn mock_source_ok() -> MockSource {
     let call = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let mut s = MockSource::new();
-    s.expect_cancel_safe().return_const(true);
     s.expect_schemaless().return_const(false);
     s.expect_body_data_type()
         .returning(|| crate::types::DataType::Json);
@@ -114,7 +113,6 @@ pub fn mock_source_ok() -> MockSource {
 
 pub fn mock_source_empty() -> MockSource {
     let mut s = MockSource::new();
-    s.expect_cancel_safe().return_const(true);
     s.expect_schemaless().return_const(false);
     s.expect_body_data_type()
         .returning(|| crate::types::DataType::Json);
@@ -128,7 +126,6 @@ pub fn mock_source_empty() -> MockSource {
 pub fn mock_source_no_cursor() -> MockSource {
     let call = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let mut s = MockSource::new();
-    s.expect_cancel_safe().return_const(true);
     s.expect_schemaless().return_const(false);
     s.expect_body_data_type()
         .returning(|| crate::types::DataType::Json);
@@ -152,7 +149,6 @@ pub fn mock_source_failing(times: u32) -> MockSource {
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(times));
     let call = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let mut s = MockSource::new();
-    s.expect_cancel_safe().return_const(true);
     s.expect_schemaless().return_const(false);
     s.expect_body_data_type()
         .returning(|| crate::types::DataType::Json);
@@ -176,7 +172,6 @@ pub fn mock_source_failing(times: u32) -> MockSource {
 
 pub fn mock_sink_ok() -> MockSink {
     let mut s = MockSink::new();
-    s.expect_cancel_safe().return_const(true);
     s.expect_schemaless().return_const(false);
     s.expect_supports_deletes().return_const(true);
     s.expect_describe_schema().returning(|_| {
@@ -198,7 +193,6 @@ pub fn mock_sink_ok() -> MockSink {
 
 pub fn mock_storage_ok() -> MockStorage {
     let mut s = MockStorage::new();
-    s.expect_cancel_safe().return_const(true);
     s.expect_load_cursor().returning(|_| Ok(None));
     s.expect_save_cursor().returning(|_, _, _| Ok(()));
     s
@@ -206,7 +200,6 @@ pub fn mock_storage_ok() -> MockStorage {
 
 pub fn mock_storage_save_fails() -> MockStorage {
     let mut s = MockStorage::new();
-    s.expect_cancel_safe().return_const(true);
     s.expect_load_cursor().returning(|_| Ok(None));
     s.expect_save_cursor()
         .returning(|_, _, _| Err(RuntimeError::Other("storage boom".into())));

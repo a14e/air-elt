@@ -48,7 +48,7 @@ async fn writes_native_uuid_column_to_mariadb() {
     };
     let ctx = sink.build_context(&spec).await.expect("ctx");
     let report = sink
-        .write_batch(&spec, ctx, batch, false)
+        .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write");
     assert_eq!(report.rows_written, 1);

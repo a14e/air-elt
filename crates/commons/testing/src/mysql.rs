@@ -99,6 +99,15 @@ async fn mysql_base_url() -> &'static String {
                     // mysqld starts dropping/blocking connections.
                     "--max-connections=500",
                     "--max-connect-errors=100000",
+                    // Cap RAM footprint inside the podman-machine: the
+                    // default InnoDB buffer pool and perf_schema together
+                    // bring the steady-state RSS to ~700 MB, which leaves
+                    // little headroom for the other test containers.
+                    "--innodb-buffer-pool-size=64M",
+                    "--performance-schema=OFF",
+                    "--table-open-cache=64",
+                    "--thread-cache-size=4",
+                    "--key-buffer-size=8M",
                 ])
                 .with_reuse(ReuseDirective::Always)
                 .start()

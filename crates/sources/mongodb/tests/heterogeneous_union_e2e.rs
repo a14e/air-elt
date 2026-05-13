@@ -70,7 +70,7 @@ async fn heterogeneous_field_inferred_as_union_and_read_back() {
     source.validate_access(&spec).await.expect("validate");
     let ctx = source.build_context(&spec).await.expect("build_context");
     let batch = source
-        .read_batch(&spec, ctx, None)
+        .read_batch(&spec, &ctx, None)
         .await
         .expect("read_batch");
 

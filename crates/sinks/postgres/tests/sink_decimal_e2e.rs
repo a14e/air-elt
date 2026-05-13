@@ -57,7 +57,7 @@ async fn writes_numeric_bigint_and_decimal() {
         next_cursor: None,
     };
     let ctx = sink.build_context(&spec).await.unwrap();
-    let report = sink.write_batch(&spec, ctx, batch, false).await.unwrap();
+    let report = sink.write_batch(&spec, &ctx, batch, false).await.unwrap();
     assert_eq!(report.rows_written, 1);
 
     let (big, rate): (BigDecimal, BigDecimal) = sqlx::query_as(&format!(
@@ -106,7 +106,7 @@ async fn cockroach_writes_numeric_decimal() {
         next_cursor: None,
     };
     let ctx = sink.build_context(&spec).await.unwrap();
-    let report = sink.write_batch(&spec, ctx, batch, false).await.unwrap();
+    let report = sink.write_batch(&spec, &ctx, batch, false).await.unwrap();
     assert_eq!(report.rows_written, 1);
 
     let (rate,): (BigDecimal,) = sqlx::query_as("SELECT rate FROM rates WHERE id = 1")

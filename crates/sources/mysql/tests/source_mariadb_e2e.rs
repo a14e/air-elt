@@ -67,7 +67,7 @@ async fn reads_native_uuid_column_from_mariadb() {
 
     let ctx = source.build_context(&spec).await.expect("ctx");
     let batch = source
-        .read_batch(&spec, ctx, None)
+        .read_batch(&spec, &ctx, None)
         .await
         .expect("read_batch");
     assert_eq!(batch.rows.len(), 1);

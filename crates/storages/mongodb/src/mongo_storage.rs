@@ -14,14 +14,17 @@
 //!   (`Storage::{load,save}_resume_token`). Same JSON-as-string
 //!   approach for the same reason.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use bson::{Document, doc};
 use mongodb::Client;
-use mongodb::options::ReplaceOptions;
+use mongodb::options::{FindOneOptions, ReplaceOptions};
 use tracing::info;
 
 use air_elt_commons_mongodb::client::{PoolSettings, connect, database_from_url};
 use air_elt_commons_mongodb::identifier;
+use air_elt_commons_mongodb::task::detached;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::model::CursorState;
 use air_elt_core::traits::Storage;
@@ -40,6 +43,9 @@ pub struct MongoStorage {
     database: String,
     collection: String,
     resume_tokens_collection: String,
+    /// Per-operation cap; applied as `max_time` / `maxTimeMS` on every
+    /// server-side call. Bounds runaway server work after a detach.
+    operation_timeout: Duration,
 }
 
 impl MongoStorage {
@@ -65,17 +71,23 @@ impl MongoStorage {
             config.acquire_timeout,
             config.idle_timeout,
             None,
-            None,
+            config.operation_timeout,
             config.max_connections,
             config.min_connections,
         );
+        let operation_timeout = settings.statement;
         let client = connect(&config.url, settings).await?;
         Ok(Self {
             client,
             database,
             collection,
             resume_tokens_collection: DEFAULT_RESUME_TOKENS_COLLECTION.to_string(),
+            operation_timeout,
         })
+    }
+
+    fn max_time_ms(&self) -> i64 {
+        i64::try_from(self.operation_timeout.as_millis()).unwrap_or(i64::MAX)
     }
 
     fn coll(&self) -> mongodb::Collection<Document> {
@@ -94,25 +106,35 @@ impl MongoStorage {
 #[async_trait]
 impl Storage for MongoStorage {
     async fn validate_access(&self) -> RuntimeResult<()> {
-        self.client
-            .database(&self.database)
-            .run_command(doc! { "ping": 1 })
-            .await
-            .map_err(RuntimeError::backend)?;
-        // Write probe: replace_one upsert + delete sentinel doc.
+        let database = self.database.clone();
+        let client = self.client.clone();
         let coll = self.coll();
-        let id = "__air_elt_probe__";
-        let opts = ReplaceOptions::builder().upsert(Some(true)).build();
-        coll.replace_one(doc! { "_id": id }, doc! { "_id": id, "probe": true })
-            .with_options(opts)
-            .await
-            .map_err(RuntimeError::backend)?;
-        let _ = coll
-            .delete_one(doc! { "_id": id })
-            .await
-            .map_err(RuntimeError::backend)?;
-        info!(database = %self.database, collection = %self.collection, "mongodb storage access validated");
-        Ok(())
+        let db_for_log = self.database.clone();
+        let coll_for_log = self.collection.clone();
+        let max_time_ms = self.max_time_ms();
+        detached(async move {
+            client
+                .database(&database)
+                .run_command(doc! { "ping": 1, "maxTimeMS": max_time_ms })
+                .await
+                .map_err(RuntimeError::backend)?;
+            // Write probe: replace_one upsert + delete sentinel doc.
+            // `ReplaceOptions`/`delete_one` don't expose `max_time` in
+            // mongodb 3.6 typed builders; the spawned task ensures the
+            // driver future is never dropped mid-await regardless.
+            let id = "__air_elt_probe__";
+            let opts = ReplaceOptions::builder().upsert(Some(true)).build();
+            coll.replace_one(doc! { "_id": id }, doc! { "_id": id, "probe": true })
+                .with_options(opts)
+                .await
+                .map_err(RuntimeError::backend)?;
+            coll.delete_one(doc! { "_id": id })
+                .await
+                .map_err(RuntimeError::backend)?;
+            info!(database = %db_for_log, collection = %coll_for_log, "mongodb storage access validated");
+            Ok(())
+        })
+        .await
     }
 
     async fn migrate(&self) -> RuntimeResult<()> {
@@ -122,24 +144,26 @@ impl Storage for MongoStorage {
 
     async fn load_cursor(&self, flow: &str) -> RuntimeResult<Option<CursorState>> {
         let coll = self.coll();
-        let opt = coll
-            .find_one(doc! { "_id": flow })
-            .await
-            .map_err(RuntimeError::backend)?;
-        let Some(doc_) = opt else { return Ok(None) };
-        let cursor_json = doc_.get_str("cursor").map_err(|_| {
-            RuntimeError::Other(format!(
-                "mongodb storage: row for flow {flow:?} is missing string field `cursor`"
-            ))
-        })?;
-        let parsed: CursorState = serde_json::from_str(cursor_json).map_err(RuntimeError::from)?;
-        Ok(Some(parsed))
-    }
-
-    fn cancel_safe(&self) -> bool {
-        // The `mongodb` 3.x Rust driver is not cancellation-safe —
-        // see `MongoSource::cancel_safe` for the full rationale.
-        false
+        let flow = flow.to_string();
+        let max_time = self.operation_timeout;
+        detached(async move {
+            let opts = FindOneOptions::builder().max_time(max_time).build();
+            let opt = coll
+                .find_one(doc! { "_id": &flow })
+                .with_options(opts)
+                .await
+                .map_err(RuntimeError::backend)?;
+            let Some(doc_) = opt else { return Ok(None) };
+            let cursor_json = doc_.get_str("cursor").map_err(|_| {
+                RuntimeError::Other(format!(
+                    "mongodb storage: row for flow {flow:?} is missing string field `cursor`"
+                ))
+            })?;
+            let parsed: CursorState =
+                serde_json::from_str(cursor_json).map_err(RuntimeError::from)?;
+            Ok(Some(parsed))
+        })
+        .await
     }
 
     async fn save_cursor(
@@ -153,39 +177,50 @@ impl Storage for MongoStorage {
             return Ok(());
         }
         let coll = self.coll();
-        let opts = ReplaceOptions::builder().upsert(Some(true)).build();
-        coll.replace_one(
-            doc! { "_id": flow },
-            doc! {
-                "_id": flow,
-                "cursor": cursor_json,
-                "updated_at": bson::DateTime::now(),
-            },
-        )
-        .with_options(opts)
+        let flow = flow.to_string();
+        detached(async move {
+            let opts = ReplaceOptions::builder().upsert(Some(true)).build();
+            coll.replace_one(
+                doc! { "_id": &flow },
+                doc! {
+                    "_id": &flow,
+                    "cursor": cursor_json,
+                    "updated_at": bson::DateTime::now(),
+                },
+            )
+            .with_options(opts)
+            .await
+            .map_err(RuntimeError::backend)?;
+            Ok(())
+        })
         .await
-        .map_err(RuntimeError::backend)?;
-        Ok(())
     }
 
     async fn load_resume_token(&self, flow: &str) -> RuntimeResult<Option<serde_json::Value>> {
-        let opt = self
-            .resume_tokens()
-            .find_one(doc! { "_id": flow })
-            .await
-            .map_err(RuntimeError::backend)?;
-        let Some(doc_) = opt else { return Ok(None) };
-        // `token` is stored as the JSON-string form (round-trips
-        // through serde_json without a parallel BSON codec — same
-        // rationale as `cursor` above).
-        let token_json = doc_.get_str("token").map_err(|_| {
-            RuntimeError::Other(format!(
-                "mongodb storage: resume-token row for flow {flow:?} is missing field `token`"
-            ))
-        })?;
-        let parsed: serde_json::Value =
-            serde_json::from_str(token_json).map_err(RuntimeError::from)?;
-        Ok(Some(parsed))
+        let coll = self.resume_tokens();
+        let flow = flow.to_string();
+        let max_time = self.operation_timeout;
+        detached(async move {
+            let opts = FindOneOptions::builder().max_time(max_time).build();
+            let opt = coll
+                .find_one(doc! { "_id": &flow })
+                .with_options(opts)
+                .await
+                .map_err(RuntimeError::backend)?;
+            let Some(doc_) = opt else { return Ok(None) };
+            // `token` is stored as the JSON-string form (round-trips
+            // through serde_json without a parallel BSON codec — same
+            // rationale as `cursor` above).
+            let token_json = doc_.get_str("token").map_err(|_| {
+                RuntimeError::Other(format!(
+                    "mongodb storage: resume-token row for flow {flow:?} is missing field `token`"
+                ))
+            })?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(token_json).map_err(RuntimeError::from)?;
+            Ok(Some(parsed))
+        })
+        .await
     }
 
     async fn save_resume_token(
@@ -198,12 +233,14 @@ impl Storage for MongoStorage {
         if dry_run {
             return Ok(());
         }
-        let opts = ReplaceOptions::builder().upsert(Some(true)).build();
-        self.resume_tokens()
-            .replace_one(
-                doc! { "_id": flow },
+        let coll = self.resume_tokens();
+        let flow = flow.to_string();
+        detached(async move {
+            let opts = ReplaceOptions::builder().upsert(Some(true)).build();
+            coll.replace_one(
+                doc! { "_id": &flow },
                 doc! {
-                    "_id": flow,
+                    "_id": &flow,
                     "token": token_json,
                     "updated_at": bson::DateTime::now(),
                 },
@@ -211,6 +248,8 @@ impl Storage for MongoStorage {
             .with_options(opts)
             .await
             .map_err(RuntimeError::backend)?;
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 }
