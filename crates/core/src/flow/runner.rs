@@ -201,31 +201,20 @@ impl FlowRunner {
     /// drift between sampling and runtime would surface here.
     async fn tick(&mut self, dry_run: bool) -> Result<bool, RuntimeError> {
         if self.cursor.is_none() {
-            let storage = self.flow.storage.clone();
-            let flow_name = self.flow.name.clone();
-            let cancel_safe = storage.cancel_safe();
+            // `with_timeout` no longer requires `Send + 'static`, so
+            // the future can borrow `&self.flow` directly. Mongo
+            // adapters handle their own driver-future cancel-safety via
+            // `task::detached`.
             self.cursor = match self.flow.cursor_persistence {
                 CursorPersistence::ColumnCursor => {
-                    let fut = async move { storage.load_cursor(&flow_name).await };
-                    run_op(
-                        &self.flow,
-                        "load_cursor",
-                        fut,
-                        cancel_safe,
-                        &mut self.shutdown,
-                    )
-                    .await?
+                    let fut = self.flow.storage.load_cursor(&self.flow.name);
+                    with_timeout(&self.flow, "load_cursor", fut, &mut self.shutdown).await?
                 }
                 CursorPersistence::ResumeToken => {
-                    let fut = async move { storage.load_resume_token(&flow_name).await };
-                    let token = run_op(
-                        &self.flow,
-                        "load_resume_token",
-                        fut,
-                        cancel_safe,
-                        &mut self.shutdown,
-                    )
-                    .await?;
+                    let fut = self.flow.storage.load_resume_token(&self.flow.name);
+                    let token =
+                        with_timeout(&self.flow, "load_resume_token", fut, &mut self.shutdown)
+                            .await?;
                     token.map(|json| {
                         CursorState::new(vec![CursorFieldValue {
                             name: RESUME_TOKEN_FIELD.into(),
@@ -244,52 +233,30 @@ impl FlowRunner {
             return Ok(true);
         }
 
-        // The derived plans cache the post-expansion `ReadSpec`. Clone
-        // it once and move the clone into the spawned future.
-        let read_spec = self.flow.derived().read_spec.clone();
-
-        // Arc-shared context: runner keeps its clone in self.source_ctx,
-        // future holds another. On async cancellation only the future's
-        // clone is dropped — runner state and cached schema / read_query
-        // survive into the next tick.
-        let src_ctx = self
-            .source_ctx
-            .as_ref()
-            .expect("ensured by ensure_built")
-            .clone();
-        let source = self.flow.source.clone();
-        let cursor = self.cursor.clone();
-        let cancel_safe = source.cancel_safe();
-        // Pull the lowered Transform program once outside the spawned
-        // future so the borrow on `derived` doesn't straddle the await.
-        let transform = self.flow.derived().transform.clone();
+        let src_ctx = self.source_ctx.as_ref().expect("ensured by ensure_built");
 
         // dry_run path: sampling validation routes through the same
         // tick. `Source::sample` returns a pre-Transform `RawBatch`;
         // the same Transform program the production tick consumes runs
         // here too so sampling exercises projection / body folding /
         // per-cell conversion identically.
-        if dry_run {
+        let raw = if dry_run {
+            let read_spec = &self.flow.derived().read_spec;
             let n = read_spec.limit;
-            let f = async move { source.sample(&read_spec, src_ctx, n).await };
-            let raw = run_op(&self.flow, "sample", f, cancel_safe, &mut self.shutdown).await?;
-            let batch = transform.apply(raw)?;
-            return self.finish_tick(batch, true).await;
-        }
-
-        // Production read path: source emits `RawBatch`; Transform
-        // applies projection / body folding / per-column conversion in
-        // one pass — including the schemaless-both `["*"]` raw
-        // passthrough flow, which lowers to a single `Body` op.
-        let f = async move {
-            source
-                .read_batch(&read_spec, src_ctx, cursor.as_ref())
-                .await
+            let fut = self.flow.source.sample(read_spec, src_ctx, n);
+            with_timeout(&self.flow, "sample", fut, &mut self.shutdown).await?
+        } else {
+            // Production read path: source emits `RawBatch`; Transform
+            // applies projection / body folding / per-column conversion
+            // in one pass — including the schemaless-both `["*"]` raw
+            // passthrough flow, which lowers to a single `Body` op.
+            let read_spec = &self.flow.derived().read_spec;
+            let cursor = self.cursor.as_ref();
+            let fut = self.flow.source.read_batch(read_spec, src_ctx, cursor);
+            with_timeout(&self.flow, "read_batch", fut, &mut self.shutdown).await?
         };
-        let raw = run_op(&self.flow, "read_batch", f, cancel_safe, &mut self.shutdown).await?;
 
-        let batch = transform.apply(raw)?;
-
+        let batch = self.flow.derived().transform.apply(raw)?;
         self.finish_tick(batch, dry_run).await
     }
 
@@ -319,21 +286,15 @@ impl FlowRunner {
     }
 
     async fn write_and_commit(&mut self, mut batch: Batch, dry_run: bool) -> RuntimeResult<()> {
-        let sink_ctx = self
-            .sink_ctx
-            .as_ref()
-            .expect("ensured by ensure_built")
-            .clone();
-        let sink = self.flow.sink.clone();
-        // Cached on `DerivedPlans`; clone-once for the spawned future.
-        let write_spec = self.flow.derived().write_spec.clone();
-        // Capture next_cursor before moving the batch into the sink —
-        // the cursor save below outlives the write call.
-        let next_cursor = batch.next_cursor.clone();
+        let sink_ctx = self.sink_ctx.as_ref().expect("ensured by ensure_built");
+        // Move next_cursor out of the batch — the cursor save below
+        // outlives the write call, and the sink does not consume the
+        // `next_cursor` slot. `take()` avoids cloning the CursorState.
+        let next_cursor = batch.next_cursor.take();
         // Append-only sinks (ClickHouse) drop deletes pre-write — the
         // sink will never observe a `RowOp::Delete`. Cursor still
         // advances over the dropped events.
-        if !sink.supports_deletes() {
+        if !self.flow.sink.supports_deletes() {
             let before = batch.rows.len();
             batch.rows.retain(|r| r.op != RowOp::Delete);
             let dropped = before - batch.rows.len();
@@ -350,20 +311,12 @@ impl FlowRunner {
                 return self.commit_cursor(next_cursor, dry_run).await;
             }
         }
-        let cancel_safe = sink.cancel_safe();
-        let fut = async move {
-            sink.write_batch(&write_spec, sink_ctx, batch, dry_run)
-                .await
-        };
-        let report = match run_op(
-            &self.flow,
-            "write_batch",
-            fut,
-            cancel_safe,
-            &mut self.shutdown,
-        )
-        .await
-        {
+        let write_spec = &self.flow.derived().write_spec;
+        let fut = self
+            .flow
+            .sink
+            .write_batch(write_spec, sink_ctx, batch, dry_run);
+        let report = match with_timeout(&self.flow, "write_batch", fut, &mut self.shutdown).await {
             Ok(r) => r,
             Err(e) => {
                 error!(flow = %self.flow.name, error = %e, "write_batch failed");
@@ -386,38 +339,21 @@ impl FlowRunner {
         dry_run: bool,
     ) -> RuntimeResult<()> {
         if let Some(next) = next_cursor {
-            let storage = self.flow.storage.clone();
-            let flow_name = self.flow.name.clone();
-            let cancel_safe = storage.cancel_safe();
             let save_result = match self.flow.cursor_persistence {
                 CursorPersistence::ColumnCursor => {
-                    let next_owned = next.clone();
-                    let fut =
-                        async move { storage.save_cursor(&flow_name, &next_owned, dry_run).await };
-                    run_op(
-                        &self.flow,
-                        "save_cursor",
-                        fut,
-                        cancel_safe,
-                        &mut self.shutdown,
-                    )
-                    .await
+                    let fut = self
+                        .flow
+                        .storage
+                        .save_cursor(&self.flow.name, &next, dry_run);
+                    with_timeout(&self.flow, "save_cursor", fut, &mut self.shutdown).await
                 }
                 CursorPersistence::ResumeToken => {
                     let token_json = extract_resume_token(&next)?;
-                    let fut = async move {
-                        storage
-                            .save_resume_token(&flow_name, &token_json, dry_run)
-                            .await
-                    };
-                    run_op(
-                        &self.flow,
-                        "save_resume_token",
-                        fut,
-                        cancel_safe,
-                        &mut self.shutdown,
-                    )
-                    .await
+                    let fut =
+                        self.flow
+                            .storage
+                            .save_resume_token(&self.flow.name, &token_json, dry_run);
+                    with_timeout(&self.flow, "save_resume_token", fut, &mut self.shutdown).await
                 }
             };
             if let Err(e) = save_result {
@@ -502,9 +438,12 @@ fn extract_resume_token(state: &CursorState) -> RuntimeResult<serde_json::Value>
     }
 }
 
-/// Cancellation-safe path: rely on `tokio::time::timeout` + `select!` —
-/// dropping `fut` mid-await is safe for the underlying driver. Used for
-/// sqlx-backed connectors.
+/// Wrap an adapter operation in the flow's `query_timeout` and the
+/// runner's shutdown watch. The runtime stays oblivious to driver-level
+/// cancel-safety: a driver that cannot tolerate `Drop` mid-await
+/// (notably `mongodb` 3.x) is responsible for shielding itself at the
+/// call site via `tokio::spawn` so its internal future never gets
+/// dropped from here. See `air_elt_commons_mongodb::task::detached`.
 async fn with_timeout<F, T>(
     flow: &FlowState,
     op: &'static str,
@@ -528,71 +467,6 @@ where
             flow: flow.name.clone(),
             op,
         }),
-    }
-}
-
-/// Cancellation-unsafe path: spawn the future on the runtime and detach
-/// the `JoinHandle` on shutdown / timeout. In tokio, dropping a
-/// `JoinHandle` does NOT abort the task — the task runs to completion
-/// independently, so the underlying driver future never gets dropped
-/// mid-await. Used for the `mongodb` 3.x driver, which is not
-/// cancellation-safe.
-async fn with_spawn_detach<F, T>(
-    flow: &FlowState,
-    op: &'static str,
-    fut: F,
-    shutdown: &mut watch::Receiver<bool>,
-) -> RuntimeResult<T>
-where
-    F: std::future::Future<Output = RuntimeResult<T>> + Send + 'static,
-    T: Send + 'static,
-{
-    let mut handle = tokio::spawn(fut);
-    tokio::select! {
-        res = &mut handle => match res {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(e),
-            Err(join_err) => Err(RuntimeError::Other(format!(
-                "spawned op {op} panicked: {join_err}"
-            ))),
-        },
-        _ = tokio::time::sleep(flow.query_timeout) => {
-            // Detach: the task keeps running; the driver future
-            // completes naturally. The connection-level / pool
-            // timeouts on the underlying client bound runaway work.
-            drop(handle);
-            Err(RuntimeError::Timeout {
-                flow: flow.name.clone(),
-                op,
-                after: flow.query_timeout,
-            })
-        }
-        _ = shutdown.changed() => {
-            drop(handle);
-            Err(RuntimeError::Cancelled {
-                flow: flow.name.clone(),
-                op,
-            })
-        }
-    }
-}
-
-/// Dispatch by connector cancellation safety.
-async fn run_op<F, T>(
-    flow: &FlowState,
-    op: &'static str,
-    fut: F,
-    cancel_safe: bool,
-    shutdown: &mut watch::Receiver<bool>,
-) -> RuntimeResult<T>
-where
-    F: std::future::Future<Output = RuntimeResult<T>> + Send + 'static,
-    T: Send + 'static,
-{
-    if cancel_safe {
-        with_timeout(flow, op, fut, shutdown).await
-    } else {
-        with_spawn_detach(flow, op, fut, shutdown).await
     }
 }
 
@@ -660,7 +534,6 @@ mod tests {
         let saw_dry = std::sync::Arc::new(AtomicBool::new(false));
 
         let mut source = crate::flow::test_utils::default_source_mock();
-        source.expect_cancel_safe().return_const(true);
         source
             .expect_build_context()
             .returning(|_| Ok(Arc::new(UnitSourceCtx)));
@@ -679,7 +552,6 @@ mod tests {
         });
 
         let mut sink = crate::traits::MockSink::new();
-        sink.expect_cancel_safe().return_const(true);
         sink.expect_schemaless().return_const(false);
         sink.expect_supports_deletes().return_const(true);
         sink.expect_build_context()
@@ -696,7 +568,6 @@ mod tests {
             });
 
         let mut storage = crate::traits::MockStorage::new();
-        storage.expect_cancel_safe().return_const(true);
         storage.expect_load_cursor().returning(|_| Ok(None));
         // Sample produces a batch with `next_cursor: None`, so the
         // runner must skip cursor persistence on the dry-run path.
@@ -722,7 +593,6 @@ mod tests {
         // that read_batch was actually called (and failed) before shutdown
         // interrupted the subsequent backoff sleep.
         let mut source = crate::traits::MockSource::new();
-        source.expect_cancel_safe().return_const(true);
         source.expect_schemaless().return_const(false);
         source
             .expect_body_data_type()
@@ -744,34 +614,6 @@ mod tests {
         tokio::time::advance(Duration::from_millis(500)).await;
         tx.send(true).unwrap();
         assert!(handle.await.unwrap().is_ok());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn spawn_detach_path_completes_when_source_is_not_cancel_safe() {
-        // A source that opts out of cancellation safety must still
-        // produce correct results in the happy path — exercises the
-        // `with_spawn_detach` branch end-to-end.
-        let mut source = crate::traits::MockSource::new();
-        source.expect_cancel_safe().return_const(false);
-        source.expect_schemaless().return_const(false);
-        source
-            .expect_body_data_type()
-            .returning(|| crate::types::DataType::Json);
-        source
-            .expect_build_context()
-            .returning(|_| Ok(Arc::new(UnitSourceCtx)));
-        let call = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        source.expect_read_batch().returning(move |_, _, _| {
-            let n = call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if n == 0 {
-                Ok(one_row_batch())
-            } else {
-                Ok(crate::model::raw::RawBatch::default())
-            }
-        });
-        let flow = test_flow(source, mock_sink_ok(), mock_storage_ok());
-        let (_tx, rx) = watch::channel(false);
-        assert!(run(flow, RunMode::Once, rx).run().await.is_ok());
     }
 
     #[test]
@@ -812,7 +654,6 @@ mod tests {
         let build_calls = std::sync::Arc::new(AtomicU32::new(0));
 
         let mut source = crate::flow::test_utils::default_source_mock();
-        source.expect_cancel_safe().return_const(true);
         source.expect_describe_schema().returning(|_| {
             Ok(crate::model::Schema::new(vec![crate::model::Field {
                 name: "id".into(),
@@ -880,7 +721,6 @@ mod tests {
         let build_calls = std::sync::Arc::new(AtomicU32::new(0));
 
         let mut source = crate::traits::MockSource::new();
-        source.expect_cancel_safe().return_const(true);
         source.expect_schemaless().return_const(false);
         source
             .expect_body_data_type()
@@ -921,7 +761,6 @@ mod tests {
         let read_calls = std::sync::Arc::new(AtomicU32::new(0));
 
         let mut source = crate::traits::MockSource::new();
-        source.expect_cancel_safe().return_const(true);
         source.expect_schemaless().return_const(false);
         source
             .expect_body_data_type()
@@ -978,7 +817,6 @@ mod tests {
         let build_calls = std::sync::Arc::new(AtomicU32::new(0));
 
         let mut source = crate::flow::test_utils::default_source_mock();
-        source.expect_cancel_safe().return_const(true);
         let bc = build_calls.clone();
         source.expect_build_context().returning(move |_| {
             bc.fetch_add(1, Ordering::SeqCst);
@@ -1041,7 +879,6 @@ mod tests {
             std::sync::Arc::new(Mutex::new(Vec::new()));
 
         let mut source = crate::flow::test_utils::default_source_mock();
-        source.expect_cancel_safe().return_const(true);
         source
             .expect_build_context()
             .returning(|_| Ok(Arc::new(UnitSourceCtx)));
@@ -1064,7 +901,6 @@ mod tests {
         });
 
         let mut sink = crate::traits::MockSink::new();
-        sink.expect_cancel_safe().return_const(true);
         sink.expect_schemaless().return_const(false);
         sink.expect_supports_deletes().return_const(true);
         sink.expect_build_context()
@@ -1108,7 +944,6 @@ mod tests {
         let read_calls = std::sync::Arc::new(AtomicU32::new(0));
 
         let mut source = crate::flow::test_utils::default_source_mock();
-        source.expect_cancel_safe().return_const(true);
         source
             .expect_build_context()
             .returning(|_| Ok(Arc::new(UnitSourceCtx)));
@@ -1139,7 +974,6 @@ mod tests {
         });
 
         let mut sink = crate::traits::MockSink::new();
-        sink.expect_cancel_safe().return_const(true);
         sink.expect_schemaless().return_const(false);
         // Append-only sink: runner must drop deletes.
         sink.expect_supports_deletes().return_const(false);
@@ -1186,7 +1020,6 @@ mod tests {
             std::sync::Arc::new(Mutex::new(Vec::new()));
 
         let mut source = crate::flow::test_utils::default_source_mock();
-        source.expect_cancel_safe().return_const(true);
         source
             .expect_build_context()
             .returning(|_| Ok(Arc::new(UnitSourceCtx)));
@@ -1213,7 +1046,6 @@ mod tests {
         });
 
         let mut sink = crate::traits::MockSink::new();
-        sink.expect_cancel_safe().return_const(true);
         sink.expect_schemaless().return_const(false);
         sink.expect_supports_deletes().return_const(false);
         sink.expect_build_context()
@@ -1222,7 +1054,6 @@ mod tests {
         sink.expect_write_batch().times(0);
 
         let mut storage = crate::traits::MockStorage::new();
-        storage.expect_cancel_safe().return_const(true);
         storage.expect_load_cursor().returning(|_| Ok(None));
         let sc = saved_cursors.clone();
         storage

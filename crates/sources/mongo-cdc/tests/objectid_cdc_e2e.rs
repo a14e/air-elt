@@ -117,7 +117,7 @@ async fn cdc_emits_object_id_as_custom_value() {
         .unwrap();
 
     let batch = source
-        .read_batch(&spec, ctx, Some(&cursor))
+        .read_batch(&spec, &ctx, Some(&cursor))
         .await
         .expect("read");
     // Dedup by _id collapses insert(a)+update(a) → final post-image of a.

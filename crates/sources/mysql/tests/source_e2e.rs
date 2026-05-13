@@ -71,7 +71,7 @@ async fn describe_and_read_with_cursor() {
     let ctx = source.build_context(&spec).await.expect("build_context");
 
     let batch = source
-        .read_batch(&spec, ctx.clone(), None)
+        .read_batch(&spec, &ctx, None)
         .await
         .expect("read_batch initial");
     assert_eq!(batch.rows.len(), 3);
@@ -81,7 +81,7 @@ async fn describe_and_read_with_cursor() {
     assert_eq!(next.fields[0].value, Value::Int64(3));
 
     let batch = source
-        .read_batch(&spec, ctx.clone(), Some(&next))
+        .read_batch(&spec, &ctx, Some(&next))
         .await
         .expect("read_batch continued");
     assert_eq!(batch.rows.len(), 2);
@@ -90,7 +90,7 @@ async fn describe_and_read_with_cursor() {
 
     let tail = batch.next_cursor.clone().unwrap();
     let empty = source
-        .read_batch(&spec, ctx, Some(&tail))
+        .read_batch(&spec, &ctx, Some(&tail))
         .await
         .expect("read_batch tail");
     assert!(empty.rows.is_empty());
@@ -146,10 +146,7 @@ async fn read_with_nullable_cursor() {
     let ctx = source.build_context(&spec).await.expect("build_context");
 
     // ASC + NULL-as-min: (NULL,2), (NULL,4) come first.
-    let batch = source
-        .read_batch(&spec, ctx.clone(), None)
-        .await
-        .expect("batch 1");
+    let batch = source.read_batch(&spec, &ctx, None).await.expect("batch 1");
     assert_eq!(batch.rows.len(), 2);
     assert_eq!(batch.rows[0].values[1], Value::Null);
     assert_eq!(batch.rows[0].values[0], Value::Int64(2));
@@ -166,7 +163,7 @@ async fn read_with_nullable_cursor() {
 
     // Null-aware path: ASC + NULL cursor → col > NULL becomes IS NOT NULL.
     let batch = source
-        .read_batch(&spec, ctx, Some(&cursor1))
+        .read_batch(&spec, &ctx, Some(&cursor1))
         .await
         .expect("batch 2");
     assert_eq!(batch.rows.len(), 2);
@@ -225,10 +222,7 @@ async fn read_with_nullable_cursor_desc() {
     let ctx = source.build_context(&spec).await.expect("build_context");
 
     // DESC + NULL-as-min: non-null comes first, NULL last.
-    let batch = source
-        .read_batch(&spec, ctx.clone(), None)
-        .await
-        .expect("batch 1");
+    let batch = source.read_batch(&spec, &ctx, None).await.expect("batch 1");
     assert_eq!(batch.rows.len(), 2);
     assert_eq!(batch.rows[0].values[1], Value::Int32(3));
     assert_eq!(batch.rows[1].values[1], Value::Int32(1));
@@ -236,7 +230,7 @@ async fn read_with_nullable_cursor_desc() {
 
     // Continue: tail is NULLs in some order.
     let batch = source
-        .read_batch(&spec, ctx, Some(&cursor1))
+        .read_batch(&spec, &ctx, Some(&cursor1))
         .await
         .expect("batch 2");
     assert_eq!(batch.rows.len(), 2);
@@ -303,7 +297,7 @@ async fn tinyint_one_round_trips_as_bool() {
 
     let ctx = source.build_context(&spec).await.expect("build_context");
     let batch = source
-        .read_batch(&spec, ctx, None)
+        .read_batch(&spec, &ctx, None)
         .await
         .expect("read_batch");
     assert_eq!(batch.rows.len(), 3);
@@ -373,7 +367,7 @@ async fn binary_columns_carry_size() {
     };
     let ctx = source.build_context(&spec).await.expect("build_context");
     let batch = source
-        .read_batch(&spec, ctx, None)
+        .read_batch(&spec, &ctx, None)
         .await
         .expect("read_batch");
     assert_eq!(batch.rows.len(), 1);

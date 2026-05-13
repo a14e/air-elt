@@ -4,6 +4,7 @@ description: "Use this agent when you need to validate that implemented code mat
 tools: Glob, Grep, Read, WebFetch, WebSearch, mcp__ide__getDiagnostics, Skill, ToolSearch, Bash
 model: inherit
 color: green
+memory: project
 ---
 
 ## Required project context

@@ -4,6 +4,7 @@ description: "Use this agent when you need to audit the quality of tests after w
 tools: Glob, Grep, Read, WebFetch, WebSearch, Bash, mcp__ide__getDiagnostics, Skill, ToolSearch, NotebookEdit
 model: inherit
 color: yellow
+memory: project
 ---
 
 ## Required project context

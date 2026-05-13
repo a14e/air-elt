@@ -213,7 +213,7 @@ impl Sink for MySqlSink {
     async fn write_batch(
         &self,
         _spec: &WriteSpec,
-        ctx: Arc<dyn SinkCtx>,
+        ctx: &Arc<dyn SinkCtx>,
         batch: Batch,
         dry_run: bool,
     ) -> RuntimeResult<WriteReport> {

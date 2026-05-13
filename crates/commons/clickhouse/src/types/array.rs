@@ -109,7 +109,7 @@ impl DynType for ChArrayType {
                 let elements: Vec<Value> = json_array
                     .into_iter()
                     .map(|j| json_to_typed_value(j, &self.element))
-                    .collect();
+                    .collect::<Result<_, _>>()?;
                 Ok(Value::Custom(Box::new(ChArrayValue {
                     element_type: self.element.clone(),
                     elements,
@@ -188,31 +188,72 @@ pub(super) fn value_to_json(v: &Value) -> Result<serde_json::Value, JsonEncodeEr
 }
 
 pub(super) fn json_to_value(j: serde_json::Value) -> Value {
-    json_to_typed_value(j, &DataType::Json)
+    // Generic JSON pivot — never overflows, so the result is always Ok.
+    // unwrap is safe because the DataType::Json arm in json_to_typed_value
+    // only routes through range-checked or text fallbacks.
+    json_to_typed_value(j, &DataType::Json).expect("DataType::Json target cannot overflow")
 }
 
 /// Convert a JSON value to the canonical `Value` variant dictated by
 /// `target`. For `DataType::Json` (the generic pivot) this is the legacy
 /// best-effort mapping. For concrete CH types (Int8, UInt64, etc.) the
-/// JSON number is narrowed to the exact target width.
-pub(super) fn json_to_typed_value(j: serde_json::Value, target: &DataType) -> Value {
-    match j {
+/// JSON number is narrowed to the exact target width and an out-of-range
+/// number is rejected — silent zero-default would corrupt data.
+pub(super) fn json_to_typed_value(
+    j: serde_json::Value,
+    target: &DataType,
+) -> Result<Value, ConvertError> {
+    fn overflow(target: &DataType) -> ConvertError {
+        ConvertError::Overflow {
+            dst: target.clone(),
+        }
+    }
+
+    Ok(match j {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(b),
         serde_json::Value::Number(n) => match target {
-            DataType::Int8 => Value::Int8(n.as_i64().map(|i| i as i8).unwrap_or(0)),
-            DataType::Int16 => Value::Int16(n.as_i64().map(|i| i as i16).unwrap_or(0)),
-            DataType::Int32 => Value::Int32(n.as_i64().map(|i| i as i32).unwrap_or(0)),
-            DataType::Int64 => Value::Int64(n.as_i64().unwrap_or(0)),
-            DataType::UInt8 => Value::UInt8(n.as_u64().map(|i| i as u8).unwrap_or(0)),
-            DataType::UInt16 => Value::UInt16(n.as_u64().map(|i| i as u16).unwrap_or(0)),
-            DataType::UInt32 => Value::UInt32(n.as_u64().map(|i| i as u32).unwrap_or(0)),
-            DataType::UInt64 => Value::UInt64(n.as_u64().unwrap_or(0)),
-            DataType::Float32 => Value::Float32(n.as_f64().map(|f| f as f32).unwrap_or(0.0)),
-            DataType::Float64 => Value::Float64(n.as_f64().unwrap_or(0.0)),
+            DataType::Int8 => Value::Int8(
+                n.as_i64()
+                    .and_then(|i| i8::try_from(i).ok())
+                    .ok_or_else(|| overflow(target))?,
+            ),
+            DataType::Int16 => Value::Int16(
+                n.as_i64()
+                    .and_then(|i| i16::try_from(i).ok())
+                    .ok_or_else(|| overflow(target))?,
+            ),
+            DataType::Int32 => Value::Int32(
+                n.as_i64()
+                    .and_then(|i| i32::try_from(i).ok())
+                    .ok_or_else(|| overflow(target))?,
+            ),
+            DataType::Int64 => Value::Int64(n.as_i64().ok_or_else(|| overflow(target))?),
+            DataType::UInt8 => Value::UInt8(
+                n.as_u64()
+                    .and_then(|i| u8::try_from(i).ok())
+                    .ok_or_else(|| overflow(target))?,
+            ),
+            DataType::UInt16 => Value::UInt16(
+                n.as_u64()
+                    .and_then(|i| u16::try_from(i).ok())
+                    .ok_or_else(|| overflow(target))?,
+            ),
+            DataType::UInt32 => Value::UInt32(
+                n.as_u64()
+                    .and_then(|i| u32::try_from(i).ok())
+                    .ok_or_else(|| overflow(target))?,
+            ),
+            DataType::UInt64 => Value::UInt64(n.as_u64().ok_or_else(|| overflow(target))?),
+            DataType::Float32 => Value::Float32(
+                n.as_f64()
+                    .map(|f| f as f32)
+                    .ok_or_else(|| overflow(target))?,
+            ),
+            DataType::Float64 => Value::Float64(n.as_f64().ok_or_else(|| overflow(target))?),
             _ => {
-                // Fall back to integer/float heuristics for types
-                // that don't have a direct JSON-number mapping.
+                // Fall back to integer/float heuristics for the generic
+                // DataType::Json pivot — no width to overflow against.
                 if let Some(i) = n.as_i64() {
                     if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
                         Value::Int32(i as i32)
@@ -240,7 +281,7 @@ pub(super) fn json_to_typed_value(j: serde_json::Value, target: &DataType) -> Va
             ))
         }
         serde_json::Value::Object(_) => Value::Json(j),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -266,6 +307,45 @@ mod tests {
         };
         let j = v.to_json().unwrap();
         assert_eq!(j, serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn json_to_typed_value_rejects_int8_overflow() {
+        let err = json_to_typed_value(serde_json::json!(300), &DataType::Int8).unwrap_err();
+        assert!(matches!(err, ConvertError::Overflow { .. }));
+    }
+
+    #[test]
+    fn json_to_typed_value_rejects_uint8_overflow() {
+        let err = json_to_typed_value(serde_json::json!(500), &DataType::UInt8).unwrap_err();
+        assert!(matches!(err, ConvertError::Overflow { .. }));
+    }
+
+    #[test]
+    fn json_to_typed_value_rejects_uint16_negative() {
+        // Negative JSON number does not fit any UInt — n.as_u64() returns None.
+        let err = json_to_typed_value(serde_json::json!(-1), &DataType::UInt16).unwrap_err();
+        assert!(matches!(err, ConvertError::Overflow { .. }));
+    }
+
+    #[test]
+    fn json_to_typed_value_accepts_in_range() {
+        let v = json_to_typed_value(serde_json::json!(120), &DataType::Int8).unwrap();
+        assert_eq!(v, Value::Int8(120));
+        let v = json_to_typed_value(serde_json::json!(-1), &DataType::Int8).unwrap();
+        assert_eq!(v, Value::Int8(-1));
+    }
+
+    #[test]
+    fn array_construct_propagates_element_overflow() {
+        let ty = ChArrayType {
+            element: DataType::Int8,
+            element_nullable: false,
+        };
+        let bad = Value::Json(serde_json::json!([1, 999]));
+        let ctx = ConversionContext::default();
+        let err = ty.construct(bad, &DataType::Json, &ctx).unwrap_err();
+        assert!(matches!(err, ConvertError::Overflow { .. }));
     }
 
     #[test]

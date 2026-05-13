@@ -76,7 +76,7 @@ async fn numeric_zero_scale_decoded_as_bigint() {
         needs_body: false,
     };
     let ctx = source.build_context(&spec).await.unwrap();
-    let batch = source.read_batch(&spec, ctx, None).await.unwrap();
+    let batch = source.read_batch(&spec, &ctx, None).await.unwrap();
     assert_eq!(batch.rows.len(), 1);
     assert_eq!(
         batch.rows[0].values[1],
@@ -145,7 +145,7 @@ async fn cockroach_decimal_round_trip() {
         needs_body: false,
     };
     let ctx = source.build_context(&spec).await.unwrap();
-    let batch = source.read_batch(&spec, ctx, None).await.unwrap();
+    let batch = source.read_batch(&spec, &ctx, None).await.unwrap();
     assert_eq!(batch.rows.len(), 1);
     assert_eq!(
         batch.rows[0].values[1],

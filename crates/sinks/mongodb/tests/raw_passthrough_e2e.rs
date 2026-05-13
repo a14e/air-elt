@@ -54,7 +54,7 @@ async fn raw_passthrough_writes_documents_verbatim() {
         ],
         next_cursor: None,
     };
-    let report = sink.write_batch(&spec, ctx, batch, false).await.unwrap();
+    let report = sink.write_batch(&spec, &ctx, batch, false).await.unwrap();
     assert_eq!(report.rows_written, 2);
 
     let coll = handle

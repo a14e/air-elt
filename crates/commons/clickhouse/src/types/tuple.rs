@@ -112,14 +112,16 @@ impl DynType for ChTupleType {
                         });
                     }
                 };
+                if json_array.len() != self.fields.len() {
+                    return Err(ConvertError::ValueShapeMismatch {
+                        src: DataType::Json,
+                    });
+                }
                 let fields: Vec<Value> = json_array
                     .into_iter()
-                    .enumerate()
-                    .map(|(i, j)| {
-                        let (dt, _) = self.fields.get(i).unwrap_or(&(DataType::Json, false));
-                        json_to_typed_value(j, dt)
-                    })
-                    .collect();
+                    .zip(self.fields.iter())
+                    .map(|(j, (dt, _))| json_to_typed_value(j, dt))
+                    .collect::<Result<_, _>>()?;
                 Ok(Value::Custom(Box::new(ChTupleValue { fields })))
             }
             DataType::Custom(t) if t.kind() == Self::KIND => Ok(value),
@@ -217,5 +219,19 @@ mod tests {
         };
         let j = v.to_json().unwrap();
         assert_eq!(j, serde_json::json!([42, "hello"]));
+    }
+
+    #[test]
+    fn tuple_construct_rejects_arity_mismatch() {
+        let ty = ChTupleType {
+            fields: vec![(DataType::Int32, false), (DataType::Bool, false)],
+        };
+        let ctx = ConversionContext::default();
+        let too_few = Value::Json(serde_json::json!([1]));
+        let err = ty.construct(too_few, &DataType::Json, &ctx).unwrap_err();
+        assert!(matches!(err, ConvertError::ValueShapeMismatch { .. }));
+        let too_many = Value::Json(serde_json::json!([1, true, "extra"]));
+        let err = ty.construct(too_many, &DataType::Json, &ctx).unwrap_err();
+        assert!(matches!(err, ConvertError::ValueShapeMismatch { .. }));
     }
 }

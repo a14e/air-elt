@@ -12,15 +12,16 @@
 //! must be applied at each call site via the per-options
 //! `max_time(Duration)` field (Find / Aggregate / FindOne / etc.).
 //! This is load-bearing: the `mongodb` 3.x Rust driver is **not**
-//! cancellation-safe, so the flow runner does NOT wrap mongo calls in
-//! `tokio::time::timeout` (dropping a future mid-await can leave driver
-//! internals inconsistent). Instead, the runner spawns the call and
-//! detaches the `JoinHandle` on timeout — the underlying driver future
-//! runs to completion in the background — and the server's `maxTimeMS`
-//! bounds runaway work. See `core::flow::runner::with_timeout` and the
-//! `cancel_safe()` trait method on `Source`/`Sink`/`Storage`.
+//! cancellation-safe — dropping a future mid-await can leave driver
+//! internals inconsistent. Each mongo adapter (source / sink / storage)
+//! therefore wraps its driver call in `task::detached`, which spawns
+//! the work on the runtime and awaits the `JoinHandle`. Dropping the
+//! handle does not abort the task, so the driver future runs to
+//! completion in the background; the server's `maxTimeMS` bounds
+//! runaway work. The flow runner is oblivious to cancel-safety — it
+//! only wraps adapter calls in `tokio::time::timeout` + a shutdown
+//! `select!`. See `task::detached`.
 
-use std::str::FromStr;
 use std::time::Duration;
 
 use mongodb::Client;
@@ -41,16 +42,11 @@ pub async fn connect(url: &str, settings: PoolSettings) -> RuntimeResult<Client>
     options.max_idle_time = Some(settings.idle);
     options.app_name = Some("air-elt".to_string());
 
-    let client = tokio::time::timeout(settings.connect, async { Client::with_options(options) })
-        .await
-        .map_err(|_| {
-            RuntimeError::Other(format!(
-                "mongo connect timed out after {:?}",
-                settings.connect
-            ))
-        })?
-        .map_err(RuntimeError::backend)?;
-    Ok(client)
+    // `Client::with_options` is synchronous (no I/O); the driver
+    // honours `connect_timeout` on the first real wire operation. No
+    // outer `tokio::time::timeout` is needed here — it would be a
+    // no-op around a synchronous function.
+    Client::with_options(options).map_err(RuntimeError::backend)
 }
 
 pub fn database_from_url(url: &str) -> Option<String> {
@@ -73,15 +69,6 @@ pub fn ensure_duration(d: Duration) -> Duration {
     } else {
         d
     }
-}
-
-// Suppress unused-import warning when the helper above is the only
-// non-trivial call site — keeps `FromStr` available for future
-// callers without forcing them to re-import.
-#[allow(dead_code)]
-fn _force_use_from_str() -> bool {
-    let _ = i32::from_str("0");
-    true
 }
 
 #[cfg(test)]

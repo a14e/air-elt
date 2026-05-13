@@ -10,8 +10,6 @@
 //! Array/Map/Tuple go through the Custom(Ch*Type) / Custom(Ch*Value)
 //! path added for AIR-22/AIR-23.
 
-use std::sync::Arc;
-
 use air_elt_commons_clickhouse::types::array::ChArrayValue;
 use air_elt_commons_clickhouse::types::map::ChMapValue;
 use air_elt_commons_clickhouse::types::tuple::ChTupleValue;
@@ -48,7 +46,7 @@ async fn round_trip_array_int32() {
         next_cursor: None,
     };
     let report = sink
-        .write_batch(&spec, Arc::clone(&ctx), batch, false)
+        .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
     assert_eq!(report.rows_written, 1);
@@ -87,7 +85,7 @@ async fn round_trip_empty_array() {
         }],
         next_cursor: None,
     };
-    sink.write_batch(&spec, Arc::clone(&ctx), batch, false)
+    sink.write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
 
@@ -128,7 +126,7 @@ async fn round_trip_map_string_int32() {
         next_cursor: None,
     };
     let report = sink
-        .write_batch(&spec, Arc::clone(&ctx), batch, false)
+        .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
     assert_eq!(report.rows_written, 1);
@@ -176,7 +174,7 @@ async fn round_trip_tuple_int32_string() {
         next_cursor: None,
     };
     let report = sink
-        .write_batch(&spec, Arc::clone(&ctx), batch, false)
+        .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
     assert_eq!(report.rows_written, 1);
@@ -231,7 +229,7 @@ async fn round_trip_nested_as_arrays() {
         next_cursor: None,
     };
     let report = sink
-        .write_batch(&spec, Arc::clone(&ctx), batch, false)
+        .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
     assert_eq!(report.rows_written, 1);

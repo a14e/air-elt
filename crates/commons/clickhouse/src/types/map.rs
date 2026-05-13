@@ -120,8 +120,8 @@ impl DynType for ChMapType {
                     .into_iter()
                     .map(|pair| match pair {
                         serde_json::Value::Array(mut a) if a.len() == 2 => {
-                            let val = json_to_typed_value(a.remove(1), &self.value);
-                            let key = json_to_typed_value(a.remove(0), &self.key);
+                            let val = json_to_typed_value(a.remove(1), &self.value)?;
+                            let key = json_to_typed_value(a.remove(0), &self.key)?;
                             Ok((key, val))
                         }
                         _ => Err(ConvertError::ValueShapeMismatch {

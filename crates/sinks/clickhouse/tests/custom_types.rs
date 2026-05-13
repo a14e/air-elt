@@ -12,7 +12,6 @@
 //! pipeline.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
 
 use air_elt_commons_clickhouse::types::aggregate_state::ChAggregateStateValue;
 use air_elt_commons_clickhouse::types::enums::ChEnumValue;
@@ -104,7 +103,7 @@ async fn round_trip_all_custom_types() {
         next_cursor: None,
     };
     let report = sink
-        .write_batch(&spec, Arc::clone(&ctx), batch, false)
+        .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
     assert_eq!(report.rows_written, 1);

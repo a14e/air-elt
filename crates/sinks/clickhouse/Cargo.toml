@@ -22,6 +22,7 @@ air-elt-commons-clickhouse = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }

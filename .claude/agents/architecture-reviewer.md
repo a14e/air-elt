@@ -4,6 +4,7 @@ description: "Use this agent when you need a high-level architectural review of 
 tools: Glob, Grep, Read, WebFetch, WebSearch, Bash, mcp__ide__getDiagnostics, Skill, ToolSearch
 model: inherit
 color: cyan
+memory: project
 ---
 
 ## Required project context

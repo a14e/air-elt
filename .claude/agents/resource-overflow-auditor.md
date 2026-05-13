@@ -4,6 +4,7 @@ description: "Read-only audit for memory safety, buffer/stack overflows, and res
 tools: Glob, Grep, Read, WebFetch, WebSearch, Bash, mcp__ide__getDiagnostics, LSP, Monitor, Skill, TaskCreate, TaskGet, TaskList, TaskUpdate, ToolSearch
 model: inherit
 color: green
+memory: project
 ---
 
 ## Required project context

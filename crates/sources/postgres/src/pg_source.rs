@@ -196,7 +196,7 @@ impl Source for PgSource {
     async fn read_batch<'a>(
         &self,
         spec: &ReadSpec,
-        ctx: Arc<dyn SourceCtx>,
+        ctx: &Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
     ) -> RuntimeResult<RawBatch> {
         let pg_ctx = ctx.downcast_ref_to::<PgSourceCtx>()?;

@@ -59,7 +59,7 @@ async fn read_with_cursor_and_dot_notation() {
     let ctx = source.build_context(&spec).await.expect("build_context");
 
     let batch = source
-        .read_batch(&spec, ctx.clone(), None)
+        .read_batch(&spec, &ctx, None)
         .await
         .expect("read_batch first");
     assert_eq!(batch.rows.len(), 3);
@@ -68,7 +68,7 @@ async fn read_with_cursor_and_dot_notation() {
 
     let next = batch.next_cursor.expect("next cursor");
     let batch2 = source
-        .read_batch(&spec, ctx, Some(&next))
+        .read_batch(&spec, &ctx, Some(&next))
         .await
         .expect("read_batch second");
     assert_eq!(batch2.rows.len(), 2);
@@ -110,7 +110,7 @@ async fn sample_returns_documents() {
     };
 
     let ctx = source.build_context(&spec).await.expect("ctx");
-    let raw = source.sample(&spec, ctx, 5).await.expect("sample");
+    let raw = source.sample(&spec, &ctx, 5).await.expect("sample");
     assert!(!raw.rows.is_empty());
     assert!(raw.rows.len() <= 5);
     for row in &raw.rows {
@@ -174,10 +174,7 @@ async fn compound_cursor_updated_at_id() {
 
     let ctx = source.build_context(&spec).await.expect("build_context");
 
-    let batch1 = source
-        .read_batch(&spec, ctx.clone(), None)
-        .await
-        .expect("batch1");
+    let batch1 = source.read_batch(&spec, &ctx, None).await.expect("batch1");
     assert_eq!(batch1.rows.len(), 2, "batch1 should be the two ua=100 rows");
     assert_eq!(batch1.rows[0].values[0], Value::Int64(1));
     assert_eq!(batch1.rows[1].values[0], Value::Int64(2));
@@ -189,7 +186,7 @@ async fn compound_cursor_updated_at_id() {
     assert_eq!(cursor1.fields[1].value, Value::Int64(2));
 
     let batch2 = source
-        .read_batch(&spec, ctx.clone(), Some(&cursor1))
+        .read_batch(&spec, &ctx, Some(&cursor1))
         .await
         .expect("batch2");
     assert_eq!(batch2.rows.len(), 2, "batch2 should pick up ua=200 and 300");
@@ -198,7 +195,7 @@ async fn compound_cursor_updated_at_id() {
 
     let cursor2 = batch2.next_cursor.expect("cursor2");
     let batch3 = source
-        .read_batch(&spec, ctx, Some(&cursor2))
+        .read_batch(&spec, &ctx, Some(&cursor2))
         .await
         .expect("batch3 (drain)");
     assert_eq!(batch3.rows.len(), 0, "no more rows after the last id");
@@ -244,7 +241,7 @@ async fn read_object_id_emits_custom_value() {
     };
     let ctx = source.build_context(&spec).await.expect("build_context");
     let batch = source
-        .read_batch(&spec, ctx, None)
+        .read_batch(&spec, &ctx, None)
         .await
         .expect("read_batch");
     assert_eq!(batch.rows.len(), 2);

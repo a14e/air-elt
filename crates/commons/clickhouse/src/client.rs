@@ -89,7 +89,12 @@ impl ChClient {
         // CH HTTP has no separate per-statement timeout — the request
         // timeout doubles as the unified call cap.
         let request_cap: Duration = config.pool.statement;
-        let pool_max = usize::try_from(config.pool.max_connections).unwrap_or(5);
+        // `max_connections == 0` would disable keep-alive and force a new
+        // TCP connection per request; clamp to at least 1 to keep the pool
+        // usable on a degenerate config.
+        let pool_max = usize::try_from(config.pool.max_connections)
+            .unwrap_or(5)
+            .max(1);
         let http = reqwest::Client::builder()
             .default_headers(headers)
             .connect_timeout(config.pool.connect)
@@ -220,4 +225,103 @@ fn insert_header(map: &mut HeaderMap, name: &str, value: &str) -> Result<(), ChC
 
 fn trim_trailing_slash(url: &str) -> String {
     url.trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Single-shot HTTP stub. Binds to 127.0.0.1:0, returns its URL, and
+    /// spawns a task that accepts exactly one connection, drains the
+    /// request, and writes the configured response. Errors on the
+    /// listener side surface via the JoinHandle.
+    async fn stub_once(status: u16, reason: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain request — just enough to unblock the client. We don't
+            // need to parse it for these tests.
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+                len = body.len(),
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn client_for(url: String) -> ChClient {
+        ChClient::connect(ChClientConfig {
+            url,
+            database: "default".into(),
+            user: None,
+            password: None,
+            pool: PoolSettings {
+                connect: Duration::from_secs(1),
+                statement: Duration::from_secs(2),
+                idle: Duration::from_secs(10),
+                ..PoolSettings::defaults()
+            },
+            compression: ChCompression::None,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn query_text_surfaces_4xx_status_and_body() {
+        let url = stub_once(400, "Bad Request", "Code: 62. DB::Exception: Syntax error").await;
+        let client = client_for(url);
+        let err = client.query_text("BOGUS").await.unwrap_err();
+        match err {
+            ChClientError::Http { status, body } => {
+                assert_eq!(status, 400);
+                assert!(body.contains("Syntax error"), "body was {body:?}");
+            }
+            other => panic!("expected Http error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_row_binary_surfaces_5xx_status_and_body() {
+        let url = stub_once(
+            500,
+            "Internal Server Error",
+            "Code: 36. DB::Exception: Bad cast",
+        )
+        .await;
+        let client = client_for(url);
+        let err = client
+            .insert_row_binary("INSERT INTO t (x) FORMAT RowBinary", vec![1, 2, 3])
+            .await
+            .unwrap_err();
+        match err {
+            ChClientError::Http { status, body } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("Bad cast"), "body was {body:?}");
+            }
+            other => panic!("expected Http error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn query_text_surfaces_transport_error_on_closed_port() {
+        // Bind then immediately drop to free the port — connect will fail.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = client_for(format!("http://{addr}"));
+        let err = client.query_text("SELECT 1").await.unwrap_err();
+        assert!(
+            matches!(err, ChClientError::Transport(_)),
+            "expected Transport error, got {err:?}"
+        );
+    }
 }

@@ -83,7 +83,9 @@ impl DynType for ChInt256Type {
                         return Err(ConvertError::ValueShapeMismatch { src: src.clone() });
                     }
                 };
-                let le_bytes = bigint_to_le32(&n);
+                let le_bytes = bigint_to_le32(&n).ok_or_else(|| ConvertError::Overflow {
+                    dst: DataType::Custom(Box::new(self.clone())),
+                })?;
                 Ok(Value::Custom(Box::new(ChInt256Value { le_bytes })))
             }
             DataType::Custom(t) if t.kind() == Self::KIND => Ok(value),
@@ -225,7 +227,10 @@ impl DynType for ChUInt256Type {
                         dst: DataType::Custom(Box::new(self.clone())),
                     });
                 }
-                let le_bytes = biguint_to_le32(n.magnitude());
+                let le_bytes =
+                    biguint_to_le32(n.magnitude()).ok_or_else(|| ConvertError::Overflow {
+                        dst: DataType::Custom(Box::new(self.clone())),
+                    })?;
                 Ok(Value::Custom(Box::new(ChUInt256Value { le_bytes })))
             }
             DataType::Custom(t) if t.kind() == Self::KIND => Ok(value),
@@ -298,33 +303,20 @@ fn downcast_uint256(value: Value, target: &DataType) -> Result<ChUInt256Value, C
 
 /// Convert a signed `BigInt` to 32-byte LE two's-complement.
 ///
-/// Negative values: compute two's complement by taking the unsigned
-/// magnitude, subtracting from 2^256 (which gives the correct LE
-/// two's-complement representation).
-pub fn bigint_to_le32(n: &BigInt) -> [u8; 32] {
-    let mut buf = [0u8; 32];
-    match n.sign() {
-        Sign::Plus | Sign::NoSign => {
-            let bytes = n.to_bytes_le().1;
-            let len = bytes.len().min(32);
-            buf[..len].copy_from_slice(&bytes[..len]);
-        }
-        Sign::Minus => {
-            // Two's complement: negate and subtract from 2^256.
-            // For negative BigInt x, the 32-byte LE representation is
-            // (2^256 + x). We compute this as the bitwise NOT of (|x| - 1).
-            let mag = n.magnitude();
-            let mag_minus_1 = mag - 1u32;
-            let bytes = mag_minus_1.to_bytes_le();
-            let len = bytes.len().min(32);
-            buf[..len].copy_from_slice(&bytes[..len]);
-            // Bitwise NOT to get the two's complement representation.
-            for byte in &mut buf {
-                *byte = !*byte;
-            }
-        }
+/// Returns `None` if the value does not fit in 256 bits — i.e. outside
+/// the inclusive range `[-2^255, 2^255 - 1]`.
+pub fn bigint_to_le32(n: &BigInt) -> Option<[u8; 32]> {
+    // `to_signed_bytes_le` returns the minimal-length two's-complement
+    // little-endian representation. We then sign-extend (or zero-extend)
+    // to exactly 32 bytes.
+    let bytes = n.to_signed_bytes_le();
+    if bytes.len() > 32 {
+        return None;
     }
-    buf
+    let fill = if n.sign() == Sign::Minus { 0xFF } else { 0x00 };
+    let mut buf = [fill; 32];
+    buf[..bytes.len()].copy_from_slice(&bytes);
+    Some(buf)
 }
 
 /// Convert a 32-byte LE two's-complement array back to a signed `BigInt`.
@@ -346,12 +338,17 @@ pub fn le32_to_bigint(bytes: &[u8; 32]) -> BigInt {
 }
 
 /// Convert a `BigUint` to 32-byte LE (unsigned).
-pub fn biguint_to_le32(n: &BigUint) -> [u8; 32] {
-    let mut buf = [0u8; 32];
+///
+/// Returns `None` if the value does not fit in 256 bits — i.e. greater
+/// than or equal to `2^256`.
+pub fn biguint_to_le32(n: &BigUint) -> Option<[u8; 32]> {
     let bytes = n.to_bytes_le();
-    let len = bytes.len().min(32);
-    buf[..len].copy_from_slice(&bytes[..len]);
-    buf
+    if bytes.len() > 32 {
+        return None;
+    }
+    let mut buf = [0u8; 32];
+    buf[..bytes.len()].copy_from_slice(&bytes);
+    Some(buf)
 }
 
 #[cfg(test)]
@@ -362,7 +359,7 @@ mod tests {
     #[test]
     fn bigint_to_le32_positive() {
         let n = BigInt::from(1i64);
-        let bytes = bigint_to_le32(&n);
+        let bytes = bigint_to_le32(&n).unwrap();
         assert_eq!(bytes[0], 1);
         assert!(bytes[1..].iter().all(|&b| b == 0));
     }
@@ -370,7 +367,7 @@ mod tests {
     #[test]
     fn bigint_to_le32_negative_one() {
         let n = BigInt::from(-1i64);
-        let bytes = bigint_to_le32(&n);
+        let bytes = bigint_to_le32(&n).unwrap();
         // -1 in two's complement is all 0xFF.
         assert!(bytes.iter().all(|&b| b == 0xFF));
     }
@@ -378,7 +375,7 @@ mod tests {
     #[test]
     fn le32_to_bigint_roundtrip_positive() {
         let original = BigInt::from(123456789_i64);
-        let bytes = bigint_to_le32(&original);
+        let bytes = bigint_to_le32(&original).unwrap();
         let back = le32_to_bigint(&bytes);
         assert_eq!(back, original);
     }
@@ -386,7 +383,7 @@ mod tests {
     #[test]
     fn le32_to_bigint_roundtrip_negative() {
         let original = BigInt::from(-987654321_i64);
-        let bytes = bigint_to_le32(&original);
+        let bytes = bigint_to_le32(&original).unwrap();
         let back = le32_to_bigint(&bytes);
         assert_eq!(back, original);
     }
@@ -394,8 +391,89 @@ mod tests {
     #[test]
     fn biguint_to_le32_round_trip() {
         let n = BigUint::from(u128::MAX);
-        let bytes = biguint_to_le32(&n);
+        let bytes = biguint_to_le32(&n).unwrap();
         let back = BigUint::from_bytes_le(&bytes);
         assert_eq!(back, n);
+    }
+
+    fn pow2_bigint(exp: usize) -> BigInt {
+        BigInt::from(1u32) << exp
+    }
+
+    fn pow2_biguint(exp: usize) -> BigUint {
+        BigUint::from(1u32) << exp
+    }
+
+    #[test]
+    fn bigint_to_le32_int256_max_fits() {
+        // 2^255 - 1 = largest valid Int256.
+        let max = pow2_bigint(255) - 1u32;
+        let bytes = bigint_to_le32(&max).unwrap();
+        assert_eq!(le32_to_bigint(&bytes), max);
+    }
+
+    #[test]
+    fn bigint_to_le32_int256_min_fits() {
+        // -2^255 = smallest valid Int256.
+        let min = -pow2_bigint(255);
+        let bytes = bigint_to_le32(&min).unwrap();
+        assert_eq!(le32_to_bigint(&bytes), min);
+    }
+
+    #[test]
+    fn bigint_to_le32_positive_overflow() {
+        // 2^255 does not fit as a signed 256-bit integer.
+        let too_big = pow2_bigint(255);
+        assert!(bigint_to_le32(&too_big).is_none());
+    }
+
+    #[test]
+    fn bigint_to_le32_negative_overflow() {
+        // -2^255 - 1 does not fit.
+        let too_small = -pow2_bigint(255) - 1u32;
+        assert!(bigint_to_le32(&too_small).is_none());
+    }
+
+    #[test]
+    fn biguint_to_le32_uint256_max_fits() {
+        // 2^256 - 1 = largest valid UInt256.
+        let max = pow2_biguint(256) - 1u32;
+        let bytes = biguint_to_le32(&max).unwrap();
+        assert_eq!(BigUint::from_bytes_le(&bytes), max);
+    }
+
+    #[test]
+    fn biguint_to_le32_overflow() {
+        // 2^256 does not fit.
+        let too_big = pow2_biguint(256);
+        assert!(biguint_to_le32(&too_big).is_none());
+    }
+
+    #[test]
+    fn construct_int256_overflow_errors() {
+        let ctx = ConversionContext::passthrough();
+        let too_big = pow2_bigint(255);
+        let err = ChInt256Type
+            .construct(
+                Value::BigInt(too_big),
+                &DataType::BigInt { width: None },
+                &ctx,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ConvertError::Overflow { .. }));
+    }
+
+    #[test]
+    fn construct_uint256_overflow_errors() {
+        let ctx = ConversionContext::passthrough();
+        let too_big = BigInt::from(pow2_biguint(256));
+        let err = ChUInt256Type
+            .construct(
+                Value::BigInt(too_big),
+                &DataType::BigInt { width: None },
+                &ctx,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ConvertError::Overflow { .. }));
     }
 }

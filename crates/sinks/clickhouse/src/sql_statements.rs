@@ -12,13 +12,3 @@ pub fn insert_row_binary_sql(table: &str, columns: &[String]) -> RuntimeResult<S
     let cols = quote_columns(columns)?;
     Ok(format!("INSERT INTO {qt} ({cols}) FORMAT RowBinary"))
 }
-
-/// Zero-row write probe. CH evaluates the SELECT and validates the
-/// INSERT column types but never writes a row.
-pub fn probe_insert_where_false(table: &str, columns: &[String]) -> RuntimeResult<String> {
-    let qt = quote_qualified(table)?;
-    let cols = quote_columns(columns)?;
-    Ok(format!(
-        "INSERT INTO {qt} ({cols}) SELECT {cols} FROM {qt} WHERE FALSE"
-    ))
-}

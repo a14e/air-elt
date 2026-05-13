@@ -11,8 +11,6 @@
 //! directly. If the byte payload were corrupted at any point on the
 //! sink path the merged result would diverge or CH would error out.
 
-use std::sync::Arc;
-
 use air_elt_commons_clickhouse::types::aggregate_state::ChAggregateStateValue;
 use air_elt_commons_testing::clickhouse::clickhouse_handle;
 use air_elt_core::model::{Batch, Row, RowOp, WriteSpec};
@@ -206,7 +204,7 @@ async fn round_trip_aggregate_states_through_sink() {
             next_cursor: None,
         };
         let report = sink
-            .write_batch(&spec, Arc::clone(&ctx), batch, false)
+            .write_batch(&spec, &ctx, batch, false)
             .await
             .unwrap_or_else(|e| panic!("[{}] write_batch: {e}", sc.label));
         assert_eq!(report.rows_written, 1, "[{}] rows_written", sc.label);

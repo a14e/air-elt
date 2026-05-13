@@ -17,8 +17,6 @@
 //! `Value::Custom(ChUInt256Value)` through `DataType::Custom(ChInt256Type)`
 //! / `DataType::Custom(ChUInt256Type)`.
 
-use std::sync::Arc;
-
 use bigdecimal::BigDecimal;
 use num_bigint::{BigInt, BigUint};
 
@@ -64,7 +62,7 @@ async fn round_trip_decimal32() {
         next_cursor: None,
     };
     let report = sink
-        .write_batch(&spec, Arc::clone(&ctx), batch, false)
+        .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
     assert_eq!(report.rows_written, 1);
@@ -106,7 +104,7 @@ async fn round_trip_decimal64() {
         }],
         next_cursor: None,
     };
-    sink.write_batch(&spec, Arc::clone(&ctx), batch, false)
+    sink.write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
 
@@ -147,7 +145,7 @@ async fn round_trip_decimal128() {
         }],
         next_cursor: None,
     };
-    sink.write_batch(&spec, Arc::clone(&ctx), batch, false)
+    sink.write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
 
@@ -188,7 +186,7 @@ async fn round_trip_decimal_negative() {
         }],
         next_cursor: None,
     };
-    sink.write_batch(&spec, Arc::clone(&ctx), batch, false)
+    sink.write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
 
@@ -232,7 +230,7 @@ async fn round_trip_int128() {
         }],
         next_cursor: None,
     };
-    sink.write_batch(&spec, Arc::clone(&ctx), batch, false)
+    sink.write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
 
@@ -274,7 +272,7 @@ async fn round_trip_uint128() {
         }],
         next_cursor: None,
     };
-    sink.write_batch(&spec, Arc::clone(&ctx), batch, false)
+    sink.write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
 
@@ -315,7 +313,7 @@ async fn round_trip_int256() {
         10,
     )
     .expect("valid big int");
-    let le_bytes = bigint_to_le32(&n);
+    let le_bytes = bigint_to_le32(&n).expect("Int256 value fits in 256 bits");
     let batch = Batch {
         rows: vec![Row {
             values: vec![
@@ -326,7 +324,7 @@ async fn round_trip_int256() {
         }],
         next_cursor: None,
     };
-    sink.write_batch(&spec, Arc::clone(&ctx), batch, false)
+    sink.write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
 
@@ -365,7 +363,7 @@ async fn round_trip_uint256() {
         10,
     )
     .expect("valid big uint");
-    let le_bytes = biguint_to_le32(&n);
+    let le_bytes = biguint_to_le32(&n).expect("UInt256 value fits in 256 bits");
     let batch = Batch {
         rows: vec![Row {
             values: vec![
@@ -376,7 +374,7 @@ async fn round_trip_uint256() {
         }],
         next_cursor: None,
     };
-    sink.write_batch(&spec, Arc::clone(&ctx), batch, false)
+    sink.write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
 

@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 
 use air_elt_commons_mongodb::client::{PoolSettings, connect, database_from_url};
 use air_elt_commons_mongodb::key_bson::KeyBson;
+use air_elt_commons_mongodb::task::detached;
 use air_elt_commons_mongodb::types::BsonObjectValue;
 use air_elt_commons_mongodb::{bson_value, identifier, path, sampling};
 use air_elt_core::error::{RuntimeError, RuntimeResult};
@@ -149,11 +150,6 @@ impl Source for MongoCdcSource {
         &self.name
     }
 
-    fn cancel_safe(&self) -> bool {
-        // The mongodb 3.x driver is not cancellation-safe.
-        false
-    }
-
     fn body_data_type(&self) -> DataType {
         // CDC attaches the source `bson::Document` as a
         // `Value::Custom(BsonObjectValue)` directly on `RawRow.body`.
@@ -183,23 +179,28 @@ impl Source for MongoCdcSource {
         // don't open a watch() here — that would require running on a
         // replica-set deployment, which we want to surface only when
         // the flow actually drains.
-        self.client
-            .database(&self.database)
-            .run_command(doc! { "ping": 1 })
-            .await
-            .map_err(RuntimeError::backend)?;
+        let client = self.client.clone();
+        let database = self.database.clone();
         let coll = self.collection(&spec.table)?;
         let opts = FindOptions::builder()
             .limit(Some(1))
             .max_time(self.operation_timeout)
             .build();
-        let _ = coll
-            .find(doc! {})
-            .with_options(opts)
-            .await
-            .map_err(RuntimeError::backend)?;
-        info!(collection = %spec.table, "mongo-cdc source access validated");
-        Ok(())
+        let table = spec.table.clone();
+        detached(async move {
+            client
+                .database(&database)
+                .run_command(doc! { "ping": 1 })
+                .await
+                .map_err(RuntimeError::backend)?;
+            coll.find(doc! {})
+                .with_options(opts)
+                .await
+                .map_err(RuntimeError::backend)?;
+            info!(collection = %table, "mongo-cdc source access validated");
+            Ok(())
+        })
+        .await
     }
 
     async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema> {
@@ -250,7 +251,7 @@ impl Source for MongoCdcSource {
     async fn read_batch<'a>(
         &self,
         spec: &ReadSpec,
-        ctx: Arc<dyn SourceCtx>,
+        ctx: &Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
     ) -> RuntimeResult<RawBatch> {
         let my_ctx =
@@ -276,13 +277,31 @@ impl Source for MongoCdcSource {
             .build();
 
         debug!(mode = ?my_ctx.mode, resume_after = resume_after.is_some(), "mongo-cdc opening change stream");
+
+        // Bump the Arc once at the spawn boundary; downcast inside.
+        // Avoids cloning `column_paths` and `mode` is `Copy`.
+        let ctx = Arc::clone(ctx);
+        let table = spec.table.clone();
+        let limit = spec.limit;
+        let needs_body = spec.needs_body;
+        let operation_timeout = self.operation_timeout;
+
+        detached(async move {
+            let my_ctx =
+                ctx.as_any()
+                    .downcast_ref::<MongoCdcCtx>()
+                    .ok_or(RuntimeError::ContextMismatch {
+                        expected: "MongoCdcCtx",
+                    })?;
+            let column_paths = my_ctx.column_paths.as_slice();
+            let mode = my_ctx.mode;
         let mut stream = coll
             .watch()
             .with_options(watch_opts)
             .await
             .map_err(RuntimeError::backend)?;
 
-        let mut events: Vec<ChangeStreamEvent<Document>> = Vec::with_capacity(spec.limit);
+        let mut events: Vec<ChangeStreamEvent<Document>> = Vec::with_capacity(limit);
         let mut last_token: Option<ResumeToken> = None;
         // Whole-batch deadline. Without it, an awaitData change-stream
         // cursor blocks `try_next` indefinitely when the workload is
@@ -302,25 +321,38 @@ impl Source for MongoCdcSource {
         // reached). On timeout we keep `last_token` at the last
         // *delivered* event's token, so the server replays anything
         // that didn't make it across the API boundary.
-        let deadline = tokio::time::Instant::now() + self.operation_timeout;
+        let deadline = tokio::time::Instant::now() + operation_timeout;
         let mut hit_deadline = false;
-        while events.len() < spec.limit {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
+        'drain: while events.len() < limit {
+            if tokio::time::Instant::now() >= deadline {
                 hit_deadline = true;
-                break;
+                break 'drain;
             }
-            match tokio::time::timeout(remaining, stream.try_next()).await {
-                Ok(Ok(Some(event))) => {
+            // Per-poll cancel-safety: the driver future is awaited to
+            // completion even when the deadline fires. We pin the
+            // future, race it against the deadline, and on the deadline
+            // arm finish driving the same pinned future — so
+            // `try_next` is never dropped mid-await. Bounded extra
+            // wait: `ChangeStreamOptions::max_await_time` (default 1s).
+            let mut try_next_fut = std::pin::pin!(stream.try_next());
+            let res = tokio::select! {
+                biased;
+                res = &mut try_next_fut => res,
+                _ = tokio::time::sleep_until(deadline) => {
+                    hit_deadline = true;
+                    try_next_fut.await
+                }
+            };
+            match res {
+                Ok(Some(event)) => {
                     last_token = stream.resume_token();
                     events.push(event);
+                    if hit_deadline {
+                        break 'drain;
+                    }
                 }
-                Ok(Ok(None)) => break,
-                Ok(Err(e)) => return Err(RuntimeError::backend(e)),
-                Err(_) => {
-                    hit_deadline = true;
-                    break;
-                }
+                Ok(None) => break 'drain,
+                Err(e) => return Err(RuntimeError::backend(e)),
             }
         }
         // After a clean drain (stream end or limit reached) pick up
@@ -366,7 +398,7 @@ impl Source for MongoCdcSource {
         // arrived without fullDocument for one-shot `find($in)`. The
         // events list is already deduped above, so the resulting list
         // has unique `_id`s by construction.
-        let ids_to_lookup: Vec<Bson> = if my_ctx.mode == UpdateMode::LookupOnUpdate {
+        let ids_to_lookup: Vec<Bson> = if mode == UpdateMode::LookupOnUpdate {
             events
                 .iter()
                 .filter_map(|e| match e.operation_type {
@@ -385,9 +417,14 @@ impl Source for MongoCdcSource {
             Vec::new()
         } else {
             let filter = doc! { "_id": { "$in": &ids_to_lookup } };
-            let opts = FindOptions::builder()
-                .max_time(self.operation_timeout)
-                .build();
+            // Pass the remaining budget (operation_timeout minus what
+            // the change-stream drain already consumed) so the lookup
+            // can't extend past the outer deadline. Fall back to a
+            // minimum tick if we've already overrun.
+            let remaining = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .max(std::time::Duration::from_millis(1));
+            let opts = FindOptions::builder().max_time(remaining).build();
             let mut find_cursor = coll
                 .find(filter)
                 .with_options(opts)
@@ -418,18 +455,18 @@ impl Source for MongoCdcSource {
                 OperationType::Insert | OperationType::Replace => {
                     if let Some(doc) = event.full_document {
                         // Cost-guarded body attach.
-                        let body = if spec.needs_body {
+                        let body = if needs_body {
                             Some(Value::Custom(Box::new(BsonObjectValue(doc.clone()))))
                         } else {
                             None
                         };
-                        out_rows.push(map_row(&my_ctx.column_paths, &doc, RowOp::Upsert, body)?);
+                        out_rows.push(map_row(column_paths, &doc, RowOp::Upsert, body)?);
                     } else {
                         warn!(op = ?event.operation_type, "mongo-cdc: insert/replace event without fullDocument; skipping");
                     }
                 }
                 OperationType::Update => {
-                    let doc = match my_ctx.mode {
+                    let doc = match mode {
                         UpdateMode::PostImage => event.full_document,
                         UpdateMode::LookupOnUpdate => event
                             .document_key
@@ -439,12 +476,12 @@ impl Source for MongoCdcSource {
                     };
                     match doc {
                         Some(d) => {
-                            let body = if spec.needs_body {
+                            let body = if needs_body {
                                 Some(Value::Custom(Box::new(BsonObjectValue(d.clone()))))
                             } else {
                                 None
                             };
-                            out_rows.push(map_row(&my_ctx.column_paths, &d, RowOp::Upsert, body)?);
+                            out_rows.push(map_row(column_paths, &d, RowOp::Upsert, body)?);
                         }
                         None => {
                             warn!(
@@ -462,17 +499,12 @@ impl Source for MongoCdcSource {
                     // rows is harmless because sinks key off the
                     // `op = Delete` route, not the body.
                     let key_doc = event.document_key.unwrap_or_default();
-                    let body = if spec.needs_body {
+                    let body = if needs_body {
                         Some(Value::Custom(Box::new(BsonObjectValue(Document::new()))))
                     } else {
                         None
                     };
-                    out_rows.push(map_row(
-                        &my_ctx.column_paths,
-                        &key_doc,
-                        RowOp::Delete,
-                        body,
-                    )?);
+                    out_rows.push(map_row(column_paths, &key_doc, RowOp::Delete, body)?);
                 }
                 OperationType::Drop
                 | OperationType::Rename
@@ -481,7 +513,7 @@ impl Source for MongoCdcSource {
                     return Err(RuntimeError::Other(format!(
                         "mongo-cdc: collection-level event {:?} on {:?} invalidated the change stream — \
                          operator action required (recreate flow / restart)",
-                        event.operation_type, spec.table
+                        event.operation_type, table
                     )));
                 }
                 _ => {
@@ -515,12 +547,14 @@ impl Source for MongoCdcSource {
             rows: out_rows,
             next_cursor,
         })
+        })
+        .await
     }
 
     async fn sample(
         &self,
         spec: &ReadSpec,
-        _ctx: Arc<dyn SourceCtx>,
+        _ctx: &Arc<dyn SourceCtx>,
         n: usize,
     ) -> RuntimeResult<RawBatch> {
         // CDC streams are open-ended: the default `sample` impl

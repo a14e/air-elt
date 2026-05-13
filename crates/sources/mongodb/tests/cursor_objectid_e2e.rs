@@ -53,10 +53,7 @@ async fn cursor_objectid_paginates() {
         needs_body: false,
     };
     let ctx = source.build_context(&spec).await.expect("ctx");
-    let batch1 = source
-        .read_batch(&spec, ctx.clone(), None)
-        .await
-        .expect("batch1");
+    let batch1 = source.read_batch(&spec, &ctx, None).await.expect("batch1");
     assert_eq!(batch1.rows.len(), 2);
     let cursor = batch1.next_cursor.expect("cursor");
     assert_eq!(cursor.fields.len(), 1);
@@ -73,7 +70,7 @@ async fn cursor_objectid_paginates() {
     }
 
     let batch2 = source
-        .read_batch(&spec, ctx, Some(&cursor))
+        .read_batch(&spec, &ctx, Some(&cursor))
         .await
         .expect("batch2");
     assert_eq!(batch2.rows.len(), 1);

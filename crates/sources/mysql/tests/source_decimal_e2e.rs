@@ -79,7 +79,7 @@ async fn decimal_zero_scale_decoded_as_bigint_and_decimal() {
         needs_body: false,
     };
     let ctx = source.build_context(&spec).await.unwrap();
-    let batch = source.read_batch(&spec, ctx, None).await.unwrap();
+    let batch = source.read_batch(&spec, &ctx, None).await.unwrap();
     assert_eq!(batch.rows.len(), 1);
     assert_eq!(
         batch.rows[0].values[1],
@@ -178,7 +178,7 @@ async fn unsigned_int_columns_round_trip() {
         needs_body: false,
     };
     let ctx = source.build_context(&spec).await.unwrap();
-    let batch = source.read_batch(&spec, ctx, None).await.unwrap();
+    let batch = source.read_batch(&spec, &ctx, None).await.unwrap();
     assert_eq!(batch.rows.len(), 2);
 
     // Row 1: zeros.
