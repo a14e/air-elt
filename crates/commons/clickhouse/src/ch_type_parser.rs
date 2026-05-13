@@ -581,19 +581,35 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         self.expect('\'')?;
         let start = self.pos;
+        let mut out = String::new();
         while let Some(c) = self.peek() {
             if c == '\'' {
-                let s = self.input[start..self.pos].to_string();
                 self.pos += 1;
-                return Ok(s);
+                return Ok(out);
             }
             if c == '\\' {
-                // CH escapes backslash-newlines etc.; accept opaquely.
+                // CH escape sequences inside single-quoted literals.
                 self.pos += c.len_utf8();
-                if let Some(next) = self.peek() {
-                    self.pos += next.len_utf8();
-                }
+                let esc = self.peek().ok_or(ParseError::UnterminatedParen { start })?;
+                let decoded = match esc {
+                    '\'' => '\'',
+                    '\\' => '\\',
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    'b' => '\u{08}',
+                    'f' => '\u{0C}',
+                    '0' => '\0',
+                    'a' => '\u{07}',
+                    'v' => '\u{0B}',
+                    // Unknown escape — pass through verbatim (CH's behaviour
+                    // for unrecognised backslash sequences in identifiers).
+                    other => other,
+                };
+                out.push(decoded);
+                self.pos += esc.len_utf8();
             } else {
+                out.push(c);
                 self.pos += c.len_utf8();
             }
         }
@@ -849,6 +865,37 @@ mod tests {
             DataType::Custom(t) => assert_eq!(t.kind(), "clickhouse.enum8"),
             _ => panic!("expected custom"),
         }
+    }
+
+    #[test]
+    fn enum_variant_unescapes_apostrophe_and_backslash() {
+        // `'it\'s'` → variant name `it's`; `'a\\b'` → `a\b`.
+        let p = parse(r"Enum8('it\'s' = 1, 'a\\b' = 2)");
+        let custom = match &p.data_type {
+            DataType::Custom(t) => t,
+            _ => panic!("expected custom"),
+        };
+        let e8 = custom
+            .as_any()
+            .downcast_ref::<crate::types::enums::ChEnum8Type>()
+            .expect("ChEnum8Type");
+        let names: Vec<&str> = e8.variants.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["it's", r"a\b"]);
+    }
+
+    #[test]
+    fn enum_variant_unescapes_control_chars() {
+        let p = parse(r"Enum8('line\nbreak' = 1, 'tab\there' = 2)");
+        let custom = match &p.data_type {
+            DataType::Custom(t) => t,
+            _ => panic!("expected custom"),
+        };
+        let e8 = custom
+            .as_any()
+            .downcast_ref::<crate::types::enums::ChEnum8Type>()
+            .expect("ChEnum8Type");
+        assert_eq!(e8.variants[0].0, "line\nbreak");
+        assert_eq!(e8.variants[1].0, "tab\there");
     }
 
     #[test]

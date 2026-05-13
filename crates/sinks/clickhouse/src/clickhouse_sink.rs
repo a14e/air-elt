@@ -52,7 +52,7 @@ impl ChSink {
         let defaults = PoolSettings::defaults();
         let pool = PoolSettings::from_options(
             config.connect_timeout,
-            config.acquire_timeout,
+            None,
             config.idle_timeout,
             Some(defaults.max_lifetime),
             config.request_timeout,
@@ -99,10 +99,14 @@ impl Sink for ChSink {
     async fn validate_access(&self, spec: &WriteSpec) -> RuntimeResult<()> {
         // Liveness probe.
         self.client.ping().await.map_err(RuntimeError::backend)?;
-        // Type/permission probe: zero-row INSERT.
-        let probe = sql::probe_insert_where_false(&spec.table, &spec.columns)?;
+        // Permission probe: empty-body RowBinary INSERT. The server parses
+        // the table + column list (validating that they exist and that we
+        // have INSERT privilege) but writes zero rows. This avoids the
+        // SELECT privilege that a `... SELECT ... WHERE FALSE` probe would
+        // need on the target table.
+        let probe = sql::insert_row_binary_sql(&spec.table, &spec.columns)?;
         self.client
-            .query_text(&probe)
+            .insert_row_binary(&probe, Vec::new())
             .await
             .map_err(RuntimeError::backend)?;
         info!(table = %spec.table, "clickhouse sink access validated");

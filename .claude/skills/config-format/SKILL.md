@@ -85,10 +85,11 @@ INSERTs use the HTTP `RowBinary` format. Authentication is over standard CH `X-C
 | `user` | string | none | Optional username. |
 | `password` | string | none | Optional password. Pair with `[secrets]` to avoid leaking it in the config file. |
 | `connect-timeout` | Duration | `"5s"` | TCP connect timeout. |
-| `acquire-timeout` | Duration | `"10s"` | Pool acquire timeout (HTTP connection reuse). |
 | `idle-timeout` | Duration | `"5m"` | Idle HTTP connection lifetime. |
 | `request-timeout` | Duration | `"30s"` | Whole-request cap (connect + send + server compute + body download). CH has no per-statement timeout exposed over HTTP. |
 | `max-connections` | u32 | 5 | HTTP pool size cap. |
+
+**Unsupported pool fields.** Because the CH sink uses an HTTP client (reqwest) rather than a database connection pool, the fields `acquire-timeout`, `max-lifetime`, and `min-connections` — present in the Postgres / MySQL / MongoDB connectors — are **not supported**. Specifying any of them raises a `ConfigError::Invalid` at load time naming the offending field. This is intentional: silently ignoring a timeout the operator set would be misleading.
 
 **Type mapping.** Native CH types are parsed from `system.columns.type`. `Nullable(T)` is stripped onto `Field.nullable`; `LowCardinality(T)` is stripped transparently. Canonical pivots: `String → Text`, `UInt*`/`Int8/16/32/64` → `UInt*`/`Int8/16/32/64`, `Float32/64 → Float32/64`, `Bool → Bool`, `Date`/`Date32 → Date`, `DateTime`/`DateTime64(N[, tz]) → Timestamp` (timezone qualifier parsed and discarded — stored UTC; TZ-aware paths land in a follow-up), `Decimal(P, S)` and `Decimal32/64/128/256(S) → Decimal{P, S}` (width selected automatically by precision — ≤9 → i32, ≤18 → i64, ≤38 → i128, ≤76 → i256 LE; value scaled by `10^S`), `UUID → Uuid`, `JSON`/`Object` → `Json`. `Int8` is a full canonical pivot — the RowBinary encoder writes it as 1 byte (two's-complement bit-cast via `i8 as u8`).
 

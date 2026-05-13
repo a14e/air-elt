@@ -4,6 +4,7 @@ description: "Read-only validator for database, wire-protocol, and serialization
 tools: Glob, Grep, Read, WebFetch, WebSearch, Bash, mcp__ide__getDiagnostics, LSP, Monitor, Skill, ToolSearch
 model: inherit
 color: blue
+memory: project
 ---
 
 ## Required project context

@@ -4,6 +4,7 @@ description: "Use this agent when you need to review code changes for AI shortcu
 tools: Glob, Grep, Read, WebFetch, WebSearch, Bash, mcp__ide__getDiagnostics, Skill, ToolSearch
 model: inherit
 color: green
+memory: project
 ---
 
 ## Required project context

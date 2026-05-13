@@ -371,6 +371,20 @@ fn encode_typed(
                             expected: kind.to_string(),
                             got: "Custom(non-AggregateState)",
                         })?;
+                    // The state bytes are opaque to us; the only sanity
+                    // check we can perform locally is that the value was
+                    // built for the same aggregate function as the column.
+                    // CH would reject a quantiles state inserted into a
+                    // uniq column, but only after we've shipped the whole
+                    // batch — fail fast here instead.
+                    let value_kind = ChAggregateStateType::kind_for_fn(&v.fn_name);
+                    if value_kind != kind {
+                        return Err(EncodeError::Mismatch {
+                            column: column.to_string(),
+                            expected: kind.to_string(),
+                            got: "AggregateState built for a different function",
+                        });
+                    }
                     out.extend_from_slice(&v.bytes);
                     Ok(())
                 }
@@ -514,13 +528,24 @@ fn encode_typed(
                         }
                     })?;
                     // Tuple: no length prefix, just field payloads in order.
+                    // CH-side schema is the source of truth — value arity must
+                    // match exactly. A mismatch means upstream schema drift;
+                    // silently treating extras as Json (or missing fields as
+                    // defaults) would corrupt the row.
+                    if v.fields.len() != tuple_ty.fields.len() {
+                        return Err(EncodeError::Mismatch {
+                            column: column.to_string(),
+                            expected: format!(
+                                "Tuple of {} fields (got {})",
+                                tuple_ty.fields.len(),
+                                v.fields.len()
+                            ),
+                            got: "Tuple with wrong arity",
+                        });
+                    }
                     for (i, field) in v.fields.iter().enumerate() {
-                        let (field_dt, field_nullable) = tuple_ty
-                            .fields
-                            .get(i)
-                            .map(|(dt, n)| (dt, *n))
-                            .unwrap_or((&DataType::Json, false));
-                        encode_typed_nullable(out, column, field_dt, field, field_nullable)?;
+                        let (field_dt, field_nullable) = &tuple_ty.fields[i];
+                        encode_typed_nullable(out, column, field_dt, field, *field_nullable)?;
                     }
                     Ok(())
                 }
@@ -548,10 +573,15 @@ fn encode_typed(
 /// * precision ≤ 38 → 16-byte `i128` (Decimal128)
 /// * precision ≤ 76 → 32-byte signed LE (Decimal256)
 ///
-/// When `precision` is `None` we fall back to i128 (safe for any
-/// `BigDecimal` that fits in 38 decimal digits).
+/// When `precision` is `None` we fall back to **Decimal128** (16 bytes,
+/// 38 significant digits). Mantissa overflow is caught by
+/// [`encode_bigint_le`]'s width check — there is no silent truncation.
 ///
-/// The value is scaled by `10^scale` to produce an integer mantissa.
+/// The value's scale must match `effective_scale` either exactly or with
+/// only zero-valued fractional digits past `effective_scale` — the
+/// encoder will not silently drop significant precision. Conversion
+/// callers carry the `truncate` flag and must round the value before it
+/// reaches here.
 fn encode_decimal(
     out: &mut Vec<u8>,
     column: &str,
@@ -582,6 +612,17 @@ fn encode_decimal(
     } else {
         drop(mantissa);
         let scaled = d.with_scale_round(effective_scale, bigdecimal::RoundingMode::Down);
+        // Detect lossy rounding: if the truncated value is not numerically
+        // equal to the original, significant fractional digits were
+        // dropped. Refuse rather than corrupt — upstream conversion is
+        // expected to apply `truncate=true` when this is intended.
+        if scaled.cmp(d) != std::cmp::Ordering::Equal {
+            return Err(EncodeError::OutOfRange {
+                column: column.to_string(),
+                value: d.to_string(),
+                target: format!("Decimal(scale={effective_scale})"),
+            });
+        }
         let (m, _) = scaled.as_bigint_and_exponent();
         m
     };
@@ -613,7 +654,6 @@ fn encode_bigint_le(
     target_name: &str,
 ) -> Result<(), EncodeError> {
     use crate::types::int256::bigint_to_le32;
-    use num_bigint::Sign;
 
     match width {
         4 => {
@@ -641,22 +681,13 @@ fn encode_bigint_le(
             write_le(out, &v.to_le_bytes())
         }
         32 => {
-            // 32-byte two's-complement LE.  `bigint_to_le32` handles sign.
-            let bytes = bigint_to_le32(n);
-            // Range-check: for positive values, top byte must not set the
-            // sign bit; for negative values, top byte must have the sign
-            // bit set (i.e. the value fits in 255 bits + sign).
-            let fits = match n.sign() {
-                Sign::Plus | Sign::NoSign => bytes[31] & 0x80 == 0,
-                Sign::Minus => bytes[31] & 0x80 != 0,
-            };
-            if !fits {
-                return Err(EncodeError::OutOfRange {
-                    column: column.to_string(),
-                    value: n.to_string(),
-                    target: format!("{target_name}256 (i256)"),
-                });
-            }
+            // 32-byte two's-complement LE; returns None if the value
+            // does not fit in the signed 256-bit range.
+            let bytes = bigint_to_le32(n).ok_or_else(|| EncodeError::OutOfRange {
+                column: column.to_string(),
+                value: n.to_string(),
+                target: format!("{target_name}256 (i256)"),
+            })?;
             write_le(out, &bytes)
         }
         _ => unreachable!("decimal_width produces only 4/8/16/32"),
@@ -930,6 +961,71 @@ mod tests {
     }
 
     #[test]
+    fn decimal_rejects_lossy_scale_truncation() {
+        // 1.234567 → Decimal(9,2) would drop "4567" digits silently.
+        let d: BigDecimal = "1.234567".parse().unwrap();
+        let mut out = Vec::new();
+        let err = encode_value(
+            &mut out,
+            &field(
+                "d",
+                DataType::Decimal {
+                    precision: Some(9),
+                    scale: Some(2),
+                },
+                false,
+            ),
+            &Value::Decimal(d),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EncodeError::OutOfRange { .. }));
+    }
+
+    #[test]
+    fn decimal_accepts_lossless_scale_rescale() {
+        // 1.50 at scale 2 → Decimal(9,1): trailing zero only, no info loss.
+        let d: BigDecimal = "1.50".parse().unwrap();
+        let mut out = Vec::new();
+        encode_value(
+            &mut out,
+            &field(
+                "d",
+                DataType::Decimal {
+                    precision: Some(9),
+                    scale: Some(1),
+                },
+                false,
+            ),
+            &Value::Decimal(d),
+        )
+        .unwrap();
+        let mantissa = i32::from_le_bytes(out[..4].try_into().unwrap());
+        assert_eq!(mantissa, 15);
+    }
+
+    #[test]
+    fn decimal_precision_none_uses_decimal128_and_rejects_overflow() {
+        // precision=None → Decimal128 (16 bytes = signed i128, max ≈ 1.7e38).
+        // 2e38 must overflow inside encode_bigint_le.
+        let huge: BigDecimal = "200000000000000000000000000000000000000".parse().unwrap();
+        let mut out = Vec::new();
+        let err = encode_value(
+            &mut out,
+            &field(
+                "d",
+                DataType::Decimal {
+                    precision: None,
+                    scale: Some(0),
+                },
+                false,
+            ),
+            &Value::Decimal(huge),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EncodeError::OutOfRange { .. }));
+    }
+
+    #[test]
     fn decimal_negative_value() {
         // Decimal32(2) with value -1.00 → mantissa = -100 as i32 LE.
         let d: BigDecimal = "-1.00".parse().unwrap();
@@ -990,7 +1086,7 @@ mod tests {
     fn int256_encodes_32_le_bytes() {
         use crate::types::int256::{ChInt256Type, ChInt256Value, bigint_to_le32};
         let n = num_bigint::BigInt::from(1i64);
-        let le_bytes = bigint_to_le32(&n);
+        let le_bytes = bigint_to_le32(&n).unwrap();
         let dt = DataType::Custom(Box::new(ChInt256Type));
         let mut out = Vec::new();
         encode_value(
@@ -1008,7 +1104,7 @@ mod tests {
     fn uint256_encodes_32_le_bytes() {
         use crate::types::int256::{ChUInt256Type, ChUInt256Value, biguint_to_le32};
         let n = num_bigint::BigUint::from(255u32);
-        let le_bytes = biguint_to_le32(&n);
+        let le_bytes = biguint_to_le32(&n).unwrap();
         let dt = DataType::Custom(Box::new(ChUInt256Type));
         let mut out = Vec::new();
         encode_value(
@@ -1105,6 +1201,32 @@ mod tests {
     }
 
     #[test]
+    fn tuple_rejects_arity_mismatch_too_many() {
+        let tuple_dt = DataType::Custom(Box::new(ChTupleType {
+            fields: vec![(DataType::Int32, false)],
+        }));
+        let tuple_val = Value::Custom(Box::new(ChTupleValue {
+            fields: vec![Value::Int32(1), Value::Int32(2)],
+        }));
+        let mut out = Vec::new();
+        let err = encode_value(&mut out, &field("t", tuple_dt, false), &tuple_val).unwrap_err();
+        assert!(matches!(err, EncodeError::Mismatch { .. }));
+    }
+
+    #[test]
+    fn tuple_rejects_arity_mismatch_too_few() {
+        let tuple_dt = DataType::Custom(Box::new(ChTupleType {
+            fields: vec![(DataType::Int32, false), (DataType::Bool, false)],
+        }));
+        let tuple_val = Value::Custom(Box::new(ChTupleValue {
+            fields: vec![Value::Int32(1)],
+        }));
+        let mut out = Vec::new();
+        let err = encode_value(&mut out, &field("t", tuple_dt, false), &tuple_val).unwrap_err();
+        assert!(matches!(err, EncodeError::Mismatch { .. }));
+    }
+
+    #[test]
     fn map_encodes_var_uint_len_then_pairs() {
         let map_dt = DataType::Custom(Box::new(ChMapType {
             key: DataType::Text { size: None },
@@ -1133,5 +1255,41 @@ mod tests {
         assert_eq!(out[9], b'y');
         // Pair 1 val: Int32 2 LE
         assert_eq!(out[10], 2);
+    }
+
+    #[test]
+    fn aggregate_state_encodes_bytes_for_matching_fn() {
+        let dt = DataType::Custom(Box::new(ChAggregateStateType {
+            fn_name: "uniq".to_string(),
+            arg_types: vec!["String".to_string()],
+            simple: false,
+            kind: ChAggregateStateType::kind_for_fn("uniq"),
+        }));
+        let val = Value::Custom(Box::new(ChAggregateStateValue {
+            bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            fn_name: "uniq".to_string(),
+        }));
+        let mut out = Vec::new();
+        encode_value(&mut out, &field("u", dt, false), &val).unwrap();
+        assert_eq!(out, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn aggregate_state_rejects_fn_name_mismatch() {
+        // Column declares `quantilesTDigest`, value carries `uniq` state —
+        // CH would later reject this; encoder must catch it locally.
+        let dt = DataType::Custom(Box::new(ChAggregateStateType {
+            fn_name: "quantilesTDigest".to_string(),
+            arg_types: vec!["Float64".to_string()],
+            simple: false,
+            kind: ChAggregateStateType::kind_for_fn("quantilesTDigest"),
+        }));
+        let val = Value::Custom(Box::new(ChAggregateStateValue {
+            bytes: vec![1, 2, 3],
+            fn_name: "uniq".to_string(),
+        }));
+        let mut out = Vec::new();
+        let err = encode_value(&mut out, &field("q", dt, false), &val).unwrap_err();
+        assert!(matches!(err, EncodeError::Mismatch { .. }));
     }
 }

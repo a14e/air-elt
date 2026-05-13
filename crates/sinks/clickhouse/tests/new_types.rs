@@ -315,7 +315,7 @@ async fn round_trip_int256() {
         10,
     )
     .expect("valid big int");
-    let le_bytes = bigint_to_le32(&n);
+    let le_bytes = bigint_to_le32(&n).expect("Int256 value fits in 256 bits");
     let batch = Batch {
         rows: vec![Row {
             values: vec![
@@ -365,7 +365,7 @@ async fn round_trip_uint256() {
         10,
     )
     .expect("valid big uint");
-    let le_bytes = biguint_to_le32(&n);
+    let le_bytes = biguint_to_le32(&n).expect("UInt256 value fits in 256 bits");
     let batch = Batch {
         rows: vec![Row {
             values: vec![
