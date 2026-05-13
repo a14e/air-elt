@@ -1,5 +1,5 @@
 [package]
-name = "air-elt-commons-testing"
+name = "air-elt-commons-mssql"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,24 +11,24 @@ authors.workspace = true
 doctest = false
 
 [dependencies]
+air-elt-core = { workspace = true }
 air-elt-commons = { workspace = true }
-sqlx = { workspace = true }
 tiberius = { workspace = true }
 bb8-tiberius = { workspace = true }
 bb8 = { workspace = true }
-air-elt-commons-mssql = { workspace = true }
-testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true }
-bollard = { workspace = true }
-rand = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+num-bigint = { workspace = true }
+num-traits = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+bigdecimal = { workspace = true }
+base64 = { workspace = true }
+toml = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
-mongodb = { workspace = true }
-bson = { workspace = true }
-sha2 = { workspace = true }
-reqwest = { workspace = true }
 
 [lints]
 workspace = true

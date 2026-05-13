@@ -41,6 +41,10 @@ E2E tests need a PostgreSQL instance. Two options:
 - **Local**: install podman — no env vars needed. `pg_pool()` auto-detects the podman socket (including the macOS `podman machine` layout under `$TMPDIR/podman/*-api.sock`) and spins up ephemeral containers. Docker Desktop works via the default `/var/run/docker.sock` path.
 - **External / CI**: set `AIR_ELT_TEST_PG_URL=postgres://…`. Tests create unique sandbox schemas and clean them up on handle drop. Orphaned schemas older than 24 h are self-healed on startup.
 
+### Requirements
+
+- MSSQL tests on macOS / Apple Silicon require Rosetta enabled in podman or Docker.
+
 ## Environment variables
 
 - `AIR_ELT_TEST_PG_URL` — external postgres for e2e tests. CI uses this; local dev almost never needs it.

@@ -109,6 +109,7 @@ jobs:
       AIR_ELT_TEST_MONGO_RS_URL: "mongodb://localhost:27019/?replicaSet=rs0&directConnection=true"
       AIR_ELT_TEST_COCKROACHDB_URL: "postgres://root@localhost:26257/defaultdb?sslmode=disable"
       AIR_ELT_TEST_CLICKHOUSE_URL: "http://localhost:8123"
+      AIR_ELT_TEST_MSSQL_URL: "mssql://sa:AirEltTest123!@localhost:1433"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -216,6 +217,26 @@ jobs:
           done
           echo "clickhouse did not become ready in 60s"
           docker logs clickhouse || true
+          exit 1
+      - name: Start MS SQL single-node
+        run: |
+          set -euo pipefail
+          docker run -d --name mssql -p 1433:1433 \
+            --tmpfs /var/opt/mssql:rw,size=2g \
+            -e ACCEPT_EULA=Y \
+            -e MSSQL_SA_PASSWORD=AirEltTest123! \
+            -e MSSQL_PID=Developer \
+            mcr.microsoft.com/mssql/server:2022-CU22-ubuntu-22.04
+          for i in $(seq 1 120); do
+            if docker exec mssql \
+                /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'AirEltTest123!' -C -Q 'SELECT 1' \
+                >/dev/null 2>&1; then
+              echo "mssql ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "mssql did not become ready in 120s"
+          docker logs mssql || true
           exit 1
       - name: cargo test
         run: cargo test --workspace --all-targets

@@ -281,3 +281,87 @@ cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
 
     pg.pool.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_to_pg_with_mssql_storage() {
+    let pg = pg_pool().await;
+    let ms = air_elt_commons_testing::mssql::mssql_pool().await;
+
+    let src_table = format!("{}.items", pg.schema);
+    let dst_table = format!("{}.items_dst", pg.schema);
+
+    pg.pool
+        .execute(
+            format!("CREATE TABLE {src_table} (id BIGINT NOT NULL, val INT NOT NULL)").as_str(),
+        )
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!("CREATE TABLE {dst_table} (id BIGINT NOT NULL, val INT NOT NULL)").as_str(),
+        )
+        .await
+        .unwrap();
+
+    sqlx::query(&format!(
+        "INSERT INTO {src_table} (id, val) VALUES ($1, $2)"
+    ))
+    .bind(1i64)
+    .bind(100i32)
+    .execute(&pg.pool)
+    .await
+    .unwrap();
+
+    let config_toml = format!(
+        r#"
+[[sources]]
+name = "src"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[sinks]]
+name = "snk"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[storages]]
+name = "st"
+type = "mssql"
+config = {{ url = "{ms_url}" }}
+
+[flow.items]
+source = "src"
+sink = "snk"
+storage = "st"
+from = "{src_table}"
+to = "{dst_table}"
+batch-limit = 8
+
+mapping = ["*"]
+
+cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
+"#,
+        pg_url = pg.url_with_search_path(),
+        ms_url = ms.url,
+        src_table = src_table,
+        dst_table = dst_table,
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
+
+    let rows: Vec<(i64, i32)> =
+        sqlx::query_as(&format!("SELECT id, val FROM {dst_table} ORDER BY id"))
+            .fetch_all(&pg.pool)
+            .await
+            .unwrap();
+
+    assert_eq!(rows.len(), 1, "row must reach sink with mssql storage");
+    assert_eq!(rows[0], (1, 100));
+
+    pg.pool.close().await;
+    drop(ms);
+}

@@ -4,6 +4,7 @@ pub mod cockroach;
 pub mod filelock;
 pub mod mariadb;
 pub mod mongo;
+pub mod mssql;
 pub mod mysql;
 pub mod pg;
 pub mod ryuk;

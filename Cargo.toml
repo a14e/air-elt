@@ -20,6 +20,10 @@ members = [
     "crates/storages/postgres",
     "crates/storages/mysql",
     "crates/storages/mongodb",
+    "crates/commons/mssql",
+    "crates/sources/mssql",
+    "crates/sinks/mssql",
+    "crates/storages/mssql",
 ]
 
 [workspace.package]
@@ -49,6 +53,10 @@ air-elt-sink-mongodb = { path = "crates/sinks/mongodb", version = "0.1.0" }
 air-elt-storage-mongodb = { path = "crates/storages/mongodb", version = "0.1.0" }
 air-elt-commons-clickhouse = { path = "crates/commons/clickhouse", version = "0.1.0" }
 air-elt-sink-clickhouse = { path = "crates/sinks/clickhouse", version = "0.1.0" }
+air-elt-commons-mssql = { path = "crates/commons/mssql", version = "0.1.0" }
+air-elt-source-mssql = { path = "crates/sources/mssql", version = "0.1.0" }
+air-elt-sink-mssql = { path = "crates/sinks/mssql", version = "0.1.0" }
+air-elt-storage-mssql = { path = "crates/storages/mssql", version = "0.1.0" }
 
 ahash = "0.8.12"
 tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "test-util"] }
@@ -58,7 +66,12 @@ serde_json = "1.0.149"
 toml = "1.1.2"
 serde_yaml = "=0.9.33"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "macros", "migrate", "chrono", "uuid", "json", "bigdecimal"] }
+tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "chrono", "rustls", "tokio-util"] }
+bb8-tiberius = "0.16.0"
+bb8 = "0.9.1"
+tokio-util = { version = "0.7.17", features = ["compat"] }
 num-bigint = { version = "0.4.6", features = ["serde"] }
+num-traits = "0.2.19"
 bigdecimal = { version = "0.4.10", features = ["serde"] }
 iso8601-duration = "0.2.0"
 thiserror = "2.0.18"
@@ -71,7 +84,7 @@ chrono = { version = "0.4.44", features = ["serde"] }
 uuid = { version = "1.23.1", features = ["v4", "serde"] }
 futures = "0.3.32"
 testcontainers = { version = "0.27.3", features = ["reusable-containers"] }
-testcontainers-modules = { version = "0.15.0", features = ["postgres", "mysql", "mariadb", "mongo", "clickhouse"] }
+testcontainers-modules = { version = "0.15.0", features = ["postgres", "mysql", "mariadb", "mongo", "clickhouse", "mssql_server"] }
 # Direct bollard dep for the few places we drive the docker daemon
 # without going through testcontainers (force-removing a stale ryuk
 # between handshake retries). Pin matches testcontainers' transitive

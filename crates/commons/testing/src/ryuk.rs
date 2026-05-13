@@ -177,10 +177,10 @@ async fn start_session(socket: &str) -> Result<SessionHandle, String> {
         // containers cycling 5× in 2 min. 5 min is comfortably wider
         // than any realistic inter-binary gap and only delays final
         // teardown after the last test exits.
-        .with_env_var("RYUK_RECONNECTION_TIMEOUT", "5m")
+        .with_env_var("RYUK_RECONNECTION_TIMEOUT", "10m")
         // Initial-connection timeout: if nothing dials ryuk within this,
-        // it self-shuts. 60 s accommodates slow first-run image pulls.
-        .with_env_var("RYUK_CONNECTION_TIMEOUT", "60s")
+        // it self-shuts. 120 s accommodates slow MSSQL image pulls.
+        .with_env_var("RYUK_CONNECTION_TIMEOUT", "120s")
         .with_env_var("RYUK_VERBOSE", "true")
         // Inside-container path of the docker-compat socket. macOS/podman
         // and Docker Desktop both expose `/var/run/docker.sock` to

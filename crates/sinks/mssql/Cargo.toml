@@ -1,0 +1,36 @@
+[package]
+name = "air-elt-sink-mssql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+air-elt-core = { workspace = true }
+air-elt-commons = { workspace = true }
+air-elt-commons-mssql = { workspace = true }
+tiberius = { workspace = true }
+bb8-tiberius = { workspace = true }
+bb8 = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+num-bigint = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bigdecimal = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+air-elt-commons-testing = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

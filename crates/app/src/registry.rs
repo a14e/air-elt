@@ -5,13 +5,16 @@ use std::sync::Arc;
 use air_elt_core::registry::Registry;
 use air_elt_sink_clickhouse::ChSinkFactory;
 use air_elt_sink_mongodb::MongoSinkFactory;
+use air_elt_sink_mssql::MssqlSinkFactory;
 use air_elt_sink_mysql::MySqlSinkFactory;
 use air_elt_sink_postgres::PgSinkFactory;
 use air_elt_source_mongo_cdc::MongoCdcSourceFactory;
 use air_elt_source_mongodb::MongoSourceFactory;
+use air_elt_source_mssql::MssqlSourceFactory;
 use air_elt_source_mysql::MySqlSourceFactory;
 use air_elt_source_postgres::PgSourceFactory;
 use air_elt_storage_mongodb::MongoStorageFactory;
+use air_elt_storage_mssql::MssqlStorageFactory;
 use air_elt_storage_mysql::MySqlStorageFactory;
 use air_elt_storage_postgres::PgStorageFactory;
 
@@ -30,6 +33,9 @@ pub fn build_registry() -> Registry {
     registry.register_source("mysql", Arc::new(MySqlSourceFactory));
     registry.register_sink("mysql", Arc::new(MySqlSinkFactory));
     registry.register_storage("mysql", Arc::new(MySqlStorageFactory));
+    registry.register_source("mssql", Arc::new(MssqlSourceFactory));
+    registry.register_sink("mssql", Arc::new(MssqlSinkFactory));
+    registry.register_storage("mssql", Arc::new(MssqlStorageFactory));
     registry.register_source("mongodb", Arc::new(MongoSourceFactory));
     registry.register_source("mongo-cdc", Arc::new(MongoCdcSourceFactory));
     registry.register_sink("mongodb", Arc::new(MongoSinkFactory));
