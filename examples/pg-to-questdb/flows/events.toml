@@ -1,0 +1,20 @@
+[flow.events]
+source = "pg_src"
+sink = "questdb_sink"
+storage = "pg_state"
+
+from = "public.events"
+to = "events"
+
+batch-limit = 500
+
+# pg-wire is the only transport. BINARY / IPv4 / DATE / LONG256 / GEOHASH
+# all bind through sqlx; QuestDB coerces server-side per DDL.
+mapping = [
+    { from = "ts",       to = "ts" },        # designated timestamp
+    { from = "event_id", to = "event_id" },  # LONG
+    { from = "payload",  to = "payload" },   # BINARY
+    { from = "src_ip",   to = "src_ip" },    # IPv4 (custom kind)
+]
+
+cursor = { fields = ["ts"], order = "asc", interval = "5s" }

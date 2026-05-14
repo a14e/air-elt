@@ -7,6 +7,7 @@ use air_elt_sink_clickhouse::ChSinkFactory;
 use air_elt_sink_mongodb::MongoSinkFactory;
 use air_elt_sink_mysql::MySqlSinkFactory;
 use air_elt_sink_postgres::PgSinkFactory;
+use air_elt_sink_questdb::QuestDbSinkFactory;
 use air_elt_source_mongo_cdc::MongoCdcSourceFactory;
 use air_elt_source_mongodb::MongoSourceFactory;
 use air_elt_source_mysql::MySqlSourceFactory;
@@ -39,5 +40,12 @@ pub fn build_registry() -> Registry {
     // (e.g. `mongo-cdc`) may pair with it without a mandatory
     // `[flow.x.conflict]` block (append-only ingest).
     registry.register_sink("clickhouse", Arc::new(ChSinkFactory));
+    // QuestDB sink — pg-wire only. Like ClickHouse, declares
+    // `supports_deletes() = false`. Hard-rejects `[flow.<name>.conflict]`
+    // because QuestDB dedup is DDL-level (`DEDUP UPSERT KEYS(...)`).
+    // `validate_access` requires the designated timestamp column to appear
+    // in the mapping. INSERTs are chunked at `QDB_PG_MAX_BIND_PARAMS = 9_200`
+    // to work around a QuestDB 8.2.3 pg-wire bug.
+    registry.register_sink("questdb", Arc::new(QuestDbSinkFactory));
     registry
 }

@@ -36,6 +36,7 @@ dependencies = [
  "air-elt-sink-mongodb",
  "air-elt-sink-mysql",
  "air-elt-sink-postgres",
+ "air-elt-sink-questdb",
  "air-elt-source-mongo-cdc",
  "air-elt-source-mongodb",
  "air-elt-source-mysql",
@@ -146,10 +147,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "air-elt-commons-questdb"
+version = "0.1.0"
+dependencies = [
+ "air-elt-commons",
+ "air-elt-core",
+ "bigdecimal",
+ "chrono",
+ "num-bigint",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "air-elt-commons-testing"
 version = "0.1.0"
 dependencies = [
  "air-elt-commons",
+ "air-elt-commons-questdb",
  "bollard",
  "bson",
  "mongodb",
@@ -261,6 +281,25 @@ dependencies = [
  "bigdecimal",
  "chrono",
  "num-bigint",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "air-elt-sink-questdb"
+version = "0.1.0"
+dependencies = [
+ "air-elt-commons",
+ "air-elt-commons-questdb",
+ "air-elt-commons-testing",
+ "air-elt-core",
+ "async-trait",
+ "chrono",
  "serde",
  "serde_json",
  "sqlx",
@@ -4291,9 +4330,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "ureq"
-version = "3.3.0"
+version = "3.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
+checksum = "d39cb1dbab692d82a977c0392ffac19e188bd9186a9f32806f0aaa859d75585a"
 dependencies = [
  "base64 0.22.1",
  "log",
@@ -4301,14 +4340,15 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "ureq-proto",
- "utf8-zero",
+ "utf-8",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
 name = "ureq-proto"
-version = "0.6.0"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e994ba84b0bd1b1b0cf92878b7ef898a5c1760108fe7b6010327e274917a808c"
+checksum = "d81f9efa9df032be5934a46a068815a10a042b494b6a58cb0a1a97bb5467ed6f"
 dependencies = [
  "base64 0.22.1",
  "http",
@@ -4330,10 +4370,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "utf8-zero"
-version = "0.8.1"
+name = "utf-8"
+version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
+checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "utf8_iter"

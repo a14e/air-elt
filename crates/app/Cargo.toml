@@ -32,6 +32,7 @@ air-elt-source-mongo-cdc = { workspace = true }
 air-elt-sink-mongodb = { workspace = true }
 air-elt-storage-mongodb = { workspace = true }
 air-elt-sink-clickhouse = { workspace = true }
+air-elt-sink-questdb = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

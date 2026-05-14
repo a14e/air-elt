@@ -17,6 +17,8 @@ members = [
     "crates/sinks/mysql",
     "crates/sinks/mongodb",
     "crates/sinks/clickhouse",
+    "crates/commons/questdb",
+    "crates/sinks/questdb",
     "crates/storages/postgres",
     "crates/storages/mysql",
     "crates/storages/mongodb",
@@ -49,6 +51,8 @@ air-elt-sink-mongodb = { path = "crates/sinks/mongodb", version = "0.1.0" }
 air-elt-storage-mongodb = { path = "crates/storages/mongodb", version = "0.1.0" }
 air-elt-commons-clickhouse = { path = "crates/commons/clickhouse", version = "0.1.0" }
 air-elt-sink-clickhouse = { path = "crates/sinks/clickhouse", version = "0.1.0" }
+air-elt-commons-questdb = { path = "crates/commons/questdb", version = "0.1.0" }
+air-elt-sink-questdb = { path = "crates/sinks/questdb", version = "0.1.0" }
 
 ahash = "0.8.12"
 tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "test-util"] }

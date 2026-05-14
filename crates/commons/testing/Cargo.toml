@@ -12,6 +12,7 @@ doctest = false
 
 [dependencies]
 air-elt-commons = { workspace = true }
+air-elt-commons-questdb = { workspace = true }
 sqlx = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
