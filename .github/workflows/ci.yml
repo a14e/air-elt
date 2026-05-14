@@ -109,6 +109,8 @@ jobs:
       AIR_ELT_TEST_MONGO_RS_URL: "mongodb://localhost:27019/?replicaSet=rs0&directConnection=true"
       AIR_ELT_TEST_COCKROACHDB_URL: "postgres://root@localhost:26257/defaultdb?sslmode=disable"
       AIR_ELT_TEST_CLICKHOUSE_URL: "http://localhost:8123"
+      # QuestDB pg-wire (sole transport). Port 8812 maps to host 8812.
+      AIR_ELT_TEST_QUESTDB_URL: "postgres://admin:quest@localhost:8812/qdb"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -216,6 +218,43 @@ jobs:
           done
           echo "clickhouse did not become ready in 60s"
           docker logs clickhouse || true
+          exit 1
+      - name: Verify QuestDB image tag matches commons-testing
+        # The image tag below MUST match
+        # `air_elt_commons_testing::questdb::QUESTDB_IMAGE_TAG`. Fail
+        # fast on drift instead of waiting for a test to fail at runtime.
+        run: |
+          set -euo pipefail
+          grep -q 'questdb/questdb:8.2.3' \
+            crates/commons/testing/src/questdb.rs
+          grep -q 'questdb/questdb:8.2.3' \
+            .github/workflows/ci.yml
+      - name: Install postgresql-client for the QuestDB readiness probe
+        # ubuntu-latest does not ship `psql` by default. The QuestDB image
+        # itself is JRE-only — no psql inside the container — so we
+        # install the client package on the runner instead.
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+      - name: Start QuestDB single-node
+        # QuestDB exposes pg-wire on 8812 (the sole transport this sink
+        # uses). Image tag MUST match
+        # `air_elt_commons_testing::questdb::QUESTDB_IMAGE_TAG` — the
+        # commons-testing module is the source of truth.
+        run: |
+          set -euo pipefail
+          docker run -d --name questdb -p 8812:8812 \
+            questdb/questdb:8.2.3
+          for i in $(seq 1 60); do
+            if PGPASSWORD=quest psql -h localhost -p 8812 -U admin -d qdb \
+                -c 'SELECT 1' >/dev/null 2>&1; then
+              echo "questdb ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "questdb did not become ready in 60s"
+          docker logs questdb || true
           exit 1
       - name: cargo test
         run: cargo test --workspace --all-targets

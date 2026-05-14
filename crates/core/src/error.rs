@@ -77,6 +77,9 @@ pub enum ConfigError {
 
     #[error("config validation failed: {reason}")]
     Invalid { reason: String },
+
+    #[error("sink {sink:?} does not support conflict resolution: {hint}")]
+    ConflictNotSupported { sink: String, hint: String },
 }
 
 #[derive(Debug, Error)]
@@ -101,6 +104,16 @@ pub enum TypeError {
          DataType cannot be `Null`"
     )]
     NullSinkColumn { column: String },
+
+    #[error(
+        "column {column:?}: value type {got_kind} is not supported for sink column \
+         declared as {expected}"
+    )]
+    SinkValueUnsupported {
+        column: String,
+        expected: String,
+        got_kind: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -231,6 +244,28 @@ pub enum ValidationError {
          declare explicit mapping entries for the key columns"
     )]
     ConflictKeyNotInMapping { flow: String, key: String },
+
+    #[error(
+        "table {table:?}: designated timestamp column {column:?} is not in mapping — \
+         QuestDB requires the designated timestamp column to be written"
+    )]
+    MissingDesignatedTimestamp { table: String, column: String },
+
+    #[error(
+        "sink {sink:?} cannot accept type {type_name:?} for column {column:?} in table {table:?}: {hint}"
+    )]
+    UnsupportedSinkType {
+        sink: String,
+        table: String,
+        column: String,
+        type_name: String,
+        hint: String,
+    },
+
+    #[error(
+        "sink {sink:?}: target table {table:?} does not exist — schema introspection returned no columns"
+    )]
+    SinkTableNotFound { sink: String, table: String },
 }
 
 /// Errors produced by `value_to_json` and the source-side body-fill

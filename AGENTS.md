@@ -23,7 +23,7 @@ After a compaction, assume skills are not loaded — load them again before star
 * All library versions must be pinned explicitly.
 * Avoid git operations on update.
 * Human-facing instructions live in `README.md`.
-* Agent tasks live in `agent_tasks/`.
+* Agent tasks live in `agent_tasks/`. (Only human can write to this dir. You can write there only if user asks you)
 * If Docker is unavailable, check podman; prefer podman.
 * Delete every temporary file you create.
 * After every change, run `cargo fmt` and `cargo clippy --all-targets --workspace -- -D warnings`. and MANDATORY after

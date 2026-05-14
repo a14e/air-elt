@@ -9,3 +9,4 @@ mod pg_to_clickhouse;
 mod pg_to_cockroachdb;
 mod pg_to_mongo;
 mod pg_to_pg;
+mod pg_to_questdb;

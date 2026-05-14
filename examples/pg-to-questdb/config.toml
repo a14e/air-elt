@@ -1,0 +1,25 @@
+[config]
+include = ["flows"]
+
+# Postgres → QuestDB over pg-wire. The QuestDB sink chunks each INSERT
+# at 9_200 bound parameters to stay below an upstream QuestDB 8.2.3 bug.
+
+[secrets]
+PG_SRC_URL = "postgres://postgres:postgres@localhost:5432/source"
+QDB_URL = "postgres://admin:quest@localhost:8812/qdb"
+PG_STATE_URL = "postgres://postgres:postgres@localhost:5432/state"
+
+[[sources]]
+name = "pg_src"
+type = "postgres"
+config = { url = "${PG_SRC_URL}" }
+
+[[sinks]]
+name = "questdb_sink"
+type = "questdb"
+config = { url = "${QDB_URL}" }
+
+[[storages]]
+name = "pg_state"
+type = "postgres"
+config = { url = "${PG_STATE_URL}" }
