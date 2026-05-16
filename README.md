@@ -47,6 +47,8 @@ E2E tests need a PostgreSQL instance. Two options:
 - `AIR_ELT_TEST_COCKROACHDB_URL` — external CockroachDB instance (`postgres://root@host:26257/defaultdb?sslmode=disable` shape). Optional locally — `cockroach_pool()` falls back to a `cockroachdb/cockroach:v25.1.0 start-single-node --insecure` testcontainer when unset. CI sets it.
 - `DOCKER_HOST` — override socket auto-detection for testcontainers. Usually unset.
 - `AIR_ELT_LOG` / `RUST_LOG` — logging level (`info` by default). **`debug` is only safe for short diagnostic sessions** — it logs full SQL per batch, which is tens of KB per line at default `batch_limit = 1024`. Do not leave `debug` on in production. `trace` is an even firmer don't-for-prod.
+- `AIR_ELT_SYNC_LOGGING=true` — write log lines synchronously instead of through the default non-blocking background worker. Trades throughput for the guarantee that no line is lost around startup or crash. Accepts `true` / `1` (case-insensitive); anything else keeps the default async path.
+- `AIR_ELT_JSON_LOGGING=true` — emit logs as JSON lines instead of the default human-friendly format. Same truthy parsing as above.
 - Any `${VAR}` reference inside the config file is expanded from process env at load time; defaults are spelled `${VAR:default}`. Avoid embedding secrets in command-line arguments — they appear in `ps` output. Use the config's `[secrets]` section or a dedicated `${VAR}` with a restricted env.
 
 ## CockroachDB

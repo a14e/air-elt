@@ -20,7 +20,11 @@ TOML keys use **kebab-case** for multi-word fields (`batch-limit`, `max-connecti
 
 ## Logging
 
-Initialise the subscriber once via `air_elt_commons::tracing_init` in `app::main`. Style rules (structured fields, no instrument, no println) live in `rust-guidelines`.
+Initialise the subscriber once via `air_elt_commons::tracing_init` in `app::main`. The function returns an `Option<tracing_appender::non_blocking::WorkerGuard>` (`#[must_use]`) — bind it in `main` (`let _g = tracing_init::init();`) so the async background worker drains on shutdown. Env knobs: `AIR_ELT_LOG` / `RUST_LOG` (level), `AIR_ELT_SYNC_LOGGING` (opt-out of async writes), `AIR_ELT_JSON_LOGGING` (emit JSON). Style rules (structured fields, no instrument, no println) live in `rust-guidelines`.
+
+## Boolean env / string flags
+
+`air_elt_commons::bool_flag` — `parse(&str) -> Option<bool>` (accepts `true/1/t/y/yes` and `false/0/f/n/no`, case- and whitespace-insensitive) and `from_env(key, default)`. Use it for any string-typed boolean knob instead of hand-rolling `.eq_ignore_ascii_case("true")` per call site.
 
 ## SQL helpers
 
