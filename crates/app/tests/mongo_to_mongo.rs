@@ -30,7 +30,7 @@ use std::str::FromStr;
 
 use air_elt_app::App;
 use air_elt_commons_testing::mongo::mongo_pool;
-use bson::{Bson, Decimal128, doc, oid::ObjectId};
+use bson::{Bson, Decimal128, doc, oid::ObjectId, spec::BinarySubtype};
 use chrono::{TimeZone, Utc};
 use futures::TryStreamExt;
 
@@ -42,10 +42,10 @@ async fn mongo_to_mongo_wildcard_raw_passthrough_preserves_bson_fidelity() {
     let dst_db = format!("{}_dst", mongo.database);
     let state_db = format!("{}_state", mongo.database);
 
-    // Two documents with all the BSON variants the plan calls out: a
-    // native ObjectId `_id`, a Decimal128 amount, a BSON DateTime, a
-    // string array, and a nested document. If the runner detoured the
-    // payload through JSON, every one of these would visibly degrade.
+    // Two documents covering every BSON variant the runner must
+    // forward verbatim. If the pipeline ever detoured through JSON or
+    // through the per-field codec, every one of these would visibly
+    // degrade.
     let oid_a = ObjectId::from_bytes([
         0x65, 0x4f, 0x10, 0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x00, 0x00, 0x01,
     ]);
@@ -66,20 +66,70 @@ async fn mongo_to_mongo_wildcard_raw_passthrough_preserves_bson_fidelity() {
             .unwrap()
             .timestamp_millis(),
     );
+    let uid_a = uuid::Uuid::parse_str("a3d4b1f0-e1c2-4d2a-9b8e-1122334455aa").unwrap();
+    let uid_b = uuid::Uuid::parse_str("b1c2d3e4-f5a6-4b7c-8d9e-aabbccddeeff").unwrap();
 
     let doc_a = doc! {
         "_id": oid_a,
+        // Bool / Int32 / Int64 / Double — every numeric BSON kind.
+        "flag": true,
+        "i32": 42_i32,
+        "i64": 9_000_000_000_i64,
+        "f64": std::f64::consts::PI,
+        // String, plus Decimal128 / DateTime guarded explicitly below.
+        "name": "alice",
         "amount": dec_a,
         "created_at": ts_a,
+        // Binary generic + Binary UUID subtype. Subtype tags only
+        // survive on the raw-passthrough path.
+        "blob": Bson::Binary(bson::Binary {
+            subtype: BinarySubtype::Generic,
+            bytes: vec![0xDE, 0xAD, 0xBE, 0xEFu8],
+        }),
+        "uid": Bson::Binary(bson::Binary {
+            subtype: BinarySubtype::Uuid,
+            bytes: uid_a.as_bytes().to_vec(),
+        }),
+        // BSON null is its own variant; arrays preserve element types.
+        "missing": Bson::Null,
         "tags": ["a", "b", "c"],
-        "nested": { "x": 1_i32, "y": "z" },
+        "nested": { "x": 1_i32, "y": "z", "deep": { "k": 2_i32 } },
+        // RegularExpression, MinKey and MaxKey are not representable
+        // by the per-field codec (`from_bson` errors on them) — only
+        // the raw-passthrough path forwards them intact.
+        "pattern": Bson::RegularExpression(bson::Regex {
+            pattern: "^foo".into(),
+            options: "i".into(),
+        }),
+        "min": Bson::MinKey,
+        "max": Bson::MaxKey,
     };
     let doc_b = doc! {
         "_id": oid_b,
+        "flag": false,
+        "i32": -7_i32,
+        "i64": -9_000_000_000_i64,
+        "f64": std::f64::consts::E,
+        "name": "bob",
         "amount": dec_b,
         "created_at": ts_b,
+        "blob": Bson::Binary(bson::Binary {
+            subtype: BinarySubtype::Generic,
+            bytes: vec![0x00, 0x01, 0x02, 0x03],
+        }),
+        "uid": Bson::Binary(bson::Binary {
+            subtype: BinarySubtype::Uuid,
+            bytes: uid_b.as_bytes().to_vec(),
+        }),
+        "missing": Bson::Null,
         "tags": ["x", "y"],
-        "nested": { "x": 2_i32, "y": "w" },
+        "nested": { "x": 2_i32, "y": "w", "deep": { "k": 3_i32 } },
+        "pattern": Bson::RegularExpression(bson::Regex {
+            pattern: "bar$".into(),
+            options: "".into(),
+        }),
+        "min": Bson::MinKey,
+        "max": Bson::MaxKey,
     };
 
     let src_coll = mongo
@@ -124,8 +174,10 @@ storage = "mongo_state"
 from = "items"
 to = "items"
 batch-limit = 16
-mapping = ["*"]
 cursor = {{ fields = [], order = "asc", interval = "100ms" }}
+
+[flow.items.mapping]
+"*" = "*"
 "#,
     );
 
@@ -160,21 +212,62 @@ cursor = {{ fields = [], order = "asc", interval = "100ms" }}
         let amount = sink.get("amount").expect("amount present");
         assert!(
             matches!(amount, Bson::Decimal128(_)),
-            "amount must remain BSON Decimal128 (a JSON detour would \
-             have downgraded it to a string or sub-document); got {amount:?}"
+            "amount must remain BSON Decimal128; got {amount:?}"
         );
         let id = sink.get("_id").expect("_id present");
         assert!(
             matches!(id, Bson::ObjectId(_)),
-            "_id must remain BSON ObjectId (a JSON detour would have \
-             downgraded it to a hex string); got {id:?}"
+            "_id must remain BSON ObjectId; got {id:?}"
         );
         let created = sink.get("created_at").expect("created_at present");
         assert!(
             matches!(created, Bson::DateTime(_)),
-            "created_at must remain BSON DateTime (a JSON detour would \
-             have downgraded it to an RFC3339 string); got {created:?}"
+            "created_at must remain BSON DateTime; got {created:?}"
         );
+        let flag = sink.get("flag").expect("flag present");
+        assert!(
+            matches!(flag, Bson::Boolean(_)),
+            "flag must remain BSON Boolean; got {flag:?}"
+        );
+        let i32_value = sink.get("i32").expect("i32 present");
+        assert!(
+            matches!(i32_value, Bson::Int32(_)),
+            "i32 must remain BSON Int32 (not widened to Int64); got {i32_value:?}"
+        );
+        let i64_value = sink.get("i64").expect("i64 present");
+        assert!(
+            matches!(i64_value, Bson::Int64(_)),
+            "i64 must remain BSON Int64; got {i64_value:?}"
+        );
+        let f64_value = sink.get("f64").expect("f64 present");
+        assert!(
+            matches!(f64_value, Bson::Double(_)),
+            "f64 must remain BSON Double; got {f64_value:?}"
+        );
+        let name = sink.get("name").expect("name present");
+        assert!(
+            matches!(name, Bson::String(_)),
+            "name must remain BSON String; got {name:?}"
+        );
+        let blob = sink.get("blob").expect("blob present");
+        match blob {
+            Bson::Binary(b) => assert!(
+                matches!(b.subtype, BinarySubtype::Generic),
+                "blob must remain BSON Binary subtype Generic; got {:?}",
+                b.subtype
+            ),
+            other => panic!("blob must remain BSON Binary; got {other:?}"),
+        }
+        let uid = sink.get("uid").expect("uid present");
+        match uid {
+            Bson::Binary(b) => assert!(
+                matches!(b.subtype, BinarySubtype::Uuid | BinarySubtype::UuidOld),
+                "uid must keep its UUID subtype (per-field codec would \
+                 normalise it to Generic); got {:?}",
+                b.subtype
+            ),
+            other => panic!("uid must remain BSON Binary; got {other:?}"),
+        }
         let tags = sink.get("tags").expect("tags present");
         assert!(
             matches!(tags, Bson::Array(_)),
@@ -184,6 +277,27 @@ cursor = {{ fields = [], order = "asc", interval = "100ms" }}
         assert!(
             matches!(nested, Bson::Document(_)),
             "nested must remain a BSON sub-document; got {nested:?}"
+        );
+        let missing = sink.get("missing").expect("missing present");
+        assert!(
+            matches!(missing, Bson::Null),
+            "BSON Null must round-trip as Null (and not be dropped); got {missing:?}"
+        );
+        let pattern = sink.get("pattern").expect("pattern present");
+        assert!(
+            matches!(pattern, Bson::RegularExpression(_)),
+            "RegularExpression must survive raw-passthrough (the per-field \
+             codec rejects it outright); got {pattern:?}"
+        );
+        let min = sink.get("min").expect("min present");
+        assert!(
+            matches!(min, Bson::MinKey),
+            "MinKey must survive raw-passthrough; got {min:?}"
+        );
+        let max = sink.get("max").expect("max present");
+        assert!(
+            matches!(max, Bson::MaxKey),
+            "MaxKey must survive raw-passthrough; got {max:?}"
         );
 
         // 2. Strongest signal: byte-equal serialisation. Decimal128

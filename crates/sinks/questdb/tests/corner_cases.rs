@@ -12,9 +12,11 @@ use air_elt_core::traits::Sink;
 use air_elt_core::types::Value;
 use air_elt_sink_questdb::{QuestDbSink, QuestDbSinkConfig};
 
-/// All-delete batch on a no-delete sink. The runner pre-filters Delete
-/// rows; the sink's defence-in-depth must also report `rows_written = 0`
-/// without touching the writer.
+/// All-delete batch on a no-delete sink. Under the post-AIR-70
+/// contract the runner ships the FULL batch (deletes included) to a
+/// `supports_deletes() == false` sink; the sink is the authoritative
+/// filter and must drop the deletes, report `rows_written = 0`, and
+/// not touch the writer at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_delete_batch_writes_zero_rows() {
     let h = questdb_pool().await.expect("questdb pool");
@@ -49,6 +51,7 @@ async fn all_delete_batch_writes_zero_rows() {
     // no traffic.
     let delete_row = Row {
         values: vec![Value::Timestamp(ts), Value::Float64(1.0)],
+        body: None,
         op: RowOp::Delete,
     };
     let report = sink

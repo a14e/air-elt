@@ -21,17 +21,26 @@ pub enum RowOp {
     Delete,
 }
 
-/// A sink-bound row produced by the Transform interpreter.
-///
-/// `values` carries one canonical [`Value`] per `WriteSpec.columns`
-/// slot — the order of values matches the order of declared sink
-/// columns. The schemaless raw-passthrough flow (mongo→mongo `["*"]`)
-/// lowers to a Transform with a single `Body` op writing one
+/// A row that flows through the pipeline. Sources construct it with
+/// per-column `values` (one per `ReadSpec.columns` slot) and an
+/// optional full-document `body` (attached only when
+/// `ReadSpec.needs_body == true`). The Transform interpreter
+/// repositions / converts these into a sink-shaped row in place; the
+/// `body` slot is `None` by the time a row reaches the sink. The
+/// schemaless raw-passthrough flow (mongo→mongo `["*"]`) lowers to a
+/// Transform with a single `Body` op writing one
 /// `Value::Custom(BsonObjectValue)`; mongo sink recognises that shape
 /// and writes the BSON document at root.
 #[derive(Debug, Clone, Default)]
 pub struct Row {
     pub values: Vec<Value>,
+    /// Optional "full document" body, populated by sources whose flow
+    /// reads `ReadSpec.needs_body == true`. Relational sources push
+    /// `Value::Json(...)`; mongo sources push
+    /// `Value::Custom(BsonObjectValue(doc))`. The Transform interpreter
+    /// `Body` op consumes it via `take()` (last reference) or `clone()`
+    /// (earlier references); post-Transform rows carry `None`.
+    pub body: Option<Value>,
     /// Default `Upsert`. CDC sources set `Delete` for tombstone events.
     pub op: RowOp,
 }
@@ -40,14 +49,25 @@ impl Row {
     pub fn upsert(values: Vec<Value>) -> Self {
         Self {
             values,
+            body: None,
             op: RowOp::Upsert,
         }
     }
+
     pub fn delete(values: Vec<Value>) -> Self {
         Self {
             values,
+            body: None,
             op: RowOp::Delete,
         }
+    }
+
+    /// Attach a body payload when the flow has body targets
+    /// (`ReadSpec.needs_body == true`). `None` is a no-op so call
+    /// sites can pass a cost-guarded `Option<Value>` straight in.
+    pub fn with_body(mut self, body: Option<Value>) -> Self {
+        self.body = body;
+        self
     }
 }
 
@@ -77,10 +97,9 @@ pub struct ReadSpec {
     /// typed struct in `build_context`.
     pub source_options: toml::Table,
     /// `true` when the flow has at least one body target — sources
-    /// populate `body: Option<Value>` on each
-    /// [`crate::model::raw::RawRow`] so the Transform interpreter can
-    /// fold body columns at native fidelity.
-    /// Defaults to `false`; flipped on by
+    /// populate `body: Option<Value>` on each [`Row`] so the Transform
+    /// interpreter can fold body columns at native fidelity. Defaults
+    /// to `false`; flipped on by
     /// `flow_state::build_derived_plans_from_expanded` when expansion
     /// produces a `body` block.
     pub needs_body: bool,
@@ -149,6 +168,7 @@ mod tests {
     fn upsert_constructor_sets_op() {
         let row = Row::upsert(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)]);
         assert_eq!(row.op, RowOp::Upsert);
+        assert!(row.body.is_none());
         assert_eq!(row.values.len(), 3);
     }
 
@@ -156,6 +176,13 @@ mod tests {
     fn delete_constructor_sets_op() {
         let row = Row::delete(vec![Value::Int32(7)]);
         assert_eq!(row.op, RowOp::Delete);
+        assert!(row.body.is_none());
         assert_eq!(row.values, vec![Value::Int32(7)]);
+    }
+
+    #[test]
+    fn with_body_attaches_value() {
+        let row = Row::upsert(Vec::new()).with_body(Some(Value::Json(serde_json::json!({"a": 1}))));
+        assert_eq!(row.body, Some(Value::Json(serde_json::json!({"a": 1}))));
     }
 }

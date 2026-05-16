@@ -57,6 +57,7 @@ async fn round_trip_decimal32() {
     let batch = Batch {
         rows: vec![Row {
             values: vec![Value::UInt64(1), Value::Decimal(d)],
+            body: None,
             op: RowOp::Upsert,
         }],
         next_cursor: None,
@@ -100,6 +101,7 @@ async fn round_trip_decimal64() {
     let batch = Batch {
         rows: vec![Row {
             values: vec![Value::UInt64(1), Value::Decimal(d)],
+            body: None,
             op: RowOp::Upsert,
         }],
         next_cursor: None,
@@ -141,6 +143,7 @@ async fn round_trip_decimal128() {
     let batch = Batch {
         rows: vec![Row {
             values: vec![Value::UInt64(1), Value::Decimal(d)],
+            body: None,
             op: RowOp::Upsert,
         }],
         next_cursor: None,
@@ -182,6 +185,7 @@ async fn round_trip_decimal_negative() {
     let batch = Batch {
         rows: vec![Row {
             values: vec![Value::UInt64(1), Value::Decimal(d)],
+            body: None,
             op: RowOp::Upsert,
         }],
         next_cursor: None,
@@ -226,6 +230,7 @@ async fn round_trip_int128() {
     let batch = Batch {
         rows: vec![Row {
             values: vec![Value::UInt64(1), Value::Custom(Box::new(ChInt128Value(n)))],
+            body: None,
             op: RowOp::Upsert,
         }],
         next_cursor: None,
@@ -268,6 +273,7 @@ async fn round_trip_uint128() {
     let batch = Batch {
         rows: vec![Row {
             values: vec![Value::UInt64(1), Value::Custom(Box::new(ChUInt128Value(n)))],
+            body: None,
             op: RowOp::Upsert,
         }],
         next_cursor: None,
@@ -320,6 +326,7 @@ async fn round_trip_int256() {
                 Value::UInt64(1),
                 Value::Custom(Box::new(ChInt256Value { le_bytes })),
             ],
+            body: None,
             op: RowOp::Upsert,
         }],
         next_cursor: None,
@@ -370,6 +377,7 @@ async fn round_trip_uint256() {
                 Value::UInt64(1),
                 Value::Custom(Box::new(ChUInt256Value { le_bytes })),
             ],
+            body: None,
             op: RowOp::Upsert,
         }],
         next_cursor: None,

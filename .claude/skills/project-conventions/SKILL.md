@@ -82,13 +82,13 @@ ClickHouse is sink-only today; `commons-clickhouse` carries the helpers shared w
 
 ## Sink::supports_deletes (append-only ingest)
 
-`Sink::supports_deletes() -> bool` (default `true`). ClickHouse sink overrides to `false`. Three behavioural consequences:
+`Sink::supports_deletes() -> bool` (default `true`). ClickHouse and QuestDB sinks override to `false`. Three behavioural consequences:
 
-1. **Runner**: `FlowRunner::write_and_commit` filters out `RowOp::Delete` rows pre-write when the sink declares no-delete. If the batch becomes empty after filtering, the cursor still advances (via `commit_cursor`) and the sink is not called.
+1. **Sink self-filter (authoritative).** A sink that returns `false` from `supports_deletes()` MUST drop `RowOp::Delete` rows itself inside `write_batch` and return a `WriteReport` containing the count of upsert rows actually written. The runner no longer pre-filters — it ships the whole batch and lets the sink decide. The runner still advances the cursor on every successful `write_batch`, so an all-delete batch lands as `rows_written = 0` and the cursor moves past the dropped events. ClickHouse filters via `batch.rows.iter().filter(|r| r.op == RowOp::Upsert)`; QuestDB filters inside `pg_writer::write`.
 2. **Validation pipeline**: `validate_delete_access` is gated on `source.emits_deletes() && conflict.is_some() && sink.supports_deletes()` — the probe is skipped against append-only sinks regardless of source/conflict shape.
 3. **Assemble**: the otherwise-mandatory `[flow.<name>.conflict]` block for CDC sources (`mongo-cdc`) becomes optional when the sink declares no-delete. Append-only ingest: every CDC event lands as a plain INSERT.
 
-Future no-delete sinks (e.g. an append-only event-store backend) should override this method and inherit all three behaviours without further changes.
+Future no-delete sinks (e.g. an append-only event-store backend) MUST repeat the self-filter pattern — the runner does not assist. A regression test that feeds a Delete-only batch through the sink and asserts a clean `WriteReport { rows_written: 0 }` is the project convention.
 
 ## Type model and the N+N matrix
 
@@ -100,7 +100,7 @@ Canonical types are the only pivot — connectors do NOT introduce parallel enum
 - **`core::types::default_value::parse`** — parses a TOML default literal against the sink `DataType`. Bytes columns require a typed prefix (`hex:` / `base64:` / `utf8:` / `bin:`).
 - The compiled `Transform` program is owned by `DerivedPlans` and rebuilt whenever the schema is re-introspected.
 
-**Spec carries the body flag.** `ReadSpec` precomputes `needs_body: bool` — set when the compiled Transform contains at least one `TransformOp::Body` (i.e. some sink column is fed from the row body). Sources MUST consult this flag and only populate `RawRow.body` when set. Relational sources build the body via `air_elt_core::transform::build_body_json`; Mongo wraps the document as `Value::Custom(BsonObjectValue)`. Sources MUST NOT compute conversions or pack bodies for sink columns themselves — that happens in Transform.
+**Spec carries the body flag.** `ReadSpec` precomputes `needs_body: bool` — set when the compiled Transform contains at least one `TransformOp::Body` (i.e. some sink column is fed from the row body). Sources MUST consult this flag and only populate `Row.body` when set. Relational sources build the body via `air_elt_core::transform::build_body_json`; Mongo wraps the document as `Value::Custom(BsonObjectValue)`. Sources MUST NOT compute conversions or pack bodies for sink columns themselves — that happens in Transform. `Row` is the single row type — there is no separate `RawRow`; post-Transform rows carry `body = None` by construction.
 
 ### Connector-local custom types (`DynType` / `DynValue`)
 

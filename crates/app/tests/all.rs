@@ -1,6 +1,7 @@
 mod cli_validate;
 mod cockroachdb_to_pg;
 mod mariadb_to_pg;
+mod mongo_cdc_to_clickhouse;
 mod mongo_to_mongo;
 mod mongo_to_mysql;
 mod mongo_to_pg;

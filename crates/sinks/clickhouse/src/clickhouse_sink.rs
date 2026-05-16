@@ -152,9 +152,15 @@ impl Sink for ChSink {
                 .map_err(RuntimeError::backend)?;
             return Ok(WriteReport { rows_written: 0 });
         }
-        // Runner pre-filters Delete rows when `supports_deletes() = false`.
-        // Defensive check: skip Deletes if they ever reach the sink.
-        let mut body: Vec<u8> = Vec::with_capacity(batch.rows.len() * ch_ctx.columns.len() * 8);
+        // Authoritative filter: sinks whose `supports_deletes() = false`
+        // own the responsibility of dropping `Delete` rows themselves
+        // and returning a `WriteReport` with the upsert count. The
+        // runner no longer pre-filters. Why size the buffer from the
+        // upsert count, not `batch.rows.len()`: delete-heavy CDC ticks
+        // would otherwise pre-allocate megabytes that the encode loop
+        // never touches.
+        let upsert_count = batch.rows.iter().filter(|r| r.op == RowOp::Upsert).count();
+        let mut body: Vec<u8> = Vec::with_capacity(upsert_count * ch_ctx.columns.len() * 8);
         let mut rows_written: u64 = 0;
         for row in batch.rows.iter().filter(|r| r.op == RowOp::Upsert) {
             rows_written += 1;

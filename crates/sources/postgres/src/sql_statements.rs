@@ -27,11 +27,17 @@ pub fn probe_select(table: &str, columns: &[String]) -> RuntimeResult<String> {
 /// Build the SELECT projection list, applying per-column wire-format
 /// adapters where sqlx cannot decode the native type directly.
 ///
-/// `hll` is the only such case today: sqlx has no `hll` decoder, so
-/// we project each HLL column through `hll_send(col)::bytea AS col`.
-/// `hll_send` is the extension's binary output function — it returns
-/// the same wire bytes that `hll_recv` (used by the sink's `::hll`
-/// cast) accepts on input, so the round-trip is byte-exact.
+/// Two adapters today:
+/// * `hll` — sqlx has no `hll` decoder, so HLL columns are projected
+///   through `hll_send(col)::bytea AS col`. `hll_send` is the extension's
+///   binary output function — it returns the same wire bytes that
+///   `hll_recv` (used by the sink's `::hll` cast) accepts on input, so
+///   the round-trip is byte-exact.
+/// * `xml` — sqlx-postgres 0.8 has no `xml`-typed `String` decoder
+///   (its `String` impl whitelists `TEXT`/`VARCHAR`/`BPCHAR`/`NAME`/
+///   `CITEXT`/`UNKNOWN` but not `XML`). Cast each `xml` column to `text`
+///   in the projection so the wire payload arrives as a regular text
+///   value the codec can pick up.
 fn projection_for(columns: &[String], column_types: &[DataType]) -> RuntimeResult<String> {
     if column_types.len() != columns.len() {
         return Err(RuntimeError::Other(format!(
@@ -49,6 +55,9 @@ fn projection_for(columns: &[String], column_types: &[DataType]) -> RuntimeResul
         match dt {
             DataType::Custom(t) if t.kind() == PgHllType::KIND => {
                 out.push_str(&format!("hll_send({q})::bytea AS {q}"));
+            }
+            DataType::Xml => {
+                out.push_str(&format!("{q}::text AS {q}"));
             }
             _ => out.push_str(&q),
         }

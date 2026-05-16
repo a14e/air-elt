@@ -129,10 +129,9 @@ sink = "pg_sink"
 storage = "pg_state"
 from = "users"
 to = "public.users"
-mapping = [
-    { from = "_id", to = "id" },
-    { from = "name", to = "name" },
-]
+[flow.users.mapping]
+id = "_id"
+name = "name"
 batch-limit = 500
 
 # Required: cdc emits Upsert/Delete; the sink needs a key.
@@ -156,7 +155,7 @@ strategy = "overwrite"
 | `storage` | string | required | Storage name |
 | `from` | string | required | Source table (dot-qualified: `schema.table`) |
 | `to` | string | required | Sink table |
-| `mapping` | array | required | Column mapping rules |
+| `mapping` | table | required | Column mapping rules, **keyed by sink column name**. See `mapping` section below. |
 | `cursor` | table | required | Cursor config |
 | `batch-limit` | usize | 1024 | Max rows per batch. `batch-limit × mapping cols ≤ 60,000` |
 | `query-timeout` | Duration | `"30s"` | Per-operation timeout for read/write/cursor calls |
@@ -207,18 +206,29 @@ strategy = "overwrite"  # "ignore" | "overwrite"
 
 ### `mapping`
 
-Two surfaces coexist: a long-form table that carries the full feature set (`truncate`, `default`), and a short string form for the common cases.
+Mapping is an **inverted TOML table** keyed by sink column name. The right-hand side is either a bare string (interpreted as the source column `from`) or a long-form inline table carrying the full feature set (`truncate`, `default`, `switch`).
 
 ```toml
-mapping = [
-  { from = "col_a", to = "col_b" },                              # long form
-  { from = "long_text", to = "summary", truncate = true },
-  { from = "blob_in",   to = "blob_out", default = "hex:00" },
-  "created_at",                                                  # short: ≡ {from, to = "created_at"}
-  "src_name:dst_name",                                           # short: from:to
-  "*",                                                           # wildcard expansion
-  "*:body",                                                      # body mapping
-]
+[flow.<name>.mapping]
+# Identity / rename — bare string RHS is always `from`. Identity is the
+# case `key == value`; rename is `key != value`. No separate forms.
+field4 = "field4"
+display = "user_name"
+
+# Long-form table. The sink column name is the key — there is NO `to`
+# field inside the inline table.
+summary = { from = "long_text", truncate = true }
+blob_out = { from = "blob_in",  default = "hex:00" }
+
+# Body-pack: route the row body into a single sink column. RHS `"*"`
+# triggers it when the key is a regular column name.
+body = "*"
+
+# Wildcard expansion: the literal pair `"*" = "*"`.
+"*" = "*"
+
+# Switch: value-to-value lookup.
+status_label = { from = "status", switch = { ACTIVE = "active", FINISHED = "finished" }, default = "unknown" }
 ```
 
 **Long-form fields**
@@ -226,22 +236,24 @@ mapping = [
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `from` | string | required | Source column name |
-| `to` | string | required | Sink column name |
 | `truncate` | bool | `false` | Opt the column into narrowing conversions: text/bytes shrink (UTF-safe for text), integer/float saturate to target's max/min, decimal scale drop, json/xml → `text(n)` serialize. Forbidden combinations (`Json → Json`, `Xml → Xml`, UUID truncations, `Date → Timestamp`) remain rejected. |
-| `default` | scalar / table | none | Fallback value substituted when the source value is `Null`. Permits mapping a nullable source into a `NOT NULL` sink. Validation rejects `default` if the source column is `NOT NULL` (the substitution would never fire). The literal is parsed against the resolved sink `DataType` (see grammar below). |
+| `default` | scalar / table | none | Fallback value substituted when the source value is `Null` and when `switch` produces no match. Permits mapping a nullable source into a `NOT NULL` sink. On the Direct path validation rejects `default` if the source column is `NOT NULL`. The literal is parsed against the resolved sink `DataType` (see grammar below). |
+| `switch` | inline table | none | Value-to-value lookup. Keys (inline-table keys — always strings in TOML) are parsed against the source column's `DataType`; values are parsed against the sink column's `DataType` (or contribute to union-collapse for schemaless sinks). Output: the matched value, or `default` on miss / NULL input, or `Value::Null` if no `default`. See **Switch** below. |
 
-`#[serde(deny_unknown_fields)]` rejects any additional keys at parse time on the long form — this includes the previously-reserved `transform`, `timezone`, `data-type` placeholders, which are now removed.
+`#[serde(deny_unknown_fields)]` rejects any additional keys at parse time on the long form — including a stray `to` field (the map key already carries it).
 
-**Short-form grammar**
+**Short-form grammar** — string RHS:
 
-| Form | Equivalent long form | Notes |
-|------|---------------------|-------|
-| `"name"` | `{from = "name", to = "name"}` | Identity. `name` validated as an identifier (dot-paths allowed for Mongo). |
-| `"a:b"` | `{from = "a", to = "b"}` | Order is `from:to`. |
-| `"*"` (or `"*:*"`) | wildcard expansion | See **Wildcard** below. |
-| `"*:body"` | wildcard body mapping | Lowers to `Body { to = "body" }` — routes the row body into one sink column named `body`. |
+| Pair | Meaning |
+|------|---------|
+| `key = "value"` (value ≠ `"*"`) | `from = "value", to = "key"`. Identity and rename collapse to this case. |
+| `key = "*"` (key ≠ `"*"`) | Body-pack into sink column `key`. Lowers to `Body { to = key }`. |
+| `"*" = "*"` | Wildcard expansion (see **Wildcard** below). |
+| `"*" = "anything-else"` | Rejected — wildcard key only accepts wildcard value. |
 
-Whitespace inside the string is rejected — no trim, no leading/trailing/inner spaces (including unicode whitespace). Short-form entries cannot carry `truncate` or `default`; if you need either, use the long form. Forbidden: `"field:*"` (single source field broadcast to all sink columns is ambiguous). Forbidden: more than one `"*"`; cannot combine `"*"` with `"*:NAME"` in the same mapping.
+Whitespace inside the RHS string is rejected. Multiple body-pack entries with distinct keys are allowed (post-expansion uniqueness still enforced). Combining `"*" = "*"` with any body-pack entry is rejected — they're mutually exclusive.
+
+The legacy `mapping = [...]` array form (with `{ from, to, ... }` entries or shorthand strings like `"name"`, `"a:b"`, `"*:body"`) is **removed**. The deserialiser rejects it with a clear error pointing at the new shape.
 
 **Wildcard `"*"`**
 
@@ -257,9 +269,33 @@ The matrix is NOT relaxed under `*` — same-name pairs still go through the N+N
 
 Universe-size cap: 4096 columns post-expansion → `WildcardUniverseTooLarge`.
 
-**Body mapping `"*:body"`** (lowered to `Body { to }`)
+**Body mapping `name = "*"`** (lowered to `Body { to = name }`)
 
-Routes the row body into a single sink column. For relational sources the source builds the body as `Value::Json` via `air_elt_core::transform::build_body_json`; for Mongo sources the body is `Value::Custom(BsonObjectValue)`. The sink column type must accept the body shape (`Json` for the SQL sinks, schemaless for Mongo). Mixed mappings work: `["id", "*:body"]` keeps `id` as a separate sink column AND includes `id` in the body. Multiple `*:NAME` rules are allowed when their target columns differ. Duplicate target → `DuplicateSinkField`.
+Routes the row body into a single sink column. For relational sources the source builds the body as `Value::Json` via `air_elt_core::transform::build_body_json`; for Mongo sources the body is `Value::Custom(BsonObjectValue)`. The sink column type must accept the body shape (`Json` for the SQL sinks, schemaless for Mongo). Mixed mappings work: `id = "id"` next to `body = "*"` keeps `id` as a separate sink column AND includes `id` in the body. Multiple body-pack entries with distinct target columns are allowed. Duplicate target → `DuplicateSinkField`.
+
+**Switch `field = { from = ..., switch = {...}, default = ... }`** (lowered to `TransformOp::Switch`)
+
+Per-row value-to-value lookup. The `switch` inline table maps source-side keys (parsed against the source column's `DataType` — TOML inline-table keys are always strings, so `1 = "one"` and `"1" = "one"` both arrive as the key text `"1"` and are parsed as an integer when the source is `Int*`) to sink-side values.
+
+```toml
+[flow.<name>.mapping.status_label]
+from = "status"
+switch = { ACTIVE = "active", FINISHED = "finished" }
+default = "unknown"
+```
+
+Behaviour:
+- Hit → matched value (typed against the sink `DataType` for typed sinks; type-derived for schemaless).
+- Miss → `default` (if set) or `Value::Null`.
+- NULL source → `default` (if set) or `Value::Null`. The switch is NOT consulted on NULL.
+
+Key matching is type-canonical, NOT string-canonical: `Int8(1)`, `Int32(1)`, `BigInt(1)` all collapse onto the same `SwitchKey::Int(1)`. Float keys use `f64::to_bits` with NaN-bit-pattern normalisation (all NaNs collapse, `-0.0` collapses with `+0.0`). Sources whose declared `DataType` is `Json`/`Xml`/`Union`/`Custom` cannot host a switch — surfaces `SwitchUnsupportedSource`.
+
+Sink type derivation:
+- **Typed sink** (postgres/mysql/clickhouse/questdb): each RHS literal is parsed against the sink column's declared `DataType` via the same parser used by `default`. Mismatch → `SwitchValueTypeMismatch`.
+- **Schemaless sink** (mongo): RHS literals are parsed untyped → each produces a `(Value, DataType)` pair. The set of observed `DataType`s collapses via `core::types::collapse_union` into a single widened type when widening rules apply (Int8 ∪ Int32 → Int32; Text(5) ∪ Text(9) → Text(9)); otherwise the column type becomes `DataType::Union(...)`.
+
+Validation rejects empty `switch = {}` and duplicate canonical keys (`SwitchDuplicateKey`). The match table is built once at validate time; runtime lookup is one `AHashMap` probe per row.
 
 NULL fields are omitted from the body object — an all-NULL row produces `{}`.
 

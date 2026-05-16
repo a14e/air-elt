@@ -92,7 +92,12 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
                 sep.push_bind::<Option<BigDecimal>>(None);
             }
             DataType::Xml => {
+                // sqlx cannot infer the `xml` type from a NULL bind; pair the
+                // typed-NULL string with an explicit `::xml` cast so the
+                // placeholder lands as `$N::xml` and PG accepts it for an
+                // `xml` column.
                 sep.push_bind::<Option<String>>(None);
+                sep.push_unseparated("::xml");
             }
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
                 unreachable!("postgres has no unsigned integer column types")
@@ -136,6 +141,13 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
         }
         Value::Text(s) => {
             sep.push_bind(s.clone());
+            // The canonical `Value::Xml` slot is folded into `Value::Text`;
+            // the column-level distinction lives only on `dt`. When the
+            // sink column is `xml`, pair the text bind with an explicit
+            // `::xml` cast so PG accepts the literal.
+            if matches!(dt, DataType::Xml) {
+                sep.push_unseparated("::xml");
+            }
         }
         Value::Bytes(b) => {
             sep.push_bind(b.clone());

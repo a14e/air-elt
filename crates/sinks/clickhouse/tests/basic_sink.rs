@@ -48,13 +48,18 @@ async fn round_trip_simple_columns() {
                     Value::Text("alice".into()),
                     Value::Int32(30),
                 ],
+                body: None,
                 op: RowOp::Upsert,
             },
-            // This delete should NOT reach the sink in production (the
-            // runner pre-filters). We submit it directly to exercise the
-            // defensive sink-side filter inside `write_batch`.
+            // Append-only contract: the runner ships the FULL batch
+            // (deletes included) to a sink that declares
+            // `supports_deletes() == false`. The sink is responsible
+            // for dropping `RowOp::Delete` rows itself. This case
+            // exercises the authoritative sink-side filter inside
+            // `write_batch`.
             Row {
                 values: vec![Value::UInt64(2), Value::Text("ignored".into()), Value::Null],
+                body: None,
                 op: RowOp::Delete,
             },
         ],

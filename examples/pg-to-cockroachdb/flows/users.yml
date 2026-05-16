@@ -10,9 +10,9 @@ flow:
     batch-limit: 500
 
     mapping:
-      - { from: id, to: id }
-      - { from: email, to: email }
-      - { from: display_name, to: display_name }
+      id: id
+      email: email
+      display_name: display_name
 
     cursor:
       fields: ["id"]

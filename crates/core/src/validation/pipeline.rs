@@ -20,6 +20,7 @@ use crate::registry::Registry;
 use crate::traits::{Sink, Source, Storage};
 use crate::types::{ConversionContext, DataType};
 use crate::validation::checks;
+use crate::validation::compatibility::CompatibilityValidator;
 
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -167,8 +168,12 @@ pub async fn assemble(
             // permit the empty-fields case.
             let raw_passthrough_eligible = source.schemaless()
                 && sink.schemaless()
-                && flow.mapping.iter().any(|m| {
-                    matches!(m, crate::config::model::MappingRule::Shorthand(s) if s == "*" || s == "*:*")
+                && flow.mapping.iter().any(|(key, rhs)| {
+                    key == "*"
+                        && matches!(
+                            rhs,
+                            crate::config::model::MappingRhs::Short(s) if s == "*"
+                        )
                 });
             if !raw_passthrough_eligible {
                 return Err(ValidationError::AccessFailed {
@@ -317,10 +322,17 @@ fn passthrough_plans(
                     column: m.from.clone(),
                 });
             }
+            if m.switch.is_some() {
+                return Err(ValidationError::SwitchRequiresFields {
+                    flow: flow_name.to_string(),
+                    column: m.from.clone(),
+                });
+            }
             Ok(ColumnConversionPlan {
                 source: DataType::Json,
                 sink: DataType::Json,
                 ctx: ConversionContext::passthrough(),
+                switch: None,
             })
         })
         .collect()
@@ -704,13 +716,42 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
         } else {
             Some(&dst_schema_full)
         };
-        crate::model::flow_state::build_derived_plans_from_expanded(
+        let built = crate::model::flow_state::build_derived_plans_from_expanded(
             &flow,
             &expanded,
             Some(&src_schema_full),
             dst_for_build,
             dst_schemaless,
-        )?
+        )?;
+
+        // Sink-aware compatibility check: compare every post-transform
+        // output `DataType` against the corresponding sink column. This
+        // replaces the source-vs-sink matrix branch that used to live
+        // in `checks::check_mapping` and accepts cross-family flows
+        // (e.g. `Bool → Text` via `Switch`) that the lossless matrix
+        // would have refused on the raw source type. Schemaless sinks
+        // short-circuit inside the validator.
+        let sink_column_names: Vec<String> = expanded
+            .direct
+            .iter()
+            .map(|d| d.to.clone())
+            .chain(
+                expanded
+                    .body
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|b| b.targets.iter().cloned()),
+            )
+            .collect();
+        let source_body_dt = flow.source.body_data_type();
+        let validator = CompatibilityValidator::new(
+            &flow.name,
+            &built.transform,
+            &src_schema_full,
+            &source_body_dt,
+        );
+        validator.validate(&dst_schema_full, &sink_column_names, flow.sink.schemaless())?;
+        built
     } else {
         info!(
             flow = %flow.name,
@@ -825,6 +866,19 @@ mod tests {
             to: to.into(),
             truncate: false,
             default_literal: Some(default),
+        }
+    }
+
+    fn rule_switch(from: &str, to: &str) -> ColumnMapping {
+        ColumnMapping::Switch {
+            from: from.into(),
+            to: to.into(),
+            truncate: false,
+            cases: vec![crate::mapping::column::SwitchCase {
+                key: "x".into(),
+                value: toml::Value::String("y".into()),
+            }],
+            default_literal: None,
         }
     }
 
@@ -974,6 +1028,30 @@ mod tests {
         assert!(
             matches!(err, ValidationError::DefaultRequiresFields { .. }),
             "expected DefaultRequiresFields, got {err:?}"
+        );
+    }
+
+    /// Mirror of the `DefaultRequiresFields` test for the parallel
+    /// `switch` rejection branch (`passthrough_plans`). Without schema
+    /// introspection the switch's source/sink types can't be resolved,
+    /// so the mapping must be rejected at validate time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fields_check_false_with_switch_rejected() {
+        let mut source = default_source_mock();
+        source.expect_name().return_const("src".to_string());
+        source.expect_describe_schema().times(0);
+        let mut sink = MockSink::new();
+        sink.expect_describe_schema().times(0);
+        sink.expect_schemaless().return_const(false);
+        let storage = MockStorage::new();
+
+        let rules = vec![rule_switch("a", "a")];
+        let flow = flow_with(source, sink, storage, rules, false);
+
+        let err = validate_flow(flow).await.unwrap_err();
+        assert!(
+            matches!(err, ValidationError::SwitchRequiresFields { .. }),
+            "expected SwitchRequiresFields, got {err:?}"
         );
     }
 

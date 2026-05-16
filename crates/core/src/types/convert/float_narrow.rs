@@ -1,6 +1,8 @@
-//! `Float64 → Float32` (saturate to f32::MAX/MIN, NaN preserved) and
-//! `Float64 → Int*` (truncate-toward-zero, then saturate). NaN → integer is
-//! rejected as `Overflow`.
+//! `Float{64,32} → Float32` (saturate to f32::MAX/MIN, NaN preserved) and
+//! `Float{64,32} → Int*` / `UInt*` (truncate-toward-zero, then saturate).
+//! NaN → integer is rejected as `Overflow`. `Float32` sources widen
+//! losslessly to `f64` before dispatching to the saturating primitives,
+//! so the per-width logic is shared.
 
 use super::error::ConvertError;
 use super::saturate::*;
@@ -10,7 +12,10 @@ pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, Co
     use DataType::*;
     let n = match (src, &value) {
         (Float64, Value::Float64(n)) => *n,
-        (Float64, _) => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        (Float32, Value::Float32(n)) => *n as f64,
+        (Float64 | Float32, _) => {
+            return Err(ConvertError::ValueShapeMismatch { src: src.clone() });
+        }
         _ => {
             return Err(ConvertError::Unsupported {
                 src: src.clone(),
@@ -170,10 +175,39 @@ mod tests {
         assert!(matches!(res, Err(ConvertError::ValueShapeMismatch { .. })));
     }
 
+    /// Float32 source widens to f64 internally; per-width saturation is
+    /// shared with the Float64 path. Pin both signed and unsigned arms.
     #[test]
-    fn non_float64_source_rejected() {
-        let res = convert(Value::Float32(1.0), &DataType::Float32, &DataType::Float32);
-        assert!(matches!(res, Err(ConvertError::Unsupported { .. })));
+    fn f32_to_int_each_width() {
+        for (dst, expected) in [
+            (DataType::Int16, Value::Int16(7)),
+            (DataType::Int32, Value::Int32(7)),
+            (DataType::Int64, Value::Int64(7)),
+            (DataType::UInt8, Value::UInt8(7)),
+            (DataType::UInt32, Value::UInt32(7)),
+        ] {
+            let out = convert(Value::Float32(7.9_f32), &DataType::Float32, &dst).unwrap();
+            assert_eq!(out, expected);
+        }
+    }
+
+    /// Float32 NaN → integer rejected as Overflow, same as Float64.
+    #[test]
+    fn f32_nan_overflows_for_int() {
+        let res = convert(
+            Value::Float32(f32::NAN),
+            &DataType::Float32,
+            &DataType::Int32,
+        );
+        assert!(matches!(res, Err(ConvertError::Overflow { .. })));
+    }
+
+    /// Float32 source MUST carry a `Value::Float32`; a `Value::Float64`
+    /// payload tagged with `Float32` source is a shape mismatch.
+    #[test]
+    fn f32_source_with_wrong_value_shape_rejected() {
+        let res = convert(Value::Float64(1.0), &DataType::Float32, &DataType::Int32);
+        assert!(matches!(res, Err(ConvertError::ValueShapeMismatch { .. })));
     }
 
     #[test]

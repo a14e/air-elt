@@ -8,11 +8,10 @@ to = "user_events"
 
 batch-limit = 500
 
-mapping = [
-    { from = "_id", to = "id" },
-    { from = "name", to = "name" },
-    { from = "email", to = "email" },
-]
+[flow.users.mapping]
+id = "_id"
+name = "name"
+email = "email"
 
 # NB: no `[flow.users.conflict]` block. The CH sink declares
 # `supports_deletes() = false`, so the validation pipeline does NOT

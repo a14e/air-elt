@@ -55,10 +55,12 @@ async fn nullable_columns_round_trip_null_and_value() {
                     Value::Text("alice".into()),
                     Value::Int32(30),
                 ],
+                body: None,
                 op: RowOp::Upsert,
             },
             Row {
                 values: vec![Value::UInt64(2), Value::Null, Value::Null],
+                body: None,
                 op: RowOp::Upsert,
             },
         ],

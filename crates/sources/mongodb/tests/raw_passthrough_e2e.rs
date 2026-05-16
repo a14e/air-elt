@@ -2,7 +2,7 @@
 //!
 //! When `ReadSpec.columns` is empty (the wildcard expansion
 //! signal for schemaless-both flows), `read_batch` emits one row per
-//! document carrying the whole document on `RawRow.body` as a
+//! document carrying the whole document on `Row.body` as a
 //! `BsonObjectValue` — no per-field projection, no `next_cursor`.
 
 #![allow(clippy::unwrap_used)]
@@ -64,7 +64,7 @@ async fn read_batch_raw_mode_emits_bson_object_rows() {
     // Source advertises schemaless.
     assert!(<MongoSource as Source>::schemaless(&source));
 
-    // Each row is a passthrough RawRow: empty `values`, payload on `body`.
+    // Each row is a passthrough Row: empty `values`, payload on `body`.
     for row in &batch.rows {
         assert!(row.values.is_empty(), "passthrough rows have no values");
         let v = row.body.clone().expect("passthrough row has body");
@@ -88,7 +88,7 @@ async fn read_batch_raw_mode_emits_bson_object_rows() {
 /// Body-flow read: per-column `ReadSpec.columns` populated, plus
 /// `needs_body: true` (set when the expanded mapping has body
 /// targets). Each emitted row carries both the per-column values AND
-/// the source `bson::Document` on `RawRow.body` as a `BsonObjectValue`
+/// the source `bson::Document` on `Row.body` as a `BsonObjectValue`
 /// — verified via downcast.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_batch_attaches_body_when_needs_body_set() {
@@ -135,7 +135,7 @@ async fn read_batch_attaches_body_when_needs_body_set() {
         let v = row
             .body
             .clone()
-            .expect("needs_body=true must attach RawRow.body");
+            .expect("needs_body=true must attach Row.body");
         match v {
             air_elt_core::types::Value::Custom(dv) => {
                 let any = dv.into_any();
@@ -153,7 +153,7 @@ async fn read_batch_attaches_body_when_needs_body_set() {
 }
 
 /// Cost-guard regression at the source layer: with `needs_body=false`
-/// (the default for non-body flows) `RawRow.body` is `None` for every
+/// (the default for non-body flows) `Row.body` is `None` for every
 /// row — no document clone, no allocation past the per-column values
 /// vec.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -196,6 +196,6 @@ async fn read_batch_skips_body_when_needs_body_unset() {
     assert_eq!(batch.rows.len(), 1);
     assert!(
         batch.rows[0].body.is_none(),
-        "needs_body=false must leave RawRow.body=None (cost guard)"
+        "needs_body=false must leave Row.body=None (cost guard)"
     );
 }

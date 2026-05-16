@@ -38,6 +38,11 @@ async fn pg_to_mongo_with_mixed_nullability_and_nested_path() {
         .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
         .await
         .unwrap();
+    // Source carries the broadest type set the PG source produces. The
+    // Mongo sink is schemaless, so the matrix narrowing check is skipped
+    // and every value flows through to BSON without per-column truncate
+    // gating. XML round-trips as `Bson::String` (the canonical text form
+    // of XML).
     pg.pool
         .execute(
             format!(
@@ -50,7 +55,18 @@ async fn pg_to_mongo_with_mixed_nullability_and_nested_path() {
                     nickname TEXT,
                     visits BIGINT,
                     created_at TIMESTAMPTZ NOT NULL,
-                    payload JSONB
+                    payload JSONB,
+                    rating SMALLINT NOT NULL,
+                    score32 REAL NOT NULL,
+                    score64 DOUBLE PRECISION NOT NULL,
+                    huge_count NUMERIC(20, 0) NOT NULL,
+                    balance NUMERIC(10, 2) NOT NULL,
+                    handle VARCHAR(8) NOT NULL,
+                    avatar BYTEA NOT NULL,
+                    avatar_big BYTEA,
+                    born_on DATE NOT NULL,
+                    public_id UUID NOT NULL,
+                    profile_xml XML
                 )"
             )
             .as_str(),
@@ -60,9 +76,15 @@ async fn pg_to_mongo_with_mixed_nullability_and_nested_path() {
 
     let base = Utc.with_ymd_and_hms(2026, 4, 22, 10, 0, 0).unwrap();
     let insert = format!(
-        "INSERT INTO \"{src_schema}\".users \
-         (id, name, addr_city, is_active, score, nickname, visits, created_at, payload) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+        "INSERT INTO \"{src_schema}\".users (
+            id, name, addr_city, is_active, score, nickname, visits, created_at, payload,
+            rating, score32, score64, huge_count, balance, handle,
+            avatar, avatar_big, born_on, public_id, profile_xml
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9,
+            $10, $11, $12, $13::numeric, $14::numeric, $15,
+            $16, $17, $18, $19, $20::xml
+         )"
     );
     // 5 rows with rotating NULL placement on the nullable columns, so
     // every nullable column hits both NULL and present in the sample.
@@ -70,6 +92,11 @@ async fn pg_to_mongo_with_mixed_nullability_and_nested_path() {
         let nickname = (i != 2).then(|| format!("nick-{i}"));
         let visits = (i != 3).then_some(i * 10);
         let payload = (i != 4).then(|| serde_json::json!({ "row": i }));
+        let avatar_big = (i != 2).then(|| vec![0xab_u8; i as usize]);
+        let profile_xml =
+            (i != 5).then(|| format!("<profile id=\"{i}\"><name>row-{i}</name></profile>"));
+        let huge: bigdecimal::BigDecimal = format!("{i}9999999999999999999").parse().unwrap();
+        let balance: bigdecimal::BigDecimal = format!("{i}.50").parse().unwrap();
         sqlx::query(&insert)
             .bind(i)
             .bind(format!("user-{i}"))
@@ -80,6 +107,19 @@ async fn pg_to_mongo_with_mixed_nullability_and_nested_path() {
             .bind(visits)
             .bind(base + chrono::Duration::seconds(i))
             .bind(payload)
+            .bind(i as i16 + 1)
+            .bind(0.5_f32 + i as f32)
+            .bind(0.125_f64 * (i + 1) as f64)
+            .bind(huge)
+            .bind(balance)
+            .bind(format!("h{i}"))
+            .bind(vec![i as u8, (i + 1) as u8])
+            .bind(avatar_big)
+            .bind(chrono::NaiveDate::from_ymd_opt(1990, 1, i as u32).unwrap())
+            .bind(uuid::Uuid::from_u128(
+                0xa0eebc99_9c0b_4ef8_bb6d_6bb9bd380a00 + i as u128,
+            ))
+            .bind(profile_xml)
             .execute(&pg.pool)
             .await
             .unwrap();
@@ -113,23 +153,33 @@ from = "{src_schema}.users"
 to = "users"
 batch-limit = 2
 
-mapping = [
-    {{ from = "id", to = "_id" }},
-    {{ from = "name", to = "name" }},
-    {{ from = "addr_city", to = "addr.city" }},
-    {{ from = "is_active", to = "is_active" }},
-    {{ from = "score", to = "score" }},
-    {{ from = "nickname", to = "nickname" }},
-    {{ from = "visits", to = "visits" }},
-    {{ from = "created_at", to = "created_at" }},
-    {{ from = "payload", to = "payload" }},
-]
-
 cursor = {{ fields = ["created_at", "id"], order = "asc", interval = "100ms" }}
 
 [flow.users.conflict]
 key = ["_id"]
 strategy = "overwrite"
+
+[flow.users.mapping]
+_id = "id"
+name = "name"
+"addr.city" = "addr_city"
+is_active = "is_active"
+score = "score"
+nickname = "nickname"
+visits = "visits"
+created_at = "created_at"
+payload = "payload"
+rating = "rating"
+score32 = "score32"
+score64 = "score64"
+huge_count = "huge_count"
+balance = "balance"
+handle = "handle"
+avatar = "avatar"
+avatar_big = "avatar_big"
+born_on = "born_on"
+public_id = "public_id"
+profile_xml = "profile_xml"
 "#,
     );
 
@@ -161,6 +211,62 @@ strategy = "overwrite"
     );
     assert!(!third.get_bool("is_active").unwrap(), "row 3 → odd → false");
     assert_eq!(third.get_i32("score").unwrap(), 300);
+    // Wide-type round-trip: every canonical PG type lands as a BSON value.
+    assert_eq!(third.get_i32("rating").unwrap(), 4);
+    let score32_val = third.get("score32").expect("score32 present");
+    // Float32 → BSON: depending on the version of bson, this lands as
+    // `Bson::Double` (f64). Probe both shapes for safety.
+    let s32 = score32_val
+        .as_f64()
+        .or_else(|| score32_val.as_i32().map(f64::from))
+        .or_else(|| score32_val.as_i64().map(|n| n as f64))
+        .expect("score32 should land as a BSON number");
+    assert!((s32 - 3.5_f64).abs() < 0.001);
+    let s64_val = third.get("score64").expect("score64 present");
+    let s64 = s64_val
+        .as_f64()
+        .or_else(|| s64_val.as_i32().map(f64::from))
+        .expect("score64 should land as a BSON number");
+    assert!((s64 - 0.5_f64).abs() < 0.001);
+    // BigInt overflows i64 and arrives as a string (Decimal → JSON-canonical
+    // string rule, see `value_to_json` / `to_bson`).
+    assert_eq!(third.get_str("huge_count").unwrap(), "39999999999999999999");
+    // Decimal(10, 2) becomes Bson::Decimal128 when parseable; assert by
+    // probing both shapes (Decimal128 vs String fallback).
+    let balance_val = third.get("balance").expect("balance present");
+    let balance_str = match balance_val {
+        bson::Bson::Decimal128(d) => d.to_string(),
+        bson::Bson::String(s) => s.clone(),
+        other => panic!("unexpected balance shape: {other:?}"),
+    };
+    let balance_parsed: bigdecimal::BigDecimal = balance_str.parse().unwrap();
+    assert_eq!(
+        balance_parsed,
+        "3.50".parse::<bigdecimal::BigDecimal>().unwrap()
+    );
+    assert_eq!(third.get_str("handle").unwrap(), "h3");
+    let avatar = third.get_binary_generic("avatar").unwrap();
+    assert_eq!(avatar, &vec![3_u8, 4]);
+    let avatar_big = third.get_binary_generic("avatar_big").unwrap();
+    assert_eq!(avatar_big, &vec![0xab_u8; 3]);
+    let born_on = third.get_datetime("born_on").unwrap();
+    let born_ms = born_on.timestamp_millis();
+    let born_chrono = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(born_ms).unwrap();
+    assert_eq!(
+        born_chrono.date_naive(),
+        chrono::NaiveDate::from_ymd_opt(1990, 1, 3).unwrap()
+    );
+    // PG UUID round-trips as BSON Binary subtype 4 (UUID).
+    let public_id_val = third.get("public_id").expect("public_id present");
+    match public_id_val {
+        bson::Bson::Binary(b) => assert_eq!(b.bytes.len(), 16),
+        bson::Bson::String(s) => assert_eq!(s.len(), 36),
+        other => panic!("unexpected public_id shape: {other:?}"),
+    }
+    assert_eq!(
+        third.get_str("profile_xml").unwrap(),
+        "<profile id=\"3\"><name>row-3</name></profile>"
+    );
 
     // The Mongo sink's documented semantics map SQL NULL to *missing*
     // BSON keys (not `Bson::Null`) — Mongo treats absent and explicit
@@ -180,6 +286,16 @@ strategy = "overwrite"
         got[3].get("payload").is_none(),
         "row 4 → payload NULL must be absent, got {:?}",
         got[3].get("payload")
+    );
+    assert!(
+        got[1].get("avatar_big").is_none(),
+        "row 2 → avatar_big NULL must be absent, got {:?}",
+        got[1].get("avatar_big")
+    );
+    assert!(
+        got[4].get("profile_xml").is_none(),
+        "row 5 → profile_xml NULL must be absent, got {:?}",
+        got[4].get("profile_xml")
     );
 
     // Where the nullable columns are present, the value must be intact.
@@ -300,9 +416,10 @@ from = "{src_schema}.items"
 to = "items"
 batch-limit = 8
 
-mapping = ["*"]
-
 cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
+
+[flow.items.mapping]
+"*" = "*"
 "#,
     );
 
@@ -374,7 +491,7 @@ cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
 }
 
 /// `*:body` pack across the pg → mongo seam. The pg source populates
-/// `RawRow.body` with `Value::Json` (the canonical body type); the
+/// `Row.body` with `Value::Json` (the canonical body type); the
 /// body conversion plan on this flow is identity (`Json → Json`), so
 /// the value reaches the mongo sink as
 /// `Value::Json(serde_json::Value::Object(...))` and the sink writes
@@ -451,12 +568,11 @@ from = "{src_schema}.events"
 to = "events"
 batch-limit = 8
 
-mapping = [
-    {{ from = "id", to = "id" }},
-    "*:body",
-]
-
 cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
+
+[flow.events.mapping]
+id = "id"
+body = "*"
 "#,
     );
 
@@ -503,6 +619,115 @@ cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
             "row {i}: body.score must be numeric, got {score:?}"
         );
     }
+
+    pg.pool.close().await;
+}
+
+/// AIR-70 `switch` expression with integer keys, struct-to-unstructured
+/// (pg → mongo schemaless sink). Exercises both a key hit and the
+/// `default` fallback when the source value misses the switch table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_to_mongo_switch_int_keys_schemaless_sink() {
+    let pg = pg_pool().await;
+    let mongo = mongo_pool().await;
+
+    let src_schema = format!("{}_sw", pg.schema);
+    let dst_db = format!("{}_sw", mongo.database);
+
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{src_schema}\".tickets (
+                    id          BIGINT NOT NULL,
+                    status_code INT NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let insert = format!(
+        "INSERT INTO \"{src_schema}\".tickets (id, status_code) \
+         VALUES ($1, $2)"
+    );
+    let fixtures: [(i64, i32); 3] = [(1, 1), (2, 2), (3, 99)];
+    for (id, code) in fixtures {
+        sqlx::query(&insert)
+            .bind(id)
+            .bind(code)
+            .execute(&pg.pool)
+            .await
+            .unwrap();
+    }
+
+    let pg_url = pg.url_with_search_path();
+    let mongo_url = mongo.url.clone();
+
+    let config_toml = format!(
+        r#"
+[[sources]]
+name = "pg_src"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[sinks]]
+name = "mongo_sink"
+type = "mongodb"
+config = {{ url = "{mongo_url}", database = "{dst_db}" }}
+
+[[storages]]
+name = "pg_state"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[flow.tickets]
+source = "pg_src"
+sink = "mongo_sink"
+storage = "pg_state"
+from = "{src_schema}.tickets"
+to = "tickets"
+batch-limit = 8
+
+cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
+
+[flow.tickets.mapping]
+_id = "id"
+label = {{ from = "status_code", switch = {{ 1 = "open", 2 = "closed" }}, default = "unknown" }}
+"#,
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
+
+    let sink = mongo
+        .client
+        .database(&dst_db)
+        .collection::<bson::Document>("tickets");
+    let mut cursor = sink.find(doc! {}).sort(doc! { "_id": 1 }).await.unwrap();
+    let mut got = Vec::new();
+    while let Some(d) = cursor.try_next().await.unwrap() {
+        got.push(d);
+    }
+    assert_eq!(got.len(), 3);
+
+    assert_eq!(got[0].get_i64("_id").unwrap(), 1);
+    assert_eq!(got[0].get_str("label").unwrap(), "open");
+    assert_eq!(got[1].get_i64("_id").unwrap(), 2);
+    assert_eq!(got[1].get_str("label").unwrap(), "closed");
+    assert_eq!(got[2].get_i64("_id").unwrap(), 3);
+    assert_eq!(
+        got[2].get_str("label").unwrap(),
+        "unknown",
+        "miss must fall back to `default`"
+    );
 
     pg.pool.close().await;
 }

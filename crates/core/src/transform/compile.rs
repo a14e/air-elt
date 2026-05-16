@@ -78,12 +78,24 @@ pub fn compile_to_transform(
         }
         let take = TransformOp::Take { source_index };
         let plan = &conversions[i];
-        let op = if plan.is_identity() {
+        let op = if let Some(switch) = plan.switch.clone() {
+            // Switch path: the lookup produces values already in the
+            // sink's `DataType`, so no `Convert` wrapping is required.
+            // `truncate` travels onto the op for symmetry with the
+            // `Convert` arm — `output_type` consults it during
+            // `Transform::resolve_types`.
+            TransformOp::Switch {
+                input: Box::new(take),
+                table: switch,
+                truncate: plan.ctx.truncate,
+            }
+        } else if plan.is_identity() {
             take
         } else {
             TransformOp::Convert {
                 input: Box::new(take),
                 plan: plan.clone(),
+                truncate: plan.ctx.truncate,
             }
         };
         cols.push(op);
@@ -99,6 +111,7 @@ pub fn compile_to_transform(
                 TransformOp::Convert {
                     input: Box::new(inner),
                     plan: plan.clone(),
+                    truncate: plan.ctx.truncate,
                 }
             };
             cols.push(op);
@@ -109,7 +122,7 @@ pub fn compile_to_transform(
         check_indices_in_range(op, read_len)?;
     }
 
-    Ok(Transform::new(cols))
+    Ok(Transform::new(cols, read_columns.to_vec()))
 }
 
 fn check_indices_in_range(op: &TransformOp, read_len: usize) -> Result<(), ValidationError> {
@@ -122,7 +135,9 @@ fn check_indices_in_range(op: &TransformOp, read_len: usize) -> Result<(), Valid
             }
         }
         TransformOp::Body => {}
-        TransformOp::Convert { input, .. } => check_indices_in_range(input, read_len)?,
+        TransformOp::Convert { input, .. } | TransformOp::Switch { input, .. } => {
+            check_indices_in_range(input, read_len)?
+        }
     }
     Ok(())
 }
@@ -149,6 +164,7 @@ mod tests {
             to: to.into(),
             truncate: false,
             default_literal: None,
+            switch: None,
         }
     }
 
@@ -187,6 +203,7 @@ mod tests {
             source: DataType::Int16,
             sink: DataType::Int64,
             ctx: crate::types::ConversionContext::passthrough(),
+            switch: None,
         };
         let read_columns = vec!["a".to_string()];
         let t = compile_to_transform(
@@ -256,6 +273,7 @@ mod tests {
             source: DataType::Int32,
             sink: DataType::Int32,
             ctx: crate::types::ConversionContext::passthrough(),
+            switch: None,
         };
         let read_columns = vec!["a".to_string()];
         let t = compile_to_transform(
@@ -267,6 +285,55 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(&t.cols[0], TransformOp::Take { source_index: 0 }));
+    }
+
+    /// `ColumnConversionPlan.switch = Some(table)` lowers to
+    /// `TransformOp::Switch { input: Take{i}, table, truncate }` — NOT
+    /// wrapped in `Convert`. Catches regressions in the lowering branch
+    /// at compile.rs:81 where the switch arm could silently degenerate
+    /// into a bare `Take` or a `Convert` wrap.
+    #[test]
+    fn switch_plan_lowers_to_switch_op() {
+        use crate::transform::switch::{SwitchKey, SwitchTable};
+        use crate::types::Value;
+
+        let mut cases = ahash::AHashMap::new();
+        cases.insert(SwitchKey::Bool(true), Value::Text("yes".into()));
+        cases.insert(SwitchKey::Bool(false), Value::Text("no".into()));
+        let table = SwitchTable {
+            cases,
+            default: None,
+            output_type: DataType::Text { size: None },
+        };
+        let expanded = ExpandedMapping {
+            direct: vec![direct("flag", "label")],
+            body: None,
+        };
+        let plan = ColumnConversionPlan {
+            source: DataType::Bool,
+            sink: DataType::Text { size: None },
+            ctx: crate::types::ConversionContext::passthrough(),
+            switch: Some(table),
+        };
+        let read_columns = vec!["flag".to_string()];
+        let t = compile_to_transform(
+            &expanded,
+            DataType::Json,
+            std::slice::from_ref(&plan),
+            &[],
+            &read_columns,
+        )
+        .unwrap();
+        assert_eq!(t.cols.len(), 1);
+        match &t.cols[0] {
+            TransformOp::Switch { input, .. } => {
+                assert!(matches!(
+                    input.as_ref(),
+                    TransformOp::Take { source_index: 0 }
+                ));
+            }
+            other => panic!("expected Switch, got {other:?}"),
+        }
     }
 
     /// Schemaless-both `["*"]` (mongo→mongo) lowers to a single

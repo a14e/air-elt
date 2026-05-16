@@ -2,12 +2,12 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sqlx::{Column, MySqlPool, Row};
+use sqlx::{Column, MySqlPool, Row as SqlxRow};
 use tracing::{debug, info};
 
 use air_elt_commons_mysql::pool;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
-use air_elt_core::model::raw::{RawBatch, RawRow};
+use air_elt_core::model::{Batch, Row};
 use air_elt_core::model::{CursorFieldValue, CursorState};
 use air_elt_core::model::{ReadSpec, Schema, SchemaProvider, SourceCtx};
 use air_elt_core::traits::Source;
@@ -163,7 +163,7 @@ impl Source for MySqlSource {
         spec: &ReadSpec,
         ctx: &Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
-    ) -> RuntimeResult<RawBatch> {
+    ) -> RuntimeResult<Batch> {
         let my_ctx = ctx.downcast_ref_to::<MySqlSourceCtx>()?;
 
         let query_plan = match cursor {
@@ -248,7 +248,7 @@ impl Source for MySqlSource {
             } else {
                 None
             };
-            out_rows.push(RawRow::upsert(values).with_body(body));
+            out_rows.push(Row::upsert(values).with_body(body));
         }
 
         let next_cursor = last_cursor_values.map(|values| {
@@ -264,7 +264,7 @@ impl Source for MySqlSource {
             CursorState::new(fields)
         });
 
-        Ok(RawBatch {
+        Ok(Batch {
             rows: out_rows,
             next_cursor,
         })

@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use crate::config::model::CursorOrder;
 use crate::error::RuntimeError;
-use crate::model::raw::{RawBatch, RawRow};
 use crate::model::{
     AssembledFlow, ConfigReadSpec, ConfigWriteSpec, CursorFieldValue, CursorState, DerivedPlans,
     Field, FlowState, ReadSpec, Schema, SchemaProvider, SinkCtx, SourceCtx, WriteReport, WriteSpec,
 };
+use crate::model::{Batch, Row};
 use crate::traits::{MockSink, MockSource, MockStorage};
 use crate::types::DataType;
 use crate::types::value::Value;
@@ -82,9 +82,9 @@ pub fn raw_passthrough_source_mock() -> MockSource {
     s
 }
 
-pub fn one_row_batch() -> RawBatch {
-    RawBatch {
-        rows: vec![RawRow::upsert(vec![Value::Int64(1)])],
+pub fn one_row_batch() -> Batch {
+    Batch {
+        rows: vec![Row::upsert(vec![Value::Int64(1)])],
         next_cursor: Some(CursorState::new(vec![CursorFieldValue {
             name: "id".into(),
             value: Value::Int64(1),
@@ -105,7 +105,7 @@ pub fn mock_source_ok() -> MockSource {
         if n == 0 {
             Ok(one_row_batch())
         } else {
-            Ok(RawBatch::default())
+            Ok(Batch::default())
         }
     });
     s
@@ -119,7 +119,7 @@ pub fn mock_source_empty() -> MockSource {
     s.expect_build_context()
         .returning(|_| Ok(Arc::new(UnitSourceCtx)));
     s.expect_read_batch()
-        .returning(|_, _ctx, _| Ok(RawBatch::default()));
+        .returning(|_, _ctx, _| Ok(Batch::default()));
     s
 }
 
@@ -134,12 +134,12 @@ pub fn mock_source_no_cursor() -> MockSource {
     s.expect_read_batch().returning(move |_, _ctx, _| {
         let n = call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if n == 0 {
-            Ok(RawBatch {
-                rows: vec![RawRow::upsert(vec![Value::Int64(1)])],
+            Ok(Batch {
+                rows: vec![Row::upsert(vec![Value::Int64(1)])],
                 next_cursor: None,
             })
         } else {
-            Ok(RawBatch::default())
+            Ok(Batch::default())
         }
     });
     s
@@ -163,7 +163,7 @@ pub fn mock_source_failing(times: u32) -> MockSource {
             if n == 0 {
                 Ok(one_row_batch())
             } else {
-                Ok(RawBatch::default())
+                Ok(Batch::default())
             }
         }
     });
@@ -247,9 +247,10 @@ pub fn test_flow_named(
         cursor_persistence: crate::model::CursorPersistence::ColumnCursor,
     };
     let derived = DerivedPlans {
-        transform: crate::transform::Transform::new(vec![crate::transform::TransformOp::Take {
-            source_index: 0,
-        }]),
+        transform: crate::transform::Transform::new(
+            vec![crate::transform::TransformOp::Take { source_index: 0 }],
+            vec!["id".into()],
+        ),
         read_spec: ReadSpec {
             columns: vec!["id".into()],
             table: "public.t".into(),

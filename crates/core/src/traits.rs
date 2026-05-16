@@ -3,7 +3,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::error::RuntimeResult;
-use crate::model::raw::RawBatch;
 use crate::model::{
     Batch, CursorState, ReadSpec, Schema, SinkCtx, SourceCtx, WriteReport, WriteSpec,
 };
@@ -31,7 +30,7 @@ pub trait Source: Send + Sync {
         spec: &ReadSpec,
         ctx: &Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
-    ) -> RuntimeResult<RawBatch>;
+    ) -> RuntimeResult<Batch>;
 
     /// Probe read for sampling-validation. Returns rows in the same
     /// pre-Transform shape `read_batch` produces — the runner applies
@@ -45,7 +44,7 @@ pub trait Source: Send + Sync {
         spec: &ReadSpec,
         ctx: &Arc<dyn SourceCtx>,
         n: usize,
-    ) -> RuntimeResult<RawBatch> {
+    ) -> RuntimeResult<Batch> {
         let mut sample_spec = spec.clone();
         sample_spec.limit = n;
         self.read_batch(&sample_spec, ctx, None).await
@@ -73,7 +72,7 @@ pub trait Source: Send + Sync {
     }
 
     /// The canonical [`DataType`] of the body payload this source
-    /// attaches to `RawRow.body` when `ReadSpec.needs_body` is `true`.
+    /// attaches to `Row.body` when `ReadSpec.needs_body` is `true`.
     /// Drives the per-body-target conversion plan's source `DataType`,
     /// the matrix check on body sink columns, and the Transform
     /// compiler's object-shape assertion. Must satisfy
@@ -121,9 +120,13 @@ pub trait Sink: Send + Sync {
     /// `false` for append-only sinks whose engine has no cheap
     /// `DELETE`/`UPDATE` (notably ClickHouse MergeTree). When this is
     /// `false`:
-    /// * the runner drops every `Row { op: Delete }` from each batch
-    ///   before calling `write_batch` — the sink will never observe a
-    ///   delete row;
+    /// * the runner ships the WHOLE batch (delete rows included) to
+    ///   `write_batch`. The sink is responsible for dropping
+    ///   `Row { op: Delete }` rows itself and returning a `WriteReport`
+    ///   whose `rows_written` counts the upserts only. The cursor
+    ///   still advances on the strength of that report — even an
+    ///   all-delete batch must call through (it commits `rows_written: 0`
+    ///   and lets the flow move past the range);
     /// * the validation pipeline skips `validate_delete_access` for
     ///   this sink, even if the source emits deletes;
     /// * CDC sources may omit the otherwise-mandatory `[flow.<x>.conflict]`

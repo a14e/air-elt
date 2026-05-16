@@ -3,7 +3,7 @@
 //!
 //! Used by relational sources (postgres, mysql) when the flow has a body
 //! target — the source attaches the resulting JSON wrapped in
-//! `Value::Json(...)` on `RawRow.body`. The Transform interpreter
+//! `Value::Json(...)` on `Row.body`. The Transform interpreter
 //! `Body` op then absorbs the value.
 
 use crate::error::RuntimeResult;

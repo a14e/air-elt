@@ -58,7 +58,7 @@ pub struct ExpandedMapping {
 /// `from` columns and the remaining source schema columns); the source's
 /// `read_batch` implementation pairs `row.values[direct_count..]` with
 /// the tail slice of these names to assemble the body payload — sources
-/// populate `RawRow.body` directly. All targets
+/// populate `Row.body` directly. All targets
 /// are duplicate-free (post-expansion `DuplicateSinkField` check).
 #[derive(Debug, Clone)]
 pub struct Body {
@@ -71,12 +71,28 @@ pub struct Body {
 /// nullable sink columns that have no same-named source column entirely
 /// — they never appear in the expanded mapping, and the sink relies on
 /// its DDL default / NULL when writing the row.
+///
+/// `switch` is present when the source-side mapping entry carried a
+/// `switch = { ... }` table. The cases / fallback default are still in
+/// raw TOML form here — canonicalisation against the resolved
+/// source/sink `DataType`s happens later in the validation pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DirectMapping {
     pub from: String,
     pub to: String,
     pub truncate: bool,
     pub default_literal: Option<toml::Value>,
+    pub switch: Option<SwitchSpec>,
+}
+
+/// Raw switch-table spec attached to a [`DirectMapping`]. `cases` keeps
+/// declaration order from TOML. Both `key` (string text) and `value`
+/// (TOML literal) are still untyped here — they are parsed against the
+/// resolved source / sink `DataType`s during validation, then folded
+/// into the `TransformOp::Switch` lookup table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwitchSpec {
+    pub cases: Vec<crate::mapping::column::SwitchCase>,
 }
 
 /// Synthetic body target name reserved for the schemaless-both
@@ -207,32 +223,49 @@ pub fn expand(
                 to: field.name.clone(),
                 truncate: false,
                 default_literal: None,
+                switch: None,
             });
         }
     }
 
     // Explicit overrides. Walk rules in user-declared order:
-    // each Direct either replaces a wildcard slot of the same `to` or
-    // appends to the tail.
+    // each Direct/Switch either replaces a wildcard slot of the same
+    // `to` or appends to the tail.
     for rule in rules {
-        if let ColumnMapping::Direct {
-            from,
-            to,
-            truncate,
-            default_literal,
-        } = rule
-        {
-            let new_entry = DirectMapping {
+        let new_entry = match rule {
+            ColumnMapping::Direct {
+                from,
+                to,
+                truncate,
+                default_literal,
+            } => DirectMapping {
                 from: from.clone(),
                 to: to.clone(),
                 truncate: *truncate,
                 default_literal: default_literal.clone(),
-            };
-            if let Some(idx) = direct.iter().position(|d| d.to == to.as_str()) {
-                direct[idx] = new_entry;
-            } else {
-                direct.push(new_entry);
-            }
+                switch: None,
+            },
+            ColumnMapping::Switch {
+                from,
+                to,
+                truncate,
+                cases,
+                default_literal,
+            } => DirectMapping {
+                from: from.clone(),
+                to: to.clone(),
+                truncate: *truncate,
+                default_literal: default_literal.clone(),
+                switch: Some(SwitchSpec {
+                    cases: cases.clone(),
+                }),
+            },
+            ColumnMapping::Wildcard | ColumnMapping::Body { .. } => continue,
+        };
+        if let Some(idx) = direct.iter().position(|d| d.to == new_entry.to) {
+            direct[idx] = new_entry;
+        } else {
+            direct.push(new_entry);
         }
     }
 
@@ -403,6 +436,7 @@ mod tests {
             to: to.into(),
             truncate: false,
             default_literal: None,
+            switch: None,
         }
     }
 

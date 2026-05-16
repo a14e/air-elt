@@ -28,7 +28,7 @@ use air_elt_commons_mongodb::{bson_value, identifier, path, sampling};
 use air_elt_core::config::model::CursorOrder;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::mapping::FieldPath;
-use air_elt_core::model::raw::{RawBatch, RawRow};
+use air_elt_core::model::{Batch, Row};
 use air_elt_core::model::{
     CursorFieldValue, CursorState, ReadSpec, Schema, SchemaProvider, SourceCtx,
 };
@@ -158,7 +158,7 @@ impl Source for MongoSource {
 
     fn body_data_type(&self) -> DataType {
         // Mongo attaches the source `bson::Document` as a
-        // `Value::Custom(BsonObjectValue)` directly on `RawRow.body`
+        // `Value::Custom(BsonObjectValue)` directly on `Row.body`
         // when the flow has body targets — `BsonObjectType::is_object()`
         // is `true` so the Transform compiler accepts it.
         DataType::Custom(Box::new(air_elt_commons_mongodb::types::BsonObjectType))
@@ -251,7 +251,7 @@ impl Source for MongoSource {
         spec: &ReadSpec,
         ctx: &Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
-    ) -> RuntimeResult<RawBatch> {
+    ) -> RuntimeResult<Batch> {
         let my_ctx =
             ctx.as_any()
                 .downcast_ref::<MongoSourceCtx>()
@@ -298,30 +298,30 @@ impl Source for MongoSource {
             // schemaless-both flow leaves `spec.columns` empty (no per-
             // column projection) and `spec.cursor_fields` empty (raw
             // passthrough is incompatible with column-based cursors —
-            // enforced at validation time). Emit one `RawRow` per document
+            // enforced at validation time). Emit one `Row` per document
             // carrying the whole document on `body` as
             // `Value::Custom(BsonObjectValue(...))`; the Transform
             // interpreter folds it into `Row::passthrough(BsonObjectValue)`
             // for the mongo sink fast path.
             if columns_empty {
-                let mut rows: Vec<RawRow> = Vec::with_capacity(limit);
+                let mut rows: Vec<Row> = Vec::with_capacity(limit);
                 while let Some(d) = find_cursor
                     .try_next()
                     .await
                     .map_err(RuntimeError::backend)?
                 {
                     rows.push(
-                        RawRow::upsert(Vec::new())
+                        Row::upsert(Vec::new())
                             .with_body(Some(Value::Custom(Box::new(BsonObjectValue(d))))),
                     );
                 }
-                return Ok(RawBatch {
+                return Ok(Batch {
                     rows,
                     next_cursor: None,
                 });
             }
 
-            let mut out_rows: Vec<RawRow> = Vec::with_capacity(limit);
+            let mut out_rows: Vec<Row> = Vec::with_capacity(limit);
             let mut last_cursor_values: Option<Vec<Value>> = None;
 
             while let Some(d) = find_cursor
@@ -357,7 +357,7 @@ impl Source for MongoSource {
                 } else {
                     None
                 };
-                out_rows.push(RawRow::upsert(values).with_body(body));
+                out_rows.push(Row::upsert(values).with_body(body));
             }
 
             let next_cursor = last_cursor_values.map(|values| {
@@ -368,7 +368,7 @@ impl Source for MongoSource {
                     .collect();
                 CursorState::new(fields)
             });
-            Ok(RawBatch {
+            Ok(Batch {
                 rows: out_rows,
                 next_cursor,
             })

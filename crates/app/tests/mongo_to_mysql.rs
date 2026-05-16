@@ -2,14 +2,17 @@
 //!
 //! Proves the runner can pull from a schemaless document source into a
 //! schemaful relational sink and surface bugs in:
-//!   * sample-based BSON schema inference for many BSON types
-//!     (Int32, Int64, Double, Boolean, String, ObjectId-as-binary,
-//!     DateTime, Document/Json),
+//!   * sample-based BSON schema inference for the BSON types Mongo
+//!     hands the codec as a typed `Value` (Int32, Int64, Double,
+//!     Boolean, String, Binary generic, DateTime, Document/Json,
+//!     ObjectId via the `mongodb.object_id` custom),
 //!   * NULL passthrough across the boundary (Mongo `null`/missing
 //!     fields → SQL `NULL` on a nullable column),
 //!   * dot-notation source path (`addr.city`) flattening a nested BSON
 //!     subtree onto a flat MySQL column,
 //!   * `truncate = true` opt-in for unbounded text → `VARCHAR(N)`,
+//!     unbounded bytes → `VARBINARY(N)`, `Float64 → Float32` and
+//!     `Int32 → UInt32` (sign-loss path),
 //!   * `ON DUPLICATE KEY UPDATE` upsert on the cursor key, idempotent
 //!     across re-runs,
 //!   * cursor state lives in the schemaless Mongo storage collection
@@ -30,7 +33,7 @@ use air_elt_commons_testing::mongo::mongo_pool;
 use air_elt_commons_testing::mysql::mysql_pool;
 use air_elt_core::model::cursor::CursorState;
 use air_elt_core::types::value::Value;
-use bson::doc;
+use bson::{Bson, doc, oid::ObjectId, spec::BinarySubtype};
 use chrono::{DateTime, TimeZone, Utc};
 use sqlx::Executor;
 
@@ -56,14 +59,22 @@ async fn mongo_to_mysql_with_many_types_and_nulls() {
                 // be paired with `default = "..."` on their mapping to
                 // bridge the Mongo source's always-nullable inference.
                 "CREATE TABLE `{dst_db_sql}`.users (
-                    id BIGINT NOT NULL PRIMARY KEY,
-                    name VARCHAR(64) NOT NULL,
-                    city VARCHAR(64) NOT NULL,
-                    score INT NOT NULL,
-                    rating DOUBLE NULL,
-                    is_active TINYINT(1) NULL,
-                    created_at TIMESTAMP NULL,
-                    payload JSON NULL
+                    id              BIGINT NOT NULL PRIMARY KEY,
+                    name            VARCHAR(64) NOT NULL,
+                    city            VARCHAR(64) NOT NULL,
+                    score           INT NOT NULL,
+                    score_unsigned  INT UNSIGNED NULL,
+                    qty             BIGINT NULL,
+                    rating          DOUBLE NULL,
+                    rating32        FLOAT NULL,
+                    is_active       TINYINT(1) NULL,
+                    note            TEXT NULL,
+                    note_short      VARCHAR(8) NULL,
+                    blob_data       VARBINARY(64) NULL,
+                    oid_hex         VARCHAR(24) NULL,
+                    oid_bytes       VARBINARY(12) NULL,
+                    created_at      TIMESTAMP NULL,
+                    payload         JSON NULL
                 ) ENGINE=InnoDB"
             )
             .as_str(),
@@ -71,14 +82,19 @@ async fn mongo_to_mysql_with_many_types_and_nulls() {
         .await
         .unwrap();
 
-    // Seed Mongo source with 5 docs that exercise every BSON type the
-    // mapping reads, plus rotating NULL placement on the nullable fields
-    // (every column hits at least one NULL within the sample).
+    // Seed 5 docs that exercise every BSON type the mapping reads,
+    // plus rotating NULL placement on the nullable fields (every
+    // column hits at least one NULL within the sample).
     let src_users = mongo
         .client
         .database(&src_db_mongo)
         .collection::<bson::Document>("users");
     let base = Utc.with_ymd_and_hms(2026, 4, 22, 10, 0, 0).unwrap();
+    let oid_seed = ObjectId::from_bytes([
+        0x65, 0x4f, 0x10, 0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x00, 0x00, 0x01,
+    ]);
+    let blob_seed: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEFu8];
+
     let mut docs = Vec::new();
     for i in 1_i64..=5 {
         let mut d = doc! {
@@ -86,31 +102,61 @@ async fn mongo_to_mysql_with_many_types_and_nulls() {
             "name": format!("user-{i}"),
             "addr": { "city": format!("city-{i}") },
             "score": i as i32 * 10,
+            // `score_unsigned` re-reads `score` and routes to a UNSIGNED
+            // sink column via `truncate = true` (sign-loss path).
+            "qty": i * 100_000,
             "rating": (i as f64) * 1.5,
+            // `rating_short` carries an in-range Float64 so the
+            // truncate path doesn't visibly degrade the value.
+            "rating_short": (i as f64) * 2.5,
             "is_active": i % 2 == 0,
+            "note": format!("note-{i}"),
+            // `note_long` exceeds the varchar(8) sink width so the
+            // text-narrowing path actually fires on row 1.
+            "note_long": "this string is way longer than eight chars",
+            "blob": Bson::Binary(bson::Binary {
+                subtype: BinarySubtype::Generic,
+                bytes: blob_seed.clone(),
+            }),
+            "oid": oid_seed,
             "created_at": bson::DateTime::from_millis((base + chrono::Duration::seconds(i)).timestamp_millis()),
             "payload": doc! { "row": i, "next": i + 1 },
         };
-        // Rotate NULLs across both NOT NULL columns (which must be
-        // bridged via `default = ...`) and genuinely nullable columns
-        // (which round-trip as SQL NULL).
+        // Rotate NULLs across NOT NULL columns (which must be bridged
+        // via `default = ...`) and genuinely nullable columns (which
+        // round-trip as SQL NULL).
         match i {
             2 => {
                 // NOT NULL `name` → `default = "anonymous"`.
-                d.insert("name", bson::Bson::Null);
+                d.insert("name", Bson::Null);
                 // Nullable `rating` → SQL NULL.
-                d.insert("rating", bson::Bson::Null);
+                d.insert("rating", Bson::Null);
+                // Nullable `rating32` → SQL NULL.
+                d.insert("rating_short", Bson::Null);
+                // Nullable `score_unsigned` → SQL NULL.
+                d.insert("score", Bson::Null);
             }
             3 => {
                 // NOT NULL `city` (via dot-path) → `default = "unknown"`.
-                d.insert("addr", doc! { "city": bson::Bson::Null });
+                d.insert("addr", doc! { "city": Bson::Null });
                 // Nullable `is_active` → SQL NULL.
-                d.insert("is_active", bson::Bson::Null);
+                d.insert("is_active", Bson::Null);
+                // Nullable `qty` → SQL NULL.
+                d.insert("qty", Bson::Null);
+                // Nullable `note` / `note_short` → SQL NULL.
+                d.insert("note", Bson::Null);
+                d.insert("note_long", Bson::Null);
             }
             4 => {
                 // NOT NULL `score` → `default = -1`.
-                d.insert("score", bson::Bson::Null);
-                d.insert("payload", bson::Bson::Null);
+                d.insert("score", Bson::Null);
+                d.insert("payload", Bson::Null);
+                d.insert("blob", Bson::Null);
+                d.insert("created_at", Bson::Null);
+            }
+            5 => {
+                // Nullable `oid` → SQL NULL on both oid_hex and oid_bytes.
+                d.insert("oid", Bson::Null);
             }
             _ => {}
         }
@@ -121,6 +167,18 @@ async fn mongo_to_mysql_with_many_types_and_nulls() {
     let mongo_url = mongo.url.clone();
     let mysql_url = mysql.url_with_database();
 
+    // The mapping covers:
+    //   * Bool (`is_active`), Int32 (`score`), Int32→UInt32 truncate
+    //     (`score_unsigned`), Int64 (`_id`, `qty`), Float64 (`rating`),
+    //     Float64→Float32 truncate (`rating32`).
+    //   * Text unbounded → varchar(N) with truncate (`name`, dotted
+    //     `city`, `note_short`), Text unbounded → text (`note`).
+    //   * Bytes unbounded → varbinary(N) with truncate (`blob_data`).
+    //   * BSON DateTime → timestamp (`created_at`).
+    //   * BSON Document → json (`payload`).
+    //   * ObjectId (custom MongoObjectIdType) → varchar(24) (hex form)
+    //     AND → varbinary(12) (12-byte form), same `oid` feeding two
+    //     sinks lossless.
     let config_yaml = format!(
         r#"
 sources:
@@ -157,26 +215,30 @@ flow:
       # NOT NULL PRIMARY KEY` requires a default to placate the
       # nullable-source check. `0` is a sentinel that should never fire
       # in practice -- a missing `_id` would be a malformed document.
-      - {{ from: _id, to: id, default: 0 }}
+      id: {{ from: _id, default: 0 }}
       # NOT NULL columns with `default: ...` -- `check_mapping` admits
       # `nullable_src -> not_null_sink` only when a default literal is
-      # present. The runtime `convert` arm substitutes the default when
-      # the source value is `Null`, so the seed below intentionally drops
-      # `name` / `city` / `score` to NULL on selected rows to verify the
-      # substitution actually fires.
-      #
-      # `truncate: true` is also needed for the text columns: Mongo
-      # strings are unbounded text; MySQL `VARCHAR(64)` carries a width.
-      # The lossless matrix forbids unbounded -> bounded narrowing -- opt
-      # into the wider matrix (`is_compatible_with_truncate`).
-      - {{ from: name, to: name, truncate: true, default: anonymous }}
-      - {{ from: "addr.city", to: city, truncate: true, default: unknown }}
-      - {{ from: score, to: score, default: -1 }}
-      # Genuinely nullable columns -- NULL passes through as SQL NULL.
-      - {{ from: rating, to: rating }}
-      - {{ from: is_active, to: is_active }}
-      - {{ from: created_at, to: created_at }}
-      - {{ from: payload, to: payload }}
+      # present.
+      name: {{ from: name, truncate: true, default: anonymous }}
+      city: {{ from: "addr.city", truncate: true, default: unknown }}
+      score: {{ from: score, default: -1 }}
+      # Int32 source → UInt32 sink: matrix forbids without truncate
+      # (sign loss). With `truncate: true` the conversion saturates at
+      # the unsigned floor when negative; the seed feeds only positives.
+      score_unsigned: {{ from: score, truncate: true }}
+      qty: qty
+      rating: rating
+      rating32: {{ from: rating_short, truncate: true }}
+      is_active: is_active
+      note: {{ from: note, truncate: true }}
+      note_short: {{ from: note_long, truncate: true }}
+      # Bytes unbounded → bytes(N) requires truncate.
+      blob_data: {{ from: blob, truncate: true }}
+      # Same ObjectId routed both to hex text and to raw 12 bytes.
+      oid_hex: oid
+      oid_bytes: oid
+      created_at: created_at
+      payload: payload
 
     cursor:
       fields: [_id]
@@ -195,51 +257,91 @@ flow:
     let app = App::from_path(&config_path).expect("App::from_path");
     app.run_once().await.expect("run_once");
 
-    // NOT NULL columns are non-Option in the SELECT — sqlx will panic
-    // if any row has a SQL NULL there, which would itself be the bug
-    // we want to catch.
+    // sqlx's `FromRow` tops out at 16-arity tuples -- split into two
+    // reads keyed on the BIGINT primary key.
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(
-        i64,
-        String,
-        String,
-        i32,
-        Option<f64>,
-        Option<bool>,
-        Option<DateTime<Utc>>,
-        Option<serde_json::Value>,
+    let head: Vec<(
+        i64,            // id
+        String,         // name
+        String,         // city
+        i32,            // score
+        Option<u32>,    // score_unsigned
+        Option<i64>,    // qty
+        Option<f64>,    // rating
+        Option<f32>,    // rating32
+        Option<bool>,   // is_active
+        Option<String>, // note
+        Option<String>, // note_short
     )> = sqlx::query_as(&format!(
-        "SELECT id, name, city, score, rating, is_active, created_at, payload \
+        "SELECT id, name, city, score, score_unsigned, qty, rating, rating32, \
+                is_active, note, note_short \
          FROM `{dst_db_sql}`.users ORDER BY id"
     ))
     .fetch_all(&mysql.pool)
     .await
     .unwrap();
-    assert_eq!(rows.len(), 5, "all 5 docs must land in the SQL sink");
+    #[allow(clippy::type_complexity)]
+    let tail: Vec<(
+        i64,                       // id
+        Option<Vec<u8>>,           // blob_data
+        Option<String>,            // oid_hex
+        Option<Vec<u8>>,           // oid_bytes
+        Option<DateTime<Utc>>,     // created_at
+        Option<serde_json::Value>, // payload
+    )> = sqlx::query_as(&format!(
+        "SELECT id, blob_data, oid_hex, oid_bytes, created_at, payload \
+         FROM `{dst_db_sql}`.users ORDER BY id"
+    ))
+    .fetch_all(&mysql.pool)
+    .await
+    .unwrap();
+    assert_eq!(head.len(), 5, "all 5 docs must land in the SQL sink");
+    assert_eq!(tail.len(), 5);
 
-    let r1 = &rows[0];
-    assert_eq!(r1.0, 1);
-    assert_eq!(r1.1, "user-1");
-    assert_eq!(r1.2, "city-1");
-    assert_eq!(r1.3, 10);
-    assert_eq!(r1.4, Some(1.5));
-    assert_eq!(r1.5, Some(false));
-    assert_eq!(r1.6, Some(base + chrono::Duration::seconds(1)));
-    assert_eq!(r1.7, Some(serde_json::json!({"row": 1, "next": 2})));
+    // Row 1: every nullable column carries a real value (NULL rotation
+    // hits rows 2..=5).
+    let h1 = &head[0];
+    let t1 = &tail[0];
+    assert_eq!(h1.0, 1);
+    assert_eq!(h1.1, "user-1");
+    assert_eq!(h1.2, "city-1");
+    assert_eq!(h1.3, 10);
+    assert_eq!(h1.4, Some(10_u32));
+    assert_eq!(h1.5, Some(100_000));
+    assert_eq!(h1.6, Some(1.5));
+    assert_eq!(h1.7, Some(2.5_f32));
+    assert_eq!(h1.8, Some(false));
+    assert_eq!(h1.9.as_deref(), Some("note-1"));
+    // Truncate fired: source text length > 8 chars, sink keeps first 8.
+    assert_eq!(h1.10.as_deref(), Some("this str"));
+    assert_eq!(t1.1.as_deref(), Some(blob_seed.as_slice()));
+    assert_eq!(t1.2.as_deref(), Some("654f10800102030405000001"));
+    assert_eq!(t1.3.as_deref(), Some(oid_seed.bytes().as_slice()));
+    assert_eq!(t1.4, Some(base + chrono::Duration::seconds(1)));
+    assert_eq!(t1.5, Some(serde_json::json!({"row": 1, "next": 2})));
 
-    // Defaults must fire on the NOT NULL columns where the source was NULL.
-    assert_eq!(rows[1].1, "anonymous", "row 2 → name default substituted");
-    assert_eq!(rows[2].2, "unknown", "row 3 → city default substituted");
-    assert_eq!(rows[3].3, -1, "row 4 → score default substituted");
+    // Defaults fire on NOT NULL columns where the source value was NULL.
+    assert_eq!(head[1].1, "anonymous", "row 2 -> name default fired");
+    assert_eq!(head[2].2, "unknown", "row 3 -> city default fired");
+    assert_eq!(head[3].3, -1, "row 4 -> score default fired");
 
-    // Genuinely nullable columns round-trip as SQL NULL where the source had it.
-    assert!(rows[1].4.is_none(), "row 2 → rating NULL");
-    assert!(rows[2].5.is_none(), "row 3 → is_active NULL");
-    assert!(rows[3].7.is_none(), "row 4 → payload NULL");
+    // NULL passthrough on nullable columns where the source had NULL.
+    assert!(head[1].6.is_none(), "row 2 -> rating NULL");
+    assert!(head[1].7.is_none(), "row 2 -> rating32 NULL");
+    assert!(head[1].4.is_none(), "row 2 -> score_unsigned NULL");
+    assert!(head[2].8.is_none(), "row 3 -> is_active NULL");
+    assert!(head[2].5.is_none(), "row 3 -> qty NULL");
+    assert!(head[2].9.is_none(), "row 3 -> note NULL");
+    assert!(head[2].10.is_none(), "row 3 -> note_short NULL");
+    assert!(tail[3].1.is_none(), "row 4 -> blob NULL");
+    assert!(tail[3].4.is_none(), "row 4 -> created_at NULL");
+    assert!(tail[3].5.is_none(), "row 4 -> payload NULL");
+    assert!(tail[4].2.is_none(), "row 5 -> oid_hex NULL");
+    assert!(tail[4].3.is_none(), "row 5 -> oid_bytes NULL");
 
-    // Re-run is a no-op thanks to the upsert. Verify both row count
-    // and content survived — a buggy upsert that wiped substituted
-    // defaults back to NULL would surface here.
+    // Re-run is a no-op thanks to the upsert. Verify both row count and
+    // content survive -- a buggy upsert that wiped substituted defaults
+    // back to NULL would surface here.
     app.run_once().await.expect("run_once (re-run)");
     let rows2: Vec<(i64, String, i32)> = sqlx::query_as(&format!(
         "SELECT id, name, score FROM `{dst_db_sql}`.users ORDER BY id"
@@ -261,10 +363,6 @@ flow:
         .await
         .unwrap()
         .expect("cursor saved");
-    // Cursor is stored as a JSON string under field `cursor`. Parse it
-    // back into `CursorState` and assert the exact tail value rather than
-    // a presence probe — the seed inserted `_id` 1..=5, ascending, so
-    // the saved cursor must point at `_id = 5` (the last row processed).
     let cursor_json = cursor_doc
         .get_str("cursor")
         .expect("cursor field is a string");

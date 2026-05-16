@@ -2,13 +2,13 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sqlx::{Column, PgPool, Row};
+use sqlx::{Column, PgPool, Row as SqlxRow};
 use tracing::{debug, info};
 
 use air_elt_commons_pg::Dialect;
 use air_elt_commons_pg::pool;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
-use air_elt_core::model::raw::{RawBatch, RawRow};
+use air_elt_core::model::{Batch, Row};
 use air_elt_core::model::{CursorFieldValue, CursorState};
 use air_elt_core::model::{ReadSpec, Schema, SchemaProvider, SourceCtx};
 use air_elt_core::traits::Source;
@@ -198,7 +198,7 @@ impl Source for PgSource {
         spec: &ReadSpec,
         ctx: &Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
-    ) -> RuntimeResult<RawBatch> {
+    ) -> RuntimeResult<Batch> {
         let pg_ctx = ctx.downcast_ref_to::<PgSourceCtx>()?;
 
         let query_plan = match cursor {
@@ -301,7 +301,7 @@ impl Source for PgSource {
             } else {
                 None
             };
-            out_rows.push(RawRow::upsert(values).with_body(body));
+            out_rows.push(Row::upsert(values).with_body(body));
         }
 
         let next_cursor = last_cursor_values.map(|values| {
@@ -317,7 +317,7 @@ impl Source for PgSource {
             CursorState::new(fields)
         });
 
-        Ok(RawBatch {
+        Ok(Batch {
             rows: out_rows,
             next_cursor,
         })

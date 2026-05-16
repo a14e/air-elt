@@ -106,10 +106,12 @@ async fn raw_passthrough_dry_run_skips_writes() {
         rows: vec![
             Row {
                 values: vec![Value::Custom(Box::new(BsonObjectValue(d1.clone())))],
+                body: None,
                 op: RowOp::Upsert,
             },
             Row {
                 values: vec![Value::Custom(Box::new(BsonObjectValue(d2.clone())))],
+                body: None,
                 op: RowOp::Upsert,
             },
         ],

@@ -1,7 +1,6 @@
 pub mod context;
 pub mod cursor;
 pub mod flow_state;
-pub mod raw;
 pub mod schema;
 pub mod spec;
 
@@ -11,7 +10,6 @@ pub use flow_state::{
     AssembledFlow, ColumnConversionPlan, CursorPersistence, DerivedPlans, FlowState,
     build_derived_plans, build_derived_plans_from_expanded,
 };
-pub use raw::{RawBatch, RawRow};
 pub use schema::{Field, Schema, SchemaKind};
 pub use spec::{
     Batch, ConfigReadSpec, ConfigWriteSpec, ReadSpec, Row, RowOp, WriteReport, WriteSpec,
