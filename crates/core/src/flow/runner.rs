@@ -7,8 +7,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::model::{
-    Batch, CursorFieldValue, CursorPersistence, CursorState, FlowState, RowOp, Schema, SinkCtx,
-    SourceCtx,
+    Batch, CursorFieldValue, CursorPersistence, CursorState, FlowState, Schema, SinkCtx, SourceCtx,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,7 +235,7 @@ impl FlowRunner {
         let src_ctx = self.source_ctx.as_ref().expect("ensured by ensure_built");
 
         // dry_run path: sampling validation routes through the same
-        // tick. `Source::sample` returns a pre-Transform `RawBatch`;
+        // tick. `Source::sample` returns a pre-Transform `Batch`;
         // the same Transform program the production tick consumes runs
         // here too so sampling exercises projection / body folding /
         // per-cell conversion identically.
@@ -246,7 +245,7 @@ impl FlowRunner {
             let fut = self.flow.source.sample(read_spec, src_ctx, n);
             with_timeout(&self.flow, "sample", fut, &mut self.shutdown).await?
         } else {
-            // Production read path: source emits `RawBatch`; Transform
+            // Production read path: source emits `Batch`; Transform
             // applies projection / body folding / per-column conversion
             // in one pass — including the schemaless-both `["*"]` raw
             // passthrough flow, which lowers to a single `Body` op.
@@ -291,26 +290,10 @@ impl FlowRunner {
         // outlives the write call, and the sink does not consume the
         // `next_cursor` slot. `take()` avoids cloning the CursorState.
         let next_cursor = batch.next_cursor.take();
-        // Append-only sinks (ClickHouse) drop deletes pre-write — the
-        // sink will never observe a `RowOp::Delete`. Cursor still
-        // advances over the dropped events.
-        if !self.flow.sink.supports_deletes() {
-            let before = batch.rows.len();
-            batch.rows.retain(|r| r.op != RowOp::Delete);
-            let dropped = before - batch.rows.len();
-            if dropped > 0 {
-                debug!(
-                    flow = %self.flow.name,
-                    deletes_dropped = dropped,
-                    "sink does not support deletes — dropping delete rows"
-                );
-            }
-            if batch.rows.is_empty() {
-                // Still need to advance the cursor below; skip the sink
-                // call entirely (no rows to write).
-                return self.commit_cursor(next_cursor, dry_run).await;
-            }
-        }
+        // No pre-write delete filter here. Sinks whose
+        // `supports_deletes() == false` (ClickHouse, QuestDB) drop
+        // Delete rows themselves and return a `WriteReport` with the
+        // upsert count — the cursor still advances on the call below.
         let write_spec = &self.flow.derived().write_spec;
         let fut = self
             .flow
@@ -540,13 +523,13 @@ mod tests {
         let rc = read_calls.clone();
         source.expect_read_batch().returning(move |_, _, _| {
             rc.fetch_add(1, Ordering::SeqCst);
-            Ok(crate::model::raw::RawBatch::default())
+            Ok(crate::model::spec::Batch::default())
         });
         let sc = sample_calls.clone();
         source.expect_sample().returning(move |_, _, _| {
             sc.fetch_add(1, Ordering::SeqCst);
-            Ok(crate::model::raw::RawBatch {
-                rows: vec![crate::model::raw::RawRow::upsert(vec![Value::Int64(1)])],
+            Ok(crate::model::spec::Batch {
+                rows: vec![crate::model::spec::Row::upsert(vec![Value::Int64(1)])],
                 next_cursor: None,
             })
         });
@@ -673,7 +656,7 @@ mod tests {
                 Err(RuntimeError::backend(std::io::Error::other("net down")))
             } else {
                 // Empty drain → daemon idles.
-                Ok(crate::model::raw::RawBatch::default())
+                Ok(crate::model::spec::Batch::default())
             }
         });
 
@@ -776,7 +759,7 @@ mod tests {
             if n < 2 {
                 Err(RuntimeError::JsonEncode(JsonEncodeError::DepthExceeded))
             } else {
-                Ok(crate::model::raw::RawBatch::default())
+                Ok(crate::model::spec::Batch::default())
             }
         });
 
@@ -828,7 +811,7 @@ mod tests {
             if n < 1 {
                 Err(RuntimeError::backend(std::io::Error::other("net down")))
             } else {
-                Ok(crate::model::raw::RawBatch::default())
+                Ok(crate::model::spec::Batch::default())
             }
         });
 
@@ -886,8 +869,8 @@ mod tests {
         source.expect_read_batch().returning(move |_, _, _| {
             let n = rc.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
-                Ok(crate::model::raw::RawBatch {
-                    rows: vec![crate::model::raw::RawRow::upsert(vec![Value::Int64(42)])],
+                Ok(crate::model::spec::Batch {
+                    rows: vec![crate::model::spec::Row::upsert(vec![Value::Int64(42)])],
                     next_cursor: Some(crate::model::CursorState::new(vec![
                         crate::model::CursorFieldValue {
                             name: "id".into(),
@@ -896,7 +879,7 @@ mod tests {
                     ])),
                 })
             } else {
-                Ok(crate::model::raw::RawBatch::default())
+                Ok(crate::model::spec::Batch::default())
             }
         });
 
@@ -912,6 +895,7 @@ mod tests {
                     .unwrap()
                     .extend(batch.rows.iter().map(|r| crate::model::Row {
                         values: r.values.clone(),
+                        body: None,
                         op: r.op,
                     }));
                 Ok(crate::model::WriteReport {
@@ -931,11 +915,14 @@ mod tests {
         assert_eq!(rows[0].values, vec![Value::Int64(42)]);
     }
 
-    /// When the sink declares `supports_deletes() == false`, the runner
-    /// must filter `RowOp::Delete` rows out before `write_batch`. Verify
-    /// that the sink only sees the Upsert.
+    /// Per the post-AIR-70 contract: the runner ships the full batch
+    /// (deletes included) to a sink that declares
+    /// `supports_deletes() == false`. The sink is responsible for
+    /// dropping `RowOp::Delete` rows itself and reporting only the
+    /// upsert count back. This test asserts the runner passes the
+    /// whole batch through without filtering.
     #[tokio::test(start_paused = true)]
-    async fn no_delete_sink_filters_delete_rows_pre_write() {
+    async fn no_delete_sink_receives_full_batch_runner_does_not_filter() {
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -951,11 +938,10 @@ mod tests {
         source.expect_read_batch().returning(move |_, _, _| {
             let n = rc.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
-                Ok(crate::model::raw::RawBatch {
+                Ok(crate::model::spec::Batch {
                     rows: vec![
-                        crate::model::raw::RawRow::upsert(vec![Value::Int64(1)]),
-                        // Delete event from a hypothetical CDC source.
-                        crate::model::raw::RawRow {
+                        crate::model::spec::Row::upsert(vec![Value::Int64(1)]),
+                        crate::model::spec::Row {
                             values: vec![Value::Int64(2)],
                             body: None,
                             op: crate::model::RowOp::Delete,
@@ -969,27 +955,36 @@ mod tests {
                     ])),
                 })
             } else {
-                Ok(crate::model::raw::RawBatch::default())
+                Ok(crate::model::spec::Batch::default())
             }
         });
 
         let mut sink = crate::traits::MockSink::new();
         sink.expect_schemaless().return_const(false);
-        // Append-only sink: runner must drop deletes.
+        // Append-only sink: it will self-filter inside write_batch.
         sink.expect_supports_deletes().return_const(false);
         sink.expect_build_context()
             .returning(|_| Ok(Arc::new(UnitSinkCtx)));
         let cap = captured.clone();
         sink.expect_write_batch()
             .returning(move |_, _ctx, batch, _dry| {
+                // Capture exactly what the runner handed in. Real
+                // append-only sinks (ClickHouse, QuestDB) would then
+                // filter deletes themselves.
+                let upserts = batch
+                    .rows
+                    .iter()
+                    .filter(|r| r.op == crate::model::RowOp::Upsert)
+                    .count() as u64;
                 cap.lock()
                     .unwrap()
                     .extend(batch.rows.iter().map(|r| crate::model::Row {
                         values: r.values.clone(),
+                        body: None,
                         op: r.op,
                     }));
                 Ok(crate::model::WriteReport {
-                    rows_written: batch.rows.len() as u64,
+                    rows_written: upserts,
                 })
             });
 
@@ -1001,21 +996,26 @@ mod tests {
             .expect("flow runs");
 
         let rows = captured.lock().unwrap();
-        assert_eq!(rows.len(), 1, "delete row must be filtered pre-write");
+        assert_eq!(
+            rows.len(),
+            2,
+            "sink must observe BOTH rows — runner no longer filters"
+        );
         assert_eq!(rows[0].op, crate::model::RowOp::Upsert);
-        assert_eq!(rows[0].values, vec![Value::Int64(1)]);
+        assert_eq!(rows[1].op, crate::model::RowOp::Delete);
     }
 
-    /// When a batch consists entirely of delete rows and the sink
-    /// declares `supports_deletes() == false`, the runner must NOT call
-    /// `write_batch` at all — but it must still commit the cursor so
-    /// the flow doesn't get stuck re-reading the same range forever.
+    /// Per the post-AIR-70 contract: an all-delete batch against an
+    /// append-only sink still triggers `write_batch` (the sink is the
+    /// authoritative filter and reports `rows_written: 0`). The cursor
+    /// must still advance so the flow doesn't loop on the same range.
     #[tokio::test(start_paused = true)]
-    async fn no_delete_sink_all_deletes_skips_write_but_commits_cursor() {
+    async fn no_delete_sink_all_deletes_still_calls_write_and_commits_cursor() {
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let read_calls = std::sync::Arc::new(AtomicU32::new(0));
+        let write_calls = std::sync::Arc::new(AtomicU32::new(0));
         let saved_cursors: std::sync::Arc<Mutex<Vec<crate::model::CursorState>>> =
             std::sync::Arc::new(Mutex::new(Vec::new()));
 
@@ -1027,8 +1027,8 @@ mod tests {
         source.expect_read_batch().returning(move |_, _, _| {
             let n = rc.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
-                Ok(crate::model::raw::RawBatch {
-                    rows: vec![crate::model::raw::RawRow {
+                Ok(crate::model::spec::Batch {
+                    rows: vec![crate::model::spec::Row {
                         values: vec![Value::Int64(7)],
                         body: None,
                         op: crate::model::RowOp::Delete,
@@ -1041,7 +1041,7 @@ mod tests {
                     ])),
                 })
             } else {
-                Ok(crate::model::raw::RawBatch::default())
+                Ok(crate::model::spec::Batch::default())
             }
         });
 
@@ -1050,8 +1050,13 @@ mod tests {
         sink.expect_supports_deletes().return_const(false);
         sink.expect_build_context()
             .returning(|_| Ok(Arc::new(UnitSinkCtx)));
-        // The whole point: write_batch must not be invoked.
-        sink.expect_write_batch().times(0);
+        let wc = write_calls.clone();
+        sink.expect_write_batch()
+            .returning(move |_, _ctx, _batch, _dry| {
+                wc.fetch_add(1, Ordering::SeqCst);
+                // Sink self-filtered all deletes; nothing to report.
+                Ok(crate::model::WriteReport { rows_written: 0 })
+            });
 
         let mut storage = crate::traits::MockStorage::new();
         storage.expect_load_cursor().returning(|_| Ok(None));
@@ -1070,6 +1075,11 @@ mod tests {
             .await
             .expect("flow runs");
 
+        assert_eq!(
+            write_calls.load(Ordering::SeqCst),
+            1,
+            "write_batch must be called once — sink is the authoritative filter"
+        );
         let saves = saved_cursors.lock().unwrap();
         assert_eq!(
             saves.len(),

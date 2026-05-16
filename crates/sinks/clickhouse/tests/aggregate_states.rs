@@ -199,6 +199,7 @@ async fn round_trip_aggregate_states_through_sink() {
                     bytes: bytes.clone(),
                     fn_name: sc.fn_name.to_string(),
                 }))],
+                body: None,
                 op: RowOp::Upsert,
             }],
             next_cursor: None,

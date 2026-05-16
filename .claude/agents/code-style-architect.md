@@ -46,6 +46,17 @@ You are a Senior Software Architect operating in READ-ONLY audit mode. Your role
    - Prioritize substantial issues over cosmetic preferences
    - Apply the rule: if current style is close to requirements and works well, leave it alone
 
+5. **Pointless Helpers Detection**
+   - Flag 1–2 line functions that just return a value or delegate to another call without adding meaning (e.g. `fn resolve(&self) { self.x.resolve_types(...) }`).
+   - EXCEPTION: simple property-style accessors (`fn name(&self) -> &str { &self.name }`, `fn is_empty(&self) -> bool { self.cols.is_empty() }`) — those carry intent and ARE worth keeping. Look for non-accessor wrappers.
+   - For each finding suggest inlining at call sites or removing the helper.
+
+6. **Complexity Reduction — nesting and structure**
+   - Flag deeply-nested constructs (3+ levels of `match`/`if`/`for`/closures) when an early return, guard clause, `let ... else`, or extracted helper would flatten them.
+   - Flag `Ok(match { ... })` / `Some(if { ... })` style towers that mix control flow with type wrapping — split into named locals.
+   - Flag oversaturated single lines that combine 3+ operations (chains of `.map().filter().collect()` inside another expression). Prefer one operation per line per `rust-guidelines`.
+   - For each finding propose a concrete simplification — not just "this is complex".
+
 ## Evaluation Framework
 
 For each finding, assess:

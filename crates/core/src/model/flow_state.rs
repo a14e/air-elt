@@ -7,6 +7,11 @@ use crate::error::ValidationError;
 use crate::mapping::{self, ColumnMapping, DirectMapping, ExpandedMapping};
 use crate::model::{ConfigReadSpec, ConfigWriteSpec, ReadSpec, Schema, WriteSpec};
 use crate::traits::{Sink, Source, Storage};
+use crate::transform::SwitchTable;
+// Switch tables travel inline on the conversion plan — no Arc, no
+// global registry. The plan / Transform are only cloned at validation
+// / sampling boundaries, which happens a handful of times per flow
+// lifetime; the per-tick path borrows.
 use crate::types::{ConversionContext, DataType};
 
 /// A flow with its components built and config-time specs derived, but
@@ -61,11 +66,19 @@ pub enum CursorPersistence {
 /// pair plus the per-mapping `ConversionContext` (truncate flag + parsed
 /// default value). Built by `validation::pipeline::validate` after schema
 /// introspection.
+///
+/// When `switch.is_some()`, the lowered transform op is a
+/// `TransformOp::Switch` (no further `Convert` wrapping — switch values
+/// are already in the sink's `DataType` after compile-time
+/// canonicalisation). `switch` and `ctx.default` are independent — the
+/// switch carries its own default (folded into the `SwitchTable`); the
+/// plan's `ctx.default` is only consulted on the `Direct` path.
 #[derive(Debug, Clone)]
 pub struct ColumnConversionPlan {
     pub source: DataType,
     pub sink: DataType,
     pub ctx: ConversionContext,
+    pub switch: Option<SwitchTable>,
 }
 
 impl ColumnConversionPlan {
@@ -75,11 +88,15 @@ impl ColumnConversionPlan {
             source: dt.clone(),
             sink: dt,
             ctx: ConversionContext::passthrough(),
+            switch: None,
         }
     }
 
     pub fn is_identity(&self) -> bool {
-        self.source == self.sink && !self.ctx.truncate && self.ctx.default.is_none()
+        self.source == self.sink
+            && !self.ctx.truncate
+            && self.ctx.default.is_none()
+            && self.switch.is_none()
     }
 }
 
@@ -217,7 +234,7 @@ pub fn build_derived_plans_from_expanded(
         cursor_order: flow.config_read_spec.cursor_order,
         limit: flow.config_read_spec.limit,
         source_options: flow.config_read_spec.source_options.clone(),
-        // The source attaches `RawRow.body` only when the flow has a body
+        // The source attaches `Row.body` only when the flow has a body
         // target — the cost-guard tells it whether to pay per row.
         needs_body: expanded.body.is_some(),
     };
@@ -272,6 +289,7 @@ fn build_body_conversions(
             source: body_data_type.clone(),
             sink: sink_dt,
             ctx: ConversionContext::passthrough(),
+            switch: None,
         });
     }
     Ok(plans)
@@ -314,6 +332,7 @@ fn build_conversions(
     dst_schema: Option<&Schema>,
 ) -> Result<Vec<ColumnConversionPlan>, ValidationError> {
     let flow_name = &flow.name;
+    let dst_schemaless = flow.sink.schemaless();
     let mut plans: Vec<ColumnConversionPlan> = Vec::with_capacity(expanded.direct.len());
     for m in &expanded.direct {
         let DirectMapping {
@@ -321,6 +340,7 @@ fn build_conversions(
             to,
             truncate,
             default_literal,
+            switch,
         } = m;
         let src = src_schema.ok_or_else(|| ValidationError::AccessFailed {
             component: "source:schema",
@@ -348,13 +368,54 @@ fn build_conversions(
                 });
             }
         };
-        if default_literal.is_some() && !src_field.nullable {
+        // `default_literal` without `switch` is the NULL-fallback for the
+        // source column; it's only meaningful when the source is
+        // nullable. With `switch` present the same literal becomes the
+        // switch's miss-fallback (default arm), which fires on EVERY
+        // unmatched key regardless of nullability — skip the guard.
+        if default_literal.is_some() && switch.is_none() && !src_field.nullable {
             return Err(ValidationError::DefaultOnNotNullSource {
                 flow: flow_name.clone(),
                 column: from.clone(),
             });
         }
-        let parsed_default =
+        // Switch path: build the lookup table now. The switch's own
+        // default replaces the `ctx.default` slot — the runtime path
+        // for Switch never consults `ctx.default`, so we leave it
+        // empty here. `truncate` is consumed by `compile_switch` to
+        // shorten over-length `Text` / `Bytes` RHS literals.
+        //
+        // Reject a `switch` without `default` against a NOT NULL sink
+        // column: a miss would otherwise emit `Value::Null` at runtime,
+        // violating the NOT NULL constraint downstream. The check is
+        // skipped on schemaless sinks (no declared nullability).
+        if let Some(_spec) = switch
+            && default_literal.is_none()
+            && !dst_schemaless
+            && let Some(sink_field) = dst_schema.and_then(|s| s.find(to))
+            && !sink_field.nullable
+        {
+            return Err(ValidationError::SwitchMissingDefaultForNotNullSink {
+                flow: flow_name.clone(),
+                column: to.clone(),
+            });
+        }
+        let switch_table = match switch {
+            Some(spec) => Some(crate::transform::compile_switch(
+                flow_name,
+                to,
+                &spec.cases,
+                default_literal.as_ref(),
+                *truncate,
+                &src_field.data_type,
+                &sink_dt,
+                dst_schemaless,
+            )?),
+            None => None,
+        };
+        let parsed_default = if switch.is_some() {
+            None
+        } else {
             match default_literal {
                 Some(lit) => Some(crate::types::default_value::parse(lit, &sink_dt).map_err(
                     |e| ValidationError::DefaultParse {
@@ -364,7 +425,8 @@ fn build_conversions(
                     },
                 )?),
                 None => None,
-            };
+            }
+        };
         let mut ctx = ConversionContext::passthrough();
         ctx.truncate = *truncate;
         ctx.default = parsed_default;
@@ -372,13 +434,15 @@ fn build_conversions(
             source: src_field.data_type.clone(),
             sink: sink_dt,
             ctx,
+            switch: switch_table,
         });
     }
-    // Body / wildcard-pack outputs land in `Row.computed`, which
-    // `apply_conversions` never walks — no identity plan needed for
-    // body targets. Sources populate `RawRow.body` directly inside
-    // `read_batch`; the Transform interpreter folds it into `computed`,
-    // and sinks read both halves through `Row::columns()`.
+    // Body / wildcard-pack outputs are produced by `TransformOp::Body`
+    // ops in the compiled program — they read `Row.body` populated by
+    // the source (when `ReadSpec.needs_body == true`) and write into the
+    // sink's row slot at the matching position. No `ColumnConversionPlan`
+    // is emitted for them; per-body-target plans, if any, are added
+    // separately by `build_body_conversions` above.
     Ok(plans)
 }
 
@@ -642,5 +706,129 @@ mod tests {
         assert_eq!(plans.read_spec.columns, vec!["a".to_string()]);
         assert_eq!(plans.write_spec.columns, vec!["a".to_string()]);
         assert_eq!(plans.transform.cols.len(), 1);
+    }
+
+    fn switch_case(key: &str, value: &str) -> crate::mapping::SwitchCase {
+        crate::mapping::SwitchCase {
+            key: key.into(),
+            value: toml::Value::String(value.into()),
+        }
+    }
+
+    /// Switch without `default` against a NOT NULL sink column must be
+    /// rejected at validate-time: a key miss would otherwise emit
+    /// `Value::Null` at runtime and slam into the NOT NULL constraint
+    /// downstream. Guard lives at `flow_state.rs::build_conversions`.
+    #[test]
+    fn switch_without_default_rejected_against_not_null_sink() {
+        let flow = assembled(vec![ColumnMapping::Switch {
+            from: "code".into(),
+            to: "label".into(),
+            truncate: false,
+            cases: vec![switch_case("1", "open"), switch_case("2", "closed")],
+            default_literal: None,
+        }]);
+        let src = schema(&[("code", DataType::Int32, false)]);
+        let dst = schema(&[("label", DataType::Text { size: None }, false)]);
+        let res = build_derived_plans(&flow, &src, &dst);
+        match res {
+            Err(ValidationError::SwitchMissingDefaultForNotNullSink { flow, column }) => {
+                assert_eq!(flow, "test");
+                assert_eq!(column, "label");
+            }
+            Err(other) => panic!("expected SwitchMissingDefaultForNotNullSink, got {other:?}"),
+            Ok(_) => panic!("expected SwitchMissingDefaultForNotNullSink, got Ok"),
+        }
+    }
+
+    /// Same shape but with `default = "unknown"` is accepted — the
+    /// default arm covers the miss case so NOT NULL is safe.
+    #[test]
+    fn switch_with_default_accepted_against_not_null_sink() {
+        let flow = assembled(vec![ColumnMapping::Switch {
+            from: "code".into(),
+            to: "label".into(),
+            truncate: false,
+            cases: vec![switch_case("1", "open"), switch_case("2", "closed")],
+            default_literal: Some(toml::Value::String("unknown".into())),
+        }]);
+        let src = schema(&[("code", DataType::Int32, false)]);
+        let dst = schema(&[("label", DataType::Text { size: None }, false)]);
+        build_derived_plans(&flow, &src, &dst).expect("default arm bridges NOT NULL sink");
+    }
+
+    /// `default = …` on a NOT NULL source column is rejected: the
+    /// default would never fire (the source has no NULL to substitute
+    /// for), so the literal is dead code. Guard lives at
+    /// `flow_state.rs::build_conversions` next to the switch case.
+    #[test]
+    fn default_on_not_null_source_rejected() {
+        let flow = assembled(vec![ColumnMapping::Direct {
+            from: "a".into(),
+            to: "a".into(),
+            truncate: false,
+            default_literal: Some(toml::Value::Integer(0)),
+        }]);
+        let src = schema(&[("a", DataType::Int32, false)]);
+        let dst = schema(&[("a", DataType::Int32, false)]);
+        let res = build_derived_plans(&flow, &src, &dst);
+        match res {
+            Err(ValidationError::DefaultOnNotNullSource { flow, column }) => {
+                assert_eq!(flow, "test");
+                assert_eq!(column, "a");
+            }
+            Err(other) => panic!("expected DefaultOnNotNullSource, got {other:?}"),
+            Ok(_) => panic!("expected DefaultOnNotNullSource, got Ok"),
+        }
+    }
+
+    /// Same default on a NULLABLE source is accepted — that's the
+    /// canonical NULL-bridge use case.
+    #[test]
+    fn default_on_nullable_source_accepted() {
+        let flow = assembled(vec![ColumnMapping::Direct {
+            from: "a".into(),
+            to: "a".into(),
+            truncate: false,
+            default_literal: Some(toml::Value::Integer(0)),
+        }]);
+        let src = schema(&[("a", DataType::Int32, true)]);
+        let dst = schema(&[("a", DataType::Int32, false)]);
+        build_derived_plans(&flow, &src, &dst).expect("nullable source admits default bridge");
+    }
+
+    /// `default = …` on a NOT NULL source is **allowed when combined
+    /// with `switch`** — for switch the default is the miss-fallback,
+    /// which fires on every unmatched key regardless of source
+    /// nullability. The guard explicitly excludes switch entries.
+    #[test]
+    fn default_on_not_null_source_with_switch_accepted() {
+        let flow = assembled(vec![ColumnMapping::Switch {
+            from: "code".into(),
+            to: "label".into(),
+            truncate: false,
+            cases: vec![switch_case("1", "open"), switch_case("2", "closed")],
+            default_literal: Some(toml::Value::String("unknown".into())),
+        }]);
+        let src = schema(&[("code", DataType::Int32, false)]);
+        let dst = schema(&[("label", DataType::Text { size: None }, false)]);
+        build_derived_plans(&flow, &src, &dst).expect("switch's default is miss-fallback, not NULL-bridge");
+    }
+
+    /// Switch without `default` against a NULLABLE sink column is
+    /// accepted: a miss producing `Value::Null` is valid for nullable
+    /// columns.
+    #[test]
+    fn switch_without_default_accepted_against_nullable_sink() {
+        let flow = assembled(vec![ColumnMapping::Switch {
+            from: "code".into(),
+            to: "label".into(),
+            truncate: false,
+            cases: vec![switch_case("1", "open"), switch_case("2", "closed")],
+            default_literal: None,
+        }]);
+        let src = schema(&[("code", DataType::Int32, false)]);
+        let dst = schema(&[("label", DataType::Text { size: None }, true)]);
+        build_derived_plans(&flow, &src, &dst).expect("nullable sink admits NULL on miss");
     }
 }

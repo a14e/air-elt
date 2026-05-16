@@ -456,7 +456,7 @@ async fn cdc_to_pg_sink_round_trip_with_inserts_and_deletes() {
     // batch carries exactly two Delete rows.
     assert_eq!(batch.rows.len(), 2);
     assert!(batch.rows.iter().all(|r| r.op == RowOp::Delete));
-    sink.write_batch(&write_spec, &sink_ctx, batch.into_batch(), false)
+    sink.write_batch(&write_spec, &sink_ctx, batch, false)
         .await
         .expect("mixed batch");
 
@@ -666,7 +666,7 @@ async fn cdc_to_mysql_sink_round_trip_with_inserts_and_deletes() {
         .read_batch(&read_spec, &src_ctx, Some(&cursor))
         .await
         .expect("read");
-    sink.write_batch(&write_spec, &sink_ctx, batch.into_batch(), false)
+    sink.write_batch(&write_spec, &sink_ctx, batch, false)
         .await
         .expect("mixed batch");
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users_mc")
@@ -732,7 +732,7 @@ async fn cdc_to_mongo_sink_round_trip_with_inserts_and_deletes() {
         .read_batch(&read_spec, &src_ctx, Some(&cursor))
         .await
         .expect("read");
-    sink.write_batch(&write_spec, &sink_ctx, batch.into_batch(), false)
+    sink.write_batch(&write_spec, &sink_ctx, batch, false)
         .await
         .expect("mixed batch");
 
@@ -953,7 +953,7 @@ fn swap_mysql_credentials(url: &str, user: &str, pwd: &str) -> String {
 
 /// Body-fill cost guard — CDC arm. With `needs_body=true` upsert
 /// events (insert / replace / update post-image) must populate
-/// `RawRow.body` with the post-image as a
+/// `Row.body` with the post-image as a
 /// `Value::Custom(BsonObjectValue(Document))`. Delete events also
 /// carry an (empty) `Value::Custom(BsonObjectValue(Document::new()))`
 /// so `Transform::Body` always sees a value.
@@ -999,7 +999,7 @@ async fn cdc_attaches_body_for_upsert_when_needs_body_set() {
 }
 
 /// Cost-guard regression at the CDC source: with `needs_body=false`
-/// upsert events do NOT populate `RawRow.body`.
+/// upsert events do NOT populate `Row.body`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cdc_skips_body_for_upsert_when_needs_body_unset() {
     let mongo = mongo_rs_pool().await;
@@ -1034,6 +1034,6 @@ async fn cdc_skips_body_for_upsert_when_needs_body_unset() {
     assert_eq!(batch.rows[0].op, RowOp::Upsert);
     assert!(
         batch.rows[0].body.is_none(),
-        "needs_body=false must leave RawRow.body=None (cost guard)"
+        "needs_body=false must leave Row.body=None (cost guard)"
     );
 }

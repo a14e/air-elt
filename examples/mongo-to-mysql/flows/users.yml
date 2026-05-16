@@ -14,9 +14,9 @@ flow:
     # a flat SQL column. `addr.city` reads `users.addr.city` and writes it
     # to the plain `city` column on the MySQL side.
     mapping:
-      - { from: _id, to: id }
-      - { from: name, to: name }
-      - { from: addr.city, to: city }
+      id: _id
+      name: name
+      city: addr.city
 
     cursor:
       fields: ["_id"]

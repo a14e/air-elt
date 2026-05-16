@@ -39,12 +39,14 @@ fn check_mapping_object_id_identity_is_compatible() {
             to: "_id".into(),
             truncate: false,
             default_literal: None,
+            switch: None,
         },
         DirectMapping {
             from: "name".into(),
             to: "name".into(),
             truncate: false,
             default_literal: None,
+            switch: None,
         },
     ];
     check_mapping(&src_schema, &sink_schema, &mappings).expect("custom identity must be accepted");
@@ -63,6 +65,7 @@ fn check_mapping_javascript_identity_is_compatible() {
         to: "code".into(),
         truncate: false,
         default_literal: None,
+        switch: None,
     }];
     check_mapping(&src_schema, &sink_schema, &mappings).expect("custom identity must be accepted");
 }

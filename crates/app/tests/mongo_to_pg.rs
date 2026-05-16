@@ -1,35 +1,45 @@
-//! Cross-vendor: MongoDB source → PostgreSQL sink, PostgreSQL storage,
-//! exercising the `*:body` JSON auto-pack across the BSON-to-JSONB
-//! boundary.
+//! Cross-vendor: MongoDB source → PostgreSQL sink, PostgreSQL storage.
 //!
-//! Pre-Fix-1 (this commit) the mongo source's `read_batch` populated
-//! `RawRow.body` with a `Value::Custom(BsonObjectValue(doc))` in every
-//! body slot. Without a matching matrix conversion, the Custom value
-//! reached the pg sink's `bind_value_separated` and tripped the
-//! "unsupported custom value kind" arm — the panic this test guards
-//! against. The fix routes the body slot through the canonical matrix
-//! arm `BsonObject -> Json` so the value lands in the JSONB column
-//! as `Value::Json(serde_json::Value::Object(...))` — every BSON type
-//! is mapped through `bson_value::bson_to_json` (Decimal128 → string,
-//! ObjectId → 24-hex string, Date → RFC3339 string, etc.).
+//! The original test guarded the BSON-body → JSONB conversion arm.
+//! It now also exercises **broad typed-mapping coverage**: every
+//! canonical type the BSON-side codec emits as a typed `Value` (Bool,
+//! Int32, Int64, Float64, String, Binary generic, BSON DateTime,
+//! Document, ObjectId) lands in a typed PG sink column and round-trips
+//! through the matrix.
 //!
-//! The single-flow test pulls 3 documents with mixed BSON shapes
-//! (a Decimal128, an ObjectId and a sub-document) and asserts that the
-//! body JSONB column on the pg sink contains the JSON encoding the
-//! `BsonObjectType::convert` arm produces.
+//! Highlights:
+//! * `truncate = true` on `String → varchar(N)` and on `Float64 →
+//!   Float32`.
+//! * Dot-notation source path (`addr.city`) flattens a nested BSON
+//!   sub-document onto a flat PG column.
+//! * Same `oid` (`MongoObjectIdType` custom) feeds two sink columns —
+//!   `varchar(24)` (hex form) and `bytea` (12-byte form).
+//! * NOT NULL sink columns are bridged with `default = ...` literals
+//!   (Mongo sample inference always emits `nullable = true`); nullable
+//!   sink columns let actual SQL NULLs round-trip.
+//!
+//! Intentionally not covered:
+//! * `Binary subtype=UUID → uuid`: `bson_value::from_bson` returns
+//!   `Value::Bytes` regardless of subtype while the inferrer reports
+//!   `DataType::Uuid` — documented MVP limitation that would need a
+//!   source-side fix to bridge.
+//! * `BSON DateTime → date` (Timestamp→Date with `truncate=true`):
+//!   `compatibility::CompatibilityValidator` re-checks the post-Convert
+//!   output type against the sink under truncate and rejects `Date↔Date`
+//!   under truncate. The matrix accepts the conversion itself, but the
+//!   second-pass identity check is the blocker.
 
 #![allow(clippy::unwrap_used)]
-
-use std::str::FromStr;
 
 use air_elt_app::App;
 use air_elt_commons_testing::mongo::mongo_pool;
 use air_elt_commons_testing::pg::pg_pool;
-use bson::{Decimal128, doc, oid::ObjectId};
+use bson::{Bson, doc, oid::ObjectId, spec::BinarySubtype};
+use chrono::{DateTime, TimeZone, Utc};
 use sqlx::Executor;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mongo_to_pg_body_pack_routes_bson_object_through_matrix() {
+async fn mongo_to_pg_broad_type_coverage() {
     let mongo = mongo_pool().await;
     let pg = pg_pool().await;
 
@@ -44,9 +54,26 @@ async fn mongo_to_pg_body_pack_routes_bson_object_through_matrix() {
     pg.pool
         .execute(
             format!(
+                // Mix of NOT NULL and NULL columns. Every NOT NULL column
+                // is paired with `default = ...` on its mapping below to
+                // bridge Mongo's always-nullable inference.
                 "CREATE TABLE \"{dst_schema_pg}\".docs (
-                    id   BIGINT PRIMARY KEY,
-                    body JSONB
+                    id          bigint PRIMARY KEY,
+                    name        varchar(64) NOT NULL,
+                    city        varchar(64) NOT NULL,
+                    score       integer NOT NULL,
+                    qty         bigint NULL,
+                    rating      double precision NULL,
+                    rating32    real NULL,
+                    flag        boolean NULL,
+                    note        text NULL,
+                    note_short  varchar(8) NULL,
+                    blob        bytea NULL,
+                    oid_hex     varchar(24) NULL,
+                    oid_bytes   bytea NULL,
+                    created_at  timestamptz NULL,
+                    payload     jsonb NULL,
+                    body        jsonb NULL
                 )"
             )
             .as_str(),
@@ -54,48 +81,86 @@ async fn mongo_to_pg_body_pack_routes_bson_object_through_matrix() {
         .await
         .unwrap();
 
-    // Seed three docs with BSON-only types so a JSON detour from the
-    // source side would visibly degrade them — Decimal128 → canonical
-    // string, ObjectId → 24-hex, sub-document round-trips as a JSON
-    // object. Sorting by `_id` (the cursor) keeps the test order
-    // deterministic.
+    // Seed source docs that exercise every BSON variant we care about.
     let src = mongo
         .client
         .database(&src_db_mongo)
         .collection::<bson::Document>("docs");
+
     let oid = ObjectId::from_bytes([
         0x65, 0x4f, 0x10, 0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x00, 0x00, 0x01,
     ]);
-    let dec = Decimal128::from_str("1.230").unwrap();
-    let docs_seed = vec![
-        doc! {
-            "_id": 1_i64,
-            "name": "alice",
-            "amount": dec,
-            "tags": ["a", "b"],
-        },
-        doc! {
-            "_id": 2_i64,
-            "name": "bob",
-            "oid": oid,
-            "nested": { "city": "Berlin", "n": 7_i32 },
-        },
-        doc! {
-            "_id": 3_i64,
-            "name": "carol",
-            "score": 42_i32,
-        },
-    ];
-    for d in &docs_seed {
+    let blob_bytes = vec![0xDE, 0xAD, 0xBE, 0xEFu8];
+    let base = Utc.with_ymd_and_hms(2026, 4, 22, 10, 0, 0).unwrap();
+
+    // Row 1: every field present, every nullable column carries a value.
+    let doc_1 = doc! {
+        "_id": 1_i64,
+        "name": "alice",
+        "addr": { "city": "Berlin" },
+        "score": 10_i32,
+        "qty": 1_000_000_i64,
+        "rating": 1.5_f64,
+        // `rating_short` carries a value that fits Float32 to verify
+        // the truncate path doesn't visibly degrade in-range values.
+        "rating_short": 2.5_f64,
+        "flag": true,
+        "note": "hello",
+        // `note_long` carries text longer than the varchar(8) sink
+        // column so the runtime truncation path actually fires.
+        "note_long": "this string is way longer than eight chars",
+        "blob": Bson::Binary(bson::Binary {
+            subtype: BinarySubtype::Generic,
+            bytes: blob_bytes.clone(),
+        }),
+        "oid": oid,
+        "created_at": bson::DateTime::from_millis(base.timestamp_millis()),
+        "payload": doc! { "row": 1_i32, "tags": ["a", "b"] },
+    };
+
+    // Row 2: rotate NULLs through every nullable sink column and trip
+    // the `default` substitution on every NOT NULL sink column.
+    let doc_2 = doc! {
+        "_id": 2_i64,
+        // NULL on NOT NULL `name` -> default "anonymous" must fire.
+        "name": Bson::Null,
+        // NULL on NOT NULL `city` (via dot-path) -> default "unknown".
+        "addr": { "city": Bson::Null },
+        // NULL on NOT NULL `score` -> default -1.
+        "score": Bson::Null,
+        // Every nullable column nulled out so the NULL passthrough is
+        // exercised at least once per column within the sample.
+        "qty": Bson::Null,
+        "rating": Bson::Null,
+        "rating_short": Bson::Null,
+        "flag": Bson::Null,
+        "note": Bson::Null,
+        "note_long": Bson::Null,
+        "blob": Bson::Null,
+        "oid": Bson::Null,
+        "created_at": Bson::Null,
+        "payload": Bson::Null,
+    };
+
+    for d in [&doc_1, &doc_2] {
         src.insert_one(d.clone()).await.unwrap();
     }
 
     let mongo_url = mongo.url.clone();
     let pg_url = pg.url_with_search_path();
 
-    // Mapping: explicit `_id -> id` direct + `*:body` packs the rest
-    // (which under the mongo source's `read_batch` produces a
-    // BsonObject body, then the matrix converts it to JSON for JSONB).
+    // The mapping covers every canonical type:
+    //   * Bool (`flag`), Int32 (`score`), Int64 (`_id`, `qty`),
+    //     Float64 (`rating`), Float64→Float32 truncate (`rating_short`).
+    //   * Text unbounded → text (`note`); Text unbounded → varchar(N)
+    //     with truncate (`name`, `note_short`, dotted `city`).
+    //   * Bytes generic → bytea (`blob`).
+    //   * BSON DateTime → timestamptz (`created_at`).
+    //   * BSON Document → jsonb (`payload`).
+    //   * ObjectId (custom MongoObjectIdType) → varchar(24) (hex form)
+    //     AND → bytea (12-byte form), same `oid` feeding two sinks.
+    //   * `body = "*"` packs the whole document as JSONB so we exercise
+    //     the body-pack arm next to the typed columns.
     let config_toml = format!(
         r#"
 [[sources]]
@@ -121,12 +186,25 @@ from = "docs"
 to = "{dst_schema_pg}.docs"
 batch-limit = 8
 
-mapping = [
-    {{ from = "_id", to = "id", default = 0 }},
-    "*:body",
-]
-
 cursor = {{ fields = ["_id"], order = "asc", interval = "100ms" }}
+
+[flow.docs.mapping]
+id          = {{ from = "_id", default = 0 }}
+name        = {{ from = "name", truncate = true, default = "anonymous" }}
+city        = {{ from = "addr.city", truncate = true, default = "unknown" }}
+score       = {{ from = "score", default = -1 }}
+qty         = "qty"
+rating      = "rating"
+rating32    = {{ from = "rating_short", truncate = true }}
+flag        = "flag"
+note        = "note"
+note_short  = {{ from = "note_long", truncate = true }}
+blob        = "blob"
+oid_hex     = "oid"
+oid_bytes   = "oid"
+created_at  = "created_at"
+payload     = "payload"
+body        = "*"
 "#,
     );
 
@@ -136,48 +214,220 @@ cursor = {{ fields = ["_id"], order = "asc", interval = "100ms" }}
     let app = App::from_path(&config_path).expect("App::from_path");
     app.run_once().await.expect("run_once");
 
-    let rows: Vec<(i64, serde_json::Value)> = sqlx::query_as(&format!(
-        "SELECT id, body FROM \"{dst_schema_pg}\".docs ORDER BY id"
+    // Read everything back, ordered by id. Split into two SELECT
+    // queries because sqlx's `FromRow` is only implemented for tuples
+    // of arity ≤ 16.
+    #[allow(clippy::type_complexity)]
+    let head: Vec<(
+        i64,            // id
+        String,         // name
+        String,         // city
+        i32,            // score
+        Option<i64>,    // qty
+        Option<f64>,    // rating
+        Option<f32>,    // rating32
+        Option<bool>,   // flag
+        Option<String>, // note
+        Option<String>, // note_short
+    )> = sqlx::query_as(&format!(
+        "SELECT id, name, city, score, qty, rating, rating32, flag, note, note_short \
+         FROM \"{dst_schema_pg}\".docs ORDER BY id"
     ))
     .fetch_all(&pg.pool)
     .await
     .unwrap();
-    assert_eq!(rows.len(), 3, "all source docs must reach the pg sink");
+    #[allow(clippy::type_complexity)]
+    let tail: Vec<(
+        i64,                       // id
+        Option<Vec<u8>>,           // blob
+        Option<String>,            // oid_hex
+        Option<Vec<u8>>,           // oid_bytes
+        Option<DateTime<Utc>>,     // created_at
+        Option<serde_json::Value>, // payload
+        Option<serde_json::Value>, // body
+    )> = sqlx::query_as(&format!(
+        "SELECT id, blob, oid_hex, oid_bytes, created_at, payload, body \
+         FROM \"{dst_schema_pg}\".docs ORDER BY id"
+    ))
+    .fetch_all(&pg.pool)
+    .await
+    .unwrap();
+    assert_eq!(head.len(), 2, "all source docs must reach the pg sink");
+    assert_eq!(tail.len(), 2);
 
-    // Row 1: Decimal128 must surface as the canonical string `1.230`
-    // (the BsonObject → Json arm uses `bson_value::bson_to_json` which
-    // pins this form).
-    let (id1, ref body1) = rows[0];
-    assert_eq!(id1, 1);
-    assert_eq!(body1["name"], serde_json::Value::String("alice".into()));
+    // ---------- Row 1: every field populated ----------
+    let h1 = &head[0];
+    let t1 = &tail[0];
+    assert_eq!(h1.0, 1);
+    assert_eq!(h1.1, "alice");
+    assert_eq!(h1.2, "Berlin");
+    assert_eq!(h1.3, 10);
+    assert_eq!(h1.4, Some(1_000_000));
+    assert_eq!(h1.5, Some(1.5));
+    assert_eq!(h1.6, Some(2.5_f32));
+    assert_eq!(h1.7, Some(true));
+    assert_eq!(h1.8.as_deref(), Some("hello"));
+    // truncate path: the source text length > 8 chars; sink must hold
+    // only the first 8 UTF-8 chars.
+    assert_eq!(h1.9.as_deref(), Some("this str"));
+    assert_eq!(t1.1.as_deref(), Some(blob_bytes.as_slice()));
+    // ObjectId → 24-hex string.
+    assert_eq!(t1.2.as_deref(), Some("654f10800102030405000001"));
+    // Same ObjectId → 12-byte payload.
+    assert_eq!(t1.3.as_deref(), Some(oid.bytes().as_slice()));
+    assert_eq!(t1.4, Some(base));
     assert_eq!(
-        body1["amount"],
-        serde_json::Value::String("1.230".into()),
-        "Decimal128 must round-trip as canonical decimal string in JSON"
+        t1.5,
+        Some(serde_json::json!({ "row": 1, "tags": ["a", "b"] }))
     );
+    let body_1 = t1.6.as_ref().expect("body present on row 1");
+    assert_eq!(body_1["name"], serde_json::Value::String("alice".into()));
     assert_eq!(
-        body1["tags"],
-        serde_json::json!(["a", "b"]),
-        "BSON arrays must round-trip as JSON arrays"
+        body_1["oid"],
+        serde_json::Value::String("654f10800102030405000001".into())
     );
 
-    // Row 2: ObjectId must surface as 24-hex.
-    let (id2, ref body2) = rows[1];
-    assert_eq!(id2, 2);
-    assert_eq!(
-        body2["oid"],
-        serde_json::Value::String("654f10800102030405000001".into()),
-        "ObjectId must round-trip as 24-hex string in JSON"
-    );
-    assert_eq!(
-        body2["nested"]["city"],
-        serde_json::Value::String("Berlin".into())
+    // ---------- Row 2: defaults + NULL passthrough ----------
+    let h2 = &head[1];
+    let t2 = &tail[1];
+    assert_eq!(h2.0, 2);
+    assert_eq!(h2.1, "anonymous", "NOT NULL name -> default fired");
+    assert_eq!(h2.2, "unknown", "NOT NULL city -> default fired");
+    assert_eq!(h2.3, -1, "NOT NULL score -> default fired");
+    assert!(h2.4.is_none(), "nullable qty round-trips as NULL");
+    assert!(h2.5.is_none(), "nullable rating round-trips as NULL");
+    assert!(h2.6.is_none(), "nullable rating32 round-trips as NULL");
+    assert!(h2.7.is_none(), "nullable flag round-trips as NULL");
+    assert!(h2.8.is_none(), "nullable note round-trips as NULL");
+    assert!(h2.9.is_none(), "nullable note_short round-trips as NULL");
+    assert!(t2.1.is_none(), "nullable blob round-trips as NULL");
+    assert!(t2.2.is_none(), "nullable oid_hex round-trips as NULL");
+    assert!(t2.3.is_none(), "nullable oid_bytes round-trips as NULL");
+    assert!(t2.4.is_none(), "nullable created_at round-trips as NULL");
+    assert!(t2.5.is_none(), "nullable payload round-trips as NULL");
+
+    pg.pool.close().await;
+}
+
+/// AIR-70 `switch` expression with string keys, unstructured-to-struct
+/// (mongo schemaless source → pg sink). Last row hits the `default`
+/// arm because its `status` is not in the switch table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongo_to_pg_switch_string_keys_schemaless_source() {
+    let mongo = mongo_pool().await;
+    let pg = pg_pool().await;
+
+    let src_db_mongo = format!("{}_sw", mongo.database);
+    let state_db_mongo = format!("{}_sw_state", mongo.database);
+    let dst_schema_pg = format!("{}_sw", pg.schema);
+
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{dst_schema_pg}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{dst_schema_pg}\".orders_labelled (
+                    id           BIGINT,
+                    status_label TEXT
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let src = mongo
+        .client
+        .database(&src_db_mongo)
+        .collection::<bson::Document>("orders");
+    // 1, 2 — hits. 3 — miss → default arm. 4 — explicit null. 5 —
+    // missing field entirely (schemaless source, the key is just absent
+    // in the BSON document).
+    //
+    // Mongo schemaless source surfaces both "explicit null" and "field
+    // absent" as `Value::Null` into the runtime. `TransformOp::Switch`'s
+    // NULL-source branch returns the table default — so rows 4 and 5
+    // must land as "unknown" too.
+    let docs_seed = vec![
+        doc! { "_id": 1_i64, "status": "ACTIVE" },
+        doc! { "_id": 2_i64, "status": "FINISHED" },
+        doc! { "_id": 3_i64, "status": "OTHER" },
+        doc! { "_id": 4_i64, "status": bson::Bson::Null },
+        doc! { "_id": 5_i64 },
+    ];
+    for d in &docs_seed {
+        src.insert_one(d.clone()).await.unwrap();
+    }
+
+    let mongo_url = mongo.url.clone();
+    let pg_url = pg.url_with_search_path();
+
+    let config_toml = format!(
+        r#"
+[[sources]]
+name = "mongo_src"
+type = "mongodb"
+config = {{ url = "{mongo_url}", database = "{src_db_mongo}" }}
+
+[[sinks]]
+name = "pg_sink"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[storages]]
+name = "mongo_state"
+type = "mongodb"
+config = {{ url = "{mongo_url}", database = "{state_db_mongo}" }}
+
+[flow.orders]
+source = "mongo_src"
+sink = "pg_sink"
+storage = "mongo_state"
+from = "orders"
+to = "{dst_schema_pg}.orders_labelled"
+batch-limit = 8
+
+cursor = {{ fields = ["_id"], order = "asc", interval = "100ms" }}
+
+[flow.orders.mapping]
+id = {{ from = "_id", default = 0 }}
+status_label = {{ from = "status", switch = {{ ACTIVE = "active", FINISHED = "finished" }}, default = "unknown" }}
+"#,
     );
 
-    // Row 3: plain int field round-trips as a JSON number.
-    let (id3, ref body3) = rows[2];
-    assert_eq!(id3, 3);
-    assert_eq!(body3["score"], serde_json::json!(42));
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
+
+    let rows: Vec<(i64, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT id, status_label FROM \"{dst_schema_pg}\".orders_labelled ORDER BY id"
+    ))
+    .fetch_all(&pg.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0], (1, Some("active".to_string())));
+    assert_eq!(rows[1], (2, Some("finished".to_string())));
+    assert_eq!(
+        rows[2],
+        (3, Some("unknown".to_string())),
+        "miss must fall back to `default`"
+    );
+    assert_eq!(
+        rows[3],
+        (4, Some("unknown".to_string())),
+        "explicit BSON null source must take the switch default"
+    );
+    assert_eq!(
+        rows[4],
+        (5, Some("unknown".to_string())),
+        "missing source field (absent in document) must take the switch default"
+    );
 
     pg.pool.close().await;
 }

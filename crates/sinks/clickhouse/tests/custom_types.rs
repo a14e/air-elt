@@ -98,6 +98,7 @@ async fn round_trip_all_custom_types() {
                     fn_name: "sum".to_string(),
                 })),
             ],
+            body: None,
             op: RowOp::Upsert,
         }],
         next_cursor: None,

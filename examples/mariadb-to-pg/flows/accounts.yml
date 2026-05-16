@@ -12,8 +12,8 @@ flow:
     # `ext` is a native `UUID` column on both ends — identity passthrough on
     # the type matrix, no runtime conversion needed.
     mapping:
-      - { from: id, to: id }
-      - { from: ext, to: ext }
+      id: id
+      ext: ext
 
     cursor:
       fields: ["id"]

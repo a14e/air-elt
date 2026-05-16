@@ -7,7 +7,7 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::config::env_expand;
-use crate::config::model::{MappingRule, RootConfig};
+use crate::config::model::{MappingMap, MappingRhs, RootConfig};
 use crate::error::ConfigError;
 
 /// Hard cap on a single config file. Operator-controlled files in MVP are
@@ -347,47 +347,39 @@ fn merge_extra_into(
     Ok(())
 }
 
-/// `true` iff the raw shorthand string is a wildcard or json-pack token
-/// (`"*"`, `"*:*"`, or `"*:NAME"`). The loader only needs textual
-/// recognition — full grammar validation runs later in
-/// `crate::mapping::shorthand::parse`.
-fn shorthand_defers_subset_checks(s: &str) -> bool {
-    s == "*" || s == "*:*" || s.starts_with("*:")
-}
-
-/// `true` iff `mapping` contains any rule that triggers post-expansion
-/// resolution (wildcard or JSON auto-pack). Such rules invalidate the
-/// loader-time subset checks (`cursor.fields ⊆ mapping.from`,
-/// `conflict.key ⊆ mapping.to`, `batch_limit × cols ≤ 60_000`) because
-/// the actual column set is unknown until expansion runs in
-/// `validation::pipeline::validate`.
-fn mapping_defers_subset_checks(mapping: &[MappingRule]) -> bool {
-    mapping.iter().any(|r| match r {
-        MappingRule::Shorthand(s) => shorthand_defers_subset_checks(s),
-        MappingRule::Full(_) => false,
+/// `true` iff `mapping` contains any entry that triggers post-expansion
+/// resolution (wildcard `"*" = "*"` or body-pack `NAME = "*"`). Such
+/// entries invalidate the loader-time subset checks
+/// (`cursor.fields ⊆ mapping.from`, `conflict.key ⊆ mapping.to`,
+/// `batch_limit × cols ≤ 60_000`) because the actual column set is
+/// unknown until expansion runs in `validation::pipeline::validate`.
+fn mapping_defers_subset_checks(mapping: &MappingMap) -> bool {
+    mapping.iter().any(|(_, rhs)| match rhs {
+        MappingRhs::Short(s) => s == "*",
+        MappingRhs::Full(entry) => entry.from == "*",
     })
 }
 
-/// Pull `(from, to)` out of a mapping rule when it is statically
-/// determinable at loader time. Returns `None` for shorthands that
-/// require parsing (handled by `mapping::shorthand::parse` later) and
-/// for wildcard / json-pack tokens (caller must already have decided
-/// not to perform subset checks). When a shorthand is a literal column
-/// name `"NAME"` we treat both sides as `NAME`; for `"FROM:TO"` we
-/// split on the first colon. Anything that doesn't conform is left for
-/// the shorthand parser to reject — the loader's job is best-effort
-/// extraction for the subset checks.
-fn extract_static_pair(rule: &MappingRule) -> Option<(&str, &str)> {
-    match rule {
-        MappingRule::Full(entry) => Some((entry.from.as_str(), entry.to.as_str())),
-        MappingRule::Shorthand(s) => {
-            if shorthand_defers_subset_checks(s) {
-                return None;
-            }
-            if let Some((from, to)) = s.split_once(':') {
-                Some((from, to))
+/// Pull `(from, to)` out of a mapping entry when it is statically
+/// determinable at loader time. Returns `None` for entries whose RHS is
+/// the wildcard marker `"*"` (handled by `mapping::expand` later — the
+/// caller must have already decided not to perform subset checks). The
+/// `to` side is always the map key.
+fn extract_static_pair(entry: &(String, MappingRhs)) -> Option<(&str, &str)> {
+    let (to, rhs) = entry;
+    match rhs {
+        MappingRhs::Full(e) => {
+            if e.from == "*" {
+                None
             } else {
-                Some((s.as_str(), s.as_str()))
+                Some((e.from.as_str(), to.as_str()))
+            }
+        }
+        MappingRhs::Short(s) => {
+            if s == "*" {
+                None
+            } else {
+                Some((s.as_str(), to.as_str()))
             }
         }
     }
@@ -528,11 +520,10 @@ sink = "pg_sink"
 storage = "pg_state"
 from = "public.users"
 to = "analytics.users"
-mapping = [
-    { from = "id", to = "id" },
-    { from = "name", to = "name" },
-]
 cursor = { fields = ["id"], order = "asc", interval = "1s" }
+[flow.users.mapping]
+id = "id"
+name = "name"
 "#,
         );
         let root = load(&path).unwrap();
@@ -575,8 +566,9 @@ sink = "s"
 storage = "s"
 from = "t"
 to = "t"
-mapping = [{ from = "id", to = "id" }]
 cursor = { fields = ["id"] }
+[flow.f.mapping]
+id = "id"
 "#,
         );
         let root = load(&path).unwrap();
@@ -659,8 +651,9 @@ sink = "pg"
 storage = "pg"
 from = "t"
 to = "t"
-mapping = [{ from = "id", to = "id" }]
 cursor = { fields = ["created_at"] }
+[flow.f.mapping]
+id = "id"
 "#,
         );
         let err = load(&path).unwrap_err();
@@ -672,7 +665,7 @@ cursor = { fields = ["created_at"] }
         let dir = tempfile::tempdir().unwrap();
         let mut mapping_lines = String::new();
         for i in 0..20 {
-            mapping_lines.push_str(&format!("    {{ from = \"c{i}\", to = \"c{i}\" }},\n"));
+            mapping_lines.push_str(&format!("c{i} = \"c{i}\"\n"));
         }
         let path = write(
             dir.path(),
@@ -698,9 +691,9 @@ storage = "pg"
 from = "t"
 to = "t"
 batch-limit = 5000
-mapping = [
-{mapping_lines}]
 cursor = {{ fields = ["c0"] }}
+[flow.f.mapping]
+{mapping_lines}
 "#
             ),
         );
@@ -733,8 +726,9 @@ sink = "pg"
 storage = "pg"
 from = "t"
 to = "t"
-mapping = [{ from = "id", to = "id" }]
 cursor = { fields = ["id"], interval = "0s" }
+[flow.f.mapping]
+id = "id"
 "#,
         );
         let err = load(&path).unwrap_err();
@@ -770,8 +764,9 @@ storage = "pg"
 from = "t"
 to = "t"
 query-timeout = "0s"
-mapping = [{ from = "id", to = "id" }]
 cursor = { fields = ["id"] }
+[flow.f.mapping]
+id = "id"
 "#,
         );
         let err = load(&path).unwrap_err();
@@ -842,8 +837,8 @@ flow:
     from: public.users
     to: analytics.users
     mapping:
-      - { from: id, to: id }
-      - { from: name, to: name }
+      id: id
+      name: name
     cursor:
       fields: [id]
       order: asc
@@ -889,7 +884,7 @@ flow:
     storage: pg
     from: t
     to: t
-    mapping: [{ from: id, to: id }]
+    mapping: { id: id }
     cursor: { fields: [id] }
 "#,
         );
@@ -944,7 +939,7 @@ flow:
     from: users
     to: users
     mapping:
-      - { from: id, to: id }
+      id: id
     cursor: { fields: [id] }
 "#,
         );
@@ -980,8 +975,9 @@ sink = "pg"
 storage = "pg"
 from = "users"
 to = "users"
-mapping = [{ from = "id", to = "id" }]
 cursor = { fields = ["id"] }
+[flow.users.mapping]
+id = "id"
 "#,
         );
         let root = load(dir.path().join("config.yml")).unwrap();
@@ -1022,8 +1018,9 @@ sink = "pg"
 storage = "pg"
 from = "a"
 to = "a"
-mapping = [{ from = "id", to = "id" }]
 cursor = { fields = ["id"] }
+[flow.a.mapping]
+id = "id"
 "#,
         );
         write(
@@ -1037,7 +1034,7 @@ flow:
     storage: pg
     from: b
     to: b
-    mapping: [{ from: id, to: id }]
+    mapping: { id: id }
     cursor: { fields: [id] }
 "#,
         );
@@ -1052,7 +1049,7 @@ flow:
     storage: pg
     from: c
     to: c
-    mapping: [{ from: id, to: id }]
+    mapping: { id: id }
     cursor: { fields: [id] }
 "#,
         );
@@ -1096,8 +1093,9 @@ sink = "pg"
 storage = "pg"
 from = "u"
 to = "u"
-mapping = [{ from = "id", to = "id" }]
 cursor = { fields = ["id"] }
+[flow.users.mapping]
+id = "id"
 "#,
         );
         write(
@@ -1111,7 +1109,7 @@ flow:
     storage: pg
     from: u
     to: u
-    mapping: [{ from: id, to: id }]
+    mapping: { id: id }
     cursor: { fields: [id] }
 "#,
         );
@@ -1311,8 +1309,9 @@ sink = "pg"
 storage = "pg"
 from = "users"
 to = "users"
-mapping = [{ from = "id", to = "id" }]
 cursor = { fields = ["id"] }
+[flow.users.mapping]
+id = "id"
 "#,
         );
         write(
@@ -1325,8 +1324,9 @@ sink = "pg"
 storage = "pg"
 from = "users"
 to = "users"
-mapping = [{ from = "id", to = "id" }]
 cursor = { fields = ["id"] }
+[flow.users.mapping]
+id = "id"
 "#,
         );
         let err = load(dir.path().join("config.toml")).unwrap_err();
@@ -1359,7 +1359,7 @@ flow:
     storage: pg_state
     from: users
     to: users
-    mapping: [{ from: id, to: id }]
+    mapping: { id: id }
     cursor: { fields: [id] }
 "#,
         );
@@ -1419,7 +1419,7 @@ flow:
     storage: pg
     from: t
     to: t
-    mapping: [{ from: id, to: id }]
+    mapping: { id: id }
     cursor: { fields: [id] }
 ---
 flow:
@@ -1429,7 +1429,7 @@ flow:
     storage: pg
     from: t
     to: t
-    mapping: [{ from: id, to: id }]
+    mapping: { id: id }
     cursor: { fields: [id] }
 "#,
         );
@@ -1522,17 +1522,21 @@ sink = "pg"
 storage = "pg"
 from = "t"
 to = "t"
-mapping = ["*"]
 cursor = { fields = ["id"] }
+[flow.f.mapping]
+"*" = "*"
 "#,
         );
         let root = load(&path).unwrap();
-        // Wildcard rule survives to validation as a Shorthand("*") token.
+        // Wildcard rule survives to validation as a Short("*") token
+        // keyed by the wildcard sink "*".
         let mapping = &root.flow["f"].mapping;
         assert_eq!(mapping.len(), 1);
+        let (to, rhs) = mapping.iter().next().expect("one entry");
+        assert_eq!(to, "*");
         assert!(matches!(
-            &mapping[0],
-            crate::config::model::MappingRule::Shorthand(s) if s == "*"
+            rhs,
+            crate::config::model::MappingRhs::Short(s) if s == "*"
         ));
     }
 
@@ -1563,9 +1567,10 @@ sink = "pg"
 storage = "pg"
 from = "t"
 to = "t"
-mapping = ["*"]
 cursor = { fields = ["id"] }
 conflict = { key = ["id"], strategy = "overwrite" }
+[flow.f.mapping]
+"*" = "*"
 "#,
         );
         let root = load(&path).unwrap();
@@ -1601,8 +1606,10 @@ sink = "pg"
 storage = "pg"
 from = "t"
 to = "t"
-mapping = ["id", "*"]
 cursor = { fields = ["id"] }
+[flow.f.mapping]
+id = "id"
+"*" = "*"
 "#,
         );
         let root = load(&path).unwrap();
@@ -1614,7 +1621,7 @@ cursor = { fields = ["id"] }
     /// produce a deeply-equal `flow.mapping` shape.
     #[test]
     fn yaml_toml_mapping_shorthand_parity() {
-        use crate::config::model::MappingRule;
+        use crate::config::model::MappingRhs;
 
         let dir = tempfile::tempdir().unwrap();
         let toml_path = write(
@@ -1639,8 +1646,11 @@ sink = "pg"
 storage = "pg"
 from = "t"
 to = "t"
-mapping = ["id", "*", "*:body"]
 cursor = { fields = ["id"] }
+[flow.f.mapping]
+id = "id"
+"*" = "*"
+body = "*"
 "#,
         );
         let yaml_path = write(
@@ -1660,8 +1670,11 @@ flow:
     storage: pg
     from: t
     to: t
-    mapping: ["id", "*", "*:body"]
     cursor: { fields: ["id"] }
+    mapping:
+      id: "id"
+      "*": "*"
+      body: "*"
 "#,
         );
         let toml_root = load(&toml_path).unwrap();
@@ -1675,19 +1688,20 @@ flow:
         // derived `PartialEq` (the enum wraps `MappingEntry` whose
         // `default: Option<toml::Value>` field doesn't implement
         // `PartialEq` on every dependency version).
+        let expected: &[(&str, &str)] = &[("id", "id"), ("*", "*"), ("body", "*")];
         for mapping in [toml_mapping, yaml_mapping] {
-            assert!(matches!(
-                &mapping[0],
-                MappingRule::Shorthand(s) if s == "id"
-            ));
-            assert!(matches!(
-                &mapping[1],
-                MappingRule::Shorthand(s) if s == "*"
-            ));
-            assert!(matches!(
-                &mapping[2],
-                MappingRule::Shorthand(s) if s == "*:body"
-            ));
+            // Map insertion order is parser-dependent (`toml` 1.x does
+            // not guarantee preservation), so assert as a set.
+            for (to, from) in expected {
+                let found = mapping.iter().find(|(k, _)| k == *to).unwrap_or_else(|| {
+                    panic!("missing entry for sink {to:?}");
+                });
+                assert!(
+                    matches!(&found.1, MappingRhs::Short(s) if s == from),
+                    "entry {to:?} expected Short({from:?}), got {:?}",
+                    found.1
+                );
+            }
         }
     }
 
@@ -1714,7 +1728,8 @@ flow:
     storage: pg
     from: t
     to: t
-    mapping: [123]
+    mapping:
+      id: 42
     cursor: { fields: [id] }
 "#,
         );

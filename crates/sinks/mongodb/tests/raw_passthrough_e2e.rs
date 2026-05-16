@@ -45,10 +45,12 @@ async fn raw_passthrough_writes_documents_verbatim() {
         rows: vec![
             Row {
                 values: vec![Value::Custom(Box::new(BsonObjectValue(d1.clone())))],
+                body: None,
                 op: RowOp::Upsert,
             },
             Row {
                 values: vec![Value::Custom(Box::new(BsonObjectValue(d2.clone())))],
+                body: None,
                 op: RowOp::Upsert,
             },
         ],

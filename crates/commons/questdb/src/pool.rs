@@ -18,15 +18,28 @@ use air_elt_commons::pool_settings::PoolSettings;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 
 /// Open a pg-wire pool against the QuestDB server. The pool settings
-/// honour every field of [`PoolSettings`].
+/// honour every field of [`PoolSettings`]. Every connection is opened
+/// with `SET statement_timeout` derived from `pool.statement` so a
+/// stalled QuestDB query (WAL apply, write-lock contention, etc.) is
+/// cancelled server-side rather than blocking the test pool for the
+/// full TCP / `tokio::time::timeout` window.
 pub async fn connect_pool(pg_url: &str, pool: PoolSettings) -> RuntimeResult<PgPool> {
     let opts = PgConnectOptions::from_str(pg_url).map_err(RuntimeError::backend)?;
+    let statement_timeout_ms = pool.statement.as_millis() as u64;
     let pool_opts: PgPoolOptions = PgPoolOptions::new()
         .max_connections(pool.max_connections)
         .min_connections(pool.min_connections)
         .acquire_timeout(pool.acquire)
         .idle_timeout(Some(pool.idle))
-        .max_lifetime(Some(pool.max_lifetime));
+        .max_lifetime(Some(pool.max_lifetime))
+        .after_connect(move |conn, _meta| {
+            Box::pin(async move {
+                sqlx::query(&format!("SET statement_timeout = {statement_timeout_ms}"))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        });
 
     let connect_fut = pool_opts.connect_with(opts);
     let pg_pool = tokio::time::timeout(pool.connect, connect_fut)

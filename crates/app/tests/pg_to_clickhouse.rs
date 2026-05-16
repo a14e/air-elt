@@ -97,9 +97,9 @@ flow:
     batch-limit: 3
 
     mapping:
-      - {{ from: id, to: id }}
-      - {{ from: name, to: name }}
-      - {{ from: count, to: count }}
+      id: id
+      name: name
+      count: count
 
     cursor:
       fields: [id]
@@ -155,6 +155,15 @@ async fn pg_to_clickhouse_wide_types() {
     let src_schema = format!("{}_wide", pg.schema);
 
     // --- PG source table with many types ---
+    // Exercises the broadest set of canonical types that PG can produce and
+    // CH can consume:
+    //   * Bool, Int16/32/64, Float32/64,
+    //   * BigInt (numeric(20, 0)) — wider than i64,
+    //   * Decimal(10, 2) — fractional decimal,
+    //   * Text bounded (varchar) + unbounded (text),
+    //   * Date, Timestamp (UTC), Uuid, Json (jsonb).
+    //   * Nullable column to surface the BSON/Nullable contract.
+    //   * Two truncate cases (text unbounded → varchar / Int64 → Int32).
     pg.pool
         .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
         .await
@@ -169,10 +178,16 @@ async fn pg_to_clickhouse_wide_types() {
                     measure_real  REAL NOT NULL,
                     measure_dbl   DOUBLE PRECISION NOT NULL,
                     label         VARCHAR(100) NOT NULL,
+                    description   TEXT NOT NULL,
                     collected_at  TIMESTAMPTZ NOT NULL,
                     valid_from    DATE NOT NULL,
                     uid           UUID NOT NULL,
-                    price         NUMERIC(10,2) NOT NULL
+                    price         NUMERIC(10, 2) NOT NULL,
+                    huge_count    NUMERIC(20, 0) NOT NULL,
+                    nickname      TEXT,
+                    payload       JSONB NOT NULL,
+                    long_note     TEXT NOT NULL,
+                    legacy_big    BIGINT NOT NULL
                 )"
             )
             .as_str(),
@@ -186,11 +201,14 @@ async fn pg_to_clickhouse_wide_types() {
         .unwrap();
     let valid_from = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
     let price: bigdecimal::BigDecimal = "123.45".parse().unwrap();
+    let huge_count: bigdecimal::BigDecimal = "12345678901234567890".parse().unwrap();
 
     sqlx::query(&format!(
         "INSERT INTO \"{src_schema}\".data \
-         (id, flag, small, measure_real, measure_dbl, label, collected_at, valid_from, uid, price) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+         (id, flag, small, measure_real, measure_dbl, label, description, \
+          collected_at, valid_from, uid, price, huge_count, nickname, \
+          payload, long_note, legacy_big) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"
     ))
     .bind(1_i64)
     .bind(true)
@@ -198,15 +216,52 @@ async fn pg_to_clickhouse_wide_types() {
     .bind(5.25_f32)
     .bind(7.125_f64)
     .bind("hello world")
+    .bind("a longer plain text body")
     .bind(collected_at)
     .bind(valid_from)
     .bind(uid)
     .bind(price)
+    .bind(huge_count.clone())
+    .bind(Some("alice"))
+    .bind(serde_json::json!({ "k": "v", "n": 1 }))
+    .bind("alphabet-soup-overflow")
+    .bind(10_000_i64)
+    .execute(&pg.pool)
+    .await
+    .unwrap();
+
+    // Second row exercises NULL on the nullable `nickname` column and
+    // boundary values on the truncate paths.
+    sqlx::query(&format!(
+        "INSERT INTO \"{src_schema}\".data \
+         (id, flag, small, measure_real, measure_dbl, label, description, \
+          collected_at, valid_from, uid, price, huge_count, nickname, \
+          payload, long_note, legacy_big) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"
+    ))
+    .bind(2_i64)
+    .bind(false)
+    .bind(-7_i16)
+    .bind(-1.0_f32)
+    .bind(0.0_f64)
+    .bind("plain")
+    .bind("")
+    .bind(collected_at + chrono::Duration::seconds(60))
+    .bind(chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap())
+    .bind(uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap())
+    .bind("0.00".parse::<bigdecimal::BigDecimal>().unwrap())
+    .bind("1".parse::<bigdecimal::BigDecimal>().unwrap())
+    .bind(None::<String>)
+    .bind(serde_json::json!([1, 2, 3]))
+    .bind("tiny")
+    .bind(-1_000_000_i64)
     .execute(&pg.pool)
     .await
     .unwrap();
 
     // --- CH sink table ---
+    // Most columns mirror the source. `long_note_clipped` and `legacy_big`
+    // are intentionally narrower to exercise the truncate path.
     ch.exec(
         "CREATE TABLE data_wide (
             id Int64,
@@ -215,10 +270,16 @@ async fn pg_to_clickhouse_wide_types() {
             measure_real Float32,
             measure_dbl Float64,
             label String,
+            description String,
             collected_at DateTime,
             valid_from Date,
             uid UUID,
-            price Decimal(10, 2)
+            price Decimal(10, 2),
+            huge_count Decimal(20, 0),
+            nickname Nullable(String),
+            payload String,
+            long_note_clipped String,
+            legacy_big Int32
         ) ENGINE = MergeTree() ORDER BY id",
     )
     .await
@@ -227,6 +288,15 @@ async fn pg_to_clickhouse_wide_types() {
     let pg_url = pg.url_with_search_path();
     let ch_url = &ch.url;
 
+    // Mapping:
+    //   * identity for everything that lines up;
+    //   * `payload = { from = "payload", truncate = true }` — JSON → String
+    //     is a narrowing canonical path (Json → Text(n)) requiring opt-in;
+    //   * `long_note_clipped = { from = "long_note", truncate = true }` —
+    //     Text unbounded → bounded CH String is lossless but renaming to a
+    //     differently-named sink column requires the long form;
+    //   * `legacy_big = { from = "legacy_big", truncate = true }` — Int64
+    //     → Int32 narrowing; values fit i32 so no overflow.
     let config_yaml = format!(
         r#"
 sources:
@@ -255,19 +325,25 @@ flow:
     storage: st
     from: "{src_schema}.data"
     to: "data_wide"
-    batch-limit: 1
+    batch-limit: 2
 
     mapping:
-      - {{ from: id, to: id }}
-      - {{ from: flag, to: flag }}
-      - {{ from: small, to: small }}
-      - {{ from: measure_real, to: measure_real }}
-      - {{ from: measure_dbl, to: measure_dbl }}
-      - {{ from: label, to: label }}
-      - {{ from: collected_at, to: collected_at }}
-      - {{ from: valid_from, to: valid_from }}
-      - {{ from: uid, to: uid }}
-      - {{ from: price, to: price }}
+      id: id
+      flag: flag
+      small: small
+      measure_real: measure_real
+      measure_dbl: measure_dbl
+      label: label
+      description: description
+      collected_at: collected_at
+      valid_from: valid_from
+      uid: uid
+      price: price
+      huge_count: huge_count
+      nickname: nickname
+      payload: {{ from: payload, truncate: true }}
+      long_note_clipped: {{ from: long_note, truncate: true }}
+      legacy_big: {{ from: legacy_big, truncate: true }}
 
     cursor:
       fields: [id]
@@ -285,14 +361,20 @@ flow:
 
     // --- Verify data landed in ClickHouse ---
     let body = ch
-        .exec("SELECT id, flag, small, measure_real, measure_dbl, label, collected_at, valid_from, uid, price FROM data_wide ORDER BY id FORMAT TabSeparated")
+        .exec(
+            "SELECT id, flag, small, measure_real, measure_dbl, label, description, \
+                    collected_at, valid_from, uid, price, huge_count, \
+                    coalesce(nickname, '<<NULL>>'), payload, long_note_clipped, legacy_big \
+             FROM data_wide ORDER BY id FORMAT TabSeparated",
+        )
         .await
         .unwrap();
     let rows: Vec<&str> = body.trim().split('\n').collect();
-    assert_eq!(rows.len(), 1, "expected 1 row in CH: {body}");
-    let cells: Vec<&str> = rows[0].split('\t').collect();
-    assert_eq!(cells.len(), 10, "expected 10 columns: {rows:?}");
+    assert_eq!(rows.len(), 2, "expected 2 rows in CH: {body}");
 
+    // Row 1.
+    let cells: Vec<&str> = rows[0].split('\t').collect();
+    assert_eq!(cells.len(), 16, "expected 16 columns: {rows:?}");
     assert_eq!(cells[0], "1", "id");
     assert_eq!(cells[1], "true", "flag");
     assert_eq!(cells[2], "42", "small");
@@ -307,10 +389,42 @@ flow:
         "measure_dbl: {dbl_val}"
     );
     assert_eq!(cells[5], "hello world", "label");
-    assert_eq!(cells[6], "2025-06-15 12:30:45", "collected_at");
-    assert_eq!(cells[7], "2025-01-01", "valid_from");
-    assert_eq!(cells[8], "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "uid");
-    assert_eq!(cells[9], "123.45", "price");
+    assert_eq!(cells[6], "a longer plain text body", "description");
+    assert_eq!(cells[7], "2025-06-15 12:30:45", "collected_at");
+    assert_eq!(cells[8], "2025-01-01", "valid_from");
+    assert_eq!(cells[9], "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "uid");
+    assert_eq!(cells[10], "123.45", "price");
+    assert_eq!(cells[11], "12345678901234567890", "huge_count");
+    assert_eq!(cells[12], "alice", "nickname row 1");
+    // JSON serialised as canonical text by the runner.
+    let payload_parsed: serde_json::Value = serde_json::from_str(cells[13]).unwrap();
+    assert_eq!(payload_parsed, serde_json::json!({ "k": "v", "n": 1 }));
+    assert_eq!(
+        cells[14], "alphabet-soup-overflow",
+        "long_note round-trips intact (CH String is unbounded)"
+    );
+    assert_eq!(cells[15], "10000", "legacy_big row 1 fits i32");
+
+    // Row 2 — exercises NULL nickname + boundary values.
+    let cells2: Vec<&str> = rows[1].split('\t').collect();
+    assert_eq!(cells2.len(), 16);
+    assert_eq!(cells2[0], "2");
+    assert_eq!(cells2[1], "false");
+    assert_eq!(cells2[2], "-7");
+    assert_eq!(cells2[6], "", "empty description must round-trip");
+    // CH FORMAT TabSeparated may drop trailing zeros on Decimal — assert
+    // the numeric equality rather than the textual form.
+    let price2: bigdecimal::BigDecimal = cells2[10].parse().unwrap();
+    assert_eq!(price2, "0".parse::<bigdecimal::BigDecimal>().unwrap());
+    assert_eq!(cells2[11], "1", "BigInt 1");
+    assert_eq!(
+        cells2[12], "<<NULL>>",
+        "NULL nickname must land as SQL NULL on the CH side"
+    );
+    let payload2: serde_json::Value = serde_json::from_str(cells2[13]).unwrap();
+    assert_eq!(payload2, serde_json::json!([1, 2, 3]));
+    assert_eq!(cells2[14], "tiny");
+    assert_eq!(cells2[15], "-1000000");
 
     // --- Verify cursor was saved ---
     let cursors: Vec<(String, serde_json::Value)> =

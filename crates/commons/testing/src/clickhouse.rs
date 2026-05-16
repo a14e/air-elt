@@ -121,6 +121,7 @@ async fn clickhouse_base_url() -> &'static String {
             let container = ClickHouseImage::default()
                 .with_tag("24.8") // match CI — cf. ci.yml:210
                 .with_env_var("CLICKHOUSE_SKIP_USER_SETUP", "1")
+                .with_container_name(format!("air-elt-clickhouse-{sv}"))
                 .with_label(KIND_LABEL_KEY, KIND_LABEL_VALUE)
                 .with_label(sk, sv)
                 .with_reuse(ReuseDirective::Always)

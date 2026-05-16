@@ -59,9 +59,9 @@ The flow-level `[flow.<name>.validation]` block exposes four toggles: `access`, 
 
 Data moves through three explicit layers with disjoint responsibilities:
 
-1. **Source** emits `RawBatch { rows: Vec<RawRow> }`. Each `RawRow` carries `values: Vec<Value>`, an optional `body: Option<Value>` and `op: RowOp`. Sources populate `body` only when `ReadSpec.needs_body == true`: relational sources fill `Value::Json(build_body_json(...))` (see `air_elt_core::transform::build_body_json`); Mongo wraps the document as `Value::Custom(BsonObjectValue)`.
-2. **Transform** is a pure interpreter at `crates/core/src/transform/`. The IR is closed: `TransformOp::{ Take { source_index }, Body, Convert { input, plan } }`. `Transform::apply(raw) -> Batch` runs the program. The compile step caches an identity short-circuit when every column is `Take{i}` for `i in 0..len`. An "absorb-when-last" optimisation moves the value from the last reference to a given `Take{i}` slot or the `Body` payload; earlier references clone.
-3. **Sink** consumes the resulting `Batch { rows: Vec<Row { values, op }> }` via `write_batch`. Sinks no longer perform per-cell conversion or body packing — Transform produced the final shape.
+1. **Source** emits `Batch { rows: Vec<Row> }`. Each `Row` carries `values: Vec<Value>`, an optional `body: Option<Value>` and `op: RowOp`. Sources populate `body` only when `ReadSpec.needs_body == true`: relational sources fill `Value::Json(build_body_json(...))` (see `air_elt_core::transform::build_body_json`); Mongo wraps the document as `Value::Custom(BsonObjectValue)`. There is no separate `RawRow`/`RawBatch` — the same `Row`/`Batch` types travel through Transform and onto the sink (post-Transform rows carry `body = None`).
+2. **Transform** is a pure interpreter at `crates/core/src/transform/`. The IR is closed: `TransformOp::{ Take { source_index }, Body, Convert { input, plan }, Switch { input, table } }`. `Transform::apply(batch) -> Batch` runs the program. The compile step caches an identity short-circuit when every column is `Take{i}` for `i in 0..len` — and when no row carries a body, `apply` returns the input batch unchanged. An "absorb-when-last" optimisation moves the value from the last reference to a given `Take{i}` slot or the `Body` payload; earlier references clone. `Switch` evaluates its `input` op, hashes the result through `SwitchKey::from_value`, and looks up the matched value (or `table.default`) in an `AHashMap`.
+3. **Sink** consumes the resulting `Batch { rows: Vec<Row { values, body: None, op }> }` via `write_batch`. Sinks no longer perform per-cell conversion or body packing — Transform produced the final shape.
 
 Validation-time hooks: `Source::body_data_type() -> DataType` (default `Json`; Mongo overrides to `DataType::Custom(BsonObjectType)`), and `DynType::is_object() -> bool` (default `false`; `BsonObjectType` overrides to `true`). The Transform compiler uses these to type-check `Body` sources and to permit the schemaless raw-passthrough fast path.
 
@@ -109,12 +109,14 @@ sink    = "pg_sink"
 storage = "pg_state"
 from    = "public.users"
 to      = "analytics.users"
-mapping = [{ from = "id", to = "id" }, { from = "name", to = "name" }]
+[flow.users.mapping]
+id = "id"
+name = "name"
 cursor  = { fields = ["id"], order = "asc", interval = "1s" }
 batch-limit = 1024
 ```
 
-Flow names must be unique across the root file and every `include`'d file. `mapping` accepts only `from`, `to`, `truncate`, `default` (`deny_unknown_fields`). Includes are unbounded in number, but each file is capped at 16 MiB.
+Flow names must be unique across the root file and every `include`'d file. `mapping` is a TOML table keyed by sink column name; long-form entries accept only `from`, `truncate`, `default`, `switch` (`deny_unknown_fields`). Includes are unbounded in number, but each file is capped at 16 MiB.
 
 For the full reference (every section, every field, every default, every validation rule) read the `config-format` skill.
 

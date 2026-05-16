@@ -43,7 +43,7 @@ use air_elt_commons_mongodb::types::BsonObjectValue;
 use air_elt_commons_mongodb::{bson_value, identifier, path, sampling};
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::mapping::FieldPath;
-use air_elt_core::model::raw::{RawBatch, RawRow};
+use air_elt_core::model::{Batch, Row};
 use air_elt_core::model::{
     CursorFieldValue, CursorState, ReadSpec, RowOp, Schema, SchemaProvider, SourceCtx,
 };
@@ -152,7 +152,7 @@ impl Source for MongoCdcSource {
 
     fn body_data_type(&self) -> DataType {
         // CDC attaches the source `bson::Document` as a
-        // `Value::Custom(BsonObjectValue)` directly on `RawRow.body`.
+        // `Value::Custom(BsonObjectValue)` directly on `Row.body`.
         // Delete events with no full document attach an empty document
         // so `Transform::Body` always sees a value (sinks rely on key
         // columns for delete, not body).
@@ -253,7 +253,7 @@ impl Source for MongoCdcSource {
         spec: &ReadSpec,
         ctx: &Arc<dyn SourceCtx>,
         cursor: Option<&'a CursorState>,
-    ) -> RuntimeResult<RawBatch> {
+    ) -> RuntimeResult<Batch> {
         let my_ctx =
             ctx.as_any()
                 .downcast_ref::<MongoCdcCtx>()
@@ -449,7 +449,7 @@ impl Source for MongoCdcSource {
                 .map(|(_, d)| d.clone())
         };
 
-        let mut out_rows: Vec<RawRow> = Vec::with_capacity(events.len());
+        let mut out_rows: Vec<Row> = Vec::with_capacity(events.len());
         for event in events {
             match event.operation_type {
                 OperationType::Insert | OperationType::Replace => {
@@ -543,7 +543,7 @@ impl Source for MongoCdcSource {
             }
         });
 
-        Ok(RawBatch {
+        Ok(Batch {
             rows: out_rows,
             next_cursor,
         })
@@ -556,7 +556,7 @@ impl Source for MongoCdcSource {
         spec: &ReadSpec,
         _ctx: &Arc<dyn SourceCtx>,
         n: usize,
-    ) -> RuntimeResult<RawBatch> {
+    ) -> RuntimeResult<Batch> {
         // CDC streams are open-ended: the default `sample` impl
         // (which delegates to `read_batch`) would block on the change
         // stream until `operation_timeout` fires, returning nothing.
@@ -572,25 +572,25 @@ impl Source for MongoCdcSource {
             .collect::<RuntimeResult<_>>()?;
         // The shared helper returns a pre-Transform `Vec<Row>`; the
         // runner applies the Transform program afterwards. Wrap into a
-        // `RawBatch` (`body` omitted — sampling never flexes the
+        // `Batch` (`body` omitted — sampling never flexes the
         // body-fold path).
         let rows = sampling::rows_from_documents(docs, &column_paths)?;
         let raw_rows = rows
             .into_iter()
-            .map(|r| RawRow {
+            .map(|r| Row {
                 values: r.values,
                 body: None,
                 op: r.op,
             })
             .collect();
-        Ok(RawBatch {
+        Ok(Batch {
             rows: raw_rows,
             next_cursor: None,
         })
     }
 }
 
-/// Build a `RawRow` from a change-stream document. `body` is attached
+/// Build a `Row` from a change-stream document. `body` is attached
 /// when the flow has body targets (cost-guarded by the caller). For
 /// delete events the caller passes
 /// `Some(Value::Custom(BsonObjectValue(empty Document)))` so
@@ -600,7 +600,7 @@ fn map_row(
     doc: &Document,
     op: RowOp,
     body: Option<Value>,
-) -> RuntimeResult<RawRow> {
+) -> RuntimeResult<Row> {
     let mut values = Vec::with_capacity(paths.len());
     for p in paths {
         let v = match path::get(doc, p) {
@@ -610,8 +610,8 @@ fn map_row(
         values.push(v);
     }
     let row = match op {
-        RowOp::Upsert => RawRow::upsert(values),
-        RowOp::Delete => RawRow::delete(values),
+        RowOp::Upsert => Row::upsert(values),
+        RowOp::Delete => Row::delete(values),
     };
     Ok(row.with_body(body))
 }

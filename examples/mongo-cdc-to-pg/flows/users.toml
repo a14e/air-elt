@@ -10,11 +10,10 @@ to = "public.users"
 
 batch-limit = 500
 
-mapping = [
-    { from = "_id", to = "id" },
-    { from = "name", to = "name" },
-    { from = "email", to = "email" },
-]
+[flow.users.mapping]
+id = "_id"
+name = "name"
+email = "email"
 
 # Required for cdc — change events emit Upsert/Delete and the sink
 # needs a key to target. `id` (sink-side) is mapped from `_id` above.

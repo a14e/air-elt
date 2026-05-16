@@ -1,10 +1,17 @@
-use crate::error::{TypeError, ValidationError};
+use crate::error::ValidationError;
 use crate::mapping::DirectMapping;
 use crate::model::Schema;
-use crate::types::matrix;
 
-/// Verify that every mapped column exists on both sides and that the source's
-/// canonical type is compatible with the sink's canonical type.
+/// Structural mapping guard: every mapped column must exist on both
+/// sides, and a nullable source feeding a NOT-NULL sink must carry a
+/// `default` to bridge the gap.
+///
+/// Type-compatibility checking has moved into
+/// [`crate::validation::compatibility::CompatibilityValidator`], which
+/// compares each post-transform output `DataType` (resolved via
+/// `Transform::resolve_types`) against the sink column. This split lets
+/// cross-family flows (e.g. `Bool → Text` via `Switch`) succeed where
+/// the old source-vs-sink matrix would have rejected them.
 ///
 /// Operates on the post-expansion [`DirectMapping`] vector. Sink-driven
 /// wildcard expansion already filters out nullable sink columns that
@@ -16,9 +23,7 @@ pub fn check_mapping(
     mappings: &[DirectMapping],
 ) -> Result<(), ValidationError> {
     for m in mappings {
-        let DirectMapping {
-            from, to, truncate, ..
-        } = m;
+        let DirectMapping { from, to, .. } = m;
         let src_field = source_schema
             .find(from)
             .ok_or_else(|| ValidationError::MissingField {
@@ -31,40 +36,6 @@ pub fn check_mapping(
                 side: "sink",
                 field: to.clone(),
             })?;
-
-        // `truncate=true` opts the column into the wider compatibility
-        // matrix (`is_compatible_with_truncate`); without it we only
-        // allow the lossless set.
-        let compatible = if *truncate {
-            matrix::is_compatible_with_truncate(
-                src_field.data_type.clone(),
-                sink_field.data_type.clone(),
-            )
-        } else {
-            matrix::is_compatible(src_field.data_type.clone(), sink_field.data_type.clone())
-        };
-        if !compatible {
-            let type_err = if matrix::is_narrowing(
-                src_field.data_type.clone(),
-                sink_field.data_type.clone(),
-            ) {
-                TypeError::NarrowingNotAllowed {
-                    from: src_field.data_type.clone(),
-                    to: sink_field.data_type.clone(),
-                }
-            } else {
-                TypeError::UnsupportedCast {
-                    from: src_field.data_type.clone(),
-                    to: sink_field.data_type.clone(),
-                }
-            };
-            return Err(ValidationError::IncompatibleTypes {
-                field: format!("{from} -> {to}"),
-                from: src_field.data_type.clone(),
-                to: sink_field.data_type.clone(),
-                source: type_err,
-            });
-        }
 
         // Nullability: if source allows null but sink doesn't, a
         // `default` bridges the gap. Without one, reject with a
@@ -114,6 +85,7 @@ mod tests {
             to: to.into(),
             truncate: false,
             default_literal: None,
+            switch: None,
         }
     }
 
@@ -145,22 +117,6 @@ mod tests {
             err,
             ValidationError::MissingField { side: "sink", .. }
         ));
-    }
-
-    #[test]
-    fn narrowing_mapping_rejected() {
-        let src = Schema::new(vec![Field {
-            name: "v".into(),
-            data_type: DataType::Int64,
-            nullable: false,
-        }]);
-        let dst = Schema::new(vec![Field {
-            name: "v".into(),
-            data_type: DataType::Int32,
-            nullable: false,
-        }]);
-        let err = check_mapping(&src, &dst, &[mapping("v", "v")]).unwrap_err();
-        assert!(matches!(err, ValidationError::IncompatibleTypes { .. }));
     }
 
     #[test]

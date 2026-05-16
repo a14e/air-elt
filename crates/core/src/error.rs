@@ -175,6 +175,19 @@ pub enum ValidationError {
     )]
     DefaultRequiresFields { flow: String, column: String },
 
+    #[error(
+        "flow {flow:?} field {column:?}: `switch` requires `validation.fields = true` so \
+         the source and sink types can be resolved; with `fields = false` no schema \
+         introspection runs"
+    )]
+    SwitchRequiresFields { flow: String, column: String },
+
+    #[error(
+        "flow {flow:?} field {column:?}: `switch` without a `default` against a NOT NULL \
+         sink column — any miss would emit NULL and violate the constraint"
+    )]
+    SwitchMissingDefaultForNotNullSink { flow: String, column: String },
+
     #[error("field {column:?}: failed to parse default literal: {source}")]
     DefaultParse {
         flow: String,
@@ -244,6 +257,51 @@ pub enum ValidationError {
          declare explicit mapping entries for the key columns"
     )]
     ConflictKeyNotInMapping { flow: String, key: String },
+
+    #[error(
+        "flow {flow:?}: switch key {key:?} on column {column:?} cannot be parsed against \
+         source type {source_type:?}: {detail}"
+    )]
+    SwitchKeyTypeMismatch {
+        flow: String,
+        column: String,
+        key: String,
+        source_type: DataType,
+        detail: String,
+    },
+
+    #[error(
+        "flow {flow:?}: switch value on column {column:?} for key {key:?} cannot be parsed \
+         against sink type {sink_type:?}: {detail}"
+    )]
+    SwitchValueTypeMismatch {
+        flow: String,
+        column: String,
+        key: String,
+        sink_type: DataType,
+        detail: String,
+    },
+
+    #[error(
+        "flow {flow:?}: switch on column {column:?} cannot dispatch on source type \
+         {source_type:?} — switch keys require a scalar (Int/UInt/Float/Bool/Text/Date/\
+         Timestamp/Uuid/Bytes/Decimal/BigInt)"
+    )]
+    SwitchUnsupportedSource {
+        flow: String,
+        column: String,
+        source_type: DataType,
+    },
+
+    #[error(
+        "flow {flow:?}: switch on column {column:?} has duplicate canonical key {key:?} — \
+         two case keys collapse to the same source value"
+    )]
+    SwitchDuplicateKey {
+        flow: String,
+        column: String,
+        key: String,
+    },
 
     #[error(
         "table {table:?}: designated timestamp column {column:?} is not in mapping — \

@@ -181,7 +181,13 @@ async fn start_container() -> Result<Arc<ContainerAsync<GenericImage>>, BoxError
             })?;
     let image = GenericImage::new(image_repo, image_tag)
         .with_exposed_port(ContainerPort::Tcp(QUESTDB_PG_PORT))
-        .with_wait_for(WaitFor::message_on_stdout("Server is ready"))
+        // QuestDB 8.2.3 logs the pg-wire listener readiness as
+        // `A pg-server listening on 0.0.0.0:8812 ...`. Earlier images
+        // used `Server is ready`; 8.2.3 drops that line entirely.
+        // Match the listener log — it fires once the pg port is bound
+        // and accepting connections, which is exactly what
+        // `wait_for_pg_ready` then probes.
+        .with_wait_for(WaitFor::message_on_stdout("pg-server listening on"))
         .with_container_name(format!("air-elt-questdb-tc-{session_value}"))
         .with_label(KIND_LABEL_KEY, KIND_LABEL_VALUE)
         .with_label(session_key, session_value)
@@ -202,9 +208,9 @@ async fn start_container() -> Result<Arc<ContainerAsync<GenericImage>>, BoxError
 }
 
 /// Poll `SELECT 1` against the pg-wire endpoint until it succeeds.
-/// QuestDB's stdout `Server is ready` lands ahead of full pg-wire
-/// readiness, so the extra probe avoids races against early-arriving
-/// test queries.
+/// QuestDB's `pg-server listening on …` log line lands the moment the
+/// port is bound, but the planner may still be warming up — the extra
+/// probe avoids races against early-arriving test queries.
 async fn wait_for_pg_ready(url: &str) -> Result<(), BoxError> {
     let deadline = std::time::Instant::now() + READINESS_DEADLINE;
     let mut last_error: Option<String> = None;

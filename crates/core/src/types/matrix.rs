@@ -1,11 +1,14 @@
 use crate::types::data_type::DataType;
 
-/// Compatibility predicate for validation.
+/// Lossless compatibility predicate for validation.
 ///
 /// Each connector owns its `native_type ↔ DataType` mapping; this matrix only
 /// answers: "if the source produces `source_t`, can a sink whose column
-/// canonicalises to `sink_t` accept it?". Rejected pairings fail at
-/// `validate`, before any runtime work.
+/// canonicalises to `sink_t` accept it **without loss**?". Rejected
+/// pairings fail at `validate`, before any runtime work.
+///
+/// [`is_compatible_with_truncate`] is a true super-relation of this
+/// predicate: anything this function admits is also admitted there.
 ///
 /// Rules:
 /// * exact match always allowed (modulo size widening for `Text`/`Bytes`);
@@ -161,11 +164,21 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
     }
 }
 
-/// Variant of [`is_compatible`] that admits the additional pairs the user
-/// has explicitly opted into via `truncate=true` on the mapping. Forbidden
-/// combinations (`Json→Json`, `Xml→Xml`, `Uuid` truncations,
-/// `Date→Timestamp`) return `false` here too, signalling that no consent
-/// can rescue them.
+/// Variant of [`is_compatible`] that is a **true super-relation** of the
+/// lossless matrix: every pair `is_compatible` admits is also admitted
+/// here, plus the additional narrowing pairs unlocked by the user's
+/// explicit `truncate=true` opt-in. The super-relation invariant matters
+/// at the validator: a transform that yields `plan.sink = T` against a
+/// sink column of the same `T` must validate regardless of the
+/// `truncate` flag — `truncate=true` is "I accept lossy narrowing if any
+/// happens", never "I demand narrowing". Identity pairs `(T, T)` are the
+/// canonical case (Mongo `Timestamp → Date` with `truncate=true` lands
+/// the output as `Date`, and the validator then re-checks
+/// `(Date, Date)`).
+///
+/// Forbidden truly-lossy combinations (e.g. `Date → Timestamp`) remain
+/// `false` here too: no consent can rescue a cast that has no defined
+/// runtime semantics.
 pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool {
     use DataType::*;
     if let Union(vs) = &source_t {
@@ -190,23 +203,18 @@ pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool
     if let Custom(b) = &sink_t {
         return b.can_construct_from(&source_t, true);
     }
+    // Super-relation short-circuit: anything the lossless matrix admits
+    // is admitted here unconditionally. Identity pairs `(T, T)` —
+    // including `Json/Xml/Uuid/Date/Timestamp` — flow through this arm:
+    // a `truncate=true` flag on an already-lossless mapping is a
+    // harmless no-op, never a request to actually truncate. The runtime
+    // dispatcher decides when to raise `TruncationForbidden`; the
+    // validator must not pre-reject identity at type-check time.
     if is_compatible(source_t.clone(), sink_t.clone()) {
-        // truncate=true on a pair that's already lossless: harmless no-op,
-        // BUT explicitly forbid identities that have no defined truncation
-        // semantics — Json/Xml (structure corruption) and Uuid/Date/
-        // Timestamp (atomic types, "truncating" them is meaningless). The
-        // dispatcher raises TruncationForbidden at runtime; the matrix
-        // mirrors that so validation surfaces it pre-runtime as well.
-        return !matches!(
-            (source_t, sink_t),
-            (Json, Json) | (Xml, Xml) | (Uuid, Uuid) | (Date, Date) | (Timestamp, Timestamp)
-        );
+        return true;
     }
 
     match (source_t, sink_t) {
-        // Forbidden under truncate.
-        (Json, Json) | (Xml, Xml) => false,
-        (Uuid, Uuid) | (Date, Date) | (Timestamp, Timestamp) => false,
         (Date, Timestamp) => false,
         // UUID truncations don't have defined semantics — explicitly reject.
         (Uuid, Text { size: Some(n) }) if n < 36 => false,
@@ -227,6 +235,10 @@ pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool
         // Float narrowing.
         (Float64, Float32) => true,
         (Float64, Int64 | Int32 | Int16 | Int8 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        // Float32 narrowing (symmetric with Float64). Both lose the
+        // fractional part; on integer-magnitude overflow the runtime
+        // converter raises `TruncationForbidden` per the dispatcher.
+        (Float32, Int64 | Int32 | Int16 | Int8 | UInt64 | UInt32 | UInt16 | UInt8) => true,
         // BigInt narrowing.
         (BigInt { .. }, BigInt { .. }) => true,
         (BigInt { .. }, Int64 | Int32 | Int16 | Int8 | UInt64 | UInt32 | UInt16 | UInt8) => true,
@@ -333,12 +345,12 @@ pub fn is_narrowing(source_t: DataType, sink_t: DataType) -> bool {
             | (Int64, Int16 | Int8)
             | (Int64, Int32)
             | (Float64, Float32)
-            | (Float32, Int16)
-            | (Float32, Int32)
-            | (Float32, Int64)
-            | (Float64, Int16)
-            | (Float64, Int32)
-            | (Float64, Int64)
+            // Float → signed-int (truncate matrix admits all).
+            | (Float32, Int8 | Int16 | Int32 | Int64)
+            | (Float64, Int8 | Int16 | Int32 | Int64)
+            // Float → unsigned-int (truncate matrix admits all).
+            | (Float32, UInt8 | UInt16 | UInt32 | UInt64)
+            | (Float64, UInt8 | UInt16 | UInt32 | UInt64)
             // Unsigned narrowing.
             | (UInt16, UInt8)
             | (UInt32, UInt8)
@@ -769,13 +781,16 @@ mod tests {
     }
 
     #[test]
-    fn truncate_forbids_json_xml_identity() {
-        // identity is allowed without truncate (no-op), but truncate=true on
-        // Json→Json / Xml→Xml is explicitly forbidden — would corrupt syntax.
+    fn truncate_allows_json_xml_identity() {
+        // Identity flows through the super-relation: `truncate=true` on a
+        // lossless `Json→Json` / `Xml→Xml` mapping is a harmless no-op,
+        // never a request to actually truncate the structured payload.
+        // The runtime dispatcher is the place that raises
+        // `TruncationForbidden` if truncation is ever actually attempted.
         assert!(is_compatible(DataType::Json, DataType::Json));
-        assert!(!is_compatible_with_truncate(DataType::Json, DataType::Json));
+        assert!(is_compatible_with_truncate(DataType::Json, DataType::Json));
         assert!(is_compatible(DataType::Xml, DataType::Xml));
-        assert!(!is_compatible_with_truncate(DataType::Xml, DataType::Xml));
+        assert!(is_compatible_with_truncate(DataType::Xml, DataType::Xml));
     }
 
     #[test]
@@ -785,12 +800,15 @@ mod tests {
     }
 
     #[test]
-    fn truncate_forbids_atomic_identities() {
-        // Atomic identity-with-truncate is meaningless — matrix rejects so
-        // a misconfigured mapping surfaces at validation.
-        assert!(!is_compatible_with_truncate(DataType::Uuid, DataType::Uuid));
-        assert!(!is_compatible_with_truncate(DataType::Date, DataType::Date));
-        assert!(!is_compatible_with_truncate(
+    fn truncate_allows_atomic_identities() {
+        // Atomic identity-with-truncate flows through the super-relation:
+        // `truncate=true` on a lossless identity is a harmless no-op. The
+        // motivating case is a Mongo `Timestamp → Date with truncate=true`
+        // mapping whose `plan.sink = Date` is then re-validated against a
+        // `Date` sink column; the super-relation must admit it.
+        assert!(is_compatible_with_truncate(DataType::Uuid, DataType::Uuid));
+        assert!(is_compatible_with_truncate(DataType::Date, DataType::Date));
+        assert!(is_compatible_with_truncate(
             DataType::Timestamp,
             DataType::Timestamp
         ));
@@ -935,6 +953,53 @@ mod tests {
     fn truncate_unlocks_bytes_narrow_with_unbounded_source() {
         assert!(!is_compatible(BYTES, bytes(10)));
         assert!(is_compatible_with_truncate(BYTES, bytes(10)));
+    }
+
+    /// Super-relation invariant: every identity pair `(T, T)` that
+    /// `is_compatible` admits must also be admitted by
+    /// `is_compatible_with_truncate`. This guards against regressions
+    /// where the truncate matrix drifts back into a disjoint relation
+    /// and a `truncate=true` flag on an already-lossless identity is
+    /// wrongly rejected at validation time (Mongo `Timestamp → Date
+    /// with truncate=true` would re-check `(Date, Date)` and fail).
+    /// `Union` and `Custom` are skipped — both have variant-dependent
+    /// semantics and are covered by their own dedicated tests.
+    #[test]
+    fn truncate_admits_every_identity() {
+        let variants: Vec<DataType> = vec![
+            DataType::Bool,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+            DataType::Float32,
+            DataType::Float64,
+            bigint(20),
+            dec(10, 4),
+            TEXT,
+            text(64),
+            BYTES,
+            bytes(16),
+            DataType::Date,
+            DataType::Timestamp,
+            DataType::Uuid,
+            DataType::Json,
+            DataType::Xml,
+        ];
+        for t in variants {
+            assert!(
+                is_compatible(t.clone(), t.clone()),
+                "{t:?} must be lossless-compatible with itself"
+            );
+            assert!(
+                is_compatible_with_truncate(t.clone(), t.clone()),
+                "{t:?} must remain compatible under truncate (super-relation)"
+            );
+        }
     }
 
     // ---- Truncate deny-list under truncate -------------------------
@@ -1154,5 +1219,39 @@ mod tests {
             DataType::Bytes { size: None }
         ));
         assert!(!is_narrowing(DataType::Bytes { size: None }, custom));
+    }
+
+    /// Float32 → Int/UInt narrowing is admitted **only** under
+    /// `truncate=true` (symmetric with Float64 → Int/UInt). The lossless
+    /// matrix rejects, the truncate matrix admits, and `is_narrowing`
+    /// reports `true` so the validator surfaces `NarrowingNotAllowed`
+    /// (with the "enable truncate" hint) — not `UnsupportedCast`.
+    #[test]
+    fn float32_to_int_admitted_under_truncate() {
+        let sinks = [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ];
+        for sink in sinks {
+            assert!(
+                !is_compatible(DataType::Float32, sink.clone()),
+                "Float32 → {sink:?} must be rejected by the lossless matrix"
+            );
+            assert!(
+                is_compatible_with_truncate(DataType::Float32, sink.clone()),
+                "Float32 → {sink:?} must be admitted by the truncate matrix"
+            );
+            assert!(
+                is_narrowing(DataType::Float32, sink.clone()),
+                "Float32 → {sink:?} must report as narrowing so the validator \
+                 emits NarrowingNotAllowed when truncate is missing"
+            );
+        }
     }
 }

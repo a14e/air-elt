@@ -238,7 +238,9 @@ pub fn convert(
             _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
-        // Float narrowing — only with truncate.
+        // Float narrowing — only with truncate. Float32 widens
+        // losslessly to f64 inside `float_narrow::convert`, so the
+        // per-width saturation logic is shared.
         (DataType::Float64, DataType::Float32)
         | (DataType::Float64, DataType::Int64)
         | (DataType::Float64, DataType::Int32)
@@ -247,7 +249,15 @@ pub fn convert(
         | (DataType::Float64, DataType::UInt64)
         | (DataType::Float64, DataType::UInt32)
         | (DataType::Float64, DataType::UInt16)
-        | (DataType::Float64, DataType::UInt8) => {
+        | (DataType::Float64, DataType::UInt8)
+        | (DataType::Float32, DataType::Int64)
+        | (DataType::Float32, DataType::Int32)
+        | (DataType::Float32, DataType::Int16)
+        | (DataType::Float32, DataType::Int8)
+        | (DataType::Float32, DataType::UInt64)
+        | (DataType::Float32, DataType::UInt32)
+        | (DataType::Float32, DataType::UInt16)
+        | (DataType::Float32, DataType::UInt8) => {
             require_truncate(ctx, src, dst)?;
             float_narrow::convert(value, src, dst)
         }
@@ -1257,25 +1267,23 @@ mod tests {
 
     #[test]
     fn union_src_picks_int32_arm_at_runtime() {
-        // Source `Union(Int32 | Text)` against a Text sink: a runtime
-        // Int32 value should be re-dispatched as `Int32 → Text`. We
-        // pick an unbounded Text sink so widening goes through the
-        // Int → Bool / Int → … standard arms; here we use Bool because
-        // Int → Text isn't in the lossless matrix. So instead use
-        // sink = Int64: `Union(Int32 | Int64) → Int64` should yield
-        // an Int64.
-        let src = DataType::union(vec![DataType::Int32, DataType::Int64]);
+        // Use a genuinely heterogeneous Union — Int32 + UInt32 don't
+        // collapse via widening rules (signed/unsigned families stay
+        // separate in `collapse_union`), so we get a real
+        // `DataType::Union(Int32 | UInt32)` rather than a folded leaf.
+        // A runtime Int32 value must be re-dispatched as Int32 → Int64.
+        let src = DataType::union(vec![DataType::Int32, DataType::UInt32]);
+        assert!(matches!(src, DataType::Union(_)));
         let out = convert(Value::Int32(42), &src, &DataType::Int64, &passthrough()).unwrap();
         assert_eq!(out, Value::Int64(42));
     }
 
     #[test]
     fn union_src_picks_int64_arm_at_runtime() {
-        // Same union, but the runtime value is Int64 — must pass
-        // through unchanged via the identity short-circuit after the
-        // re-dispatch maps Int64 → DataType::Int64.
-        let src = DataType::union(vec![DataType::Int32, DataType::Int64]);
-        let out = convert(Value::Int64(99), &src, &DataType::Int64, &passthrough()).unwrap();
+        // Same heterogeneous union — runtime UInt32 value must be
+        // re-dispatched as UInt32 → Int64 (lossless widening).
+        let src = DataType::union(vec![DataType::Int32, DataType::UInt32]);
+        let out = convert(Value::UInt32(99), &src, &DataType::Int64, &passthrough()).unwrap();
         assert_eq!(out, Value::Int64(99));
     }
 

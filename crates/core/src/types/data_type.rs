@@ -92,28 +92,27 @@ impl DataType {
         DataType::Bytes { size: None }
     }
 
-    /// Build a normalised `Union`. Flattens any nested `Union(...)`
-    /// inputs so the result is always one level deep, then sorts and
-    /// deduplicates so equality is observation-order-independent, and
-    /// collapses a 1-element union to the bare variant.
-    pub fn union(vs: Vec<DataType>) -> Self {
-        let mut flat: Vec<DataType> = Vec::with_capacity(vs.len());
-        for v in vs {
-            match v {
-                DataType::Union(inner) => flat.extend(inner),
-                other => flat.push(other),
-            }
-        }
-        // Why: derived `Ord` is allocation-free (lexicographic on the
-        // discriminant + fields), unlike a `format!`-based sort key
-        // which would allocate two `String`s per comparison for a type
-        // that's otherwise stack-resident.
-        flat.sort();
-        flat.dedup();
-        if flat.len() == 1 {
-            return flat.into_iter().next().expect("len==1");
-        }
-        DataType::Union(flat)
+    /// Build a normalised type from a multiset of observed members.
+    ///
+    /// Thin wrapper over
+    /// [`crate::types::union_types::collapse_union`]: flattens nested
+    /// `Union(...)` inputs, widens any same-kind family (Int/UInt/
+    /// Float/Text/Bytes) where the matrix permits, and otherwise
+    /// returns a sorted + dedup'd `DataType::Union` so equality is
+    /// observation-order-independent. A 1-element input (after
+    /// normalisation) collapses to the bare variant; an empty input
+    /// returns `DataType::Union(Vec::new())`.
+    ///
+    /// Accepts any `IntoIterator<Item = DataType>` so callers that
+    /// already have an iterator (e.g. schema-inference folds) avoid
+    /// materialising a `Vec` just to call this. `Vec<DataType>`
+    /// satisfies the bound directly, so existing call sites keep
+    /// compiling unchanged.
+    pub fn union<I>(vs: I) -> Self
+    where
+        I: IntoIterator<Item = DataType>,
+    {
+        crate::types::union_types::collapse_union(vs)
     }
 
     /// Whether this type is admissible as a cursor field. `Json`/`Xml`/

@@ -8,13 +8,12 @@ to = "target.accounts"
 
 batch-limit = 500
 
+cursor = { fields = ["id"], order = "asc", interval = "1s" }
+
 # `ext` is `VARCHAR(36)` on the MySQL side and a native `UUID` column
 # on MariaDB 10.7+. The Text → Uuid runtime conversion in
 # `convert::uuid::parse_text` accepts the canonical 36-char form
 # (and the hex / `{...}` variants too).
-mapping = [
-    { from = "id", to = "id" },
-    { from = "ext", to = "ext" },
-]
-
-cursor = { fields = ["id"], order = "asc", interval = "1s" }
+[flow.accounts.mapping]
+id = "id"
+ext = "ext"

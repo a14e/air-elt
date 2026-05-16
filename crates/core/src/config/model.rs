@@ -95,8 +95,12 @@ pub struct FlowConfig {
     pub storage: String,
     pub from: String,
     pub to: String,
+    /// Inverted mapping: keys are sink column names, values are either a
+    /// bare string (interpreted as `from` — `"*"` is special: wildcard
+    /// when the key is also `"*"`, otherwise body-pack) or a full
+    /// [`MappingEntry`] table without `to`.
     #[serde(default)]
-    pub mapping: Vec<MappingRule>,
+    pub mapping: MappingMap,
     /// Cursor config. Pull-based sources (postgres, mysql, mongodb)
     /// require non-empty `fields`. CDC sources (mongo-cdc) require
     /// empty `fields` — pagination is driven by the resume token.
@@ -127,101 +131,239 @@ fn default_batch_limit() -> usize {
     1024
 }
 
-/// One mapping rule. Single flat shape:
-/// `{ from = "a", to = "b", truncate = bool, default = <value> }`.
+/// Ordered map of sink-column-name → mapping spec.
 ///
-/// `truncate` opts into otherwise-rejected narrowing conversions (text/bytes
-/// shrink, integer/float saturate, decimal scale drop, json→text serialize).
-/// `default` substitutes when the source value is `Null`. The default
-/// literal is parsed against the resolved sink `DataType` at validation
-/// time. Bytes columns require a typed prefix (`hex:`, `base64:`, `utf8:`,
-/// `bin:`); other types use the plain TOML literal.
-///
-/// `#[serde(deny_unknown_fields)]` blocks the previously-reserved fields
-/// (`transform`, `timezone`, `data-type`) and any future leakage of
-/// "for-the-future" knobs into the config surface.
-/// A single mapping rule on a flow's `mapping = [...]` array.
-///
-/// Two surface forms accepted by the loader:
-///
-/// 1. **Shorthand** — a bare string. Interpreted later by
-///    `crate::mapping::shorthand::parse`. Examples: `"id"` (identity),
-///    `"a:b"` (rename), `"*"` / `"*:*"` (wildcard expansion),
-///    `"*:body"` (JSON auto-pack).
-/// 2. **Full** — the long-form table `{ from, to, truncate?, default? }`,
-///    matching `MappingEntry` exactly (preserves `deny_unknown_fields`).
-///
-/// Deserialization uses a hand-written `Visitor` rather than
-/// `#[serde(untagged)]` so the error message names both alternatives
-/// when neither shape matches (e.g. a YAML integer or boolean).
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub enum MappingRule {
-    /// A shorthand string. Parsed downstream into one of `Field`,
-    /// `Renamed`, `Wildcard`, or `Body` by
-    /// `crate::mapping::shorthand::parse`.
-    Shorthand(String),
-    /// The long-form mapping entry. Carries the same shape as
-    /// `MappingEntry` and inherits its `deny_unknown_fields` discipline.
-    Full(MappingEntry),
+/// Preserves declaration order so wildcard fan-out and explicit
+/// overrides produce a deterministic post-expansion shape. Backed by a
+/// `Vec` of pairs rather than `HashMap` so insertion order survives the
+/// round-trip; duplicate keys are rejected at deserialisation time.
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(transparent)]
+pub struct MappingMap(pub Vec<(String, MappingRhs)>);
+
+impl MappingMap {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, (String, MappingRhs)> {
+        self.0.iter()
+    }
 }
 
-impl<'de> Deserialize<'de> for MappingRule {
+impl<'a> IntoIterator for &'a MappingMap {
+    type Item = &'a (String, MappingRhs);
+    type IntoIter = std::slice::Iter<'a, (String, MappingRhs)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'de> Deserialize<'de> for MappingMap {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_any(MappingRuleVisitor)
+        deserializer.deserialize_any(MappingMapVisitor)
     }
 }
 
-/// Custom visitor that produces a single, explicit error naming both
-/// accepted shapes when input is neither a string nor a table. This is
-/// nicer than the default `#[serde(untagged)]` "data did not match any
-/// variant" message which collapses both branches into one line and
-/// hides which variant tripped which way.
-struct MappingRuleVisitor;
+struct MappingMapVisitor;
 
-impl<'de> Visitor<'de> for MappingRuleVisitor {
-    type Value = MappingRule;
+impl<'de> Visitor<'de> for MappingMapVisitor {
+    type Value = MappingMap;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a mapping rule: expected string shorthand or full mapping table")
+        f.write_str(
+            "a [mapping] table keyed by sink column name (the old `mapping = [...]` array form \
+             is no longer supported)",
+        )
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut out: Vec<(String, MappingRhs)> = Vec::with_capacity(map.size_hint().unwrap_or(0));
+        let mut seen: ahash::AHashSet<String> = ahash::AHashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                return Err(M::Error::custom(format!(
+                    "duplicate mapping key {key:?} — sink column names must be unique"
+                )));
+            }
+            let value: MappingRhs = map.next_value()?;
+            out.push((key, value));
+        }
+        Ok(MappingMap(out))
+    }
+
+    fn visit_seq<S>(self, _seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: serde::de::SeqAccess<'de>,
+    {
+        Err(S::Error::custom(
+            "mapping must now be a table keyed by sink column (e.g. `[mapping]\\nsink_col = \
+             \"src_col\"`). The legacy `mapping = [...]` array form was removed — see AIR-70.",
+        ))
+    }
+}
+
+/// Right-hand side of one mapping entry.
+///
+/// Two surface forms:
+///
+/// 1. **Short** — a bare string. The bare value `"*"` is special:
+///    paired with key `"*"` it triggers wildcard fan-out, and paired
+///    with any other key it triggers body-pack into that sink column.
+///    Otherwise the string is interpreted as the source column name
+///    (`from`). Identity (`field = "field"`) and rename
+///    (`dst = "src"`) collapse to this same case.
+/// 2. **Full** — the long-form table `{ from, truncate?, default?,
+///    switch? }`. The map key carries `to`; specifying `to` inside the
+///    table is a `deny_unknown_fields` error.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum MappingRhs {
+    Short(String),
+    Full(MappingEntry),
+}
+
+impl<'de> Deserialize<'de> for MappingRhs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(MappingRhsVisitor)
+    }
+}
+
+struct MappingRhsVisitor;
+
+impl<'de> Visitor<'de> for MappingRhsVisitor {
+    type Value = MappingRhs;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "a mapping value: either a source column name (string) or a `{ from = \"...\", ... }` \
+             table",
+        )
     }
 
     fn visit_str<E: DeError>(self, v: &str) -> Result<Self::Value, E> {
-        Ok(MappingRule::Shorthand(v.to_string()))
+        Ok(MappingRhs::Short(v.to_string()))
     }
 
     fn visit_string<E: DeError>(self, v: String) -> Result<Self::Value, E> {
-        Ok(MappingRule::Shorthand(v))
+        Ok(MappingRhs::Short(v))
     }
 
     fn visit_borrowed_str<E: DeError>(self, v: &'de str) -> Result<Self::Value, E> {
-        Ok(MappingRule::Shorthand(v.to_string()))
+        Ok(MappingRhs::Short(v.to_string()))
     }
 
     fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
     where
         M: MapAccess<'de>,
     {
-        // Reuse `MappingEntry`'s own deserializer so `deny_unknown_fields`
-        // and field-rename semantics stay in lockstep with the long-form
-        // shape declared below.
         let entry = MappingEntry::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
-        Ok(MappingRule::Full(entry))
+        Ok(MappingRhs::Full(entry))
     }
 }
 
+/// Long-form mapping entry. The sink column name lives on the
+/// containing [`MappingMap`] key; `to` is intentionally absent here and
+/// `deny_unknown_fields` rejects attempts to specify it.
+///
+/// `truncate` opts into otherwise-rejected narrowing conversions (text/bytes
+/// shrink, integer/float saturate, decimal scale drop, json→text serialize).
+/// `default` substitutes when the source value is `Null` (and serves as
+/// the fallback when `switch` produces no match). Bytes columns require
+/// a typed prefix (`hex:`, `base64:`, `utf8:`, `bin:`); other types use
+/// the plain TOML literal.
+///
+/// `switch` declares a value-to-value lookup table — see
+/// [`SwitchTable`] for details.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct MappingEntry {
     pub from: String,
-    pub to: String,
     #[serde(default)]
     pub truncate: bool,
     #[serde(default)]
     pub default: Option<toml::Value>,
+    #[serde(default)]
+    pub switch: Option<SwitchTable>,
+}
+
+/// Ordered switch lookup table. Each entry maps a source-side value
+/// (canonicalised against the source `DataType` at validation time) to
+/// a sink-side value. Order is preserved purely for deterministic
+/// errors / debug output; runtime lookup is hash-based.
+///
+/// Keys are TOML strings — TOML inline-table keys are always strings
+/// in serde, so an integer-shaped source column accepts both bare
+/// `1 = "..."` and quoted `"1" = "..."` forms, both reaching us as
+/// `"1"`. The literal is later parsed against the source column type
+/// (Int, Bool, Text, Date, …) and canonicalised to the matching
+/// `Value`.
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(transparent)]
+pub struct SwitchTable(pub Vec<(String, toml::Value)>);
+
+impl SwitchTable {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, (String, toml::Value)> {
+        self.0.iter()
+    }
+}
+
+impl<'de> Deserialize<'de> for SwitchTable {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SwitchTableVisitor)
+    }
+}
+
+struct SwitchTableVisitor;
+
+impl<'de> Visitor<'de> for SwitchTableVisitor {
+    type Value = SwitchTable;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an inline table of switch key → value pairs")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut out: Vec<(String, toml::Value)> = Vec::with_capacity(map.size_hint().unwrap_or(0));
+        let mut seen: ahash::AHashSet<String> = ahash::AHashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                return Err(M::Error::custom(format!(
+                    "duplicate switch key {key:?} — switch keys must be unique"
+                )));
+            }
+            let value: toml::Value = map.next_value()?;
+            out.push((key, value));
+        }
+        Ok(SwitchTable(out))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
