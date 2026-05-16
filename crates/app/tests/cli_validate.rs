@@ -145,75 +145,51 @@ flow:
     pg.pool.close().await;
 }
 
-/// Negative case: two `*:body` JSON-pack rules pointing at the same
-/// sink column. `expand` runs `check_sink_uniqueness` after pack
-/// synthesis and emits `DuplicateSinkField`. Schema introspection runs
-/// (`validation.fields = true`) so source/sink schemas are populated;
-/// the failure surfaces purely from the mapping shape.
+/// Negative case (AIR-70): two mapping rules pointing at the same sink
+/// column. Before AIR-70 this surfaced post-expansion as
+/// `ValidationError::DuplicateSinkField` from `check_sink_uniqueness`;
+/// under the inverted keyed-table mapping form the duplicate is
+/// caught earlier — by `MappingMapVisitor::visit_map` in
+/// `crates/core/src/config/model.rs:194-198`, which dedupes via an
+/// AHashSet of keys it has already seen and emits a `serde::Error::custom`
+/// with the message `"duplicate mapping key {key:?} — sink column
+/// names must be unique"`.
 ///
-/// AIR-70: under the new keyed-table mapping form, two body-pack rules
-/// targeting the same sink column collapse to a single map key, so the
-/// failure now manifests as a parse-time `duplicate mapping key` error
-/// rather than a post-expansion `DuplicateSinkField`. The fixture is
-/// kept here for traceability but the test is ignored — the surface is
-/// covered by parser-level duplicate-key detection in
-/// `crates/core/src/config/model.rs::MappingMapVisitor::visit_map`.
-#[ignore = "AIR-70: duplicate body-pack target is now a parse-time duplicate-key error, not a post-expansion DuplicateSinkField"]
+/// `App::from_path` now fails at parse time; the operator never even
+/// reaches `validate()`. We assert on the displayed error containing
+/// our visitor's signature string so the contract is pinned regardless
+/// of which `ConfigError` variant transports it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn validate_rejects_duplicate_json_pack_target() {
-    let pg = pg_pool().await;
-
-    let src_schema = format!("{}_src", pg.schema);
-    pg.pool
-        .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
-        .await
-        .unwrap();
-    pg.pool
-        .execute(
-            format!("CREATE TABLE \"{src_schema}\".users (id BIGINT PRIMARY KEY, name TEXT)")
-                .as_str(),
-        )
-        .await
-        .unwrap();
-    pg.pool
-        .execute(
-            format!(
-                "CREATE TABLE \"{src_schema}\".sink_t (id BIGINT PRIMARY KEY, body JSONB NOT NULL)"
-            )
-            .as_str(),
-        )
-        .await
-        .unwrap();
-
-    let pg_url = pg.url_with_search_path();
-
-    let config_yaml = format!(
-        r#"
+async fn from_path_rejects_duplicate_mapping_key() {
+    // No DB is needed: the failure is at parse time, before any access
+    // probe runs. `App::from_path` reads the file, deserialises through
+    // our visitor, and returns the error synchronously.
+    let config_yaml = r#"
 sources:
   - name: src
     type: postgres
     config:
-      url: "{pg_url}"
+      url: "postgres://nobody@localhost/nope"
 
 sinks:
   - name: snk
     type: postgres
     config:
-      url: "{pg_url}"
+      url: "postgres://nobody@localhost/nope"
 
 storages:
   - name: st
     type: postgres
     config:
-      url: "{pg_url}"
+      url: "postgres://nobody@localhost/nope"
 
 flow:
   bad:
     source: src
     sink: snk
     storage: st
-    from: "{src_schema}.users"
-    to: "{src_schema}.sink_t"
+    from: "public.users"
+    to: "public.sink_t"
     batch-limit: 16
 
     mapping:
@@ -224,37 +200,22 @@ flow:
       fields: [id]
       order: asc
       interval: "1s"
-"#,
-    );
+"#;
 
     let tmp = tempfile::tempdir().unwrap();
     let config_path = tmp.path().join("config.yml");
-    std::fs::write(&config_path, &config_yaml).unwrap();
+    std::fs::write(&config_path, config_yaml).unwrap();
 
-    let app = App::from_path(&config_path).expect("App::from_path");
-    let err = app
-        .validate()
-        .await
-        .expect_err("validate() must reject duplicate JSON-pack targets");
-
-    let mut found = false;
-    let mut cur: &dyn std::error::Error = err.as_ref();
-    loop {
-        if let Some(ve) = cur.downcast_ref::<ValidationError>()
-            && matches!(ve, ValidationError::DuplicateSinkField { field, .. } if field == "body")
-        {
-            found = true;
-            break;
-        }
-        match cur.source() {
-            Some(s) => cur = s,
-            None => break,
-        }
-    }
+    let err = App::from_path(&config_path)
+        .err()
+        .expect("App::from_path must reject duplicate mapping key at parse time");
+    let displayed = format!("{err:#}");
     assert!(
-        found,
-        "expected ValidationError::DuplicateSinkField {{ field: \"body\", .. }} in chain; got: {err:#}"
+        displayed.contains("duplicate mapping key"),
+        "expected the visitor's duplicate-key signature, got: {displayed}"
     );
-
-    pg.pool.close().await;
+    assert!(
+        displayed.contains("\"body\""),
+        "expected the offending key name in the error, got: {displayed}"
+    );
 }

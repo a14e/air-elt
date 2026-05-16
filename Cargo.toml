@@ -69,7 +69,8 @@ iso8601-duration = "0.2.0"
 thiserror = "2.0.18"
 anyhow = "1.0.102"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2.3"
 clap = { version = "4.6.1", features = ["derive"] }
 mimalloc = { version = "0.1.50", default-features = false }
 chrono = { version = "0.4.44", features = ["serde"] }
