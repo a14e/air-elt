@@ -44,7 +44,13 @@
 use air_elt_app::App;
 use air_elt_commons_mongodb::bson_value;
 use air_elt_commons_testing::clickhouse::clickhouse_handle;
-use air_elt_commons_testing::mongo::mongo_pool;
+// CDC requires a replica set (`$changeStream` is RS-only). `mongo_rs_pool()`
+// honours `AIR_ELT_TEST_MONGO_URL` first, which in CI points at a plain
+// standalone Mongo service — that path fails on `coll.watch()` with
+// `Location40573`. `mongo_rs_pool()` bypasses the env override and uses
+// the dedicated RS container unconditionally, so this test runs against
+// the same backend in CI and locally.
+use air_elt_commons_testing::mongo::mongo_rs_pool;
 use air_elt_core::traits::Storage;
 use air_elt_storage_mongodb::{MongoStorage, MongoStorageConfig};
 use bson::{Bson, Document, doc};
@@ -52,7 +58,7 @@ use mongodb::Collection;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mongo_cdc_to_clickhouse_drops_deletes_and_advances_cursor() {
-    let mongo = mongo_pool().await;
+    let mongo = mongo_rs_pool().await;
     let ch = clickhouse_handle().await;
 
     // --- Mongo source collection ---
@@ -317,7 +323,7 @@ fn bson_doc_to_serde_json(doc: &Document) -> serde_json::Value {
 
 async fn enable_pre_post_images(client: &mongodb::Client, db: &str, coll: &str) {
     // collMod requires the collection to exist; the seed insert above
-    // guarantees that. Mongo 6+ honours the option; `mongo_pool()`
+    // guarantees that. Mongo 6+ honours the option; `mongo_rs_pool()`
     // always backs onto a mongo:8 RS container in this repo so we can
     // rely on the option being available.
     client

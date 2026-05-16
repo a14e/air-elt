@@ -812,7 +812,8 @@ mod tests {
         }]);
         let src = schema(&[("code", DataType::Int32, false)]);
         let dst = schema(&[("label", DataType::Text { size: None }, false)]);
-        build_derived_plans(&flow, &src, &dst).expect("switch's default is miss-fallback, not NULL-bridge");
+        build_derived_plans(&flow, &src, &dst)
+            .expect("switch's default is miss-fallback, not NULL-bridge");
     }
 
     /// Switch without `default` against a NULLABLE sink column is
