@@ -254,6 +254,7 @@ mod tests {
                 fields: vec!["id".into()],
                 order: CursorOrder::Asc,
                 interval: std::time::Duration::from_secs(1),
+                jitter: None,
             },
             batch_limit: 100,
             query_timeout: None,

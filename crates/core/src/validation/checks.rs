@@ -55,6 +55,31 @@ pub fn check_mapping(
     Ok(())
 }
 
+/// Presence-only mapping guard for schemaless sources: every `from`
+/// must resolve to a field in the sampled schema, but nullability is
+/// **not** enforced (sampling is non-exhaustive, so a missing
+/// `nullable=true` flag can't be trusted as a hard rejection). Catches
+/// typos like `from = "usr_id"` instead of `"user_id"` when the
+/// sampled schema carries the typed field.
+///
+/// Callers MUST guard with `!sampled.fields().is_empty()` — an empty
+/// sample (no docs / collection empty) carries no information and we
+/// don't want to reject a valid mapping just because sampling missed.
+pub fn check_mapping_sources_exist(
+    source_schema: &Schema,
+    mappings: &[DirectMapping],
+) -> Result<(), ValidationError> {
+    for m in mappings {
+        if source_schema.find(&m.from).is_none() {
+            return Err(ValidationError::MissingField {
+                side: "source",
+                field: m.from.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Cursor fields must exist in the source schema.
 pub fn check_cursor(
     flow: &str,

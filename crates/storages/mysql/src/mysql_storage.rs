@@ -5,6 +5,7 @@ use tracing::{debug, info};
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::model::CursorState;
 use air_elt_core::traits::Storage;
+use air_elt_core::types::DataType;
 
 use crate::config::model::MySqlStorageConfig;
 use crate::sql_statements as sql;
@@ -17,23 +18,22 @@ pub struct MySqlStorage {
     /// MariaDB / older MySQL.
     upsert_sql: &'static str,
     upsert_resume_token_sql: &'static str,
+    pool_max_connections: u32,
 }
 
 impl MySqlStorage {
     pub async fn connect(config: MySqlStorageConfig) -> RuntimeResult<Self> {
-        let pool = air_elt_commons_mysql::pool::connect(
-            &config.url,
-            air_elt_commons_mysql::pool::PoolSettings::from_options(
-                config.connect_timeout,
-                config.acquire_timeout,
-                config.idle_timeout,
-                config.max_lifetime,
-                config.statement_timeout,
-                config.max_connections,
-                config.min_connections,
-            ),
-        )
-        .await?;
+        let pool_settings = air_elt_commons_mysql::pool::PoolSettings::from_options(
+            config.connect_timeout,
+            config.acquire_timeout,
+            config.idle_timeout,
+            config.max_lifetime,
+            config.statement_timeout,
+            config.max_connections,
+            config.min_connections,
+        )?;
+        let pool_max_connections = pool_settings.max_connections;
+        let pool = air_elt_commons_mysql::pool::connect(&config.url, pool_settings).await?;
         let version: String = sqlx::query_scalar("SELECT VERSION()")
             .fetch_one(&pool)
             .await
@@ -45,6 +45,7 @@ impl MySqlStorage {
             pool,
             upsert_sql,
             upsert_resume_token_sql,
+            pool_max_connections,
         })
     }
 
@@ -84,6 +85,10 @@ impl MySqlStorage {
 
 #[async_trait]
 impl Storage for MySqlStorage {
+    fn max_connections(&self) -> u32 {
+        self.pool_max_connections
+    }
+
     async fn validate_access(&self) -> RuntimeResult<()> {
         self.ensure_connection_alive().await?;
         let exists = self.cursor_table_exists().await?;
@@ -107,13 +112,17 @@ impl Storage for MySqlStorage {
         Ok(())
     }
 
-    async fn load_cursor(&self, flow: &str) -> RuntimeResult<Option<CursorState>> {
+    async fn load_cursor(
+        &self,
+        flow: &str,
+        cursor_types: &[DataType],
+    ) -> RuntimeResult<Option<CursorState>> {
         let row: Option<(serde_json::Value,)> = sqlx::query_as(sql::SELECT_CURSOR)
             .bind(flow)
             .fetch_optional(&self.pool)
             .await
             .map_err(RuntimeError::backend)?;
-        row.map(|(json,)| serde_json::from_value::<CursorState>(json).map_err(RuntimeError::from))
+        row.map(|(json,)| CursorState::from_typed_json(json, cursor_types))
             .transpose()
     }
 

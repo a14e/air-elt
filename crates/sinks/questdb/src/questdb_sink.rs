@@ -61,6 +61,7 @@ impl SchemaProvider for QuestDbSinkCtx {
 
 pub struct QuestDbSink {
     pool: PgPool,
+    pool_max_connections: u32,
 }
 
 impl QuestDbSink {
@@ -74,9 +75,13 @@ impl QuestDbSink {
             None,
             config.max_connections,
             config.min_connections,
-        );
+        )?;
+        let pool_max_connections = pool_settings.max_connections;
         let pool = connect_pool(&config.url, pool_settings).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            pool_max_connections,
+        })
     }
 
     /// Step 1: explicit conflict-config rejection. QuestDB's only dedup
@@ -172,6 +177,10 @@ impl Sink for QuestDbSink {
         false
     }
 
+    fn max_connections(&self) -> u32 {
+        self.pool_max_connections
+    }
+
     async fn validate_access(&self, spec: &WriteSpec) -> RuntimeResult<()> {
         Self::reject_conflict_block(spec)?;
         ping(&self.pool).await?;
@@ -194,10 +203,13 @@ impl Sink for QuestDbSink {
     }
 
     async fn build_context(&self, spec: &WriteSpec) -> RuntimeResult<Arc<dyn SinkCtx>> {
+        // The designated-timestamp + conflict-block invariants are
+        // primarily enforced at `validate_access`. We re-check both
+        // here so a flow with `validation.inserts = false` (which
+        // skips `validate_access`) still surfaces a typed error
+        // before any write hits the wire.
+        Self::reject_conflict_block(spec)?;
         let schema_with_designated = fetch_schema(&self.pool, &spec.table).await?;
-        // The designated-timestamp invariant is enforced up-front at
-        // `validate_access` time; we re-check here defensively so a flow
-        // that skips validation still surfaces a typed error.
         if schema_with_designated.designated_column.is_none() {
             return Err(ValidationError::MissingDesignatedTimestamp {
                 table: spec.table.clone(),

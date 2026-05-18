@@ -431,3 +431,123 @@ status_label = {{ from = "status", switch = {{ ACTIVE = "active", FINISHED = "fi
 
     pg.pool.close().await;
 }
+
+/// AIR-69 schemaless-source heterogeneous-value drift: a single Mongo
+/// collection where the same field carries `Int32` in some documents
+/// and `Int64` in others. Pre-AIR-69 the sample-derived
+/// `ColumnConversionPlan` baked the first variant the sampler saw, so
+/// the second variant would blow up at runtime with
+/// `ValueShapeMismatch`. With `Source::schemaless = true` the Transform
+/// compiler emits a dynamic-source `TransformOp::Convert`
+/// (`ColumnConversionPlan.source = None`) and the runtime
+/// resolves the source `DataType` from the actual `Value` variant per
+/// cell — every doc lands cleanly in the typed PG sink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongo_to_pg_heterogeneous_int_widths_drain_successfully() {
+    let mongo = mongo_pool().await;
+    let pg = pg_pool().await;
+
+    let src_db_mongo = format!("{}_drift", mongo.database);
+    let state_db_mongo = format!("{}_drift_state", mongo.database);
+    let dst_schema_pg = format!("{}_drift", pg.schema);
+
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{dst_schema_pg}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                // Sink demands `bigint` — wide enough to admit both
+                // Int32 and Int64 BSON values via dynamic dispatch.
+                "CREATE TABLE \"{dst_schema_pg}\".metrics (
+                    id    bigint PRIMARY KEY,
+                    score bigint NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let src = mongo
+        .client
+        .database(&src_db_mongo)
+        .collection::<bson::Document>("metrics");
+    // Mix Int32 (BSON `i32`) and Int64 (BSON `i64`) on the same field
+    // `score` across documents. The first batch of docs reads with
+    // `score` as Int32; the second batch is Int64. Under a static
+    // plan the second batch would fail; under dynamic-source Convert
+    // (`plan.source = None`) both
+    // succeed and round-trip into the `bigint` sink.
+    let docs_seed: Vec<bson::Document> = vec![
+        doc! { "_id": 1_i64, "score": 10_i32 },
+        doc! { "_id": 2_i64, "score": 20_i32 },
+        doc! { "_id": 3_i64, "score": 9_000_000_000_i64 },
+        doc! { "_id": 4_i64, "score": 30_i32 },
+        doc! { "_id": 5_i64, "score": 12_000_000_000_i64 },
+    ];
+    for d in &docs_seed {
+        src.insert_one(d.clone()).await.unwrap();
+    }
+
+    let mongo_url = mongo.url.clone();
+    let pg_url = pg.url_with_search_path();
+
+    let config_toml = format!(
+        r#"
+[[sources]]
+name = "mongo_src"
+type = "mongodb"
+config = {{ url = "{mongo_url}", database = "{src_db_mongo}" }}
+
+[[sinks]]
+name = "pg_sink"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[storages]]
+name = "mongo_state"
+type = "mongodb"
+config = {{ url = "{mongo_url}", database = "{state_db_mongo}" }}
+
+[flow.metrics]
+source = "mongo_src"
+sink = "pg_sink"
+storage = "mongo_state"
+from = "metrics"
+to = "{dst_schema_pg}.metrics"
+batch-limit = 16
+
+cursor = {{ fields = ["_id"], order = "asc", interval = "100ms" }}
+
+[flow.metrics.mapping]
+id = "_id"
+score = "score"
+"#,
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once()
+        .await
+        .expect("run_once with mixed int widths");
+
+    let rows: Vec<(i64, i64)> = sqlx::query_as(&format!(
+        "SELECT id, score FROM \"{dst_schema_pg}\".metrics ORDER BY id"
+    ))
+    .fetch_all(&pg.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0], (1, 10));
+    assert_eq!(rows[1], (2, 20));
+    assert_eq!(rows[2], (3, 9_000_000_000));
+    assert_eq!(rows[3], (4, 30));
+    assert_eq!(rows[4], (5, 12_000_000_000));
+
+    pg.pool.close().await;
+}

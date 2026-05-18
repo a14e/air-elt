@@ -1,5 +1,5 @@
 //! `_id: ObjectId` exercised as the cursor field — verifies that the
-//! `MongoObjectIdType::can_be_cursor() = true` flag is honoured end-to-end
+//! `MongoObjectIdType::cursor_compatible() = true` flag is honoured end-to-end
 //! and that ObjectId values flow through the cursor pagination loop
 //! without ever being flattened to `Bytes(12)`.
 

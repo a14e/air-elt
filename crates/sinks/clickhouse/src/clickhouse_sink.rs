@@ -45,6 +45,7 @@ impl SchemaProvider for ChSinkCtx {
 
 pub struct ChSink {
     client: ChClient,
+    pool_max_connections: u32,
 }
 
 impl ChSink {
@@ -58,13 +59,14 @@ impl ChSink {
             config.request_timeout,
             config.max_connections,
             Some(defaults.min_connections),
-        );
+        )?;
         // Map a vanishingly small per-stmt timeout to a usable default,
         // matching the SQL backends.
         let pool = PoolSettings {
             statement: pool.statement.max(Duration::from_secs(1)),
             ..pool
         };
+        let pool_max_connections = pool.max_connections;
         let compression = match config.compression {
             crate::config::model::ChCompressionKind::None => ChCompression::None,
             crate::config::model::ChCompressionKind::Lz4 => ChCompression::Lz4,
@@ -78,7 +80,10 @@ impl ChSink {
             compression,
         })
         .map_err(RuntimeError::backend)?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            pool_max_connections,
+        })
     }
 }
 
@@ -86,6 +91,10 @@ impl ChSink {
 impl Sink for ChSink {
     fn supports_deletes(&self) -> bool {
         false
+    }
+
+    fn max_connections(&self) -> u32 {
+        self.pool_max_connections
     }
 
     async fn validate_access(&self, spec: &WriteSpec) -> RuntimeResult<()> {

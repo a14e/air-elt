@@ -58,6 +58,7 @@ pub struct MongoSource {
     /// client-side shutdown / timeout (the `mongodb` 3.x driver is not
     /// cancellation-safe; see `task::detached`).
     operation_timeout: Duration,
+    pool_max_connections: u32,
 }
 
 impl MongoSource {
@@ -83,8 +84,9 @@ impl MongoSource {
             config.operation_timeout,
             config.max_connections,
             config.min_connections,
-        );
+        )?;
         let operation_timeout = settings.statement;
+        let pool_max_connections = settings.max_connections;
         let client = connect(&config.url, settings).await?;
         Ok(Self {
             client,
@@ -92,6 +94,7 @@ impl MongoSource {
             schema_sample: config.schema_sample_size.unwrap_or(DEFAULT_SCHEMA_SAMPLE),
             name,
             operation_timeout,
+            pool_max_connections,
         })
     }
 
@@ -147,6 +150,10 @@ impl SchemaProvider for MongoSourceCtx {
 impl Source for MongoSource {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn max_connections(&self) -> u32 {
+        self.pool_max_connections
     }
 
     fn schemaless(&self) -> bool {

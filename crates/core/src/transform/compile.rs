@@ -28,12 +28,19 @@ use crate::types::DataType;
 /// - `read_columns`: the post-expansion source-side column list
 ///   (i.e. `expanded.read_columns()`). Used to size the source-index
 ///   universe for `Take` ops.
+/// - `source_schemaless`: when `true`, every non-identity / non-switch
+///   direct column emits a dynamic-source [`TransformOp::Convert`]
+///   (with `plan.source = None`) keyed off the sink type only — the
+///   sampled "source type" is not authoritative for schemaless sources
+///   (Mongo). When `false`, the static `Convert` path is emitted with
+///   the resolved source `DataType` baked into `plan.source`.
 pub fn compile_to_transform(
     expanded: &ExpandedMapping,
     source_body_data_type: DataType,
     conversions: &[ColumnConversionPlan],
     body_conversions: &[ColumnConversionPlan],
     read_columns: &[String],
+    source_schemaless: bool,
 ) -> Result<Transform, ValidationError> {
     if conversions.len() != expanded.direct.len() {
         return Err(invariant(format!(
@@ -87,6 +94,23 @@ pub fn compile_to_transform(
             TransformOp::Switch {
                 input: Box::new(take),
                 table: switch,
+                truncate: plan.ctx.truncate,
+            }
+        } else if source_schemaless {
+            // Schemaless source: the sampled `plan.source` is a
+            // hypothesis, not a runtime contract. Even when the
+            // hypothesis matches the sink (identity-shape), a single
+            // cross-doc shape drift would blow up the static Convert
+            // path. We emit a dynamic-source `Convert` (plan.source =
+            // None) which dispatches on the actual `Value` variant per
+            // cell; the dispatcher short-circuits identity pairs
+            // internally, so the cost vs `Take` is one variant probe
+            // per cell.
+            let mut dyn_plan = plan.clone();
+            dyn_plan.source = None;
+            TransformOp::Convert {
+                input: Box::new(take),
+                plan: dyn_plan,
                 truncate: plan.ctx.truncate,
             }
         } else if plan.is_identity() {
@@ -186,6 +210,7 @@ mod tests {
             &conversions,
             &body_conversions,
             &read_columns,
+            false,
         )
         .unwrap();
         assert_eq!(t.cols.len(), 2);
@@ -200,7 +225,7 @@ mod tests {
             body: None,
         };
         let plan = ColumnConversionPlan {
-            source: DataType::Int16,
+            source: Some(DataType::Int16),
             sink: DataType::Int64,
             ctx: crate::types::ConversionContext::passthrough(),
             switch: None,
@@ -212,6 +237,7 @@ mod tests {
             std::slice::from_ref(&plan),
             &[],
             &read_columns,
+            false,
         )
         .unwrap();
         match &t.cols[0] {
@@ -239,6 +265,7 @@ mod tests {
             std::slice::from_ref(&plan),
             &[],
             &read_columns,
+            false,
         )
         .unwrap_err();
         assert!(matches!(err, ValidationError::AccessFailed { .. }));
@@ -253,7 +280,8 @@ mod tests {
                 targets: vec!["body".into()],
             }),
         };
-        let err = compile_to_transform(&expanded, DataType::Json, &[], &[], &[]).unwrap_err();
+        let err =
+            compile_to_transform(&expanded, DataType::Json, &[], &[], &[], false).unwrap_err();
         assert!(matches!(
             err,
             ValidationError::AccessFailed {
@@ -270,7 +298,7 @@ mod tests {
             body: None,
         };
         let plan = ColumnConversionPlan {
-            source: DataType::Int32,
+            source: Some(DataType::Int32),
             sink: DataType::Int32,
             ctx: crate::types::ConversionContext::passthrough(),
             switch: None,
@@ -282,6 +310,7 @@ mod tests {
             std::slice::from_ref(&plan),
             &[],
             &read_columns,
+            false,
         )
         .unwrap();
         assert!(matches!(&t.cols[0], TransformOp::Take { source_index: 0 }));
@@ -310,7 +339,7 @@ mod tests {
             body: None,
         };
         let plan = ColumnConversionPlan {
-            source: DataType::Bool,
+            source: Some(DataType::Bool),
             sink: DataType::Text { size: None },
             ctx: crate::types::ConversionContext::passthrough(),
             switch: Some(table),
@@ -322,6 +351,7 @@ mod tests {
             std::slice::from_ref(&plan),
             &[],
             &read_columns,
+            false,
         )
         .unwrap();
         assert_eq!(t.cols.len(), 1);
@@ -348,8 +378,15 @@ mod tests {
             }),
         };
         let body_conversions = vec![ColumnConversionPlan::identity(DataType::Json)];
-        let t =
-            compile_to_transform(&expanded, DataType::Json, &[], &body_conversions, &[]).unwrap();
+        let t = compile_to_transform(
+            &expanded,
+            DataType::Json,
+            &[],
+            &body_conversions,
+            &[],
+            false,
+        )
+        .unwrap();
         assert_eq!(t.cols.len(), 1);
         assert!(matches!(&t.cols[0], TransformOp::Body));
     }

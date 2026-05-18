@@ -23,7 +23,7 @@
 //!
 //! ## Cursor
 //!
-//! `can_be_cursor() = true`. ObjectIds carry monotonically-incrementing
+//! `cursor_compatible() = true`. ObjectIds carry monotonically-incrementing
 //! counters within the same process and timestamps across processes —
 //! good enough for cursor ordering in practice.
 
@@ -85,8 +85,24 @@ impl DynType for MongoObjectIdType {
         Self::KIND
     }
 
-    fn can_be_cursor(&self) -> bool {
+    fn cursor_compatible(&self) -> bool {
         true
+    }
+
+    /// Decode a 24-char lowercase-hex string back into a
+    /// [`MongoObjectIdValue`]. Mirrors the [`DynValue::to_json`]
+    /// projection — keep the two in lock-step.
+    fn decode_cursor_value(&self, v: &serde_json::Value) -> Result<Box<dyn DynValue>, String> {
+        let s = v
+            .as_str()
+            .ok_or_else(|| format!("expected hex string for {}", MongoObjectIdType::KIND))?;
+        let arr = parse_hex_24(s).ok_or_else(|| {
+            format!(
+                "invalid ObjectId hex (need 24 lowercase chars) for {}",
+                MongoObjectIdType::KIND
+            )
+        })?;
+        Ok(Box::new(MongoObjectIdValue(arr)))
     }
 
     fn can_convert_to(&self, target: &DataType, truncate: bool) -> bool {
@@ -303,8 +319,8 @@ mod tests {
     }
 
     #[test]
-    fn can_be_cursor_true() {
-        assert!(MongoObjectIdType.can_be_cursor());
+    fn cursor_compatible_true() {
+        assert!(MongoObjectIdType.cursor_compatible());
     }
 
     #[test]
@@ -577,5 +593,57 @@ mod tests {
         let v: Box<dyn DynValue> = Box::new(MongoObjectIdValue(sample_oid()));
         let cloned = v.clone_box();
         assert!(v.eq_dyn(&*cloned));
+    }
+
+    /// `decode_cursor_value` is the inverse of `DynValue::to_json` —
+    /// round-trip via the cursor envelope must yield the original
+    /// payload. This is the building block for cursor JSON storage
+    /// round-tripping ObjectId cursor values.
+    #[test]
+    fn decode_cursor_value_round_trips_to_json() {
+        let original = MongoObjectIdValue(sample_oid());
+        let payload = DynValue::to_json(&original).unwrap();
+        let back = MongoObjectIdType
+            .decode_cursor_value(&payload)
+            .expect("decode");
+        let downcast = back
+            .as_any()
+            .downcast_ref::<MongoObjectIdValue>()
+            .expect("downcast");
+        assert_eq!(downcast.0, original.0);
+    }
+
+    #[test]
+    fn decode_cursor_value_rejects_non_hex() {
+        let res = MongoObjectIdType.decode_cursor_value(&serde_json::json!("not-hex"));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn decode_cursor_value_rejects_non_string() {
+        let res = MongoObjectIdType.decode_cursor_value(&serde_json::json!(123));
+        assert!(res.is_err());
+    }
+
+    /// Typed cursor round-trip: serialise an ObjectId `Value::Custom`
+    /// through `Value::Serialize`, then recover it via
+    /// `DataType::decode_cursor_json` — the registry-free path the
+    /// storage layer uses.
+    #[test]
+    fn data_type_decode_cursor_json_round_trip() {
+        let original = MongoObjectIdValue(sample_oid());
+        let v = Value::Custom(Box::new(original.clone()));
+        let json = serde_json::to_value(&v).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "custom",
+                "kind": MongoObjectIdType::KIND,
+                "value": "654f10800102030405000001",
+            })
+        );
+        let dt = DataType::Custom(Box::new(MongoObjectIdType));
+        let back = dt.decode_cursor_json(json).expect("typed decode");
+        assert_eq!(back, v);
     }
 }

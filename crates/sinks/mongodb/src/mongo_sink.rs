@@ -69,6 +69,7 @@ pub struct MongoSink {
     /// Per-operation cap; applied as `max_time` / `maxTimeMS` on every
     /// server-side call. Bounds runaway server work after a detach.
     operation_timeout: Duration,
+    pool_max_connections: u32,
 }
 
 impl MongoSink {
@@ -98,8 +99,9 @@ impl MongoSink {
             config.operation_timeout,
             config.max_connections,
             config.min_connections,
-        );
+        )?;
         let operation_timeout = settings.statement;
+        let pool_max_connections = settings.max_connections;
         let client = connect(&config.url, settings).await?;
         let server_version = version::detect(&client).await?;
         info!(
@@ -113,6 +115,7 @@ impl MongoSink {
             database,
             server_version,
             operation_timeout,
+            pool_max_connections,
         })
     }
 
@@ -192,6 +195,10 @@ impl SchemaProvider for MongoSinkCtx {
 
 #[async_trait]
 impl Sink for MongoSink {
+    fn max_connections(&self) -> u32 {
+        self.pool_max_connections
+    }
+
     async fn validate_access(&self, spec: &WriteSpec) -> RuntimeResult<()> {
         let client = self.client.clone();
         let database = self.database.clone();

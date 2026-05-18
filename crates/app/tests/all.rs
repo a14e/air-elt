@@ -1,3 +1,4 @@
+mod app_migrate_ordering;
 mod cli_validate;
 mod cockroachdb_to_pg;
 mod mariadb_to_pg;
@@ -11,3 +12,4 @@ mod pg_to_cockroachdb;
 mod pg_to_mongo;
 mod pg_to_pg;
 mod pg_to_questdb;
+mod validation_semaphore;

@@ -17,7 +17,7 @@ use air_elt_core::config::loader;
 use air_elt_core::config::model::RootConfig;
 use air_elt_core::flow::engine::FlowEngine;
 use air_elt_core::flow::runner::RunMode;
-use air_elt_core::model::FlowState;
+use air_elt_core::model::{AssembledFlow, FlowState};
 use air_elt_core::registry::Registry;
 use air_elt_core::validation::pipeline::{assemble, validate};
 
@@ -38,21 +38,39 @@ pub struct ListedKinds {
 pub struct App {
     config: RootConfig,
     registry: Registry,
-    /// Tracks whether `Storage::migrate` has run for this `App`. Set by
-    /// either an explicit `migrate()` call or the implicit one inside
-    /// `run_once()`. Subsequent calls skip the DDL pass — sqlx migrate
-    /// is already idempotent at the SQL level, but the round-trip is
-    /// still measurable, and skipping it keeps the contract obvious:
-    /// migrate exactly once per `App`.
+    /// Tracks whether `Storage::migrate` has run **to completion** for
+    /// this `App`. Flipped to `true` only after every storage's
+    /// `migrate()` returned `Ok`; a partial failure (e.g. storage #2
+    /// errors after #1 succeeded) leaves the flag at `false` so the
+    /// next caller retries the full pass. The `migrate_lock` mutex
+    /// below serialises concurrent attempts so we don't run the DDL
+    /// twice when two callers race.
     migrated: AtomicBool,
-    /// Lazily-populated cache of the validated flows. Filled on first
-    /// call to `flows()` and reused by every subsequent `migrate` /
-    /// `validate` / `run_once` / `run_daemon`. Caching the validated
-    /// `Vec<FlowState>` (rather than re-running `assemble + validate`
-    /// per call) keeps the same `Arc<dyn Source/Sink/Storage>` —
-    /// and therefore the same sqlx/mongo pools — alive across
-    /// successive operations on the same `App`.
-    flows: OnceCell<Vec<FlowState>>,
+    /// Serialises concurrent calls to `migrate()` / `run_once()` so
+    /// only one task drives the DDL pass at a time. The atomic above
+    /// is the "done" signal; this mutex is the "in flight" gate. The
+    /// `Notify`-pattern alternative would be more elegant but the
+    /// mutex is dead-simple and migrate is a once-per-process event.
+    migrate_lock: tokio::sync::Mutex<()>,
+    /// Lazily-populated cache of the assembled flows — the no-I/O stage
+    /// of the validation pipeline that resolves component names, builds
+    /// connector instances through the registry, and constructs the
+    /// per-flow `ReadSpec`/`WriteSpec` halves. Filled on first call to
+    /// `flows_assembled()` and reused by every subsequent operation on
+    /// this `App`. Caching here (rather than re-running `assemble` per
+    /// call) keeps the same `Arc<dyn Source/Sink/Storage>` — and
+    /// therefore the same sqlx/mongo pools — alive across successive
+    /// `migrate` / `validate` / `run_once` / `run_daemon` calls.
+    assembled: OnceCell<Vec<AssembledFlow>>,
+    /// Lazily-populated cache of the validated flows — the I/O stage of
+    /// the validation pipeline (access probes, schema introspection,
+    /// type matrix, optional sampling). Filled on first call to
+    /// `flows_validated()`. Distinct from `assembled` because
+    /// `migrate()` must be able to drive `Storage::migrate` on the
+    /// assembled flows *before* any I/O probe runs — sampling-validation
+    /// reads `air_elt_cursors` through the runner, which would fail on a
+    /// fresh database whose storage tables don't exist yet.
+    validated: OnceCell<Vec<FlowState>>,
 }
 
 impl App {
@@ -69,18 +87,39 @@ impl App {
             config,
             registry: build_registry(),
             migrated: AtomicBool::new(false),
-            flows: OnceCell::new(),
+            migrate_lock: tokio::sync::Mutex::new(()),
+            assembled: OnceCell::new(),
+            validated: OnceCell::new(),
         }
     }
 
-    /// Lazily compute (and cache) the validated `Vec<FlowState>` for this
-    /// `App`. Internal helper used by `migrate`, `validate`, `run_once`,
-    /// and `run_daemon` so they share a single `assemble + validate`
-    /// pass — and thereby the same connector `Arc`s and pools.
-    async fn flows(&self) -> Result<&Vec<FlowState>> {
-        self.flows
+    /// Lazily run (and cache) the no-I/O `assemble` stage. Used by
+    /// `migrate` (which must run `Storage::migrate` *before* any I/O
+    /// probe) and by `flows_validated` (which feeds the assembled flows
+    /// into the I/O stage). Caching means every subsequent operation on
+    /// this `App` reuses the same connector `Arc`s — and therefore the
+    /// same sqlx/mongo pools.
+    async fn flows_assembled(&self) -> Result<&Vec<AssembledFlow>> {
+        self.assembled
             .get_or_try_init(|| async {
                 let assembled = assemble(&self.config, &self.registry).await?;
+                Ok::<_, anyhow::Error>(assembled)
+            })
+            .await
+    }
+
+    /// Lazily run (and cache) the full validation pipeline. Builds on
+    /// the cached `flows_assembled` output and runs the I/O stage
+    /// (access probes, schema introspection, type matrix, optional
+    /// sampling). Callers that depend on storage tables existing (i.e.
+    /// `run_once`, `run_daemon`) MUST have run `migrate()` first — the
+    /// sampling-validation path issues `SELECT … FROM air_elt_cursors`
+    /// through the runner, which fails on a fresh database without the
+    /// storage migrations applied.
+    async fn flows_validated(&self) -> Result<&Vec<FlowState>> {
+        self.validated
+            .get_or_try_init(|| async {
+                let assembled = self.flows_assembled().await?.clone();
                 let flows = validate(assembled).await?;
                 Ok::<_, anyhow::Error>(flows)
             })
@@ -97,44 +136,63 @@ impl App {
     }
 
     /// Run the full validation pipeline (assemble + validate). I/O probes
-    /// against every declared connector.
+    /// against every declared connector. Sampling-validation (when
+    /// enabled) drives a dry-run runner tick that reads from
+    /// `air_elt_cursors`, so callers operating against a fresh database
+    /// must call `migrate()` first.
     pub fn validate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            self.flows().await?;
+            self.flows_validated().await?;
             Ok(())
         })
     }
 
-    /// Run `Storage::migrate` for every declared storage. The DDL is
-    /// issued through the `assemble`-built `Arc<dyn Storage>` handles —
-    /// no separate validate pass, since validate's purpose is to
-    /// I/O-probe and we'd rather defer that to the runner caller. After
+    /// Run `Storage::migrate` for every declared storage. Only the
+    /// no-I/O `assemble` stage runs first — the validation I/O probes
+    /// are deferred to the runner caller. This ordering is load-bearing:
+    /// sampling-validation reads from `air_elt_cursors` through the
+    /// runner, so running it before the storage tables exist would
+    /// surface as `relation "air_elt_cursors" does not exist`. After
     /// this returns, the `migrated` flag is set so `run_once` won't
     /// repeat the DDL.
     pub fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            let flows = self.flows().await?;
-            if !self.migrated.swap(true, Ordering::AcqRel) {
-                for f in flows {
-                    f.storage.migrate().await?;
-                }
+            let assembled = self.flows_assembled().await?;
+            // Fast path: already done. Avoids taking the mutex on
+            // steady-state callers (e.g. multiple `run_once()` in a
+            // row).
+            if self.migrated.load(Ordering::Acquire) {
+                return Ok(());
             }
+            let _guard = self.migrate_lock.lock().await;
+            // Re-check inside the lock — a racing caller may have
+            // completed the pass while we were waiting.
+            if self.migrated.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            for f in assembled {
+                f.storage.migrate().await?;
+            }
+            // Flag flips ONLY after every migrate() returned Ok.
+            // A mid-pass failure leaves the flag at false, so the
+            // next caller retries the whole DDL pass against the
+            // remaining unmigrated storages.
+            self.migrated.store(true, Ordering::Release);
             Ok(())
         })
     }
 
     /// Run all flows once (drain + exit). Mirrors `air-elt run --once`.
-    /// Single assemble + validate pass: storage migrations run before
-    /// `validate` so its cursor-table probes succeed, and we skip the
-    /// migrate DDL if `migrate()` already ran on this `App`.
+    /// Storage migrations are applied (if not already) before the I/O
+    /// validation pass so its cursor-table probes succeed; subsequent
+    /// calls (including an earlier explicit `migrate()`) skip the DDL.
     pub fn run_once(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            let flows = self.flows().await?;
-            if !self.migrated.swap(true, Ordering::AcqRel) {
-                for f in flows {
-                    f.storage.migrate().await?;
-                }
-            }
+            // Reuse the dedicated migrate() path so the success-only
+            // flag flip + mutex serialisation logic lives in exactly
+            // one place.
+            self.migrate().await?;
+            let flows = self.flows_validated().await?;
             let (_tx, rx) = watch::channel(false);
             FlowEngine::new(flows.clone(), RunMode::Once, rx)
                 .run()
@@ -151,7 +209,7 @@ impl App {
         shutdown: watch::Receiver<bool>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            let flows = self.flows().await?;
+            let flows = self.flows_validated().await?;
             FlowEngine::new(flows.clone(), RunMode::Daemon, shutdown)
                 .run()
                 .await?;

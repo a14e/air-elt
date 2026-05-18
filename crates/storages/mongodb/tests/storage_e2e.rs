@@ -20,7 +20,14 @@ async fn save_and_load_cursor_roundtrip() {
     storage.validate_access().await.expect("validate_access");
     storage.migrate().await.expect("migrate");
 
-    assert!(storage.load_cursor("flow_x").await.unwrap().is_none());
+    let cursor_types = [air_elt_core::types::DataType::Int64];
+    assert!(
+        storage
+            .load_cursor("flow_x", &cursor_types)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let state = CursorState::new(vec![CursorFieldValue {
         name: "id".into(),
@@ -29,7 +36,7 @@ async fn save_and_load_cursor_roundtrip() {
     storage.save_cursor("flow_x", &state, false).await.unwrap();
 
     let loaded = storage
-        .load_cursor("flow_x")
+        .load_cursor("flow_x", &cursor_types)
         .await
         .unwrap()
         .expect("present");
@@ -41,7 +48,7 @@ async fn save_and_load_cursor_roundtrip() {
     }]);
     storage.save_cursor("flow_x", &state2, false).await.unwrap();
     let loaded2 = storage
-        .load_cursor("flow_x")
+        .load_cursor("flow_x", &cursor_types)
         .await
         .unwrap()
         .expect("present");
@@ -70,15 +77,27 @@ async fn save_cursor_and_resume_token_dry_run_skip_writes() {
         name: "id".into(),
         value: Value::Int64(7),
     }]);
+    let cursor_types = [air_elt_core::types::DataType::Int64];
 
     storage.save_cursor(flow, &state, true).await.unwrap();
     assert!(
-        storage.load_cursor(flow).await.unwrap().is_none(),
+        storage
+            .load_cursor(flow, &cursor_types)
+            .await
+            .unwrap()
+            .is_none(),
         "dry-run save_cursor must not persist a doc"
     );
 
     storage.save_cursor(flow, &state, false).await.unwrap();
-    assert_eq!(storage.load_cursor(flow).await.unwrap().unwrap(), state);
+    assert_eq!(
+        storage
+            .load_cursor(flow, &cursor_types)
+            .await
+            .unwrap()
+            .unwrap(),
+        state
+    );
 
     let token = serde_json::json!({ "_data": "82DRY" });
     storage.save_resume_token(flow, &token, true).await.unwrap();

@@ -381,6 +381,40 @@ pub struct CursorConfig {
         serialize_with = "crate::config::interval::serialize"
     )]
     pub interval: std::time::Duration,
+    /// Per-flow startup jitter that shifts the first-tick schedule grid
+    /// by a deterministic name-hashed offset in `[0, jitter)`. Tames
+    /// thundering-herd CPU spikes when many flows share the same
+    /// `interval`. When omitted, defaults to `min(interval, 5min)` —
+    /// the full interval, hard-capped at five minutes so a 24h cadence
+    /// doesn't introduce hours of startup wait. `"0s"` disables jitter
+    /// entirely — useful for tests / deterministic e2e runs. Resolved
+    /// via [`CursorConfig::effective_jitter`]; validated at config-load
+    /// against `jitter <= interval`.
+    #[serde(
+        default,
+        deserialize_with = "crate::config::interval::deserialize_opt_allow_zero",
+        serialize_with = "crate::config::interval::serialize_opt"
+    )]
+    pub jitter: Option<std::time::Duration>,
+}
+
+/// Cap for the auto-defaulted jitter: the full `interval` is clipped to
+/// this duration so a flow with `interval = 24h` doesn't sleep 24h
+/// before its first tick. Explicit operator-set values are not capped
+/// (they still pass the `jitter <= interval` rule).
+pub const JITTER_DEFAULT_CAP: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+impl CursorConfig {
+    /// Resolve the effective jitter for this cursor. When `jitter` is
+    /// `Some(d)` it's returned as-is (including `"0s"` which disables
+    /// jitter); when `None`, defaults to `min(interval, 5min)` — the
+    /// full interval, capped at five minutes.
+    pub fn effective_jitter(&self) -> std::time::Duration {
+        match self.jitter {
+            Some(d) => d,
+            None => self.interval.min(JITTER_DEFAULT_CAP),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -396,4 +430,63 @@ fn default_order() -> CursorOrder {
 
 fn default_interval() -> std::time::Duration {
     std::time::Duration::from_secs(1)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn cursor(interval: Duration, jitter: Option<Duration>) -> CursorConfig {
+        CursorConfig {
+            fields: Vec::new(),
+            order: CursorOrder::Asc,
+            interval,
+            jitter,
+        }
+    }
+
+    /// When `jitter` is absent, the default is `min(interval, 5min)`:
+    /// the full interval, clipped so a 24h interval doesn't introduce a
+    /// 24h startup wait. Spreading concurrent flows across the full
+    /// cadence period maximises fan-in smoothing per backend pool.
+    #[test]
+    fn effective_jitter_defaults_to_full_interval_capped_at_five_minutes() {
+        // 1s → 1s (interval below cap)
+        assert_eq!(
+            cursor(Duration::from_secs(1), None).effective_jitter(),
+            Duration::from_secs(1)
+        );
+        // 60s → 60s (interval below cap)
+        assert_eq!(
+            cursor(Duration::from_secs(60), None).effective_jitter(),
+            Duration::from_secs(60)
+        );
+        // 1h → cap (5min)
+        assert_eq!(
+            cursor(Duration::from_secs(3600), None).effective_jitter(),
+            Duration::from_secs(300),
+        );
+        // 24h → cap
+        assert_eq!(
+            cursor(Duration::from_secs(86_400), None).effective_jitter(),
+            Duration::from_secs(300),
+        );
+    }
+
+    /// Operator-set `jitter` is passed through verbatim — including
+    /// `"0s"`, which disables jitter entirely. The default rule only
+    /// fires when the field is `None`.
+    #[test]
+    fn effective_jitter_explicit_passthrough_including_zero() {
+        assert_eq!(
+            cursor(Duration::from_secs(60), Some(Duration::from_secs(2))).effective_jitter(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            cursor(Duration::from_secs(60), Some(Duration::ZERO)).effective_jitter(),
+            Duration::ZERO,
+        );
+    }
 }

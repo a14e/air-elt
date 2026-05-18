@@ -28,6 +28,7 @@ use air_elt_commons_mongodb::task::detached;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::model::CursorState;
 use air_elt_core::traits::Storage;
+use air_elt_core::types::DataType;
 
 use crate::config::MongoStorageConfig;
 
@@ -46,6 +47,7 @@ pub struct MongoStorage {
     /// Per-operation cap; applied as `max_time` / `maxTimeMS` on every
     /// server-side call. Bounds runaway server work after a detach.
     operation_timeout: Duration,
+    pool_max_connections: u32,
 }
 
 impl MongoStorage {
@@ -74,8 +76,9 @@ impl MongoStorage {
             config.operation_timeout,
             config.max_connections,
             config.min_connections,
-        );
+        )?;
         let operation_timeout = settings.statement;
+        let pool_max_connections = settings.max_connections;
         let client = connect(&config.url, settings).await?;
         Ok(Self {
             client,
@@ -83,6 +86,7 @@ impl MongoStorage {
             collection,
             resume_tokens_collection: DEFAULT_RESUME_TOKENS_COLLECTION.to_string(),
             operation_timeout,
+            pool_max_connections,
         })
     }
 
@@ -105,6 +109,10 @@ impl MongoStorage {
 
 #[async_trait]
 impl Storage for MongoStorage {
+    fn max_connections(&self) -> u32 {
+        self.pool_max_connections
+    }
+
     async fn validate_access(&self) -> RuntimeResult<()> {
         let database = self.database.clone();
         let client = self.client.clone();
@@ -142,10 +150,15 @@ impl Storage for MongoStorage {
         Ok(())
     }
 
-    async fn load_cursor(&self, flow: &str) -> RuntimeResult<Option<CursorState>> {
+    async fn load_cursor(
+        &self,
+        flow: &str,
+        cursor_types: &[DataType],
+    ) -> RuntimeResult<Option<CursorState>> {
         let coll = self.coll();
         let flow = flow.to_string();
         let max_time = self.operation_timeout;
+        let cursor_types: Vec<DataType> = cursor_types.to_vec();
         detached(async move {
             let opts = FindOneOptions::builder().max_time(max_time).build();
             let opt = coll
@@ -159,8 +172,9 @@ impl Storage for MongoStorage {
                     "mongodb storage: row for flow {flow:?} is missing string field `cursor`"
                 ))
             })?;
-            let parsed: CursorState =
+            let raw: serde_json::Value =
                 serde_json::from_str(cursor_json).map_err(RuntimeError::from)?;
+            let parsed = CursorState::from_typed_json(raw, &cursor_types)?;
             Ok(Some(parsed))
         })
         .await

@@ -68,6 +68,7 @@ pub struct MongoCdcSource {
     schema_sample: usize,
     operation_timeout: Duration,
     max_await_time: Duration,
+    pool_max_connections: u32,
 }
 
 impl MongoCdcSource {
@@ -93,8 +94,9 @@ impl MongoCdcSource {
             config.operation_timeout,
             config.max_connections,
             config.min_connections,
-        );
+        )?;
         let operation_timeout = settings.statement;
+        let pool_max_connections = settings.max_connections;
         let client = connect(&config.url, settings).await?;
         Ok(Self {
             client,
@@ -103,6 +105,7 @@ impl MongoCdcSource {
             schema_sample: config.schema_sample_size.unwrap_or(DEFAULT_SCHEMA_SAMPLE),
             operation_timeout,
             max_await_time: config.max_await_time.unwrap_or(DEFAULT_MAX_AWAIT),
+            pool_max_connections,
         })
     }
 
@@ -148,6 +151,10 @@ impl SchemaProvider for MongoCdcCtx {
 impl Source for MongoCdcSource {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn max_connections(&self) -> u32 {
+        self.pool_max_connections
     }
 
     fn body_data_type(&self) -> DataType {

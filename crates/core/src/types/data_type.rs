@@ -115,15 +115,80 @@ impl DataType {
         crate::types::union_types::collapse_union(vs)
     }
 
-    /// Whether this type is admissible as a cursor field. `Json`/`Xml`/
-    /// `Union` are rejected (no total order); custom types delegate to
-    /// `DynType::can_be_cursor()`.
-    pub fn can_be_cursor(&self) -> bool {
+    /// Whether this type is admissible as a cursor field. Any type
+    /// with a canonical linear order qualifies — numerics, `Text`,
+    /// `Bytes`, `Bool`, `Date`, `Timestamp`, `Uuid`. `Json` / `Xml`
+    /// / `Union` are rejected (no total order); custom types delegate
+    /// to [`DynType::cursor_compatible`].
+    pub fn cursor_compatible(&self) -> bool {
         match self {
             DataType::Json | DataType::Xml | DataType::Union(_) => false,
-            DataType::Custom(t) => t.can_be_cursor(),
+            DataType::Custom(t) => t.cursor_compatible(),
             _ => true,
         }
+    }
+
+    /// Decode a cursor-JSON value back into [`crate::types::Value`]
+    /// using **this** descriptor as the expected type. The cursor
+    /// caller (storage layer) resolves the expected `DataType` for
+    /// each cursor field from the source schema; no global registry is
+    /// consulted.
+    ///
+    /// Canonical variants delegate to the standard
+    /// `serde_json::from_value::<Value>(...)` path — non-Custom values
+    /// already self-describe in the JSON envelope and round-trip via
+    /// the `Value` serde impl. `Custom(t)` parses the
+    /// `{"type":"custom","kind":...,"value":...}` envelope, asserts the
+    /// kind matches `t.kind()`, and delegates payload decode to
+    /// [`crate::types::dynamic::DynType::decode_cursor_value`].
+    pub fn decode_cursor_json(
+        &self,
+        json: serde_json::Value,
+    ) -> Result<crate::types::Value, String> {
+        use crate::types::Value;
+        if let DataType::Custom(t) = self {
+            // Envelope shape: { "type":"custom", "kind":"<kind>", "value": ... }.
+            // Validate the kind matches the expected descriptor before
+            // delegating — a mismatch means the persisted cursor type
+            // drifted from the source schema and the caller should
+            // resync rather than silently mis-decode.
+            let obj = json.as_object().ok_or_else(|| {
+                format!(
+                    "expected an object envelope for cursor Value::Custom (kind={:?}), got {json}",
+                    t.kind()
+                )
+            })?;
+            let tag = obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "cursor envelope missing string field `type`".to_string())?;
+            if tag != "custom" {
+                return Err(format!(
+                    "cursor envelope tag {tag:?} does not match expected DataType::Custom \
+                     (kind={:?})",
+                    t.kind()
+                ));
+            }
+            let kind = obj.get("kind").and_then(|v| v.as_str()).ok_or_else(|| {
+                "cursor `custom` envelope missing string field `kind`".to_string()
+            })?;
+            if kind != t.kind() {
+                return Err(format!(
+                    "cursor envelope kind {kind:?} does not match expected DynType kind {:?}",
+                    t.kind()
+                ));
+            }
+            let payload = obj.get("value").cloned().unwrap_or(serde_json::Value::Null);
+            let inner = t.decode_cursor_value(&payload)?;
+            return Ok(Value::Custom(inner));
+        }
+        // Canonical variants: trust the tagged envelope on the wire
+        // and let `Value::Deserialize` parse it. The type-check on the
+        // source schema side is what gives us this dispatch — we don't
+        // strictly need to assert that `self == parsed.data_type()`
+        // here because a mismatch is already a bug in the caller's
+        // source-schema bookkeeping.
+        serde_json::from_value::<Value>(json).map_err(|e| e.to_string())
     }
 
     /// Whether this type is document/object-shaped. Required by the
@@ -512,13 +577,15 @@ impl<'de> Visitor<'de> for DataTypeVisitor {
 mod tests {
     use std::any::Any;
 
+    use chrono::TimeZone;
+
     use super::*;
     use crate::types::convert::ConvertError;
     use crate::types::convert::context::ConversionContext;
     use crate::types::default_value::DefaultParseError;
     use crate::types::value::Value;
 
-    /// Test-only Custom type with `can_be_cursor = true` so `can_be_cursor`
+    /// Test-only Custom type with `cursor_compatible = true` so `cursor_compatible`
     /// arm coverage is unambiguous.
     #[derive(Debug)]
     struct TestCursorable;
@@ -531,7 +598,7 @@ mod tests {
         fn kind(&self) -> &str {
             "test.cursorable"
         }
-        fn can_be_cursor(&self) -> bool {
+        fn cursor_compatible(&self) -> bool {
             true
         }
         fn can_convert_to(&self, _t: &DataType, _trunc: bool) -> bool {
@@ -694,26 +761,187 @@ mod tests {
     }
 
     #[test]
-    fn can_be_cursor_basic_variants() {
-        assert!(DataType::Int32.can_be_cursor());
-        assert!(DataType::Text { size: None }.can_be_cursor());
-        assert!(DataType::Uuid.can_be_cursor());
-        assert!(DataType::Date.can_be_cursor());
-        assert!(DataType::Timestamp.can_be_cursor());
+    fn cursor_compatible_basic_variants() {
+        assert!(DataType::Int32.cursor_compatible());
+        assert!(DataType::Text { size: None }.cursor_compatible());
+        assert!(DataType::Uuid.cursor_compatible());
+        assert!(DataType::Date.cursor_compatible());
+        assert!(DataType::Timestamp.cursor_compatible());
     }
 
     #[test]
-    fn can_be_cursor_rejects_unordered() {
-        assert!(!DataType::Json.can_be_cursor());
-        assert!(!DataType::Xml.can_be_cursor());
-        assert!(!DataType::Union(vec![DataType::Int32, DataType::Int64]).can_be_cursor());
+    fn cursor_compatible_rejects_unordered() {
+        assert!(!DataType::Json.cursor_compatible());
+        assert!(!DataType::Xml.cursor_compatible());
+        assert!(!DataType::Union(vec![DataType::Int32, DataType::Int64]).cursor_compatible());
     }
 
     #[test]
-    fn can_be_cursor_delegates_to_dyn_type() {
+    fn cursor_compatible_delegates_to_dyn_type() {
         let ok = DataType::Custom(Box::new(TestCursorable));
         let no = DataType::Custom(Box::new(TestNonCursorable));
-        assert!(ok.can_be_cursor());
-        assert!(!no.can_be_cursor());
+        assert!(ok.cursor_compatible());
+        assert!(!no.cursor_compatible());
+    }
+
+    /// Cursor-decode round-trip for canonical types: the typed entry
+    /// path on `DataType` parses each tagged envelope back into the
+    /// matching `Value` variant without consulting any registry. The
+    /// test pairs a representative sample of the variants `Value`
+    /// supports.
+    #[test]
+    fn decode_cursor_json_canonical_variants() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 4, 22).unwrap();
+        let ts = chrono::Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
+        let cases: Vec<(DataType, Value)> = vec![
+            (DataType::Int64, Value::Int64(42)),
+            (DataType::Text { size: None }, Value::Text("hi".into())),
+            (DataType::Date, Value::Date(date)),
+            (DataType::Timestamp, Value::Timestamp(ts)),
+            (
+                DataType::Json,
+                Value::Json(serde_json::json!({"nested": 1})),
+            ),
+        ];
+        for (dt, v) in cases {
+            let envelope = serde_json::to_value(&v).expect("serialize");
+            let decoded = dt.decode_cursor_json(envelope).expect("decode");
+            assert_eq!(decoded, v, "round-trip mismatch for {dt:?}");
+        }
+    }
+
+    /// A cursor-compatible Custom type that mirrors its payload as a
+    /// `u32`. The `decode_cursor_value` override is the registry-free
+    /// reload site exercised by `DataType::decode_cursor_json`.
+    #[derive(Debug, Clone, Copy)]
+    struct DecodableCustom;
+
+    impl DynType for DecodableCustom {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn kind(&self) -> &str {
+            "test.decodable"
+        }
+        fn cursor_compatible(&self) -> bool {
+            true
+        }
+        fn decode_cursor_value(
+            &self,
+            json: &serde_json::Value,
+        ) -> Result<Box<dyn crate::types::dynamic::DynValue>, String> {
+            let n = json
+                .as_u64()
+                .ok_or_else(|| format!("expected u64 for {}", self.kind()))?;
+            Ok(Box::new(DecodableValue(n as u32)))
+        }
+        fn can_convert_to(&self, _t: &DataType, _trunc: bool) -> bool {
+            false
+        }
+        fn can_construct_from(&self, _t: &DataType, _trunc: bool) -> bool {
+            false
+        }
+        fn convert(
+            &self,
+            _v: Value,
+            _t: &DataType,
+            _ctx: &ConversionContext,
+        ) -> Result<Value, ConvertError> {
+            unimplemented!()
+        }
+        fn construct(
+            &self,
+            _v: Value,
+            _t: &DataType,
+            _ctx: &ConversionContext,
+        ) -> Result<Value, ConvertError> {
+            unimplemented!()
+        }
+        fn clone_box(&self) -> Box<dyn DynType> {
+            Box::new(*self)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DecodableValue(u32);
+
+    impl crate::types::dynamic::DynValue for DecodableValue {
+        fn dyn_type(&self) -> Box<dyn DynType> {
+            Box::new(DecodableCustom)
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+        fn eq_dyn(&self, other: &dyn crate::types::dynamic::DynValue) -> bool {
+            other
+                .as_any()
+                .downcast_ref::<DecodableValue>()
+                .is_some_and(|o| o.0 == self.0)
+        }
+        fn clone_box(&self) -> Box<dyn crate::types::dynamic::DynValue> {
+            Box::new(self.clone())
+        }
+        fn to_json(&self) -> Result<serde_json::Value, crate::error::JsonEncodeError> {
+            Ok(serde_json::Value::from(self.0))
+        }
+    }
+
+    /// Round-trip: serialise a cursor-compatible Custom through the
+    /// `Value` envelope, then recover it through
+    /// `DataType::decode_cursor_json` — no global registry, the
+    /// expected descriptor is supplied by the caller.
+    #[test]
+    fn decode_cursor_json_custom_round_trips() {
+        let original = Value::Custom(Box::new(DecodableValue(7)));
+        let envelope = serde_json::to_value(&original).expect("serialize");
+        assert_eq!(
+            envelope,
+            serde_json::json!({
+                "type": "custom",
+                "kind": "test.decodable",
+                "value": 7,
+            })
+        );
+        let dt = DataType::Custom(Box::new(DecodableCustom));
+        let decoded = dt.decode_cursor_json(envelope).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    /// The default `decode_cursor_value` errors. A
+    /// cursor-incompatible Custom plumbed through
+    /// `DataType::decode_cursor_json` surfaces that error rather than
+    /// silently accepting whatever the envelope carries.
+    #[test]
+    fn decode_cursor_json_errors_for_non_cursor_compatible_custom() {
+        let dt = DataType::Custom(Box::new(TestNonCursorable));
+        let envelope = serde_json::json!({
+            "type": "custom",
+            "kind": "test.non_cursorable",
+            "value": 1,
+        });
+        let res = dt.decode_cursor_json(envelope);
+        assert!(
+            res.is_err(),
+            "default DynType::decode_cursor_value must reject the call"
+        );
+    }
+
+    /// Mismatched kind in the persisted envelope vs. expected
+    /// descriptor surfaces a clean error — cursor type drift between
+    /// the source schema and the cursor row should fail loud rather
+    /// than silently mis-decode.
+    #[test]
+    fn decode_cursor_json_rejects_kind_mismatch() {
+        let dt = DataType::Custom(Box::new(DecodableCustom));
+        let envelope = serde_json::json!({
+            "type": "custom",
+            "kind": "test.someone_else",
+            "value": 7,
+        });
+        let res = dt.decode_cursor_json(envelope);
+        assert!(res.is_err(), "kind mismatch must error");
     }
 }

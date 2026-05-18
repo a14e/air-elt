@@ -1,0 +1,17 @@
+[config]
+include = ["flows"]
+
+[[sources]]
+name = "mongo_src"
+type = "mongodb"
+config = { url = "${MONGO_URL}", database = "appdb" }
+
+[[sinks]]
+name = "pg_sink"
+type = "postgres"
+config = { url = "${PG_SINK_URL}" }
+
+[[storages]]
+name = "pg_state"
+type = "postgres"
+config = { url = "${PG_STATE_URL}" }

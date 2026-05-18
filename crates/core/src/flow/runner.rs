@@ -1,8 +1,10 @@
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ahash::AHasher;
 use tokio::sync::watch;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, sleep_until};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{RuntimeError, RuntimeResult};
@@ -14,6 +16,18 @@ use crate::model::{
 pub enum RunMode {
     Daemon,
     Once,
+}
+
+/// What the runner loop should do after a tick returns. `Continue` runs
+/// the next tick immediately (the source produced a full batch and may
+/// have more rows queued). `Idle` waits for the next grid point (the
+/// source returned an empty batch). `Exit` ends the runner (Once mode
+/// drain complete or shutdown signalled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickOutcome {
+    Continue,
+    Idle,
+    Exit,
 }
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
@@ -43,14 +57,93 @@ impl FlowRunner {
         }
     }
 
+    /// Compute the deterministic per-flow startup offset:
+    /// `hash(flow.name) % jitter` (millisecond resolution).
+    ///
+    /// **Why deterministic, not random.** A name-hashed offset is
+    /// reproducible across restarts — a flow that always lags at :23
+    /// stays at :23, which makes lag debugging traceable to a single
+    /// flow rather than a random shuffle. Operators can also reason
+    /// about steady-state phase without re-rolling on every redeploy.
+    ///
+    /// `ahash::AHasher` is the workspace's standard hasher (already a
+    /// `[workspace.dependencies]` member used by `AHashMap`); we avoid
+    /// pulling in a separate hash crate just for this.
+    fn jitter_offset(&self) -> Duration {
+        let jitter = self.flow.jitter;
+        if jitter.is_zero() {
+            return Duration::ZERO;
+        }
+        let mut hasher = AHasher::default();
+        self.flow.name.hash(&mut hasher);
+        let hash = hasher.finish();
+        // Operate in milliseconds: sub-millisecond precision is well
+        // below the runner's tick latency and lets us keep arithmetic
+        // in `u64` even for multi-hour jitter ceilings.
+        let jitter_millis = jitter.as_millis().max(1) as u64;
+        let offset_millis = hash % jitter_millis;
+        Duration::from_millis(offset_millis)
+    }
+
     pub async fn run(mut self) -> RuntimeResult<()> {
+        // Deterministic startup jitter — shifts the first-tick schedule
+        // grid by `hash(flow.name) % jitter` so a fleet of flows that
+        // share the same `interval` doesn't pile up on the same
+        // second-boundary. Subsequent ticks proceed at `interval`
+        // cadence as before — this is a one-shot offset, not a per-tick
+        // walk. **Honoured only in Daemon mode.** `RunMode::Once` is
+        // for drain-and-exit (CLI e2e + `--once` one-shots); paying a
+        // multi-minute jitter delay there would look like a hung
+        // command. `jitter = 0s` also collapses to no sleep.
+        if matches!(self.mode, RunMode::Daemon) {
+            let offset = self.jitter_offset();
+            if !offset.is_zero() {
+                debug!(
+                    flow = %self.flow.name,
+                    offset_ms = offset.as_millis() as u64,
+                    "applying startup jitter offset"
+                );
+                tokio::select! {
+                    _ = sleep(offset) => {}
+                    _ = self.shutdown.changed() => {
+                        info!(flow = %self.flow.name, "shutdown during startup jitter");
+                        return Ok(());
+                    }
+                }
+            }
+        }
         loop {
             match self.tick(false).await {
-                Ok(true) => {
+                Ok(TickOutcome::Exit) => {
                     return Ok(());
                 }
-                Ok(false) => {
+                Ok(TickOutcome::Continue) => {
                     self.backoff = BACKOFF_INITIAL;
+                }
+                Ok(TickOutcome::Idle) => {
+                    self.backoff = BACKOFF_INITIAL;
+                    // Empty batch — wait for the next grid point. Permits
+                    // were already released inside `tick`; this idle wait
+                    // does NOT hold any backend semaphore so other flows
+                    // sharing the pool can drain freely. See
+                    // [`next_tick_instant`] for the scheduling design.
+                    let now_since_epoch_ns = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    let next = next_tick_instant(
+                        &self.flow.name,
+                        self.flow.interval,
+                        self.flow.jitter,
+                        now_since_epoch_ns,
+                        Instant::now(),
+                    );
+                    tokio::select! {
+                        _ = sleep_until(next) => {}
+                        _ = self.shutdown.changed() => {
+                            return Ok(());
+                        }
+                    }
                 }
                 Err(e) => {
                     if matches!(self.mode, RunMode::Once) {
@@ -103,7 +196,10 @@ impl FlowRunner {
         // defeating the dry-run probe.
         let (_keep_tx_alive, shutdown_rx) = watch::channel(false);
         let mut runner = Self::new(flow, RunMode::Once, shutdown_rx);
-        runner.tick(true).await.map(|_| ())
+        // Sampling-validation calls `tick(true)` directly. Startup
+        // jitter lives in `run()` (Daemon-only now), not in `tick`,
+        // so the probe never sleeps on it.
+        runner.tick(true).await.map(|_outcome| ())
     }
 
     /// Ensure both source/sink ctxs are built and that `DerivedPlans`
@@ -119,6 +215,8 @@ impl FlowRunner {
         }
         let rebuild_needed = self.source_ctx.is_none() || self.sink_ctx.is_none();
         if self.source_ctx.is_none() {
+            // Source pool I/O — held only for this `build_context`.
+            let _g = self.flow.lock_handle.acquire_source().await?;
             self.source_ctx = Some(
                 self.flow
                     .source
@@ -127,6 +225,8 @@ impl FlowRunner {
             );
         }
         if self.sink_ctx.is_none() {
+            // Sink pool I/O — held only for this `build_context`.
+            let _g = self.flow.lock_handle.acquire_sink().await?;
             self.sink_ctx = Some(
                 self.flow
                     .sink
@@ -198,15 +298,41 @@ impl FlowRunner {
     /// for sample-based pre-flight checks: the dry tick exercises the
     /// same pack → convert → write path the live tick does, so any
     /// drift between sampling and runtime would surface here.
-    async fn tick(&mut self, dry_run: bool) -> Result<bool, RuntimeError> {
+    ///
+    /// **Concurrency.** Each I/O unit inside `tick` scopes its own
+    /// per-component permit: `ensure_built` takes source/sink permits
+    /// for its respective `build_context` calls; cursor load/save and
+    /// `with_storage_lock` use the storage permit; `read_batch` /
+    /// `sample` use the source permit; `write_batch` uses the sink
+    /// permit. No phase ever holds two permits at once, so no
+    /// canonical ordering is needed and deadlock between flows is
+    /// structurally impossible. The inter-tick idle sleep happens in
+    /// `run` AFTER `tick` returns, so it never holds any permit.
+    async fn tick(&mut self, dry_run: bool) -> Result<TickOutcome, RuntimeError> {
+        // Build ctx + derived plans first so the cursor reload below
+        // can resolve the expected per-field `DataType`s off the live
+        // source schema (each cursor field's type drives the typed
+        // `DataType::decode_cursor_json` dispatch inside the storage).
+        // `ensure_built` takes source/sink permits internally, one at
+        // a time, only for the build_context calls that need them.
+        self.ensure_built().await?;
+
+        if *self.shutdown.borrow() {
+            info!(flow = %self.flow.name, "shutdown signalled");
+            return Ok(TickOutcome::Exit);
+        }
+
         if self.cursor.is_none() {
-            // `with_timeout` no longer requires `Send + 'static`, so
-            // the future can borrow `&self.flow` directly. Mongo
-            // adapters handle their own driver-future cancel-safety via
-            // `task::detached`.
+            // Cursor load under storage permit — held only for this
+            // call. Released before we touch source/sink below.
+            let _g = self.flow.lock_handle.acquire_storage().await?;
             self.cursor = match self.flow.cursor_persistence {
                 CursorPersistence::ColumnCursor => {
-                    let fut = self.flow.storage.load_cursor(&self.flow.name);
+                    let cursor_types = self.resolve_cursor_types()?;
+                    let fut = self
+                        .flow
+                        .storage
+                        .load_cursor(&self.flow.name, &cursor_types);
                     with_timeout(&self.flow, "load_cursor", fut, &mut self.shutdown).await?
                 }
                 CursorPersistence::ResumeToken => {
@@ -225,13 +351,6 @@ impl FlowRunner {
             info!(flow = %self.flow.name, has_cursor = self.cursor.is_some(), "flow started");
         }
 
-        self.ensure_built().await?;
-
-        if *self.shutdown.borrow() {
-            info!(flow = %self.flow.name, "shutdown signalled");
-            return Ok(true);
-        }
-
         let src_ctx = self.source_ctx.as_ref().expect("ensured by ensure_built");
 
         // dry_run path: sampling validation routes through the same
@@ -239,49 +358,58 @@ impl FlowRunner {
         // the same Transform program the production tick consumes runs
         // here too so sampling exercises projection / body folding /
         // per-cell conversion identically.
-        let raw = if dry_run {
-            let read_spec = &self.flow.derived().read_spec;
-            let n = read_spec.limit;
-            let fut = self.flow.source.sample(read_spec, src_ctx, n);
-            with_timeout(&self.flow, "sample", fut, &mut self.shutdown).await?
-        } else {
-            // Production read path: source emits `Batch`; Transform
-            // applies projection / body folding / per-column conversion
-            // in one pass — including the schemaless-both `["*"]` raw
-            // passthrough flow, which lowers to a single `Body` op.
-            let read_spec = &self.flow.derived().read_spec;
-            let cursor = self.cursor.as_ref();
-            let fut = self.flow.source.read_batch(read_spec, src_ctx, cursor);
-            with_timeout(&self.flow, "read_batch", fut, &mut self.shutdown).await?
+        //
+        // Read under source permit only — sink permit is taken later
+        // inside `finish_tick → write_and_commit`. Sibling flows that
+        // share this source's pool serialise on this acquire; sibling
+        // flows that share only the sink/storage are unaffected.
+        let raw = {
+            let _g = self.flow.lock_handle.acquire_source().await?;
+            if dry_run {
+                let read_spec = &self.flow.derived().read_spec;
+                let n = read_spec.limit;
+                let fut = self.flow.source.sample(read_spec, src_ctx, n);
+                with_timeout(&self.flow, "sample", fut, &mut self.shutdown).await?
+            } else {
+                // Production read path: source emits `Batch`; Transform
+                // applies projection / body folding / per-column conversion
+                // in one pass — including the schemaless-both `["*"]` raw
+                // passthrough flow, which lowers to a single `Body` op.
+                let read_spec = &self.flow.derived().read_spec;
+                let cursor = self.cursor.as_ref();
+                let fut = self.flow.source.read_batch(read_spec, src_ctx, cursor);
+                with_timeout(&self.flow, "read_batch", fut, &mut self.shutdown).await?
+            }
         };
 
+        // Transform is pure compute, no I/O — runs without any permit.
         let batch = self.flow.derived().transform.apply(raw)?;
         self.finish_tick(batch, dry_run).await
     }
 
     /// Drain phase shared between the dry-run and production paths.
     /// Pulled out so the dry-run early-return can reuse it without
-    /// duplicating the empty-batch / write / interval-sleep dance.
-    async fn finish_tick(&mut self, batch: Batch, dry_run: bool) -> Result<bool, RuntimeError> {
+    /// duplicating the empty-batch / write dance. The inter-tick
+    /// idle sleep lives in `run` (not here) so it does not extend
+    /// the permit-hold region.
+    async fn finish_tick(
+        &mut self,
+        batch: Batch,
+        dry_run: bool,
+    ) -> Result<TickOutcome, RuntimeError> {
         let batch_size = batch.rows.len();
         if batch_size == 0 {
             if matches!(self.mode, RunMode::Once) {
                 debug!(flow = %self.flow.name, "drain complete");
-                return Ok(true);
+                return Ok(TickOutcome::Exit);
             }
-            tokio::select! {
-                _ = sleep(self.flow.interval) => {}
-                _ = self.shutdown.changed() => {
-                    return Ok(true);
-                }
-            }
-            return Ok(false);
+            return Ok(TickOutcome::Idle);
         }
         self.write_and_commit(batch, dry_run).await?;
         if batch_size < self.flow.derived().read_spec.limit && matches!(self.mode, RunMode::Once) {
-            return Ok(true);
+            return Ok(TickOutcome::Exit);
         }
-        Ok(false)
+        Ok(TickOutcome::Continue)
     }
 
     async fn write_and_commit(&mut self, mut batch: Batch, dry_run: bool) -> RuntimeResult<()> {
@@ -295,15 +423,20 @@ impl FlowRunner {
         // Delete rows themselves and return a `WriteReport` with the
         // upsert count — the cursor still advances on the call below.
         let write_spec = &self.flow.derived().write_spec;
-        let fut = self
-            .flow
-            .sink
-            .write_batch(write_spec, sink_ctx, batch, dry_run);
-        let report = match with_timeout(&self.flow, "write_batch", fut, &mut self.shutdown).await {
-            Ok(r) => r,
-            Err(e) => {
-                error!(flow = %self.flow.name, error = %e, "write_batch failed");
-                return Err(e);
+        // Sink pool I/O under sink permit only — released before we
+        // touch storage for the cursor save below.
+        let report = {
+            let _g = self.flow.lock_handle.acquire_sink().await?;
+            let fut = self
+                .flow
+                .sink
+                .write_batch(write_spec, sink_ctx, batch, dry_run);
+            match with_timeout(&self.flow, "write_batch", fut, &mut self.shutdown).await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(flow = %self.flow.name, error = %e, "write_batch failed");
+                    return Err(e);
+                }
             }
         };
 
@@ -322,6 +455,8 @@ impl FlowRunner {
         dry_run: bool,
     ) -> RuntimeResult<()> {
         if let Some(next) = next_cursor {
+            // Storage pool I/O under storage permit only.
+            let _g = self.flow.lock_handle.acquire_storage().await?;
             let save_result = match self.flow.cursor_persistence {
                 CursorPersistence::ColumnCursor => {
                     let fut = self
@@ -351,6 +486,57 @@ impl FlowRunner {
             );
         }
         Ok(())
+    }
+
+    /// Resolve the canonical `DataType` for each `cursor_fields` entry
+    /// off the live source schema. Drives the typed
+    /// `DataType::decode_cursor_json` dispatch the storage uses to
+    /// reload a `CursorState` — without a global registry, the storage
+    /// can't know how to reconstruct a `Value::Custom` cursor value
+    /// (e.g. ObjectId) by itself.
+    ///
+    /// Falls back to `DataType::Json` when no schema is available
+    /// (schemaless source with empty sample) — cursors over a fully
+    /// schemaless source are not officially supported but the path
+    /// stays defensive so a misconfigured flow surfaces a clean error
+    /// from `decode_cursor_json` rather than a runner panic. Missing
+    /// fields surface as `RuntimeError::Validation` so the runner
+    /// rebuilds ctx + derived on the next tick.
+    fn resolve_cursor_types(&self) -> Result<Vec<crate::types::DataType>, RuntimeError> {
+        let cursor_fields = &self.flow.derived().read_spec.cursor_fields;
+        if cursor_fields.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Schemaless sources (Mongo) may surface an empty / absent
+        // schema when the sampled collection is empty. Fall back to
+        // `DataType::Json` so cursor loading keeps working — the
+        // storage's `decode_cursor_json` handles the canonical JSON
+        // shape regardless of the original Mongo type. For typed
+        // sources (`information_schema` is authoritative) a missing
+        // field is a real validation error: we still raise
+        // `MissingCursorField` so the runner drops + rebuilds ctx.
+        let schema = self
+            .source_ctx
+            .as_ref()
+            .and_then(|c| c.as_schema_provider())
+            .map(|p| p.schema());
+        let src_schemaless = self.flow.source.schemaless();
+        let mut out = Vec::with_capacity(cursor_fields.len());
+        for field_name in cursor_fields {
+            match schema.and_then(|s| s.find(field_name)) {
+                Some(f) => out.push(f.data_type.clone()),
+                None if src_schemaless => out.push(crate::types::DataType::Json),
+                None => {
+                    return Err(RuntimeError::Validation(
+                        crate::error::ValidationError::MissingCursorField {
+                            flow: self.flow.name.clone(),
+                            field: field_name.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -453,6 +639,63 @@ where
     }
 }
 
+/// Fixed-rate scheduling anchored to UNIX_EPOCH wall clock. The flow's
+/// tick grid is the set `{ t : (t - offset_ns) mod interval == 0 }`,
+/// where `offset_ns = hash(flow_name) mod interval` (or zero when
+/// `jitter` is disabled, collapsing the grid to round wall-clock
+/// multiples of `interval`). We sleep to the next future grid point
+/// strictly after `now`.
+///
+/// **Why this design.** The grid is restart-safe (epoch-anchored, not
+/// `Instant::now()`-at-start anchored) and skip-to-future by
+/// construction — missed ticks are NEVER caught up. If a flow falls
+/// behind by 5 intervals (slow query, long backoff, busy semaphore),
+/// the next sleep lands on the next future grid point, not at the
+/// oldest-missed one. This keeps the per-flow jitter spread stable
+/// across the lifetime of the process and across restarts, and
+/// prevents back-to-back catchup bursts that would re-cluster flows
+/// after any slow phase.
+///
+/// Pure function — caller samples `SystemTime::now()` and
+/// `Instant::now()` once and passes them in; the math is trivially
+/// testable without `tokio::time::pause()`.
+fn next_tick_instant(
+    flow_name: &str,
+    interval: Duration,
+    jitter: Duration,
+    now_since_epoch_ns: u128,
+    now: Instant,
+) -> Instant {
+    let interval_ns = interval.as_nanos().max(1);
+    let offset_ns = if jitter.is_zero() {
+        0u128
+    } else {
+        let mut hasher = AHasher::default();
+        flow_name.hash(&mut hasher);
+        let hash = hasher.finish() as u128;
+        // Quantise within `interval` so the offset always falls inside
+        // one grid window — `hash mod jitter` may exceed `interval`
+        // when `jitter > interval`, which would skew the first grid
+        // window by a full period.
+        let bound = (jitter.as_nanos()).min(interval_ns);
+        if bound == 0 { 0 } else { hash % bound }
+    };
+    // Compute `(now - offset) mod interval` without ever subtracting
+    // into a wrap. `offset_ns < interval_ns` by construction above
+    // (`(jitter.as_nanos()).min(interval_ns)`), so adding one
+    // interval before subtracting guarantees a non-negative
+    // intermediate even if `now_since_epoch_ns < offset_ns` (which
+    // never happens in production but would have silently produced a
+    // near-2^128 residue under `wrapping_sub`).
+    let phase = (now_since_epoch_ns + interval_ns - offset_ns) % interval_ns;
+    let time_until_next = interval_ns - phase;
+    // `time_until_next` is in [1, interval_ns]; clamp to u64 for the
+    // tokio API (interval ceiling is operator-bounded, well under
+    // u64::MAX nanoseconds = ~584 years).
+    let time_until_next_u64 = u64::try_from(time_until_next).unwrap_or(u64::MAX);
+    now + Duration::from_nanos(time_until_next_u64)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -460,6 +703,12 @@ mod tests {
     use crate::error::JsonEncodeError;
     use crate::flow::test_utils::*;
     use crate::types::Value;
+
+    /// Shared timeline carrier for `shared_source_semaphore_serialises_ticks`.
+    /// Defined at module scope so a nested `fn` in the test body can
+    /// name it — nested `fn`s do not see types declared inside the
+    /// surrounding `async fn`.
+    type TimelineHandle = Arc<std::sync::Mutex<Vec<(String, &'static str, std::time::Instant)>>>;
 
     fn run(flow: FlowState, mode: RunMode, rx: watch::Receiver<bool>) -> FlowRunner {
         FlowRunner::new(flow, mode, rx)
@@ -551,7 +800,7 @@ mod tests {
             });
 
         let mut storage = crate::traits::MockStorage::new();
-        storage.expect_load_cursor().returning(|_| Ok(None));
+        storage.expect_load_cursor().returning(|_, _| Ok(None));
         // Sample produces a batch with `next_cursor: None`, so the
         // runner must skip cursor persistence on the dry-run path.
         storage.expect_save_cursor().times(0);
@@ -1059,7 +1308,7 @@ mod tests {
             });
 
         let mut storage = crate::traits::MockStorage::new();
-        storage.expect_load_cursor().returning(|_| Ok(None));
+        storage.expect_load_cursor().returning(|_, _| Ok(None));
         let sc = saved_cursors.clone();
         storage
             .expect_save_cursor()
@@ -1097,5 +1346,333 @@ mod tests {
         tokio::time::advance(Duration::from_secs(6)).await;
         tx.send(true).unwrap();
         assert!(handle.await.unwrap().is_ok());
+    }
+
+    /// Per-flow startup jitter must be deterministic — two `FlowRunner`s
+    /// constructed from the same name + jitter produce the same offset,
+    /// and changing the name produces a different one (almost always —
+    /// AHasher distributes evenly enough that a deliberate pair of short
+    /// names never collides in practice).
+    #[test]
+    fn jitter_offset_is_deterministic_per_flow_name() {
+        fn build_runner(name: &str, jitter: Duration) -> FlowRunner {
+            let mut flow = crate::flow::test_utils::test_flow_named(
+                name,
+                crate::flow::test_utils::default_source_mock(),
+                crate::flow::test_utils::mock_sink_ok(),
+                crate::flow::test_utils::mock_storage_ok(),
+            );
+            // Mutating the assembled half through FlowState's Deref-to-
+            // inner doesn't surface; reconstruct via the public ctor.
+            let inner = crate::model::AssembledFlow {
+                jitter,
+                ..(*flow).clone()
+            };
+            flow = crate::model::FlowState::new(inner, flow.derived().clone());
+            let (_tx, rx) = watch::channel(false);
+            FlowRunner::new(flow, RunMode::Once, rx)
+        }
+        let a1 = build_runner("flow-a", Duration::from_secs(1)).jitter_offset();
+        let a2 = build_runner("flow-a", Duration::from_secs(1)).jitter_offset();
+        let b = build_runner("flow-b", Duration::from_secs(1)).jitter_offset();
+        assert_eq!(a1, a2, "same flow name → same offset across constructions");
+        assert!(
+            a1 < Duration::from_secs(1),
+            "offset must lie in [0, jitter)"
+        );
+        assert_ne!(
+            a1, b,
+            "distinct flow names must (with overwhelming probability) yield distinct offsets"
+        );
+    }
+
+    /// Zero `jitter` collapses the offset to `Duration::ZERO` — the
+    /// runner must NOT sleep before the first tick.
+    #[test]
+    fn jitter_offset_zero_when_jitter_disabled() {
+        let mut flow = crate::flow::test_utils::test_flow_named(
+            "flow-zero",
+            crate::flow::test_utils::default_source_mock(),
+            crate::flow::test_utils::mock_sink_ok(),
+            crate::flow::test_utils::mock_storage_ok(),
+        );
+        let inner = crate::model::AssembledFlow {
+            jitter: Duration::ZERO,
+            ..(*flow).clone()
+        };
+        flow = crate::model::FlowState::new(inner, flow.derived().clone());
+        let (_tx, rx) = watch::channel(false);
+        let runner = FlowRunner::new(flow, RunMode::Once, rx);
+        assert_eq!(runner.jitter_offset(), Duration::ZERO);
+    }
+
+    /// With `jitter = 100ms` the runner waits up to 100ms before issuing
+    /// the first `read_batch`. Using paused time we advance by the
+    /// computed offset and confirm the read fires exactly after that
+    /// sleep — never before. The deterministic offset lets us assert
+    /// the exact wake-up moment rather than relying on a coarse bound.
+    #[tokio::test(start_paused = true)]
+    async fn jitter_sleeps_before_first_read() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let read_calls = std::sync::Arc::new(AtomicU32::new(0));
+
+        let mut source = crate::flow::test_utils::default_source_mock();
+        source
+            .expect_build_context()
+            .returning(|_| Ok(Arc::new(crate::flow::test_utils::UnitSourceCtx)));
+        let rc = read_calls.clone();
+        source.expect_read_batch().returning(move |_, _, _| {
+            rc.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::model::spec::Batch::default())
+        });
+
+        let mut flow = crate::flow::test_utils::test_flow_named(
+            "jitter-flow",
+            source,
+            crate::flow::test_utils::mock_sink_ok(),
+            crate::flow::test_utils::mock_storage_ok(),
+        );
+        // Replace the test-default `Duration::ZERO` jitter with 100ms so
+        // the runner actually sleeps. We rebuild the FlowState via the
+        // public constructor; mutating through `Deref<Target=AssembledFlow>`
+        // is not surfaced.
+        let inner = crate::model::AssembledFlow {
+            jitter: Duration::from_millis(100),
+            ..(*flow).clone()
+        };
+        flow = crate::model::FlowState::new(inner, flow.derived().clone());
+
+        let (tx, rx) = watch::channel(false);
+        let probe_runner = FlowRunner::new(flow.clone(), RunMode::Daemon, watch::channel(false).1);
+        let expected_offset = probe_runner.jitter_offset();
+        assert!(expected_offset < Duration::from_millis(100));
+
+        let runner = FlowRunner::new(flow, RunMode::Daemon, rx);
+        let handle = tokio::spawn(async move { runner.run().await });
+
+        // Before the offset elapses the runner must still be sleeping —
+        // no read should have fired yet.
+        if !expected_offset.is_zero() {
+            tokio::task::yield_now().await;
+            assert_eq!(
+                read_calls.load(Ordering::SeqCst),
+                0,
+                "read_batch must NOT fire before the jitter sleep elapses"
+            );
+        }
+        // Advance past the offset and let the runner reach its first
+        // read.
+        tokio::time::advance(expected_offset + Duration::from_millis(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if read_calls.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        assert!(
+            read_calls.load(Ordering::SeqCst) >= 1,
+            "read_batch must fire after the jitter sleep"
+        );
+        tx.send(true).unwrap();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    /// Two flows sharing a single-permit source semaphore must execute
+    /// their ticks SERIALLY — the second flow cannot enter
+    /// `read_batch` until the first releases the permit. Asserted via
+    /// per-flow start / end timestamps: the second flow's start must
+    /// occur after the first flow's end.
+    ///
+    /// This is the runtime-side analogue of the validation pipeline's
+    /// `FlowLockHandle` test in `util::concurrency`. The semaphore is
+    /// the only backpressure primitive at the tick boundary; if it
+    /// regressed (e.g. permit released before `write_batch`), the two
+    /// flows would interleave and the assertion would fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_source_semaphore_serialises_ticks() {
+        use std::sync::Mutex;
+
+        // Build ONE manager with a single-permit source "shared-src"
+        // and effectively-unbounded sinks/storages. Both flows then
+        // ask the same manager for a handle pointing at "shared-src",
+        // so they wind up with the same `Arc<Semaphore>` for the
+        // source slot and naturally serialise on it.
+        let mut mgr = crate::util::ConcurrencyManager::new();
+        mgr.register_source("shared-src", 1);
+        mgr.register_sink("sink-1", u32::MAX);
+        mgr.register_sink("sink-2", u32::MAX);
+        mgr.register_storage("storage-1", u32::MAX);
+        mgr.register_storage("storage-2", u32::MAX);
+
+        // Timeline recorded by each flow's mocked read_batch — we
+        // capture (flow_name, "start" | "end", Instant::now()).
+        let timeline: TimelineHandle = Arc::new(Mutex::new(Vec::new()));
+
+        fn build_flow(
+            flow_name: &str,
+            sink_name: &str,
+            storage_name: &str,
+            mgr: &crate::util::ConcurrencyManager,
+            timeline: TimelineHandle,
+        ) -> FlowState {
+            let mut source = crate::flow::test_utils::default_source_mock();
+            source
+                .expect_build_context()
+                .returning(|_| Ok(Arc::new(crate::flow::test_utils::UnitSourceCtx)));
+            let name_owned = flow_name.to_string();
+            let tl_for_read = timeline.clone();
+            let read_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            source.expect_read_batch().returning(move |_, _, _| {
+                let n = read_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    tl_for_read.lock().unwrap().push((
+                        name_owned.clone(),
+                        "start",
+                        std::time::Instant::now(),
+                    ));
+                    // Hold the permit-protected region open for a short
+                    // window so concurrent interleaving (had it been
+                    // allowed) would have been observable.
+                    std::thread::sleep(Duration::from_millis(50));
+                    tl_for_read.lock().unwrap().push((
+                        name_owned.clone(),
+                        "end",
+                        std::time::Instant::now(),
+                    ));
+                    Ok(crate::model::spec::Batch {
+                        rows: vec![crate::model::spec::Row::upsert(vec![Value::Int64(1)])],
+                        next_cursor: Some(crate::model::CursorState::new(vec![
+                            crate::model::CursorFieldValue {
+                                name: "id".into(),
+                                value: Value::Int64(1),
+                            },
+                        ])),
+                    })
+                } else {
+                    Ok(crate::model::spec::Batch::default())
+                }
+            });
+
+            let state = crate::flow::test_utils::test_flow_named(
+                flow_name,
+                source,
+                crate::flow::test_utils::mock_sink_ok(),
+                crate::flow::test_utils::mock_storage_ok(),
+            );
+            // Replace the auto-built (unbounded) handle with one that
+            // points at the shared "shared-src" semaphore — this is
+            // the wiring the validation pipeline does at assemble
+            // time for two flows pointing at the same `[[sources]]`
+            // entry.
+            let inner = crate::model::AssembledFlow {
+                lock_handle: mgr.handle("shared-src", sink_name, storage_name),
+                ..(*state).clone()
+            };
+            crate::model::FlowState::new(inner, state.derived().clone())
+        }
+
+        let f1 = build_flow("flow-1", "sink-1", "storage-1", &mgr, timeline.clone());
+        let f2 = build_flow("flow-2", "sink-2", "storage-2", &mgr, timeline.clone());
+
+        let (_tx, rx1) = watch::channel(false);
+        let (_tx2, rx2) = watch::channel(false);
+        let h1 = tokio::spawn(async move { FlowRunner::new(f1, RunMode::Once, rx1).run().await });
+        let h2 = tokio::spawn(async move { FlowRunner::new(f2, RunMode::Once, rx2).run().await });
+
+        h1.await.unwrap().expect("flow-1 ok");
+        h2.await.unwrap().expect("flow-2 ok");
+
+        // The two flows must NOT overlap. Find each flow's read-region
+        // and assert the later one starts after the earlier one ends.
+        let tl = timeline.lock().unwrap();
+        let f1_start = tl
+            .iter()
+            .find(|(n, k, _)| n == "flow-1" && *k == "start")
+            .expect("flow-1 start");
+        let f1_end = tl
+            .iter()
+            .find(|(n, k, _)| n == "flow-1" && *k == "end")
+            .expect("flow-1 end");
+        let f2_start = tl
+            .iter()
+            .find(|(n, k, _)| n == "flow-2" && *k == "start")
+            .expect("flow-2 start");
+        let f2_end = tl
+            .iter()
+            .find(|(n, k, _)| n == "flow-2" && *k == "end")
+            .expect("flow-2 end");
+
+        let serialised = f2_start.2 >= f1_end.2 || f1_start.2 >= f2_end.2;
+        assert!(
+            serialised,
+            "flows interleaved despite single-permit semaphore: \
+             f1=({:?}..{:?}), f2=({:?}..{:?})",
+            f1_start.2, f1_end.2, f2_start.2, f2_end.2
+        );
+    }
+
+    /// `next_tick_instant` returns a strictly future Instant landing on
+    /// the canonical grid (`(t - offset) mod interval == 0`). With
+    /// `jitter = 0s` offset is zero, so the grid is round multiples of
+    /// `interval`.
+    #[test]
+    fn next_tick_instant_zero_jitter_lands_on_round_multiples() {
+        let now = Instant::now();
+        let interval = Duration::from_secs(1);
+        // 12.5s past epoch → next round-second is 13.0s, 500ms away.
+        let now_since_epoch_ns: u128 = 12_500_000_000;
+        let next = next_tick_instant("any", interval, Duration::ZERO, now_since_epoch_ns, now);
+        assert_eq!(next - now, Duration::from_millis(500));
+    }
+
+    /// Two flows with the same interval but different names must land
+    /// on different grid points (offset distributed by the hasher).
+    #[test]
+    fn next_tick_instant_offsets_differ_per_flow_name() {
+        let now = Instant::now();
+        let interval = Duration::from_secs(1);
+        let jitter = Duration::from_secs(1);
+        let now_ns: u128 = 12_500_000_000;
+        let a = next_tick_instant("flow-a", interval, jitter, now_ns, now);
+        let b = next_tick_instant("flow-b", interval, jitter, now_ns, now);
+        // Both must land inside `(now, now + interval]`.
+        assert!(a > now && a <= now + interval);
+        assert!(b > now && b <= now + interval);
+        // With overwhelming probability AHasher distributes two short
+        // names to different residues mod 1s.
+        assert_ne!(a, b);
+    }
+
+    /// Skip-to-future semantics: simulate the current wall-clock time
+    /// being 5×interval past the previous grid point. The next tick
+    /// must land at the FIRST future grid point — never queue up four
+    /// missed ticks for back-to-back replay.
+    #[test]
+    fn next_tick_instant_skips_missed_grid_points() {
+        let now = Instant::now();
+        let interval = Duration::from_secs(1);
+        // 5.2s past epoch, zero jitter → next grid point is at 6.0s,
+        // 800ms away. Crucially NOT 1s-1s-1s-1s-200ms (back-to-back
+        // catchup) — just one future point.
+        let now_since_epoch_ns: u128 = 5_200_000_000;
+        let next = next_tick_instant("any", interval, Duration::ZERO, now_since_epoch_ns, now);
+        assert_eq!(next - now, Duration::from_millis(800));
+        // Sanity: the gap is strictly less than `interval`.
+        assert!(next - now < interval);
+    }
+
+    /// Exact grid-point boundary: when `(t - offset) mod interval == 0`,
+    /// the next tick must land one full interval ahead (not now itself).
+    /// Otherwise `sleep_until(now)` would return immediately and the
+    /// next iteration would re-tick instantly — a tight spin loop.
+    #[test]
+    fn next_tick_instant_on_boundary_jumps_one_interval() {
+        let now = Instant::now();
+        let interval = Duration::from_secs(1);
+        let now_since_epoch_ns: u128 = 7_000_000_000;
+        let next = next_tick_instant("any", interval, Duration::ZERO, now_since_epoch_ns, now);
+        assert_eq!(next - now, interval);
     }
 }

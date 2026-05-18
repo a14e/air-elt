@@ -48,7 +48,7 @@ pub enum ChCompressionKind {
     Lz4,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ChSinkConfig {
     /// HTTP endpoint URL, e.g. `http://localhost:8123`.
@@ -56,10 +56,18 @@ pub struct ChSinkConfig {
     /// Default database name. Used as `X-ClickHouse-Database` and
     /// when a flow's `to` is given as a bare table name.
     pub database: String,
-    #[serde(default)]
-    pub user: Option<String>,
-    #[serde(default)]
-    pub password: Option<String>,
+    /// CH user. Required at deserialize time — omitting the field in
+    /// TOML produces a clear `missing field 'user'` error before any
+    /// I/O. Use `user = "default"` together with `password = ""` for
+    /// authless CH instances (CH treats matching empty passwords as
+    /// accept). Do NOT mark with `#[serde(default)]`: an empty default
+    /// would silently re-introduce the cryptic 403 from CH 24.3+ that
+    /// rejects the `default` user from network endpoints when no
+    /// `<networks>` override is configured.
+    pub user: String,
+    /// CH password matching `user`. Required at deserialize time.
+    /// Use `""` for authless setups; see the comment on `user`.
+    pub password: String,
     /// Body compression for INSERTs. Defaults to `lz4`.
     #[serde(default)]
     pub compression: ChCompressionKind,
@@ -83,6 +91,32 @@ pub struct ChSinkConfig {
     pub request_timeout: Option<Duration>,
     #[serde(default)]
     pub max_connections: Option<u32>,
+}
+
+/// Manual `Default` (we cannot derive — `url` / `database` have no
+/// sensible defaults, but we want `..Default::default()` ergonomics in
+/// tests that set those two fields explicitly). The credential defaults
+/// match the authless variant documented on `ChSinkConfig::user`.
+///
+/// This `Default` impl is **not** wired into serde — `[serde(default)]`
+/// stays off `user` / `password` so a TOML config that omits either
+/// field fails to parse with a clear `missing field 'user'`
+/// diagnostic, instead of silently falling through to the empty-string
+/// default and surfacing a runtime 403 from CH 24.3+.
+impl Default for ChSinkConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            database: String::new(),
+            user: "default".to_string(),
+            password: String::new(),
+            compression: ChCompressionKind::default(),
+            connect_timeout: None,
+            idle_timeout: None,
+            request_timeout: None,
+            max_connections: None,
+        }
+    }
 }
 
 impl TryFrom<&ComponentConfig> for ChSinkConfig {
@@ -196,6 +230,8 @@ mod tests {
         let cfg = make_component_config(
             r#"url = "http://localhost:8123"
                database = "default"
+               user = "air"
+               password = "air"
                connect-timeout = "3s"
                request-timeout = "60s"
                idle-timeout = "2m"
@@ -209,6 +245,69 @@ mod tests {
         let parsed = result.expect("already checked");
         assert_eq!(parsed.url, "http://localhost:8123");
         assert_eq!(parsed.database, "default");
+        assert_eq!(parsed.user, "air");
+        assert_eq!(parsed.password, "air");
         assert_eq!(parsed.max_connections, Some(10));
+    }
+
+    #[test]
+    fn missing_user_field_is_rejected_with_clear_diagnostic() {
+        // CH 24.3+ rejects the `default` user from network endpoints
+        // by default; moving the credential check to serde gives users
+        // a clear "missing field `user`" diagnostic before any I/O,
+        // instead of a cryptic runtime 403.
+        let cfg = make_component_config(
+            r#"url = "http://localhost:8123"
+               database = "default"
+               password = """#,
+        );
+        let result = ChSinkConfig::try_from(&cfg);
+        match result {
+            Err(ConfigError::TomlParse { source, .. }) => {
+                let message = source.to_string();
+                assert!(
+                    message.contains("user"),
+                    "error message should mention the missing 'user' field, got: {message}"
+                );
+            }
+            other => panic!("expected ConfigError::TomlParse, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_password_field_is_rejected_with_clear_diagnostic() {
+        let cfg = make_component_config(
+            r#"url = "http://localhost:8123"
+               database = "default"
+               user = "default""#,
+        );
+        let result = ChSinkConfig::try_from(&cfg);
+        match result {
+            Err(ConfigError::TomlParse { source, .. }) => {
+                let message = source.to_string();
+                assert!(
+                    message.contains("password"),
+                    "error message should mention the missing 'password' field, got: {message}"
+                );
+            }
+            other => panic!("expected ConfigError::TomlParse, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authless_empty_password_is_accepted() {
+        // Authless CH (with `<networks><ip>::/0</ip></networks>` open
+        // for default-no-password): operator writes
+        // `user = "default", password = ""`. Both fields must still
+        // be present in the TOML.
+        let cfg = make_component_config(
+            r#"url = "http://localhost:8123"
+               database = "default"
+               user = "default"
+               password = """#,
+        );
+        let parsed = ChSinkConfig::try_from(&cfg).expect("authless config should parse");
+        assert_eq!(parsed.user, "default");
+        assert_eq!(parsed.password, "");
     }
 }

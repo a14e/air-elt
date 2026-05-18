@@ -1,0 +1,38 @@
+name: air-elt-manual-mongo-to-pg-smoke
+
+services:
+  mongo:
+    image: mongo:7
+    ports:
+      - "27117:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      # Plain-string ping form — the inline-object form (`{ping:1}`) is mangled
+      # by some compose providers when serialising the CMD array, so we keep
+      # the eval expression brace-free.
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand('ping').ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: air
+      POSTGRES_PASSWORD: air
+      POSTGRES_DB: postgres
+    ports:
+      - "54322:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./init/compose-init.sql:/docker-entrypoint-initdb.d/10-create-databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U air -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  mongo-data:
+  pg-data:

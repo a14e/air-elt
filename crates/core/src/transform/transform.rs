@@ -24,8 +24,7 @@ use crate::types::data_type::DataType;
 /// `Row` into one sink output column.
 ///
 /// The variant set is closed: `Take`, `Body`, `Convert`, `Switch`.
-/// Extending requires a real consumer; do NOT add hypothetical
-/// variants.
+/// Extending requires a real consumer; do NOT add hypothetical variants.
 #[derive(Clone, Debug)]
 pub enum TransformOp {
     /// Move (or clone, if not the last reference) `raw.values[source_index]`
@@ -40,6 +39,19 @@ pub enum TransformOp {
     /// `truncate` flag mirrors `ColumnConversionPlan.ctx.truncate` so
     /// `output_type` can consult the right compatibility relation
     /// (`is_compatible_with_truncate` when on).
+    ///
+    /// The plan's `source` field selects the dispatch mode:
+    ///
+    /// * `Some(t)` — static fast path. The source `DataType` is known
+    ///   at compile time (typed source like Postgres/MySQL whose
+    ///   `information_schema` is authoritative).
+    /// * `None` — dynamic dispatch. The source `DataType` is resolved
+    ///   per cell from the actual `Value` variant via
+    ///   [`Value::data_type`]. Emitted for schemaless sources (Mongo)
+    ///   whose sampled "source type" is not authoritative — baking it
+    ///   into a static plan would blow up on legitimate cross-doc
+    ///   shape drift (an `Int32` sample followed by an `Int64`
+    ///   document).
     Convert {
         input: Box<TransformOp>,
         plan: ColumnConversionPlan,
@@ -308,7 +320,19 @@ impl Transform {
             }
             TransformOp::Convert { input, plan, .. } => {
                 let v = self.eval_op(input, col_idx, values, body)?;
-                let out = convert(v, &plan.source, &plan.sink, &plan.ctx)?;
+                // `plan.source = Some(t)`: static fast path — the source
+                // `DataType` is known at compile time (typed source).
+                // `plan.source = None`: dynamic dispatch — resolve the
+                // source `DataType` from the actual `Value` variant per
+                // cell. Null inputs short-circuit via the dispatcher's
+                // own null/default arm — `data_type()` returns `None` on
+                // null but `convert` treats `Null` before inspecting
+                // `src`, so any placeholder is fine for the null case.
+                let src = match &plan.source {
+                    Some(t) => t.clone(),
+                    None => v.data_type().unwrap_or_else(|| plan.sink.clone()),
+                };
+                let out = convert(v, &src, &plan.sink, &plan.ctx)?;
                 Ok(out)
             }
             TransformOp::Switch { input, table, .. } => {
@@ -372,6 +396,14 @@ fn resolve_op(
             Ok(field.data_type.clone())
         }
         TransformOp::Body => Ok(source_body_type.clone()),
+        // Dynamic-source `Convert` (plan.source = None) short-circuits at
+        // the resolver: the source type is per-cell (unknown at
+        // validation time) and the op's `output_type` returns `plan.sink`
+        // directly. We deliberately skip recursing into `input` so a
+        // missing source field (schemaless source with no sample / sample
+        // missing this column) does not surface as `MissingField` here —
+        // schemaless source schemas are non-authoritative by contract.
+        TransformOp::Convert { plan, .. } if plan.source.is_none() => Ok(plan.sink.clone()),
         TransformOp::Convert { input, .. } | TransformOp::Switch { input, .. } => {
             let inner = resolve_op(input, source_schema, source_body_type, read_columns)?;
             op.output_type(&inner)
@@ -482,7 +514,7 @@ mod tests {
     #[test]
     fn convert_wraps_take_int16_to_int64() {
         let plan = ColumnConversionPlan {
-            source: DataType::Int16,
+            source: Some(DataType::Int16),
             sink: DataType::Int64,
             ctx: ConversionContext::passthrough(),
             switch: None,
@@ -503,7 +535,7 @@ mod tests {
     #[test]
     fn convert_wraps_body_into_text() {
         let plan = ColumnConversionPlan {
-            source: DataType::Json,
+            source: Some(DataType::Json),
             sink: DataType::Text { size: None },
             ctx: ConversionContext::passthrough(),
             switch: None,
@@ -551,7 +583,7 @@ mod tests {
             vec![TransformOp::Convert {
                 input: Box::new(TransformOp::Take { source_index: 0 }),
                 plan: ColumnConversionPlan {
-                    source: DataType::Int16,
+                    source: Some(DataType::Int16),
                     sink: DataType::Int64,
                     ctx: ConversionContext::passthrough(),
                     switch: None,
@@ -650,6 +682,7 @@ mod tests {
             &conversions,
             &body_conversions,
             &read_columns,
+            false,
         )
         .unwrap();
 
@@ -671,7 +704,7 @@ mod tests {
     #[test]
     fn last_take_absorb_through_convert() {
         let plan = ColumnConversionPlan {
-            source: DataType::Int32,
+            source: Some(DataType::Int32),
             sink: DataType::Int32,
             ctx: ConversionContext::passthrough(),
             switch: None,
@@ -706,7 +739,7 @@ mod tests {
     #[test]
     fn last_body_absorb_through_convert() {
         let plan = ColumnConversionPlan {
-            source: DataType::Json,
+            source: Some(DataType::Json),
             sink: DataType::Json,
             ctx: ConversionContext::passthrough(),
             switch: None,
@@ -948,6 +981,7 @@ mod tests {
             &[],
             &body_conversions,
             &read_columns,
+            false,
         )
         .unwrap_err();
         // Pin the specific failure mode: non-object body surfaces as a
@@ -971,7 +1005,7 @@ mod tests {
     #[test]
     fn output_type_convert_returns_plan_sink() {
         let plan = ColumnConversionPlan {
-            source: DataType::Int64,
+            source: Some(DataType::Int64),
             sink: DataType::Int32,
             ctx: ConversionContext::passthrough(),
             switch: None,
@@ -1032,6 +1066,269 @@ mod tests {
                 truncate: true
             }
             .truncate_flag()
+        );
+    }
+
+    // ---- Dynamic Convert (plan.source = None) — schemaless source ----
+
+    /// A `Convert { plan.source = None }` op targeting `Int64` accepts
+    /// heterogeneous `Value` variants across rows and produces `Int64`
+    /// for each one. This is the runtime invariant that frees schemaless
+    /// sources from the sampled-schema contract: 99 docs with `Int32`
+    /// plus one `Int64` no longer blow up.
+    #[test]
+    fn dynamic_convert_dispatches_per_value_variant() {
+        let plan = ColumnConversionPlan {
+            source: None,
+            sink: DataType::Int64,
+            ctx: ConversionContext::passthrough(),
+            switch: None,
+        };
+        let op = TransformOp::Convert {
+            input: Box::new(TransformOp::Take { source_index: 0 }),
+            plan,
+            truncate: false,
+        };
+        let t = Transform::new(vec![op], vec!["n".into()]);
+
+        // Batch 1: Int32 cells.
+        let raw1 = batch_of(vec![raw_row(vec![Value::Int32(42)])]);
+        let out1 = t.apply(raw1).unwrap();
+        assert_eq!(out1.rows[0].values, vec![Value::Int64(42)]);
+
+        // Batch 2: Int64 cells — same Transform program, no recompile.
+        let raw2 = batch_of(vec![raw_row(vec![Value::Int64(9_000_000_000)])]);
+        let out2 = t.apply(raw2).unwrap();
+        assert_eq!(out2.rows[0].values, vec![Value::Int64(9_000_000_000)]);
+
+        // Batch 3: Int8 cell — pure widening to Int64.
+        let raw3 = batch_of(vec![raw_row(vec![Value::Int8(7)])]);
+        let out3 = t.apply(raw3).unwrap();
+        assert_eq!(out3.rows[0].values, vec![Value::Int64(7)]);
+    }
+
+    /// `compile_to_transform(source_schemaless = true)` emits a
+    /// dynamic-source `Convert { plan.source = None }` for direct
+    /// mappings — even when the sampled `plan.source` would otherwise
+    /// match the sink (identity). The static `Take` collapse is unsafe
+    /// under schemaless sources because the next document may carry a
+    /// different variant.
+    #[test]
+    fn schemaless_compile_emits_dynamic_convert_even_for_identity_plan() {
+        use crate::mapping::{DirectMapping, ExpandedMapping};
+        use crate::model::ColumnConversionPlan;
+        use crate::transform::compile_to_transform;
+
+        let expanded = ExpandedMapping {
+            direct: vec![DirectMapping {
+                from: "n".into(),
+                to: "n".into(),
+                truncate: false,
+                default_literal: None,
+                switch: None,
+            }],
+            body: None,
+        };
+        // Identity-looking plan but `source: None` — under schemaless
+        // the compiler must still emit dynamic-source Convert.
+        let plan = ColumnConversionPlan {
+            source: None,
+            sink: DataType::Int64,
+            ctx: ConversionContext::passthrough(),
+            switch: None,
+        };
+        let read_columns = vec!["n".to_string()];
+        let t = compile_to_transform(
+            &expanded,
+            DataType::Json,
+            std::slice::from_ref(&plan),
+            &[],
+            &read_columns,
+            true,
+        )
+        .unwrap();
+        match &t.cols[0] {
+            TransformOp::Convert { plan, .. } => {
+                assert!(plan.source.is_none(), "expected dynamic-source plan");
+                assert_eq!(plan.sink, DataType::Int64);
+            }
+            other => panic!("expected dynamic Convert, got {other:?}"),
+        }
+    }
+
+    /// Companion negative: `source_schemaless = false` with the same
+    /// identity plan collapses to a bare `Take` (existing fast path).
+    /// Confirms the typed-source path is unchanged.
+    #[test]
+    fn typed_compile_keeps_identity_take_path() {
+        use crate::mapping::{DirectMapping, ExpandedMapping};
+        use crate::model::ColumnConversionPlan;
+        use crate::transform::compile_to_transform;
+
+        let expanded = ExpandedMapping {
+            direct: vec![DirectMapping {
+                from: "n".into(),
+                to: "n".into(),
+                truncate: false,
+                default_literal: None,
+                switch: None,
+            }],
+            body: None,
+        };
+        let plan = ColumnConversionPlan::identity(DataType::Int64);
+        let read_columns = vec!["n".to_string()];
+        let t = compile_to_transform(
+            &expanded,
+            DataType::Json,
+            std::slice::from_ref(&plan),
+            &[],
+            &read_columns,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(&t.cols[0], TransformOp::Take { source_index: 0 }));
+    }
+
+    /// End-to-end through `compile_to_transform`: a flow compiled with
+    /// `source_schemaless=true` and a sink column of type `BigInt`
+    /// accepts batches where the actual cell variants differ between
+    /// batches (Int32 in one, Int64 in the next). Both must succeed —
+    /// the sampled "source type" never enters the runtime.
+    #[test]
+    fn schemaless_flow_accepts_cross_batch_value_drift() {
+        use crate::mapping::{DirectMapping, ExpandedMapping};
+        use crate::model::ColumnConversionPlan;
+        use crate::transform::compile_to_transform;
+        use num_bigint::BigInt;
+
+        let expanded = ExpandedMapping {
+            direct: vec![DirectMapping {
+                from: "n".into(),
+                to: "n".into(),
+                truncate: false,
+                default_literal: None,
+                switch: None,
+            }],
+            body: None,
+        };
+        // Sample said Int32 — but that's a hypothesis. The compiler
+        // for a schemaless source must NOT honour it as the runtime
+        // source type. Sink is BigInt (arbitrary-precision). We pass
+        // `source: None` to model the schemaless plan that
+        // `build_conversions` will emit for `src_schemaless == true`.
+        let plan = ColumnConversionPlan {
+            source: None,
+            sink: DataType::BigInt { width: None },
+            ctx: ConversionContext::passthrough(),
+            switch: None,
+        };
+        let read_columns = vec!["n".to_string()];
+        let t = compile_to_transform(
+            &expanded,
+            DataType::Json,
+            std::slice::from_ref(&plan),
+            &[],
+            &read_columns,
+            true,
+        )
+        .unwrap();
+
+        // Batch 1: matches the sample's hypothesis (Int32).
+        let b1 = batch_of(vec![raw_row(vec![Value::Int32(42)])]);
+        let r1 = t.apply(b1).unwrap();
+        assert_eq!(r1.rows[0].values, vec![Value::BigInt(BigInt::from(42))]);
+
+        // Batch 2: drift — actual Int64 cell. The static plan path
+        // would have failed with `ValueShapeMismatch` here.
+        let b2 = batch_of(vec![raw_row(vec![Value::Int64(9_000_000_000)])]);
+        let r2 = t.apply(b2).unwrap();
+        assert_eq!(
+            r2.rows[0].values,
+            vec![Value::BigInt(BigInt::from(9_000_000_000_i64))]
+        );
+
+        // Batch 3: further drift — actual Int8 cell. Still fine.
+        let b3 = batch_of(vec![raw_row(vec![Value::Int8(7)])]);
+        let r3 = t.apply(b3).unwrap();
+        assert_eq!(r3.rows[0].values, vec![Value::BigInt(BigInt::from(7))]);
+    }
+
+    /// Null short-circuit on dynamic-source `Convert`: the dispatcher
+    /// treats `Value::Null` before inspecting `src`, and the default is
+    /// substituted when present.
+    #[test]
+    fn dynamic_convert_null_default_substitution() {
+        let mut ctx = ConversionContext::passthrough();
+        ctx.default = Some(Value::Int64(99));
+        let plan = ColumnConversionPlan {
+            source: None,
+            sink: DataType::Int64,
+            ctx,
+            switch: None,
+        };
+        let op = TransformOp::Convert {
+            input: Box::new(TransformOp::Take { source_index: 0 }),
+            plan,
+            truncate: false,
+        };
+        let t = Transform::new(vec![op], vec!["n".into()]);
+        let raw = batch_of(vec![raw_row(vec![Value::Null])]);
+        let out = t.apply(raw).unwrap();
+        assert_eq!(out.rows[0].values, vec![Value::Int64(99)]);
+    }
+
+    /// `Convert.output_type` returns `plan.sink` regardless of whether
+    /// the plan is static (`source = Some`) or dynamic (`source = None`).
+    /// At validation time we may have no source schema for schemaless
+    /// sources.
+    #[test]
+    fn dynamic_convert_output_type_returns_sink_only() {
+        let plan = ColumnConversionPlan {
+            source: None,
+            sink: DataType::Text { size: None },
+            ctx: ConversionContext::passthrough(),
+            switch: None,
+        };
+        let op = TransformOp::Convert {
+            input: Box::new(TransformOp::Take { source_index: 0 }),
+            plan,
+            truncate: false,
+        };
+        // Pass an unused `input` DataType: the op must not consult it.
+        let out = op.output_type(&DataType::Int32).unwrap();
+        assert_eq!(out, DataType::Text { size: None });
+    }
+
+    /// Real cross-batch source-type drift on `Convert { source: None }`:
+    /// an `Int32` cell in one batch and an `Int64` cell in the next both
+    /// flow through cleanly into the `BigInt` sink. This is the
+    /// schemaless invariant the unified `Convert` arm protects.
+    #[test]
+    fn dynamic_convert_handles_cross_batch_value_type_drift() {
+        use num_bigint::BigInt;
+
+        let plan = ColumnConversionPlan {
+            source: None,
+            sink: DataType::BigInt { width: None },
+            ctx: ConversionContext::passthrough(),
+            switch: None,
+        };
+        let op = TransformOp::Convert {
+            input: Box::new(TransformOp::Take { source_index: 0 }),
+            plan,
+            truncate: false,
+        };
+        let t = Transform::new(vec![op], vec!["n".into()]);
+
+        let b1 = batch_of(vec![raw_row(vec![Value::Int32(42)])]);
+        let r1 = t.apply(b1).unwrap();
+        assert_eq!(r1.rows[0].values, vec![Value::BigInt(BigInt::from(42))]);
+
+        let b2 = batch_of(vec![raw_row(vec![Value::Int64(9_000_000_000)])]);
+        let r2 = t.apply(b2).unwrap();
+        assert_eq!(
+            r2.rows[0].values,
+            vec![Value::BigInt(BigInt::from(9_000_000_000_i64))]
         );
     }
 }

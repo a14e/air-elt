@@ -47,24 +47,27 @@ impl SchemaProvider for MySqlSourceCtx {
 pub struct MySqlSource {
     pool: MySqlPool,
     name: String,
+    pool_max_connections: u32,
 }
 
 impl MySqlSource {
     pub async fn connect(name: String, config: MySqlSourceConfig) -> RuntimeResult<Self> {
-        let pool = pool::connect(
-            &config.url,
-            pool::PoolSettings::from_options(
-                config.connect_timeout,
-                config.acquire_timeout,
-                config.idle_timeout,
-                config.max_lifetime,
-                config.statement_timeout,
-                config.max_connections,
-                config.min_connections,
-            ),
-        )
-        .await?;
-        Ok(Self { pool, name })
+        let pool_settings = pool::PoolSettings::from_options(
+            config.connect_timeout,
+            config.acquire_timeout,
+            config.idle_timeout,
+            config.max_lifetime,
+            config.statement_timeout,
+            config.max_connections,
+            config.min_connections,
+        )?;
+        let pool_max_connections = pool_settings.max_connections;
+        let pool = pool::connect(&config.url, pool_settings).await?;
+        Ok(Self {
+            pool,
+            name,
+            pool_max_connections,
+        })
     }
 
     async fn ensure_connection_alive(&self) -> RuntimeResult<()> {
@@ -94,6 +97,10 @@ impl MySqlSource {
 impl Source for MySqlSource {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn max_connections(&self) -> u32 {
+        self.pool_max_connections
     }
 
     async fn validate_access(&self, spec: &ReadSpec) -> RuntimeResult<()> {

@@ -2,6 +2,7 @@ mod basic;
 mod corner_cases;
 mod errors;
 mod nullable;
+mod oltp_twelve_columns;
 mod pg_chunking;
 mod symbol;
 mod types_extended;

@@ -10,6 +10,16 @@ pub struct IntervalError {
     reason: String,
 }
 
+impl IntervalError {
+    /// Tag used by callers that opt into a zero duration (today: the
+    /// `cursor.jitter` config field). Decoupled from the human-readable
+    /// `Display` so a wording change can't accidentally re-enable
+    /// zero-rejection on those callers.
+    pub fn is_zero(&self) -> bool {
+        self.reason == "duration is zero"
+    }
+}
+
 pub fn parse(raw: &str) -> Result<Duration, IntervalError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -213,6 +223,35 @@ where
     let opt: Option<String> = Option::deserialize(deserializer)?;
     match opt {
         Some(s) => parse(&s).map(Some).map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
+
+/// Parse a duration accepting `"0s"` (and synonyms) as a valid zero
+/// value. The base [`parse`] rejects zero so callers like `interval`
+/// can't silently spin-loop; the per-flow `jitter` config field, by
+/// contrast, treats zero as a meaningful "disable jitter" signal — this
+/// helper covers that path.
+pub fn parse_allow_zero(raw: &str) -> Result<Duration, IntervalError> {
+    match parse(raw) {
+        Ok(d) => Ok(d),
+        Err(e) if e.is_zero() => Ok(Duration::ZERO),
+        Err(e) => Err(e),
+    }
+}
+
+/// Like [`deserialize_opt`] but accepts `"0s"` as `Some(Duration::ZERO)`.
+/// Used by config fields whose zero value carries an explicit meaning
+/// (e.g. `cursor.jitter = "0s"` disables jitter).
+pub fn deserialize_opt_allow_zero<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    match opt {
+        Some(s) => parse_allow_zero(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
         None => Ok(None),
     }
 }

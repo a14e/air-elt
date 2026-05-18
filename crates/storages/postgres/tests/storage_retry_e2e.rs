@@ -61,7 +61,7 @@ async fn cockroach_save_cursor_handles_serialization_retry() {
     }
 
     let loaded = storage
-        .load_cursor(flow)
+        .load_cursor(flow, &[air_elt_core::types::DataType::Int64])
         .await
         .expect("load_cursor")
         .expect("cursor present after concurrent saves");

@@ -1,0 +1,47 @@
+# thousand-flows-test/topology.yaml — operator-edited; everything else is generated.
+
+sources:
+  count: 10
+  tables_per_source: 1       # PHASE 1: 10 flows total
+  heavy_tables_per_source: 1
+
+sinks:
+  postgres:
+    count: 5
+  clickhouse:
+    count: 2
+  questdb:
+    count: 0     # disabled — QDB struggles past ~500 tables per instance under sustained load
+
+ports:
+  source_pg_base: 55100
+  sink_pg_base: 55200
+  sink_ch_http_base: 8200
+  sink_ch_tcp_base: 9200
+  questdb_pg_base: 55400
+  questdb_http_base: 9400
+  state_pg: 55300
+
+load:
+  # PHASE 1 — 10 flows, ~100 ops/s aggregate target.
+  heavy_rps: 10
+  light_rps: 0
+  duration_secs: 60
+  batch_size: 50
+  update_pct: 20
+  mutable_tables_per_source: 1
+
+flow:
+  batch_limit: 1000
+  cursor_interval: "5s"
+  cursor_jitter: "500ms"    # explicit 10% of interval (vs default = full interval)
+  query_timeout: "30s"
+
+resources:
+  pg_memory: "1g"
+  ch_memory: "2g"
+  qdb_memory: "1g"
+
+healthcheck:
+  interval: "2s"
+  retries: 60

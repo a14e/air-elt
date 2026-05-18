@@ -68,7 +68,7 @@ pub fn bind_typed_null<'q>(
         // emitted by the SQL template builder rather than here — this
         // helper has no access to the surrounding SQL fragment. The
         // cursor path never reaches this arm because HLL has
-        // `can_be_cursor() == false`; this is the safety net for any
+        // `cursor_compatible() == false`; this is the safety net for any
         // future write/cursor code that null-binds HLL.
         DataType::Custom(t) if t.kind() == PgHllType::KIND => query.bind::<Option<Vec<u8>>>(None),
         // Other custom types are connector-specific and need a
