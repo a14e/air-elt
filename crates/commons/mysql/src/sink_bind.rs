@@ -71,6 +71,12 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
             DataType::Uuid => {
                 sep.push_bind::<Option<String>>(None);
             }
+            DataType::Ipv4 | DataType::Ipv6 => {
+                // MySQL has no native IP type. Operators store IPs as
+                // VARCHAR/TEXT; canonical IPv4/IPv6 binds as a typed
+                // NULL string.
+                sep.push_bind::<Option<String>>(None);
+            }
             DataType::Json => {
                 sep.push_bind::<Option<serde_json::Value>>(None);
             }
@@ -132,6 +138,16 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
         }
         Value::Uuid(u) => {
             sep.push_bind(u.to_string());
+        }
+        Value::Ipv4(a) => {
+            // VARCHAR-stored IPs: bind the canonical text form. Works
+            // for VARCHAR(15)/VARCHAR(45) and TEXT columns alike, and
+            // aligns with MariaDB's IS_IPV4()/IS_IPV6() helpers which
+            // expect strings.
+            sep.push_bind(a.to_string());
+        }
+        Value::Ipv6(a) => {
+            sep.push_bind(a.to_string());
         }
         Value::Json(j) => {
             sep.push_bind(j.clone());

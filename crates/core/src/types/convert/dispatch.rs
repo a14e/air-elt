@@ -9,7 +9,7 @@
 use super::ConvertError;
 use super::context::ConversionContext;
 use super::{
-    bigint_narrow, bytes_narrow, decimal_narrow, decimal_to_float, float_narrow, int_narrow,
+    bigint_narrow, bytes_narrow, decimal_narrow, decimal_to_float, float_narrow, int_narrow, ip,
     json_text, text_bool, text_narrow, timestamp_date, uuid as uuid_conv, xml,
 };
 use crate::types::{DataType, Value};
@@ -116,6 +116,60 @@ pub fn convert(
         },
         (DataType::Bytes { .. }, DataType::Uuid) => match value {
             Value::Bytes(b) => Ok(Value::Uuid(uuid_conv::from_bytes(&b)?)),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+
+        // ---- IPv4 / IPv6 round-trips ----------------------------------
+        // Ipv4 → Ipv6 is always lossless (IPv4-mapped widening).
+        (DataType::Ipv4, DataType::Ipv6) => match value {
+            Value::Ipv4(a) => Ok(Value::Ipv6(ip::v4_to_v6(a))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        // Ipv6 → Ipv4 only when the source is IPv4-mapped. The matrix
+        // admits this pair only under `truncate=true`; here we still
+        // guard so a caller bypassing the matrix gets a clean error.
+        (DataType::Ipv6, DataType::Ipv4) => {
+            if !ctx.truncate {
+                return Err(ConvertError::Unsupported {
+                    src: src.clone(),
+                    dst: dst.clone(),
+                });
+            }
+            match value {
+                Value::Ipv6(a) => Ok(Value::Ipv4(ip::v6_to_v4_if_mapped(a)?)),
+                _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+            }
+        }
+        (DataType::Ipv4, DataType::Text { .. }) => match value {
+            Value::Ipv4(a) => Ok(Value::Text(ip::to_text_v4(a))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Ipv6, DataType::Text { .. }) => match value {
+            Value::Ipv6(a) => Ok(Value::Text(ip::to_text_v6(a))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Text { .. }, DataType::Ipv4) => match value {
+            Value::Text(s) => Ok(Value::Ipv4(ip::parse_v4(&s)?)),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Text { .. }, DataType::Ipv6) => match value {
+            Value::Text(s) => Ok(Value::Ipv6(ip::parse_v6(&s)?)),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Ipv4, DataType::Bytes { .. }) => match value {
+            Value::Ipv4(a) => Ok(Value::Bytes(ip::to_bytes_v4(a).to_vec())),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Ipv6, DataType::Bytes { .. }) => match value {
+            Value::Ipv6(a) => Ok(Value::Bytes(ip::to_bytes_v6(a).to_vec())),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Bytes { .. }, DataType::Ipv4) => match value {
+            Value::Bytes(b) => Ok(Value::Ipv4(ip::from_bytes_v4(&b)?)),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Bytes { .. }, DataType::Ipv6) => match value {
+            Value::Bytes(b) => Ok(Value::Ipv6(ip::from_bytes_v6(&b)?)),
             _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
@@ -1767,5 +1821,101 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, v);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod ip_dispatch_tests {
+    use super::*;
+    use crate::types::Value;
+
+    fn pt() -> ConversionContext {
+        ConversionContext::passthrough()
+    }
+    fn tr() -> ConversionContext {
+        ConversionContext {
+            default: None,
+            truncate: true,
+        }
+    }
+
+    #[test]
+    fn ipv4_to_ipv6_lossless_widens_to_mapped() {
+        let v = Value::Ipv4(std::net::Ipv4Addr::new(203, 0, 113, 42));
+        let out = convert(v, &DataType::Ipv4, &DataType::Ipv6, &pt()).unwrap();
+        let Value::Ipv6(a) = out else { panic!() };
+        assert_eq!(a.to_string(), "::ffff:203.0.113.42");
+    }
+
+    #[test]
+    fn ipv6_to_ipv4_requires_truncate() {
+        let v = Value::Ipv6("::ffff:203.0.113.42".parse().unwrap());
+        // Without truncate: rejected (Unsupported, since matrix admits
+        // only under truncate; dispatcher mirrors).
+        let res = convert(v.clone(), &DataType::Ipv6, &DataType::Ipv4, &pt());
+        assert!(matches!(res, Err(ConvertError::Unsupported { .. })));
+        // With truncate + IPv4-mapped: succeeds.
+        let out = convert(v, &DataType::Ipv6, &DataType::Ipv4, &tr()).unwrap();
+        assert_eq!(out, Value::Ipv4(std::net::Ipv4Addr::new(203, 0, 113, 42)));
+    }
+
+    #[test]
+    fn ipv6_to_ipv4_non_mapped_errors_at_runtime() {
+        let v = Value::Ipv6("2001:db8::1".parse().unwrap());
+        let res = convert(v, &DataType::Ipv6, &DataType::Ipv4, &tr());
+        assert!(matches!(res, Err(ConvertError::IpV6NotMappable { .. })));
+    }
+
+    #[test]
+    fn text_to_ipv4_and_back() {
+        let v = Value::Text("192.0.2.1".into());
+        let ipv4 = convert(v, &DataType::Text { size: None }, &DataType::Ipv4, &pt()).unwrap();
+        assert_eq!(ipv4, Value::Ipv4(std::net::Ipv4Addr::new(192, 0, 2, 1)));
+        let back = convert(ipv4, &DataType::Ipv4, &DataType::Text { size: None }, &pt()).unwrap();
+        assert_eq!(back, Value::Text("192.0.2.1".into()));
+    }
+
+    #[test]
+    fn text_to_ipv6_round_trips_canonical_form() {
+        let v = Value::Text("2001:0db8:0000:0000:0000:0000:0000:0001".into());
+        let ipv6 = convert(v, &DataType::Text { size: None }, &DataType::Ipv6, &pt()).unwrap();
+        let back = convert(ipv6, &DataType::Ipv6, &DataType::Text { size: None }, &pt()).unwrap();
+        // Canonical form (RFC 5952): "2001:db8::1".
+        assert_eq!(back, Value::Text("2001:db8::1".into()));
+    }
+
+    #[test]
+    fn ipv4_bytes_round_trip_network_order() {
+        let v = Value::Ipv4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        let bytes = convert(v, &DataType::Ipv4, &DataType::Bytes { size: None }, &pt()).unwrap();
+        assert_eq!(bytes, Value::Bytes(vec![10, 0, 0, 1]));
+        let back = convert(
+            bytes,
+            &DataType::Bytes { size: None },
+            &DataType::Ipv4,
+            &pt(),
+        )
+        .unwrap();
+        assert_eq!(back, Value::Ipv4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn bytes_to_ipv4_wrong_length_errors() {
+        let res = convert(
+            Value::Bytes(vec![1, 2, 3]),
+            &DataType::Bytes { size: None },
+            &DataType::Ipv4,
+            &pt(),
+        );
+        assert!(matches!(res, Err(ConvertError::Length { expected: 4, .. })));
+    }
+
+    #[test]
+    fn text_to_ipv6_then_to_ipv4_via_mapped_path() {
+        let v = Value::Text("::ffff:203.0.113.42".into());
+        let ipv6 = convert(v, &DataType::Text { size: None }, &DataType::Ipv6, &pt()).unwrap();
+        let ipv4 = convert(ipv6, &DataType::Ipv6, &DataType::Ipv4, &tr()).unwrap();
+        assert_eq!(ipv4, Value::Ipv4(std::net::Ipv4Addr::new(203, 0, 113, 42)));
     }
 }

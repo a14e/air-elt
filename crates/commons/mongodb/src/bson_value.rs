@@ -163,6 +163,11 @@ pub fn to_bson(v: &Value) -> RuntimeResult<Bson> {
             subtype: bson::spec::BinarySubtype::Uuid,
             bytes: u.as_bytes().to_vec(),
         }),
+        // BSON has no IP type; encode as canonical text string.
+        // Source-side stays as Value::Text — users opt into typed
+        // semantics via a Text → Ipv4/Ipv6 convert in mapping.
+        Value::Ipv4(a) => Bson::String(a.to_string()),
+        Value::Ipv6(a) => Bson::String(a.to_string()),
         Value::Json(j) => bson::to_bson(j).map_err(RuntimeError::backend)?,
         Value::Custom(inner) => {
             let any = inner.as_any();

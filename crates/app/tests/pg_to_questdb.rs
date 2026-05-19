@@ -281,3 +281,121 @@ flow:
     qdb.pool.close().await;
     pg.pool.close().await;
 }
+
+/// PG `inet` (IPv4 only) → QuestDB `IPV4` column. The pipeline
+/// uses `truncate = true` to narrow `postgresql.inet → Ipv4` (drops
+/// the implicit /32 mask). QuestDB has no IPv6 column type, so only
+/// v4 is exercised here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_to_questdb_ip_round_trip() {
+    let pg = pg_pool().await;
+    let qdb = questdb_pool().await.expect("questdb pool");
+
+    let src_schema = format!("{}_qdb_ip", pg.schema);
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{src_schema}\".v4_rows (
+                    ts   TIMESTAMPTZ PRIMARY KEY,
+                    addr INET NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+    let base = chrono::Utc.with_ymd_and_hms(2026, 5, 14, 12, 0, 0).unwrap();
+    for (i, ip) in ["192.0.2.1", "203.0.113.42", "10.0.0.1"].iter().enumerate() {
+        let ts = base + chrono::Duration::seconds(i as i64);
+        sqlx::query(&format!(
+            "INSERT INTO \"{src_schema}\".v4_rows(ts, addr) VALUES ($1, $2::inet)"
+        ))
+        .bind(ts)
+        .bind(*ip)
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+    }
+
+    qdb.drop_table("v4_rows_qdb").await;
+    qdb.exec(
+        "CREATE TABLE v4_rows_qdb (\
+            ts TIMESTAMP, \
+            addr IPV4\
+         ) TIMESTAMP(ts) PARTITION BY DAY;",
+    )
+    .await
+    .expect("create");
+
+    let pg_url = pg.url_with_search_path();
+    let qdb_url = qdb.url.clone();
+    let config_toml = format!(
+        r#"
+[[sources]]
+name = "pg_src"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[sinks]]
+name = "qdb_sink"
+type = "questdb"
+config = {{ url = "{qdb_url}" }}
+
+[[storages]]
+name = "pg_state"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[flow.v4]
+source = "pg_src"
+sink = "qdb_sink"
+storage = "pg_state"
+from = "{src_schema}.v4_rows"
+to = "v4_rows_qdb"
+batch-limit = 8
+cursor = {{ fields = ["ts"], order = "asc", interval = "100ms" }}
+[flow.v4.mapping]
+ts = "ts"
+addr = {{ from = "addr", truncate = true }}
+"#
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    std::fs::write(&path, &config_toml).unwrap();
+    let app = App::from_path(&path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
+
+    // Poll until QuestDB's async insert lands all 3 rows.
+    let mut got: Vec<(String,)> = Vec::new();
+    for _ in 0..50 {
+        let rows: Vec<sqlx::postgres::PgRow> =
+            sqlx::query("SELECT addr::string AS s FROM v4_rows_qdb ORDER BY ts ASC")
+                .fetch_all(&qdb.pool)
+                .await
+                .expect("select");
+        if rows.len() == 3 {
+            got = rows
+                .iter()
+                .map(|r| (r.try_get::<String, _>("s").expect("addr text"),))
+                .collect();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        got,
+        vec![
+            ("192.0.2.1".to_string(),),
+            ("203.0.113.42".to_string(),),
+            ("10.0.0.1".to_string(),),
+        ]
+    );
+
+    pg.pool.close().await;
+    qdb.pool.close().await;
+}

@@ -16,7 +16,6 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use air_elt_commons_clickhouse::types::aggregate_state::ChAggregateStateValue;
 use air_elt_commons_clickhouse::types::enums::ChEnumValue;
 use air_elt_commons_clickhouse::types::fixed_string::ChFixedStringValue;
-use air_elt_commons_clickhouse::types::ip::{ChIpv4Value, ChIpv6Value};
 use air_elt_commons_testing::clickhouse::clickhouse_handle;
 use air_elt_core::model::{Batch, Row, RowOp, WriteSpec};
 use air_elt_core::traits::Sink;
@@ -80,8 +79,8 @@ async fn round_trip_all_custom_types() {
         rows: vec![Row {
             values: vec![
                 Value::UInt64(1),
-                Value::Custom(Box::new(ChIpv4Value(v4))),
-                Value::Custom(Box::new(ChIpv6Value(v6))),
+                Value::Ipv4(v4),
+                Value::Ipv6(v6),
                 Value::Custom(Box::new(ChFixedStringValue {
                     bytes: fs_bytes.clone(),
                 })),

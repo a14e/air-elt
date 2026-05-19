@@ -19,6 +19,7 @@ pub mod dispatch;
 pub mod error;
 pub mod float_narrow;
 pub mod int_narrow;
+pub mod ip;
 pub mod json_text;
 pub mod saturate;
 pub mod text_bool;

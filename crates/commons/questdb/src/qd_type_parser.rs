@@ -23,7 +23,6 @@ use thiserror::Error;
 use air_elt_core::types::data_type::DataType;
 
 use crate::types::geohash::QuestDbGeohashType;
-use crate::types::ipv4::QuestDbIpv4Type;
 use crate::types::long256::QuestDbLong256Type;
 use crate::types::symbol::QuestDbSymbolType;
 
@@ -102,7 +101,7 @@ pub fn parse_type(input: &str) -> Result<DataType, ParseError> {
         "UUID" => DataType::Uuid,
         "BINARY" => DataType::Bytes { size: None },
         "LONG256" => DataType::Custom(Box::new(QuestDbLong256Type)),
-        "IPV4" => DataType::Custom(Box::new(QuestDbIpv4Type)),
+        "IPV4" => DataType::Ipv4,
         _ => {
             return Err(ParseError::Unknown {
                 native: trimmed.to_string(),
@@ -246,16 +245,8 @@ mod tests {
 
     #[test]
     fn ipv4_case_insensitive() {
-        let p = parse("IPv4");
-        match &p {
-            DataType::Custom(t) => assert_eq!(t.kind(), "questdb.ipv4"),
-            _ => panic!("expected Custom"),
-        }
-        let p = parse("IPV4");
-        match &p {
-            DataType::Custom(t) => assert_eq!(t.kind(), "questdb.ipv4"),
-            _ => panic!("expected Custom"),
-        }
+        assert_eq!(parse("IPv4"), DataType::Ipv4);
+        assert_eq!(parse("IPV4"), DataType::Ipv4);
     }
 
     #[test]

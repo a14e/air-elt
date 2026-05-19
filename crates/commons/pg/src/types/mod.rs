@@ -3,5 +3,7 @@
 //! extension points.
 
 pub mod hll;
+pub mod inet;
 
 pub use hll::{PgHllType, PgHllValue};
+pub use inet::{PgInetType, PgInetValue};

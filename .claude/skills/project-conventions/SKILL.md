@@ -76,13 +76,13 @@ ClickHouse is sink-only today; `commons-clickhouse` carries the helpers shared w
 - **`commons-clickhouse::row_binary`** — `encode_value(out, &Field, &Value)` writes one column-cell into a `RowBinary` byte buffer. Handles `Nullable` flag bytes, UTF-8 string LEB128 length prefix, CH's mixed-endian UUID layout, Date as `u16` days, DateTime as `u32` seconds (UTC, no TZ), `Decimal` as fixed-width signed LE (width by precision: ≤9=i32, ≤18=i64, ≤38=i128, ≤76=i256).
 - **`commons-clickhouse::types`** — the CH `DynType`/`DynValue` registry:
   - `aggregate_state` — `ChAggregateStateType { fn_name, arg_types, simple }` + opaque-bytes `ChAggregateStateValue`. `kind()` is `clickhouse.aggregate.<snake_fn>` (leak-interned at first observation per process — bounded by user-declared columns).
-  - `ip` — `ChIpv4Type` / `ChIpv6Type` + `ChIpv4Value(Ipv4Addr)` / `ChIpv6Value(Ipv6Addr)`. Cross-canonical to/from `Text`.
+  - IPv4 / IPv6 are canonical (`DataType::Ipv4` / `DataType::Ipv6`, `Value::Ipv4(Ipv4Addr)` / `Value::Ipv6(Ipv6Addr)`); CH `IPv4` columns encode as LE u32 and `IPv6` as 16 BE octets inside `commons-clickhouse::row_binary`.
   - `fixed_string` — `ChFixedStringType { size }` + bytes carrier. Cross-canonical to/from `Bytes(N)`.
   - `enum_` — `ChEnum8Type` / `ChEnum16Type` (variants table) + `ChEnumValue { name }`. Cross-canonical to/from `Text` (variant name).
   - `int128` — `ChInt128Type` / `ChUInt128Type` + `ChInt128Value(i128)` / `ChUInt128Value(u128)`. 16-byte LE. Cross-canonical to/from `BigInt`.
   - `int256` — `ChInt256Type` / `ChUInt256Type` + `ChInt256Value { le_bytes: [u8; 32] }` / `ChUInt256Value { le_bytes: [u8; 32] }`. 32-byte LE two's-complement. Cross-canonical to/from `BigInt`. Helpers: `bigint_to_le32`, `le32_to_bigint`, `biguint_to_le32`.
 
-**Custom `kind` values shipped**: `clickhouse.ipv4`, `clickhouse.ipv6`, `clickhouse.fixed_string`, `clickhouse.enum8`, `clickhouse.enum16`, `clickhouse.int128`, `clickhouse.uint128`, `clickhouse.int256`, `clickhouse.uint256`, `clickhouse.aggregate.<fn>` (e.g. `clickhouse.aggregate.quantiles_t_digest`, `clickhouse.aggregate.quantiles_d_d_sketch`).
+**Custom `kind` values shipped**: `clickhouse.fixed_string`, `clickhouse.enum8`, `clickhouse.enum16`, `clickhouse.int128`, `clickhouse.uint128`, `clickhouse.int256`, `clickhouse.uint256`, `clickhouse.aggregate.<fn>` (e.g. `clickhouse.aggregate.quantiles_t_digest`, `clickhouse.aggregate.quantiles_d_d_sketch`). IPv4 / IPv6 used to live here as `clickhouse.ipv4` / `clickhouse.ipv6`; they have been promoted to canonical `DataType::Ipv4` / `DataType::Ipv6` (AIR-88).
 
 ## Sink::supports_deletes (append-only ingest)
 
@@ -98,7 +98,7 @@ Future no-delete sinks (e.g. an append-only event-store backend) MUST repeat the
 
 Canonical types are the only pivot — connectors do NOT introduce parallel enums. Each connector maps `native → DataType` on read and `DataType → native` on write.
 
-- **`core::types::{DataType, Value}`** — the type enums. `Text`/`Bytes` carry `size: Option<u32>` (None = unbounded). `BigInt { width }` covers integer-only `numeric(p, 0)` (carrying `num_bigint::BigInt`); `Decimal { precision, scale }` covers fractional `numeric(p, s>0)` (carrying `bigdecimal::BigDecimal`). `Int8` is the canonical signed 8-bit pivot (from MySQL tinyint and ClickHouse Int8). Unsigned variants exist solely for MySQL/MariaDB UNSIGNED columns — pg never produces them.
+- **`core::types::{DataType, Value}`** — the type enums. `Text`/`Bytes` carry `size: Option<u32>` (None = unbounded). `BigInt { width }` covers integer-only `numeric(p, 0)` (carrying `num_bigint::BigInt`); `Decimal { precision, scale }` covers fractional `numeric(p, s>0)` (carrying `bigdecimal::BigDecimal`). `Int8` is the canonical signed 8-bit pivot (from MySQL tinyint and ClickHouse Int8). Unsigned variants exist solely for MySQL/MariaDB UNSIGNED columns — pg never produces them. `Ipv4` / `Ipv6` carry `std::net::Ipv4Addr` / `Ipv6Addr` host addresses (no netmask — for PG `inet` with a mask see `PgInetType`); cursor-compatible, lossless v4→v6 widening via IPv4-mapped, v6→v4 only under `truncate=true` (runtime check for `::ffff:a.b.c.d`).
 - **`core::types::matrix`** — validation-time width check. `is_compatible` is the lossless matrix; `is_compatible_with_truncate` widens to admit narrowing arms when a mapping has `truncate=true`. Reverse paths `BigInt/Decimal → Int*` and `Float → BigInt/Decimal` stay rejected at lossless level. `Decimal → Float64`/`Float32` is admitted losslessly only when precision and scale are both known and `precision ≤ 15` (Float64) / `≤ 7` (Float32); wider / unbounded Decimal lands in the truncate-tolerant matrix and the runtime dispatcher (overflow saturates to ±INFINITY).
 - **`core::types::convert`** — runtime per-cell dispatcher (`convert(value, src, dst, &ctx)`). Identity / pure-widening pairs return the value unchanged. Connectors must NOT implement these conversions themselves; the Transform layer wraps a `ColumnConversionPlan` in `TransformOp::Convert` and dispatches via `convert` at apply time.
 - **`core::types::default_value::parse`** — parses a TOML default literal against the sink `DataType`. Bytes columns require a typed prefix (`hex:` / `base64:` / `utf8:` / `bin:`).
@@ -110,12 +110,12 @@ Canonical types are the only pivot — connectors do NOT introduce parallel enum
 
 Backend-specific types that don't reduce to canonical pivots live behind `DataType::Custom(Box<dyn DynType>)` / `Value::Custom(Box<dyn DynValue>)`. Impls live in `commons-{backend}/src/types/`, never in `core`. Matrix and dispatcher delegate to trait methods.
 
-- `kind()` format `"<vendor>.<type>"`. The string is wire-stable. Existing kinds: `mongodb.object_id`, `mongodb.javascript`, `postgresql.hll`.
+- `kind()` format `"<vendor>.<type>"`. The string is wire-stable. Existing kinds: `mongodb.object_id`, `mongodb.javascript`, `postgresql.hll`, `postgresql.inet`.
 - **Mandatory: `pub const KIND: &'static str = "..."` on the type struct.** Every recognition site compares `t.kind() == T::KIND` — never spell the literal twice (rename must propagate via the compiler).
 - **Mandatory: `DynValue::to_json(&self) -> Result<serde_json::Value, JsonEncodeError>`** on every custom value. Powers the canonical JSON encoder (`core::types::json_encode::value_to_json`) and the `Body { to }` body-mapping path. Existing impls: `MongoObjectIdValue` → 24-hex string, `MongoJsValue` → code as string, `PgHllValue` → base64 string, `BsonObjectValue` → BSON-bridge via `commons-mongodb::bson_value`.
 - **`DynType::is_object() -> bool`** (default `false`). Set to `true` for types that wrap a whole-document object, signalling that they may legally feed a body slot for schemaless raw passthrough. `BsonObjectType` overrides to `true`. Mirrored at the canonical level by `DataType::is_object()` (`true` for `Json`, delegates for `Custom(t)`).
 - `Custom` forbidden as cursor field; `Value::Custom` / `DataType::Custom` Deserialize errors out (cursor-storage JSON never carries one).
-- **Existing custom kinds**: `mongodb.object_id`, `mongodb.javascript`, `mongodb.bson_object` (whole-document raw passthrough — `commons-mongodb::types::bson_object`), `postgresql.hll`.
+- **Existing custom kinds**: `mongodb.object_id`, `mongodb.javascript`, `mongodb.bson_object` (whole-document raw passthrough — `commons-mongodb::types::bson_object`), `postgresql.hll`, `postgresql.inet` (PG `inet` host+netmask wrapping `IpNetwork`; cursor-compatible; conversion to canonical `Ipv4`/`Ipv6` drops the mask and is gated on `truncate=true`).
 
 ## Sampled schema is a validation-time artifact only
 

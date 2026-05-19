@@ -551,3 +551,106 @@ score = "score"
 
     pg.pool.close().await;
 }
+
+/// Mongo `String` → PG `inet` via `Text → Ipv4/Ipv6` convert.
+/// BSON has no IP type — operators store IPs as strings; the Air Elt
+/// matrix admits `Text → Ipv4` / `Text → Ipv6` losslessly and binds
+/// the typed value into a PG `inet` column.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongo_to_pg_ip_string_to_inet() {
+    let mongo = mongo_pool().await;
+    let pg = pg_pool().await;
+
+    let src_db_mongo = format!("{}_ip", mongo.database);
+    let state_db_mongo = format!("{}_ip_state", mongo.database);
+    let dst_schema_pg = format!("{}_ip", pg.schema);
+
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{dst_schema_pg}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{dst_schema_pg}\".clients (
+                    id    BIGINT PRIMARY KEY,
+                    v4    INET NOT NULL,
+                    v6    INET NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let src = mongo
+        .client
+        .database(&src_db_mongo)
+        .collection::<bson::Document>("clients");
+    let docs = vec![
+        doc! { "_id": 1_i64, "v4": "192.0.2.1", "v6": "2001:db8::1" },
+        doc! { "_id": 2_i64, "v4": "203.0.113.42", "v6": "fe80::1" },
+    ];
+    for d in &docs {
+        src.insert_one(d.clone()).await.unwrap();
+    }
+
+    let mongo_url = mongo.url.clone();
+    let pg_url = pg.url_with_search_path();
+    let config_toml = format!(
+        r#"
+[[sources]]
+name = "mongo_src"
+type = "mongodb"
+config = {{ url = "{mongo_url}", database = "{src_db_mongo}" }}
+
+[[sinks]]
+name = "pg_sink"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[storages]]
+name = "mongo_state"
+type = "mongodb"
+config = {{ url = "{mongo_url}", database = "{state_db_mongo}" }}
+
+[flow.clients]
+source = "mongo_src"
+sink = "pg_sink"
+storage = "mongo_state"
+from = "clients"
+to = "{dst_schema_pg}.clients"
+batch-limit = 8
+
+cursor = {{ fields = ["_id"], order = "asc", interval = "100ms" }}
+
+[flow.clients.mapping]
+id = {{ from = "_id", default = 0 }}
+v4 = "v4"
+v6 = "v6"
+"#
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    std::fs::write(&path, &config_toml).unwrap();
+    let app = App::from_path(&path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
+
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(&format!(
+        "SELECT id, host(v4)::text, host(v6)::text \
+         FROM \"{dst_schema_pg}\".clients ORDER BY id"
+    ))
+    .fetch_all(&pg.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "192.0.2.1".to_string(), "2001:db8::1".to_string()),
+            (2, "203.0.113.42".to_string(), "fe80::1".to_string()),
+        ]
+    );
+
+    pg.pool.close().await;
+}

@@ -264,7 +264,8 @@ impl Sink for QuestDbSink {
 
 /// `true` when the canonical type can be carried by the pg-wire writer.
 /// Custom types are accepted only when they are explicitly QuestDB-native
-/// (`questdb.symbol`, `questdb.long256`, `questdb.ipv4`, `questdb.geohash`).
+/// (`questdb.symbol`, `questdb.long256`, `questdb.geohash`). IPv4 is
+/// canonical (`DataType::Ipv4`); IPv6 has no QuestDB column type.
 pub fn type_supported(dt: &DataType) -> bool {
     match dt {
         DataType::Bool
@@ -279,11 +280,14 @@ pub fn type_supported(dt: &DataType) -> bool {
         | DataType::Date
         | DataType::Timestamp
         | DataType::Uuid
+        | DataType::Ipv4
         | DataType::Json => true,
         DataType::Custom(t) => is_questdb_native_kind(t.kind()),
         // BigInt/Decimal need an explicit truncate to Float64 in the
         // mapping; raw BigInt/Decimal cannot land in a QuestDB column.
         DataType::BigInt { .. } | DataType::Decimal { .. } => false,
+        // No native IPv6 column in QuestDB.
+        DataType::Ipv6 => false,
         DataType::Xml | DataType::Union(_) => false,
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => false,
     }

@@ -370,3 +370,88 @@ async fn cockroach_smoke_insert_and_read_back() {
     assert_eq!(back[4], (5, "row-5".into()));
     handle.pool.close().await;
 }
+
+/// IP types end-to-end: bind canonical Value::Ipv4 / Value::Ipv6 (which the
+/// sink routes through IpNetwork host bits) and a PgInetValue (which keeps
+/// the netmask) against a PG `inet` column, then read the rows back via
+/// `host()` text projection.
+#[tokio::test]
+async fn ip_types_round_trip() {
+    use air_elt_commons_pg::types::{PgInetType, PgInetValue};
+
+    let handle = pg_pool().await;
+    handle
+        .pool
+        .execute(
+            "CREATE TABLE ip_vals (
+                id BIGINT PRIMARY KEY,
+                c_ip INET NOT NULL
+            )",
+        )
+        .await
+        .expect("create ip_vals");
+
+    let sink = PgSink::connect(PgSinkConfig {
+        url: handle.url_with_search_path(),
+        ..Default::default()
+    })
+    .await
+    .expect("connect sink");
+
+    let columns: Vec<String> = vec!["id".to_string(), "c_ip".to_string()];
+    let spec = WriteSpec {
+        columns,
+        table: format!("{}.ip_vals", handle.schema),
+        conflict: None,
+    };
+    let ctx = sink.build_context(&spec).await.expect("build_context");
+
+    // 1) Value::Ipv4 → INET column lands as 192.0.2.1/32.
+    // 2) Value::Ipv6 → INET column lands as 2001:db8::1/128.
+    // 3) Value::Custom(PgInetValue(192.0.2.0/24)) preserves the mask.
+    let rows = vec![
+        CoreRow::upsert(vec![
+            Value::Int64(1),
+            Value::Ipv4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+        ]),
+        CoreRow::upsert(vec![
+            Value::Int64(2),
+            Value::Ipv6("2001:db8::1".parse().unwrap()),
+        ]),
+        CoreRow::upsert(vec![
+            Value::Int64(3),
+            Value::Custom(Box::new(PgInetValue("192.0.2.0/24".parse().unwrap()))),
+        ]),
+    ];
+
+    let report = sink
+        .write_batch(
+            &spec,
+            &ctx,
+            Batch {
+                rows,
+                next_cursor: None,
+            },
+            false,
+        )
+        .await
+        .expect("write");
+    assert_eq!(report.rows_written, 3);
+
+    // Read back via `host()` / `text(inet)`.
+    let back: Vec<(i64, String)> = sqlx::query_as("SELECT id, text(c_ip) FROM ip_vals ORDER BY id")
+        .fetch_all(&handle.pool)
+        .await
+        .expect("read back");
+    assert_eq!(back.len(), 3);
+    assert_eq!(back[0], (1, "192.0.2.1/32".to_string()));
+    assert_eq!(back[1], (2, "2001:db8::1/128".to_string()));
+    assert_eq!(back[2], (3, "192.0.2.0/24".to_string()));
+
+    // Silences the unused-import warning for PgInetType, which is the
+    // documented canonical descriptor for the `inet` column even though
+    // the sink path doesn't take it as input.
+    let _ = PgInetType::KIND;
+
+    handle.pool.close().await;
+}

@@ -61,7 +61,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 toml = "1.1.2"
 serde_yaml = "=0.9.33"
-sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "macros", "migrate", "chrono", "uuid", "json", "bigdecimal"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "macros", "migrate", "chrono", "uuid", "json", "bigdecimal", "ipnetwork"] }
 num-bigint = { version = "0.4.6", features = ["serde"] }
 num-traits = "0.2.19"
 bigdecimal = { version = "0.4.10", features = ["serde"] }

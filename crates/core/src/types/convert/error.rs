@@ -28,4 +28,13 @@ pub enum ConvertError {
 
     #[error("string {value:?} is not a recognised boolean literal")]
     InvalidBool { value: String },
+
+    #[error("input does not parse as an {family} address: {reason}")]
+    InvalidIp {
+        family: &'static str,
+        reason: String,
+    },
+
+    #[error("IPv6 address {addr} is not IPv4-mapped (::ffff:a.b.c.d) — cannot lower to Ipv4")]
+    IpV6NotMappable { addr: String },
 }

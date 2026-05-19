@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use air_elt_core::types::DataType;
 
-use crate::types::PgHllType;
+use crate::types::{PgHllType, PgInetType};
 
 pub fn bind_typed_null<'q>(
     query: Query<'q, Postgres, PgArguments>,
@@ -54,6 +54,9 @@ pub fn bind_typed_null<'q>(
         DataType::Date => query.bind::<Option<NaiveDate>>(None),
         DataType::Timestamp => query.bind::<Option<DateTime<Utc>>>(None),
         DataType::Uuid => query.bind::<Option<Uuid>>(None),
+        DataType::Ipv4 | DataType::Ipv6 => {
+            query.bind::<Option<sqlx::types::ipnetwork::IpNetwork>>(None)
+        }
         DataType::Json => query.bind::<Option<serde_json::Value>>(None),
         // Xml carries the canonical text payload over the wire. sqlx has no
         // native `xml` type — bind as text; Postgres accepts text-typed
@@ -71,6 +74,11 @@ pub fn bind_typed_null<'q>(
         // `cursor_compatible() == false`; this is the safety net for any
         // future write/cursor code that null-binds HLL.
         DataType::Custom(t) if t.kind() == PgHllType::KIND => query.bind::<Option<Vec<u8>>>(None),
+        // PG `inet` typed NULL: sqlx-postgres recognises
+        // `Option::<IpNetwork>::None` against the `inet` OID directly.
+        DataType::Custom(t) if t.kind() == PgInetType::KIND => {
+            query.bind::<Option<sqlx::types::ipnetwork::IpNetwork>>(None)
+        }
         // Other custom types are connector-specific and need a
         // dedicated bind path. Reaching this arm means the matrix /
         // validation guards let through a custom type with no codec

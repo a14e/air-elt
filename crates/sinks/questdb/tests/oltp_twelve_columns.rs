@@ -134,6 +134,7 @@ async fn append_only_validate_access_passes() {
         .expect("validate_access on append-only OLTP table");
 
     h.drop_table(table).await;
+    h.pool.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -155,6 +156,7 @@ async fn mutable_validate_access_passes() {
         .expect("validate_access on DEDUP UPSERT mutable OLTP table");
 
     h.drop_table(table).await;
+    h.pool.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -223,4 +225,5 @@ async fn oltp_row_round_trip() {
     assert_eq!(metadata, "{\"channel\":\"web\"}");
 
     h.drop_table(table).await;
+    h.pool.close().await;
 }

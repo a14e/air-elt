@@ -55,6 +55,12 @@ pub enum DataType {
     Date,
     Timestamp,
     Uuid,
+    /// IPv4 host address. Carried as `std::net::Ipv4Addr` (4 octets,
+    /// network byte order). Cursor-compatible (total numeric order).
+    Ipv4,
+    /// IPv6 host address. Carried as `std::net::Ipv6Addr` (16 octets,
+    /// network byte order). Cursor-compatible (total numeric order).
+    Ipv6,
     Json,
     /// XML payload, carried as canonical text. Distinct from `Text` so the
     /// matrix and convert dispatcher can apply XML-specific rules
@@ -227,6 +233,8 @@ impl Hash for DataType {
             | DataType::Date
             | DataType::Timestamp
             | DataType::Uuid
+            | DataType::Ipv4
+            | DataType::Ipv6
             | DataType::Json
             | DataType::Xml => {}
             DataType::BigInt { width } => width.hash(state),
@@ -300,10 +308,12 @@ fn variant_order(d: &DataType) -> u8 {
         DataType::Date => 15,
         DataType::Timestamp => 16,
         DataType::Uuid => 17,
-        DataType::Json => 18,
-        DataType::Xml => 19,
-        DataType::Union(_) => 20,
-        DataType::Custom(_) => 21,
+        DataType::Ipv4 => 18,
+        DataType::Ipv6 => 19,
+        DataType::Json => 20,
+        DataType::Xml => 21,
+        DataType::Union(_) => 22,
+        DataType::Custom(_) => 23,
     }
 }
 
@@ -342,6 +352,8 @@ impl std::fmt::Display for DataType {
             DataType::Date => f.write_str("date"),
             DataType::Timestamp => f.write_str("timestamp"),
             DataType::Uuid => f.write_str("uuid"),
+            DataType::Ipv4 => f.write_str("ipv4"),
+            DataType::Ipv6 => f.write_str("ipv6"),
             DataType::Json => f.write_str("json"),
             DataType::Xml => f.write_str("xml"),
             DataType::Union(vs) => {
@@ -396,6 +408,8 @@ impl Serialize for DataType {
             DataType::Date => serializer.serialize_str("date"),
             DataType::Timestamp => serializer.serialize_str("timestamp"),
             DataType::Uuid => serializer.serialize_str("uuid"),
+            DataType::Ipv4 => serializer.serialize_str("ipv4"),
+            DataType::Ipv6 => serializer.serialize_str("ipv6"),
             DataType::Json => serializer.serialize_str("json"),
             DataType::Xml => serializer.serialize_str("xml"),
             DataType::BigInt { width } => {
@@ -493,6 +507,8 @@ impl<'de> Visitor<'de> for DataTypeVisitor {
             "date" => Ok(DataType::Date),
             "timestamp" => Ok(DataType::Timestamp),
             "uuid" => Ok(DataType::Uuid),
+            "ipv4" => Ok(DataType::Ipv4),
+            "ipv6" => Ok(DataType::Ipv6),
             "json" => Ok(DataType::Json),
             "xml" => Ok(DataType::Xml),
             // Payload-bearing variants must arrive as a map; if a bare
@@ -519,6 +535,8 @@ impl<'de> Visitor<'de> for DataTypeVisitor {
                     "date",
                     "timestamp",
                     "uuid",
+                    "ipv4",
+                    "ipv6",
                     "json",
                     "xml",
                     "union",
@@ -690,6 +708,8 @@ mod tests {
             (DataType::Date, serde_json::json!("date")),
             (DataType::Timestamp, serde_json::json!("timestamp")),
             (DataType::Uuid, serde_json::json!("uuid")),
+            (DataType::Ipv4, serde_json::json!("ipv4")),
+            (DataType::Ipv6, serde_json::json!("ipv6")),
             (DataType::Json, serde_json::json!("json")),
             (DataType::Xml, serde_json::json!("xml")),
             (
@@ -767,6 +787,8 @@ mod tests {
         assert!(DataType::Uuid.cursor_compatible());
         assert!(DataType::Date.cursor_compatible());
         assert!(DataType::Timestamp.cursor_compatible());
+        assert!(DataType::Ipv4.cursor_compatible());
+        assert!(DataType::Ipv6.cursor_compatible());
     }
 
     #[test]

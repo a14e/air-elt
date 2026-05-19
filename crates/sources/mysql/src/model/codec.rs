@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::Row;
@@ -67,6 +69,26 @@ pub fn decode_column(row: &MySqlRow, index: usize, data_type: DataType) -> Runti
         },
         DataType::Json => nullable::<serde_json::Value>(row, index)
             .map(|o| o.map(Value::Json).unwrap_or(Value::Null)),
+        // MySQL has no native IP type — these arms exist only for
+        // pipelines that explicitly declare `DataType::Ipv4`/`Ipv6`
+        // against a VARCHAR/TEXT column. We decode the cell as text
+        // and parse via std::net::Ipv*Addr.
+        DataType::Ipv4 => match nullable::<String>(row, index)? {
+            None => Ok(Value::Null),
+            Some(s) => std::net::Ipv4Addr::from_str(s.trim())
+                .map(Value::Ipv4)
+                .map_err(|e| {
+                    RuntimeError::Other(format!("invalid IPv4 text in mysql column: {e}"))
+                }),
+        },
+        DataType::Ipv6 => match nullable::<String>(row, index)? {
+            None => Ok(Value::Null),
+            Some(s) => std::net::Ipv6Addr::from_str(s.trim())
+                .map(Value::Ipv6)
+                .map_err(|e| {
+                    RuntimeError::Other(format!("invalid IPv6 text in mysql column: {e}"))
+                }),
+        },
         // MySQL/MariaDB `decimal(p, 0)` arrives as `BigDecimal`. Force-
         // rescale to 0 before extracting so a future sqlx normalisation of
         // values like `1000` (potentially surfacing as `1e3`) doesn't trip
@@ -143,6 +165,8 @@ pub fn bind_cursor_value<'q>(
         Value::Date(d) => query.bind(*d),
         Value::Timestamp(ts) => query.bind(*ts),
         Value::Uuid(u) => query.bind(u.to_string()),
+        Value::Ipv4(a) => query.bind(a.to_string()),
+        Value::Ipv6(a) => query.bind(a.to_string()),
         Value::Json(j) => query.bind(j),
         Value::BigInt(b) => query.bind(BigDecimal::new(b.clone(), 0)),
         Value::Decimal(d) => query.bind(d.clone()),

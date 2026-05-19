@@ -4,6 +4,7 @@
 
 (Mandatory) When exploring the project, read `air-elt-overview`.
 (Mandatory) When writing code or planning, also use `rust-guidelines` and `project-conventions`.
+(Mandatory) Before writing or modifying any test (unit, integration, e2e), load `testing-guidelines`.
 If you need to work with configs, use `config-format`.
 Save context using `context-saving` (load it before complex tasks and project research).
 Use the skill tools rather than reading skill files directly.
@@ -11,6 +12,7 @@ Use the skill tools rather than reading skill files directly.
 If you add a new shared utility — document it in `project-conventions`.
 
 (Mandatory) When editing skills, use the `skill-authoring` skill.
+Keep skill bodies small. When a section grows too large, move it into `references/<topic>.md` next to `SKILL.md`; in `SKILL.md` leave a short brief and a relative link to the reference.
 
 When updating configs, also update `config-format`.
 

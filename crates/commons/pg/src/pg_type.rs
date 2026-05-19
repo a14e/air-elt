@@ -8,7 +8,7 @@
 
 use air_elt_core::types::DataType;
 
-use super::types::PgHllType;
+use super::types::{PgHllType, PgInetType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PgType {
@@ -41,6 +41,11 @@ pub enum PgType {
     /// Mapped to a connector-defined `Custom(PgHllType)` rather than a
     /// canonical `DataType` variant; HLL has no canonical analogue.
     Hll,
+    /// PG `inet` — IP host address with optional netmask. Mapped to a
+    /// connector-defined `Custom(PgInetType)` so the netmask survives
+    /// the pipeline; conversions to canonical `Ipv4` / `Ipv6` drop the
+    /// mask under operator `truncate=true` opt-in.
+    Inet,
 }
 
 impl PgType {
@@ -75,6 +80,10 @@ impl PgType {
             // `data_type` column is `'USER-DEFINED'` for extension types
             // and never equals `"hll"`).
             "hll" => PgType::Hll,
+            "inet" => PgType::Inet,
+            // `cidr` deliberately omitted — it always carries a mask
+            // and is a different conceptual type from `inet`. Users
+            // can fall through to the unsupported-type error.
             // `timestamp` / `timestamp without time zone` intentionally omitted.
             _ => return None,
         };
@@ -133,6 +142,7 @@ pub fn to_internal(
         },
         PgType::Xml => DataType::Xml,
         PgType::Hll => DataType::Custom(Box::new(PgHllType)),
+        PgType::Inet => DataType::Custom(Box::new(PgInetType)),
     }
 }
 
@@ -177,6 +187,24 @@ mod tests {
             DataType::Custom(t) => assert_eq!(t.kind(), "postgresql.hll"),
             other => panic!("expected DataType::Custom(hll), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inet_parses_and_maps_to_custom() {
+        assert_eq!(PgType::parse("inet"), Some(PgType::Inet));
+        let dt = to_internal(PgType::Inet, None, None, None);
+        match dt {
+            DataType::Custom(t) => assert_eq!(t.kind(), "postgresql.inet"),
+            other => panic!("expected DataType::Custom(inet), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cidr_is_unsupported() {
+        // `cidr` is structurally a separate concept; we deliberately
+        // do not surface it as `inet` to avoid silently dropping the
+        // mask semantics.
+        assert!(PgType::parse("cidr").is_none());
     }
 
     #[test]
