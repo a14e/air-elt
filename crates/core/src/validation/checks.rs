@@ -1,6 +1,7 @@
 use crate::error::ValidationError;
 use crate::mapping::DirectMapping;
 use crate::model::Schema;
+use crate::types::DataType;
 
 /// Structural mapping guard: every mapped column must exist on both
 /// sides, and a nullable source feeding a NOT-NULL sink must carry a
@@ -49,6 +50,21 @@ pub fn check_mapping(
                 field: format!("{from} -> {to}"),
                 source_nullable: src_field.nullable,
                 sink_nullable: sink_field.nullable,
+            });
+        }
+
+        // Lossy-conversion gate: `Float* -> Bool` under `truncate=true`
+        // can yield `Value::Null` from NaN inputs. The sink column must
+        // be nullable, or the mapping must carry a default to absorb
+        // the NaN case. Any future lossy-conversion that produces Null
+        // (rather than erroring) should extend this check.
+        let from_float = matches!(src_field.data_type, DataType::Float32 | DataType::Float64);
+        let to_bool = matches!(sink_field.data_type, DataType::Bool);
+        if from_float && to_bool && m.truncate && !sink_field.nullable && !default_present {
+            return Err(ValidationError::LossyConversionRequiresNullableOrDefault {
+                field: format!("{from} -> {to}"),
+                from: src_field.data_type.clone(),
+                to: sink_field.data_type.clone(),
             });
         }
     }
@@ -165,6 +181,48 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn float_to_bool_truncate_requires_nullable_sink_or_default() {
+        let src = Schema::new(vec![Field {
+            name: "rate".into(),
+            data_type: DataType::Float64,
+            nullable: false,
+        }]);
+
+        // Non-nullable sink, no default → reject.
+        let dst_strict = Schema::new(vec![Field {
+            name: "alive".into(),
+            data_type: DataType::Bool,
+            nullable: false,
+        }]);
+        let mut m = mapping("rate", "alive");
+        m.truncate = true;
+        let err = check_mapping(&src, &dst_strict, &[m.clone()]).unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::LossyConversionRequiresNullableOrDefault { .. }
+        ));
+
+        // Nullable sink → accept.
+        let dst_nullable = Schema::new(vec![Field {
+            name: "alive".into(),
+            data_type: DataType::Bool,
+            nullable: true,
+        }]);
+        check_mapping(&src, &dst_nullable, &[m.clone()]).unwrap();
+
+        // Non-nullable sink WITH default → accept.
+        let mut m_with_default = m.clone();
+        m_with_default.default_literal = Some(toml::Value::Boolean(false));
+        check_mapping(&src, &dst_strict, &[m_with_default]).unwrap();
+
+        // Without truncate → not gated by this rule (the matrix would
+        // have rejected the conversion earlier).
+        let mut m_no_truncate = mapping("rate", "alive");
+        m_no_truncate.truncate = false;
+        check_mapping(&src, &dst_strict, &[m_no_truncate]).unwrap();
     }
 
     #[test]

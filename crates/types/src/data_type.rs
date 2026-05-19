@@ -5,7 +5,7 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::types::dynamic::DynType;
+use crate::dynamic::DynType;
 
 /// Canonical "pivot" type. Each connector maps native ↔ canonical, the runner
 /// uses the matrix in `super::matrix` to validate compatibility.
@@ -80,7 +80,7 @@ pub enum DataType {
     /// observation order.
     Union(Vec<DataType>),
     /// Connector-specific opaque type. The descriptor implements
-    /// [`crate::types::dynamic::DynType`] which provides the matrix and
+    /// [`crate::dynamic::DynType`] which provides the matrix and
     /// convert hooks. Cursor JSON storage MUST never see this — the
     /// validation pipeline rejects flows whose cursor field carries a
     /// non-cursorable type.
@@ -101,7 +101,7 @@ impl DataType {
     /// Build a normalised type from a multiset of observed members.
     ///
     /// Thin wrapper over
-    /// [`crate::types::union_types::collapse_union`]: flattens nested
+    /// [`crate::union_types::collapse_union`]: flattens nested
     /// `Union(...)` inputs, widens any same-kind family (Int/UInt/
     /// Float/Text/Bytes) where the matrix permits, and otherwise
     /// returns a sorted + dedup'd `DataType::Union` so equality is
@@ -118,7 +118,7 @@ impl DataType {
     where
         I: IntoIterator<Item = DataType>,
     {
-        crate::types::union_types::collapse_union(vs)
+        crate::union_types::collapse_union(vs)
     }
 
     /// Whether this type is admissible as a cursor field. Any type
@@ -134,7 +134,7 @@ impl DataType {
         }
     }
 
-    /// Decode a cursor-JSON value back into [`crate::types::Value`]
+    /// Decode a cursor-JSON value back into [`crate::Value`]
     /// using **this** descriptor as the expected type. The cursor
     /// caller (storage layer) resolves the expected `DataType` for
     /// each cursor field from the source schema; no global registry is
@@ -146,12 +146,9 @@ impl DataType {
     /// the `Value` serde impl. `Custom(t)` parses the
     /// `{"type":"custom","kind":...,"value":...}` envelope, asserts the
     /// kind matches `t.kind()`, and delegates payload decode to
-    /// [`crate::types::dynamic::DynType::decode_cursor_value`].
-    pub fn decode_cursor_json(
-        &self,
-        json: serde_json::Value,
-    ) -> Result<crate::types::Value, String> {
-        use crate::types::Value;
+    /// [`crate::dynamic::DynType::decode_cursor_value`].
+    pub fn decode_cursor_json(&self, json: serde_json::Value) -> Result<crate::Value, String> {
+        use crate::Value;
         if let DataType::Custom(t) = self {
             // Envelope shape: { "type":"custom", "kind":"<kind>", "value": ... }.
             // Validate the kind matches the expected descriptor before
@@ -595,13 +592,11 @@ impl<'de> Visitor<'de> for DataTypeVisitor {
 mod tests {
     use std::any::Any;
 
-    use chrono::TimeZone;
-
     use super::*;
-    use crate::types::convert::ConvertError;
-    use crate::types::convert::context::ConversionContext;
-    use crate::types::default_value::DefaultParseError;
-    use crate::types::value::Value;
+    use crate::convert::ConvertError;
+    use crate::convert::context::ConversionContext;
+    use crate::default_value::DefaultParseError;
+    use crate::value::Value;
 
     /// Test-only Custom type with `cursor_compatible = true` so `cursor_compatible`
     /// arm coverage is unambiguous.
@@ -806,32 +801,6 @@ mod tests {
         assert!(!no.cursor_compatible());
     }
 
-    /// Cursor-decode round-trip for canonical types: the typed entry
-    /// path on `DataType` parses each tagged envelope back into the
-    /// matching `Value` variant without consulting any registry. The
-    /// test pairs a representative sample of the variants `Value`
-    /// supports.
-    #[test]
-    fn decode_cursor_json_canonical_variants() {
-        let date = chrono::NaiveDate::from_ymd_opt(2026, 4, 22).unwrap();
-        let ts = chrono::Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
-        let cases: Vec<(DataType, Value)> = vec![
-            (DataType::Int64, Value::Int64(42)),
-            (DataType::Text { size: None }, Value::Text("hi".into())),
-            (DataType::Date, Value::Date(date)),
-            (DataType::Timestamp, Value::Timestamp(ts)),
-            (
-                DataType::Json,
-                Value::Json(serde_json::json!({"nested": 1})),
-            ),
-        ];
-        for (dt, v) in cases {
-            let envelope = serde_json::to_value(&v).expect("serialize");
-            let decoded = dt.decode_cursor_json(envelope).expect("decode");
-            assert_eq!(decoded, v, "round-trip mismatch for {dt:?}");
-        }
-    }
-
     /// A cursor-compatible Custom type that mirrors its payload as a
     /// `u32`. The `decode_cursor_value` override is the registry-free
     /// reload site exercised by `DataType::decode_cursor_json`.
@@ -851,7 +820,7 @@ mod tests {
         fn decode_cursor_value(
             &self,
             json: &serde_json::Value,
-        ) -> Result<Box<dyn crate::types::dynamic::DynValue>, String> {
+        ) -> Result<Box<dyn crate::dynamic::DynValue>, String> {
             let n = json
                 .as_u64()
                 .ok_or_else(|| format!("expected u64 for {}", self.kind()))?;
@@ -887,7 +856,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct DecodableValue(u32);
 
-    impl crate::types::dynamic::DynValue for DecodableValue {
+    impl crate::dynamic::DynValue for DecodableValue {
         fn dyn_type(&self) -> Box<dyn DynType> {
             Box::new(DecodableCustom)
         }
@@ -897,13 +866,13 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn Any> {
             self
         }
-        fn eq_dyn(&self, other: &dyn crate::types::dynamic::DynValue) -> bool {
+        fn eq_dyn(&self, other: &dyn crate::dynamic::DynValue) -> bool {
             other
                 .as_any()
                 .downcast_ref::<DecodableValue>()
                 .is_some_and(|o| o.0 == self.0)
         }
-        fn clone_box(&self) -> Box<dyn crate::types::dynamic::DynValue> {
+        fn clone_box(&self) -> Box<dyn crate::dynamic::DynValue> {
             Box::new(self.clone())
         }
         fn to_json(&self) -> Result<serde_json::Value, crate::error::JsonEncodeError> {
@@ -965,5 +934,171 @@ mod tests {
         });
         let res = dt.decode_cursor_json(envelope);
         assert!(res.is_err(), "kind mismatch must error");
+    }
+
+    // ---- Property-based tests --------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Strategy yielding any non-`Custom`, non-`Union` `DataType`,
+    /// covering both unit-shaped variants and the parametric ones.
+    fn any_simple_data_type() -> impl Strategy<Value = DataType> {
+        prop_oneof![
+            Just(DataType::Bool),
+            Just(DataType::Int8),
+            Just(DataType::Int16),
+            Just(DataType::Int32),
+            Just(DataType::Int64),
+            Just(DataType::UInt8),
+            Just(DataType::UInt16),
+            Just(DataType::UInt32),
+            Just(DataType::UInt64),
+            Just(DataType::Float32),
+            Just(DataType::Float64),
+            Just(DataType::Date),
+            Just(DataType::Timestamp),
+            Just(DataType::Uuid),
+            Just(DataType::Ipv4),
+            Just(DataType::Ipv6),
+            Just(DataType::Json),
+            Just(DataType::Xml),
+            prop::option::of(1u32..=64).prop_map(|w| DataType::BigInt { width: w }),
+            (1u32..=38, 0u32..=18).prop_map(|(p, s)| DataType::Decimal {
+                precision: Some(p),
+                scale: Some(s.min(p)),
+            }),
+            Just(DataType::Decimal {
+                precision: None,
+                scale: None,
+            }),
+            prop::option::of(1u32..=1024).prop_map(|sz| DataType::Text { size: sz }),
+            prop::option::of(1u32..=1024).prop_map(|sz| DataType::Bytes { size: sz }),
+        ]
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn data_type_serde_round_trip_non_custom(#[strategy(any_simple_data_type())] t: DataType) {
+        let json = serde_json::to_value(&t).expect("serialize");
+        let back: DataType = serde_json::from_value(json).expect("deserialize");
+        prop_assert_eq!(back, t);
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(512))]
+    fn cursor_compatible_classification(#[strategy(any_simple_data_type())] t: DataType) {
+        let expected = !matches!(t, DataType::Json | DataType::Xml);
+        prop_assert_eq!(t.cursor_compatible(), expected);
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(64))]
+    fn cursor_compatible_rejects_union(
+        #[strategy(prop::collection::vec(any_simple_data_type(), 0..4))] inner: Vec<DataType>,
+    ) {
+        let dt = DataType::Union(inner);
+        prop_assert!(!dt.cursor_compatible());
+    }
+
+    /// Strategy yielding a `(DataType, Value)` pair whose value matches
+    /// the declared canonical type. Used to drive `decode_cursor_json`
+    /// round-trip without inventing per-variant golden cases.
+    fn any_canonical_type_value_pair() -> impl Strategy<Value = (DataType, Value)> {
+        let bool_pair = any::<bool>().prop_map(|b| (DataType::Bool, Value::Bool(b)));
+        let int8_pair = any::<i8>().prop_map(|n| (DataType::Int8, Value::Int8(n)));
+        let int16_pair = any::<i16>().prop_map(|n| (DataType::Int16, Value::Int16(n)));
+        let int32_pair = any::<i32>().prop_map(|n| (DataType::Int32, Value::Int32(n)));
+        let int64_pair = any::<i64>().prop_map(|n| (DataType::Int64, Value::Int64(n)));
+        let uint8_pair = any::<u8>().prop_map(|n| (DataType::UInt8, Value::UInt8(n)));
+        let uint16_pair = any::<u16>().prop_map(|n| (DataType::UInt16, Value::UInt16(n)));
+        let uint32_pair = any::<u32>().prop_map(|n| (DataType::UInt32, Value::UInt32(n)));
+        let uint64_pair = any::<u64>().prop_map(|n| (DataType::UInt64, Value::UInt64(n)));
+        let float32_pair = any::<f32>()
+            .prop_filter("no NaN", |f| !f.is_nan())
+            .prop_map(|n| (DataType::Float32, Value::Float32(n)));
+        let float64_pair = any::<f64>()
+            .prop_filter("no NaN", |f| !f.is_nan())
+            .prop_map(|n| (DataType::Float64, Value::Float64(n)));
+        let big_int_pair = any::<i128>().prop_map(|n| {
+            (
+                DataType::BigInt { width: None },
+                Value::BigInt(num_bigint::BigInt::from(n)),
+            )
+        });
+        let decimal_pair = (any::<i64>(), 0i64..18).prop_map(|(mantissa, scale)| {
+            (
+                DataType::Decimal {
+                    precision: None,
+                    scale: None,
+                },
+                Value::Decimal(bigdecimal::BigDecimal::new(
+                    num_bigint::BigInt::from(mantissa),
+                    scale,
+                )),
+            )
+        });
+        let text_pair = ".*".prop_map(|s: String| (DataType::Text { size: None }, Value::Text(s)));
+        let bytes_pair = prop::collection::vec(any::<u8>(), 0..32)
+            .prop_map(|b| (DataType::Bytes { size: None }, Value::Bytes(b)));
+        let date_pair = (1970i32..2100, 1u32..=12, 1u32..=28).prop_map(|(y, m, d)| {
+            (
+                DataType::Date,
+                Value::Date(chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap()),
+            )
+        });
+        let timestamp_pair = any::<i64>().prop_filter_map("range", |seconds| {
+            let s = seconds % 4_000_000_000;
+            chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0)
+                .map(|t| (DataType::Timestamp, Value::Timestamp(t)))
+        });
+        let uuid_pair = any::<[u8; 16]>()
+            .prop_map(|b| (DataType::Uuid, Value::Uuid(uuid::Uuid::from_bytes(b))));
+        let ipv4_pair = any::<u32>().prop_map(|n| {
+            (
+                DataType::Ipv4,
+                Value::Ipv4(std::net::Ipv4Addr::from(n.to_be_bytes())),
+            )
+        });
+        let ipv6_pair = any::<[u8; 16]>()
+            .prop_map(|b| (DataType::Ipv6, Value::Ipv6(std::net::Ipv6Addr::from(b))));
+        let json_pair =
+            any::<i64>().prop_map(|n| (DataType::Json, Value::Json(serde_json::json!({ "n": n }))));
+
+        prop_oneof![
+            bool_pair,
+            int8_pair,
+            int16_pair,
+            int32_pair,
+            int64_pair,
+            uint8_pair,
+            uint16_pair,
+            uint32_pair,
+            uint64_pair,
+            float32_pair,
+            float64_pair,
+            big_int_pair,
+            decimal_pair,
+            text_pair,
+            bytes_pair,
+            date_pair,
+            timestamp_pair,
+            uuid_pair,
+            ipv4_pair,
+            ipv6_pair,
+            json_pair,
+        ]
+    }
+
+    /// `DataType::decode_cursor_json` round-trips every canonical
+    /// `(DataType, Value)` pair where the value matches the declared
+    /// type. Replaces the per-variant table that used to live as a
+    /// `#[test]` golden case — the property is "serialize via Value
+    /// then decode through the typed entry yields the original",
+    /// independent of any particular variant.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn decode_cursor_json_canonical_round_trip(
+        #[strategy(any_canonical_type_value_pair())] pair: (DataType, Value),
+    ) {
+        let (dt, value) = pair;
+        let envelope = serde_json::to_value(&value).expect("serialize");
+        let decoded = dt.decode_cursor_json(envelope).expect("decode");
+        prop_assert_eq!(decoded, value);
     }
 }

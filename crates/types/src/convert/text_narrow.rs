@@ -4,7 +4,7 @@
 
 use super::error::ConvertError;
 use super::text_truncate::truncate_chars;
-use crate::types::{DataType, Value};
+use crate::{DataType, Value};
 
 pub fn convert(
     value: Value,
@@ -76,5 +76,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, Value::Text("abc".into()));
+    }
+
+    // ---- Property-based tests --------------------------------------
+
+    use proptest::prelude::*;
+
+    fn arb_unicode_string() -> impl Strategy<Value = String> {
+        prop::collection::vec(any::<char>(), 0..20)
+            .prop_map(|cs| cs.into_iter().collect::<String>())
+    }
+
+    /// Random Unicode strings truncated to any character budget always
+    /// produce a valid UTF-8 string. Rust's `&str` invariant already
+    /// guarantees this at the type level (the slice we hand out came
+    /// from a `char_indices` boundary), but the property also asserts
+    /// codepoint-count semantics and prefix-ness — independent of the
+    /// type system.
+    #[test_strategy::proptest]
+    fn text_narrow_utf8_char_boundaries(
+        #[strategy(arb_unicode_string())] s: String,
+        #[strategy(0u32..40)] max: u32,
+    ) {
+        let out = convert(
+            Value::Text(s.clone()),
+            &DataType::Text { size: Some(max) },
+            Some(max),
+        )
+        .unwrap();
+        let Value::Text(out_s) = out else {
+            prop_assert!(false, "expected Value::Text");
+            return Ok(());
+        };
+        // The result roundtrips through `from_utf8` — i.e. it is valid
+        // UTF-8 at every byte boundary.
+        prop_assert!(std::str::from_utf8(out_s.as_bytes()).is_ok());
+        // Codepoint-count semantics: result has at most `max` chars.
+        prop_assert!(out_s.chars().count() <= max as usize);
+        // And is a prefix of the input.
+        prop_assert!(s.starts_with(&out_s));
+        // Either we truncated at exactly the budget, or we returned the
+        // full input.
+        let input_chars = s.chars().count();
+        if input_chars > max as usize {
+            prop_assert_eq!(out_s.chars().count(), max as usize);
+        } else {
+            prop_assert_eq!(out_s.as_str(), s.as_str());
+        }
     }
 }

@@ -30,6 +30,27 @@ We use `cargo nextest` instead of `cargo test`:
 1. Full task-completion run: `cargo nextest run --no-fail-fast` (covers the whole workspace; `--no-fail-fast` reports every failure rather than stopping at the first).
 2. Regular dev runs (single suite, single test, narrow scope): `cargo nextest run …` without `--no-fail-fast`.
 
+## Property-based testing for types and converters
+
+Any change in `crates/types/` (the canonical type model + converters)
+must extend the proptest suite, not just the spec-cases.
+
+- Use `proptest = "1"` and `test-strategy = "0.4"` (declared as
+  `[dev-dependencies]` in `crates/types/Cargo.toml`).
+- Prefer `#[test_strategy::proptest]` with typed-parameter strategies,
+  or hand-built `prop_compose!` strategies for workspace types that
+  lack `Arbitrary` (`BigInt`, `BigDecimal`, `Uuid`, `Ipv4Addr`,
+  `Ipv6Addr`, `DateTime<Utc>`, `NaiveDate`).
+- Keep golden tables (exact-byte serialisations) and anti-grep tests
+  as plain `#[test]` — properties cannot replace them.
+- A new variant on `DataType` or `Value` requires extending the matching
+  strategy/`Arbitrary` arm so the existing properties extend to it
+  automatically.
+- Run via `cargo nextest run -p air-elt-types`.
+- Commit `crates/types/proptest-regressions/` to git. Proptest writes
+  shrink seeds there when a property fails; checking it in lets the
+  same failing seed be replayed locally and in CI.
+
 ## When adding a new sink / source / storage
 
 1. Write detailed tests for it in its folder.

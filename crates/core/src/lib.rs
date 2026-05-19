@@ -6,7 +6,7 @@ pub mod model;
 pub mod registry;
 pub mod traits;
 pub mod transform;
-pub mod types;
+pub use air_elt_types as types;
 pub mod util;
 pub mod validation;
 

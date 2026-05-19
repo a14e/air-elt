@@ -137,13 +137,14 @@ mod tests {
     }
 
     #[test]
-    fn v4_to_v6_round_trips_through_mapped_extractor() {
+    fn v4_to_v6_mapped_canonical_text_form() {
+        // Anchor a specific edge: the canonical text form of the
+        // IPv4-mapped IPv6 address embeds the dotted-quad untouched in
+        // the trailing 32 bits — the round-trip property is covered
+        // exhaustively by `ip_v4_mapped_v6_round_trip_boundaries` below.
         let a4 = Ipv4Addr::new(203, 0, 113, 42);
         let a6 = v4_to_v6(a4);
-        // The IPv4-mapped form has the host in the low 32 bits and the
-        // ::ffff: tag in the next 16 bits.
         assert_eq!(to_text_v6(a6), "::ffff:203.0.113.42");
-        assert_eq!(v6_to_v4_if_mapped(a6).unwrap(), a4);
     }
 
     #[test]
@@ -171,15 +172,25 @@ mod tests {
     }
 
     #[test]
-    fn bytes_round_trip_v4_v6() {
+    fn to_bytes_v4_matches_dotted_quad_octets() {
+        // Anchor a single specific byte order claim — the property
+        // `ipv4_be_round_trip` exercises round-tripping exhaustively;
+        // this case nails down the BE octet layout itself.
         let a4 = Ipv4Addr::new(10, 0, 0, 1);
-        let raw = to_bytes_v4(a4);
-        assert_eq!(raw, [10, 0, 0, 1]);
-        assert_eq!(from_bytes_v4(&raw).unwrap(), a4);
+        assert_eq!(to_bytes_v4(a4), [10, 0, 0, 1]);
+    }
 
-        let a6: Ipv6Addr = "2001:db8::1".parse().unwrap();
-        let raw = to_bytes_v6(a6);
-        assert_eq!(from_bytes_v6(&raw).unwrap(), a6);
+    #[test]
+    fn ip_v4_broadcast_and_loopback_round_trip() {
+        // Explicit anchors for the well-known boundary IPv4 addresses.
+        // The randomised PT below already covers the property; these
+        // names document the intent for future readers.
+        for a4 in [Ipv4Addr::BROADCAST, Ipv4Addr::LOCALHOST] {
+            let raw = to_bytes_v4(a4);
+            assert_eq!(from_bytes_v4(&raw).unwrap(), a4);
+            let mapped = v4_to_v6(a4);
+            assert_eq!(v6_to_v4_if_mapped(mapped).unwrap(), a4);
+        }
     }
 
     #[test]
@@ -202,5 +213,44 @@ mod tests {
                 Err(ConvertError::Length { expected: 16, .. })
             ));
         }
+    }
+
+    // ---- Property-based tests --------------------------------------
+
+    use proptest::prelude::*;
+
+    fn any_ipv4() -> impl Strategy<Value = Ipv4Addr> {
+        any::<[u8; 4]>().prop_map(Ipv4Addr::from)
+    }
+
+    fn any_ipv6() -> impl Strategy<Value = Ipv6Addr> {
+        any::<[u8; 16]>().prop_map(Ipv6Addr::from)
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn ipv4_be_round_trip(#[strategy(any_ipv4())] a: Ipv4Addr) {
+        let raw = to_bytes_v4(a);
+        let back = from_bytes_v4(&raw).expect("decode");
+        prop_assert_eq!(back, a);
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn ipv6_be_round_trip(#[strategy(any_ipv6())] a: Ipv6Addr) {
+        let raw = to_bytes_v6(a);
+        let back = from_bytes_v6(&raw).expect("decode");
+        prop_assert_eq!(back, a);
+    }
+
+    /// Widen every IPv4 to its `::ffff:a.b.c.d` form and narrow back —
+    /// the four octets must survive bit-for-bit. This exercises the
+    /// `truncate=true` arm of `v6_to_v4_if_mapped`.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn ip_v4_mapped_v6_round_trip_boundaries(#[strategy(any_ipv4())] a4: Ipv4Addr) {
+        let a6 = v4_to_v6(a4);
+        let back = v6_to_v4_if_mapped(a6).expect("mapped");
+        prop_assert_eq!(back, a4);
+        // The mapped form must keep the IPv4 octets in the trailing 32 bits.
+        let octets6 = to_bytes_v6(a6);
+        prop_assert_eq!(&octets6[12..], &a4.octets()[..]);
     }
 }

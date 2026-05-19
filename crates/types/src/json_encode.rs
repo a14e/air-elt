@@ -31,10 +31,10 @@
 //! envelope. The unit grep test below asserts the literal substring
 //! does not appear in this file's source.
 //!
-//! [`Value`]: crate::types::value::Value
+//! [`Value`]: crate::value::Value
 
 use crate::error::JsonEncodeError;
-use crate::types::value::Value;
+use crate::value::Value;
 
 /// Maximum nesting depth across recursive `Value::Json` payloads.
 pub const MAX_JSON_DEPTH: usize = 100;
@@ -153,7 +153,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::types::dynamic::{DynType, DynValue};
+    use crate::dynamic::{DynType, DynValue};
     use bigdecimal::BigDecimal;
     use chrono::{DateTime, NaiveDate, Utc};
     use num_bigint::BigInt;
@@ -240,26 +240,26 @@ mod tests {
         fn kind(&self) -> &str {
             "stub.t"
         }
-        fn can_convert_to(&self, _: &crate::types::DataType, _: bool) -> bool {
+        fn can_convert_to(&self, _: &crate::DataType, _: bool) -> bool {
             false
         }
-        fn can_construct_from(&self, _: &crate::types::DataType, _: bool) -> bool {
+        fn can_construct_from(&self, _: &crate::DataType, _: bool) -> bool {
             false
         }
         fn convert(
             &self,
             _: Value,
-            _: &crate::types::DataType,
-            _: &crate::types::convert::context::ConversionContext,
-        ) -> Result<Value, crate::types::convert::ConvertError> {
+            _: &crate::DataType,
+            _: &crate::convert::context::ConversionContext,
+        ) -> Result<Value, crate::convert::ConvertError> {
             unimplemented!()
         }
         fn construct(
             &self,
             _: Value,
-            _: &crate::types::DataType,
-            _: &crate::types::convert::context::ConversionContext,
-        ) -> Result<Value, crate::types::convert::ConvertError> {
+            _: &crate::DataType,
+            _: &crate::convert::context::ConversionContext,
+        ) -> Result<Value, crate::convert::ConvertError> {
             unimplemented!()
         }
         fn clone_box(&self) -> Box<dyn DynType> {
@@ -363,5 +363,177 @@ mod tests {
             "json_encode.rs must not call {needle} — \
              it would route Value through its cursor-envelope Serialize"
         );
+    }
+
+    // ---- Property-based tests --------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Yields any non-finite `f32` — covers the full NaN / Inf
+    /// bit-space, not just the three canonical patterns. IEEE-754
+    /// binary32: bit 31 = sign, bits 23..=30 = exponent, bits 0..=22 =
+    /// mantissa. Setting the exponent to all-ones produces ±INFINITY
+    /// (mantissa = 0) and every signalling/quiet NaN (mantissa != 0).
+    /// Constructing the bits directly avoids `prop_filter` blowing the
+    /// 65 536 local-reject budget for a ~1-in-2048 occurrence.
+    fn non_finite_f32() -> impl Strategy<Value = f32> {
+        (any::<bool>(), any::<u32>()).prop_map(|(sign, mantissa)| {
+            let sign_bit = u32::from(sign) << 31;
+            let exponent_bits = 0xFF_u32 << 23;
+            let mantissa_bits = mantissa & 0x007F_FFFF;
+            f32::from_bits(sign_bit | exponent_bits | mantissa_bits)
+        })
+    }
+
+    /// Yields any non-finite `f64` — IEEE-754 binary64 with the
+    /// 11-bit exponent forced to all-ones. Same bit-space coverage as
+    /// the `f32` strategy.
+    fn non_finite_f64() -> impl Strategy<Value = f64> {
+        (any::<bool>(), any::<u64>()).prop_map(|(sign, mantissa)| {
+            let sign_bit = u64::from(sign) << 63;
+            let exponent_bits = 0x7FF_u64 << 52;
+            let mantissa_bits = mantissa & 0x000F_FFFF_FFFF_FFFF;
+            f64::from_bits(sign_bit | exponent_bits | mantissa_bits)
+        })
+    }
+
+    /// Decode a lowercase hex string back into bytes. Test-only inverse
+    /// of `bytes_to_hex`; used to lock the round-trip contract.
+    fn hex_decode(s: &str) -> Vec<u8> {
+        assert!(s.len().is_multiple_of(2), "hex length must be even");
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(s.len() / 2);
+        for chunk in bytes.chunks(2) {
+            let hi = hex_nibble(chunk[0]);
+            let lo = hex_nibble(chunk[1]);
+            out.push((hi << 4) | lo);
+        }
+        out
+    }
+
+    fn hex_nibble(b: u8) -> u8 {
+        match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            _ => panic!("non-hex byte: {b}"),
+        }
+    }
+
+    /// Build a `serde_json::Value` nested to `depth` layers, alternating
+    /// between object and array containers. Used to exercise the
+    /// `Object`/`Array` branches inside `encode_serde_json_at_depth`.
+    fn mixed_nest(depth: usize) -> serde_json::Value {
+        let mut v = serde_json::Value::Null;
+        for level in 0..depth {
+            if level.is_multiple_of(2) {
+                v = serde_json::Value::Array(vec![v]);
+            } else {
+                let mut map = serde_json::Map::new();
+                map.insert("k".to_string(), v);
+                v = serde_json::Value::Object(map);
+            }
+        }
+        v
+    }
+
+    /// Walk a `serde_json::Value` and return its maximum container
+    /// nesting depth (scalars = 0). Used to assert structural
+    /// preservation in the array/object property.
+    fn structural_depth(v: &serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::Array(items) => {
+                1 + items.iter().map(structural_depth).max().unwrap_or(0)
+            }
+            serde_json::Value::Object(map) => {
+                1 + map.values().map(structural_depth).max().unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(64))]
+    fn value_to_json_non_finite_float32_to_null(#[strategy(non_finite_f32())] x: f32) {
+        let result = value_to_json(&Value::Float32(x)).expect("encode");
+        prop_assert_eq!(result, serde_json::Value::Null);
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(64))]
+    fn value_to_json_non_finite_float64_to_null(#[strategy(non_finite_f64())] x: f64) {
+        let result = value_to_json(&Value::Float64(x)).expect("encode");
+        prop_assert_eq!(result, serde_json::Value::Null);
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn value_to_json_uint64_safe_window(#[strategy(any::<u64>())] n: u64) {
+        let result = value_to_json(&Value::UInt64(n)).expect("encode");
+        if n >= U64_JSON_SAFE_MAX {
+            prop_assert_eq!(result, serde_json::Value::String(n.to_string()));
+        } else {
+            prop_assert_eq!(result, serde_json::Value::from(n));
+        }
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(100))]
+    fn depth_cap_monotone_under(#[strategy(0usize..=99)] n: usize) {
+        fn nest(n: usize) -> serde_json::Value {
+            let mut v = serde_json::Value::Array(vec![]);
+            for _ in 0..n {
+                v = serde_json::Value::Array(vec![v]);
+            }
+            v
+        }
+        let value = Value::Json(nest(n));
+        prop_assert!(value_to_json(&value).is_ok());
+    }
+
+    /// Mixed Array/Object nesting under the depth cap must encode
+    /// successfully and preserve the structural depth. The pre-existing
+    /// `depth_cap_monotone_under` exercises only the `Array` branch;
+    /// this one walks both `Array` and `Object` arms inside
+    /// `encode_serde_json_at_depth`.
+    #[test_strategy::proptest(ProptestConfig::with_cases(64))]
+    fn json_encode_array_depth_inside_value_json(#[strategy(0usize..=50)] depth: usize) {
+        let input = mixed_nest(depth);
+        let expected_depth = structural_depth(&input);
+        let encoded = value_to_json(&Value::Json(input)).expect("encode");
+        prop_assert_eq!(structural_depth(&encoded), expected_depth);
+    }
+
+    /// Hex round-trip property: `hex_decode(bytes_to_hex(v)) == v` and
+    /// the encoded string is exactly twice as long as the input. Locks
+    /// the canonical lowercase-hex contract for `Value::Bytes`.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn json_encode_bytes_to_hex_round_trip(
+        #[strategy(prop::collection::vec(any::<u8>(), 0usize..=64))] bytes: Vec<u8>,
+    ) {
+        let encoded = value_to_json(&Value::Bytes(bytes.clone())).expect("encode");
+        let hex = match encoded {
+            serde_json::Value::String(s) => s,
+            other => {
+                prop_assert!(false, "expected string, got {other:?}");
+                unreachable!()
+            }
+        };
+        prop_assert_eq!(hex.len(), bytes.len() * 2);
+        prop_assert_eq!(hex_decode(&hex), bytes);
+    }
+
+    /// Array-in-object-in-array at the 100/101 boundary: at depth 100
+    /// the encoder must accept the payload, at depth 101 it must reject
+    /// with `DepthExceeded`. Exercises the `Object` arm in the depth
+    /// counter — the plain-array boundary test only covers `Array`.
+    #[test]
+    fn json_encode_mixed_nesting_depth_at_boundary() {
+        // `Value::Json` consumes one depth slot, then 99 mixed layers
+        // → max depth reached = 100. Pass.
+        let ok = Value::Json(mixed_nest(99));
+        assert!(value_to_json(&ok).is_ok());
+
+        // 101 mixed layers → exceeds cap. Fail.
+        let bad = Value::Json(mixed_nest(101));
+        assert!(matches!(
+            value_to_json(&bad),
+            Err(JsonEncodeError::DepthExceeded)
+        ));
     }
 }

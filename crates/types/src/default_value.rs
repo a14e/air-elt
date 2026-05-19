@@ -12,7 +12,7 @@ use num_bigint::BigInt;
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::types::{DataType, Value};
+use crate::{DataType, Value};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DefaultParseError {
@@ -371,8 +371,7 @@ fn parse_xml(literal: &toml::Value) -> Result<Value, DefaultParseError> {
     let s = literal
         .as_str()
         .ok_or(DefaultParseError::TypeMismatch { dst: DataType::Xml })?;
-    crate::types::convert::xml::validate(s)
-        .map_err(|reason| DefaultParseError::InvalidXml { reason })?;
+    crate::convert::xml::validate(s).map_err(|reason| DefaultParseError::InvalidXml { reason })?;
     Ok(Value::Text(s.to_string()))
 }
 
@@ -571,12 +570,31 @@ mod tests {
         ));
     }
 
+    /// Table-driven consolidation: every "string-only" sink rejects a
+    /// non-string literal with `TypeMismatch`. Replaces the previous
+    /// per-type `*_non_string_rejected` tests (`bytes`, `text`, `date`,
+    /// `timestamp`, `uuid`, `xml`, `ipv4`/`ipv6`) — the assertion shape
+    /// is identical, so consolidating into a loop tightens the spec.
     #[test]
-    fn ip_non_string_rejected() {
-        let res = parse(&toml::Value::Integer(0), &DataType::Ipv4);
-        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
-        let res = parse(&toml::Value::Integer(0), &DataType::Ipv6);
-        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+    fn non_string_literal_rejected_for_string_only_sinks() {
+        let int_literal = toml::Value::Integer(0);
+        let cases: &[DataType] = &[
+            DataType::Bytes { size: None },
+            DataType::Text { size: None },
+            DataType::Date,
+            DataType::Timestamp,
+            DataType::Uuid,
+            DataType::Ipv4,
+            DataType::Ipv6,
+            DataType::Xml,
+        ];
+        for dt in cases {
+            let res = parse(&int_literal, dt);
+            assert!(
+                matches!(res, Err(DefaultParseError::TypeMismatch { .. })),
+                "non-string literal must be rejected for {dt:?}, got {res:?}",
+            );
+        }
     }
 
     #[test]
@@ -668,12 +686,6 @@ mod tests {
         assert_eq!(v, Value::Bytes(vec![1, 2, 3, 4]));
     }
 
-    #[test]
-    fn bytes_non_string_literal_rejected() {
-        let res = parse(&toml::Value::Integer(42), &DataType::Bytes { size: None });
-        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
-    }
-
     // ---- Text ------------------------------------------------------
 
     #[test]
@@ -687,12 +699,6 @@ mod tests {
         // "Привет" = 6 chars, 12 bytes. Sink size=10 chars must accept.
         let v = parse(&lit("Привет"), &DataType::Text { size: Some(10) }).unwrap();
         assert_eq!(v, Value::Text("Привет".into()));
-    }
-
-    #[test]
-    fn text_non_string_literal_rejected() {
-        let res = parse(&toml::Value::Integer(42), &DataType::Text { size: None });
-        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
     }
 
     // ---- Signed ints — exact boundaries ----------------------------
@@ -923,12 +929,6 @@ mod tests {
     // ---- Date / Timestamp ------------------------------------------
 
     #[test]
-    fn date_non_string_rejected() {
-        let res = parse(&toml::Value::Integer(0), &DataType::Date);
-        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
-    }
-
-    #[test]
     fn timestamp_ok() {
         let v = parse(&lit("2024-01-15T12:00:00Z"), &DataType::Timestamp).unwrap();
         assert!(matches!(v, Value::Timestamp(_)));
@@ -941,28 +941,6 @@ mod tests {
             res,
             Err(DefaultParseError::InvalidTimestamp { .. })
         ));
-    }
-
-    #[test]
-    fn timestamp_non_string_rejected() {
-        let res = parse(&toml::Value::Integer(0), &DataType::Timestamp);
-        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
-    }
-
-    // ---- Uuid ------------------------------------------------------
-
-    #[test]
-    fn uuid_non_string_rejected() {
-        let res = parse(&toml::Value::Integer(0), &DataType::Uuid);
-        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
-    }
-
-    // ---- Xml -------------------------------------------------------
-
-    #[test]
-    fn xml_non_string_rejected() {
-        let res = parse(&toml::Value::Integer(0), &DataType::Xml);
-        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
     }
 
     // ---- Json — toml_to_json variants ------------------------------
@@ -1025,7 +1003,7 @@ mod tests {
         accept: bool,
     }
 
-    impl crate::types::dynamic::DynType for StubCustom {
+    impl crate::dynamic::DynType for StubCustom {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
@@ -1043,16 +1021,16 @@ mod tests {
             &self,
             _v: Value,
             _t: &DataType,
-            _ctx: &crate::types::convert::ConversionContext,
-        ) -> Result<Value, crate::types::convert::ConvertError> {
+            _ctx: &crate::convert::ConversionContext,
+        ) -> Result<Value, crate::convert::ConvertError> {
             unimplemented!()
         }
         fn construct(
             &self,
             _v: Value,
             _s: &DataType,
-            _ctx: &crate::types::convert::ConversionContext,
-        ) -> Result<Value, crate::types::convert::ConvertError> {
+            _ctx: &crate::convert::ConversionContext,
+        ) -> Result<Value, crate::convert::ConvertError> {
             unimplemented!()
         }
         fn parse_default(
@@ -1065,7 +1043,7 @@ mod tests {
                 Ok(None)
             }
         }
-        fn clone_box(&self) -> Box<dyn crate::types::dynamic::DynType> {
+        fn clone_box(&self) -> Box<dyn crate::dynamic::DynType> {
             Box::new(*self)
         }
     }
@@ -1084,6 +1062,300 @@ mod tests {
         assert!(
             matches!(res, Err(DefaultParseError::TypeMismatch { .. })),
             "got {res:?}"
+        );
+    }
+
+    // ---- Property-based tests --------------------------------------
+    //
+    // Round-trip and structural properties that span the entire input
+    // domain. The spec-case `#[test]`s above pin specific error variants
+    // (`InvalidHex`, `InvalidBase64`, `ScaleExceeds`, `OutOfRange`,
+    // `MissingPrefix`, etc.) — those stay as named tests because a
+    // property can only assert "rejected", not "rejected with the right
+    // discriminant".
+
+    use proptest::prelude::*;
+
+    /// `Vec<u8>` round-trips through the `hex:` prefix grammar.
+    /// Lowercase encoder; the parser also accepts uppercase — that
+    /// arm is anchored by `bytes_hex_uppercase_accepted`.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn bytes_hex_round_trip(#[strategy(prop::collection::vec(any::<u8>(), 0..32))] bytes: Vec<u8>) {
+        let hex_payload: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let literal = lit(&format!("hex:{hex_payload}"));
+        let parsed = parse(&literal, &DataType::Bytes { size: None }).expect("hex round trip");
+        prop_assert_eq!(parsed, Value::Bytes(bytes));
+    }
+
+    /// `Vec<u8>` round-trips through the `base64:` prefix grammar
+    /// (standard alphabet with `=` padding).
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn bytes_base64_round_trip(
+        #[strategy(prop::collection::vec(any::<u8>(), 0..32))] bytes: Vec<u8>,
+    ) {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let literal = lit(&format!("base64:{payload}"));
+        let parsed = parse(&literal, &DataType::Bytes { size: None }).expect("base64 round trip");
+        prop_assert_eq!(parsed, Value::Bytes(bytes));
+    }
+
+    /// ASCII strings encode losslessly through the `utf8:` prefix.
+    /// Restricted to ASCII because `utf8:hello` is meant for textual
+    /// defaults; multi-byte handling is covered separately by the
+    /// `text_uses_chars_not_bytes_for_length` anti-regression case.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn bytes_utf8_round_trip_when_within_chars(#[strategy("[ -~]{0,32}")] payload: String) {
+        let literal = lit(&format!("utf8:{payload}"));
+        let parsed = parse(&literal, &DataType::Bytes { size: Some(64) }).expect("utf8 round trip");
+        prop_assert_eq!(parsed, Value::Bytes(payload.into_bytes()));
+    }
+
+    /// `bin:` prefix accepts only 0/1 chars and a length divisible by
+    /// 8. Generates a `Vec<u8>` of length 0..16, emits its binary form,
+    /// and asserts the parser recovers the bytes.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn bytes_bin_round_trip(#[strategy(prop::collection::vec(any::<u8>(), 0..16))] bytes: Vec<u8>) {
+        let payload: String = bytes.iter().map(|b| format!("{b:08b}")).collect();
+        let literal = lit(&format!("bin:{payload}"));
+        let parsed = parse(&literal, &DataType::Bytes { size: None }).expect("bin round trip");
+        prop_assert_eq!(parsed, Value::Bytes(bytes));
+    }
+
+    /// Signed-int width acceptance: in-range `i64`s land in the matching
+    /// canonical `Value::Int*` variant; out-of-range values yield
+    /// `OutOfRange`. Tests all four widths in one property by reusing
+    /// the `n` sample against each.
+    #[test_strategy::proptest(ProptestConfig::with_cases(512))]
+    fn signed_int_accepts_within_range_rejects_outside(n: i64) {
+        let cases: &[(DataType, i64, i64)] = &[
+            (DataType::Int8, i8::MIN as i64, i8::MAX as i64),
+            (DataType::Int16, i16::MIN as i64, i16::MAX as i64),
+            (DataType::Int32, i32::MIN as i64, i32::MAX as i64),
+            (DataType::Int64, i64::MIN, i64::MAX),
+        ];
+        for (dt, lo, hi) in cases {
+            let res = parse(&toml::Value::Integer(n), dt);
+            if n >= *lo && n <= *hi {
+                prop_assert!(res.is_ok(), "expected {n} to fit {dt:?}, got {res:?}");
+            } else {
+                prop_assert!(
+                    matches!(res, Err(DefaultParseError::OutOfRange { .. })),
+                    "expected OutOfRange for {n} against {dt:?}, got {res:?}",
+                );
+            }
+        }
+    }
+
+    /// Unsigned-int width acceptance: non-negative within max → OK,
+    /// over max → `OutOfRange`, negative → `SignLoss`. TOML integers
+    /// are `i64`, so we can only probe `UInt64` up to `i64::MAX`.
+    #[test_strategy::proptest(ProptestConfig::with_cases(512))]
+    fn unsigned_int_accepts_within_range_rejects_outside(n: i64) {
+        let cases: &[(DataType, u64)] = &[
+            (DataType::UInt8, u8::MAX as u64),
+            (DataType::UInt16, u16::MAX as u64),
+            (DataType::UInt32, u32::MAX as u64),
+            (DataType::UInt64, i64::MAX as u64),
+        ];
+        for (dt, max) in cases {
+            let res = parse(&toml::Value::Integer(n), dt);
+            if n < 0 {
+                prop_assert!(
+                    matches!(res, Err(DefaultParseError::SignLoss { .. })),
+                    "expected SignLoss for {n} against {dt:?}, got {res:?}",
+                );
+            } else if (n as u64) > *max {
+                prop_assert!(
+                    matches!(res, Err(DefaultParseError::OutOfRange { .. })),
+                    "expected OutOfRange for {n} against {dt:?}, got {res:?}",
+                );
+            } else {
+                prop_assert!(res.is_ok(), "expected {n} to fit {dt:?}, got {res:?}");
+            }
+        }
+    }
+
+    /// `BigInt { width }` accepts a value iff its decimal digit count
+    /// fits the declared width. Symmetric on the negative side. Width
+    /// is sampled 1..=10 so the i64 generator straddles the boundary.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn bigint_width_boundary(n: i64, #[strategy(1u32..=10)] width: u32) {
+        let dt = DataType::BigInt { width: Some(width) };
+        let literal = lit(&n.to_string());
+        let res = parse(&literal, &dt);
+        // Reference: width=w admits |n| <= 10^w - 1.
+        let mut max = 1i128;
+        for _ in 0..width {
+            max *= 10;
+        }
+        max -= 1;
+        let fits = (n as i128).abs() <= max;
+        if fits {
+            prop_assert!(
+                res.is_ok(),
+                "expected {n} to fit width={width}, got {res:?}"
+            );
+        } else {
+            prop_assert!(
+                matches!(res, Err(DefaultParseError::OutOfRange { .. })),
+                "expected OutOfRange for {n} at width={width}, got {res:?}",
+            );
+        }
+    }
+
+    /// `Decimal { precision, scale }` admits a literal iff its
+    /// normalised fractional-digit count fits `scale` AND its integer
+    /// part fits `precision - scale`. The strategy samples mantissa
+    /// and a literal-scale-in-string, builds a `BigDecimal` shape that
+    /// matches, then asserts the parser's verdict against the
+    /// independently-computed predicate.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn decimal_scale_and_precision_bound(
+        #[strategy(-1_000_000_000_i64..1_000_000_000)] mantissa: i64,
+        #[strategy(0u32..=6)] literal_scale: u32,
+        #[strategy(1u32..=12)] precision: u32,
+        #[strategy(0u32..=6)] scale: u32,
+    ) {
+        prop_assume!(scale <= precision);
+        // Render the mantissa as `<int>.<frac>` with `literal_scale`
+        // fractional digits (zero-padded). For mantissa=12345 and
+        // literal_scale=2 → "123.45".
+        let abs = mantissa.unsigned_abs() as u128;
+        let mut divisor = 1u128;
+        for _ in 0..literal_scale {
+            divisor *= 10;
+        }
+        let int_part = abs / divisor;
+        let frac_part = abs % divisor;
+        let sign = if mantissa < 0 { "-" } else { "" };
+        let s = if literal_scale == 0 {
+            format!("{sign}{int_part}")
+        } else {
+            format!(
+                "{sign}{int_part}.{frac_part:0width$}",
+                width = literal_scale as usize
+            )
+        };
+        let literal = lit(&s);
+        let dt = DataType::Decimal {
+            precision: Some(precision),
+            scale: Some(scale),
+        };
+        let res = parse(&literal, &dt);
+
+        // Reference predicate: normalise the literal's significant scale
+        // (strip trailing zeros from the fractional part), then compare.
+        let mut significant_scale = literal_scale;
+        let mut remaining_frac = frac_part;
+        let mut divisor_left = divisor;
+        while significant_scale > 0 && divisor_left > 1 && remaining_frac.is_multiple_of(10) {
+            remaining_frac /= 10;
+            divisor_left /= 10;
+            significant_scale -= 1;
+        }
+        let scale_ok = significant_scale <= scale;
+        let int_digits_allowed = precision - scale;
+        let mut max_int = 1u128;
+        for _ in 0..int_digits_allowed {
+            max_int *= 10;
+        }
+        // |d| < 10^(precision - scale) is the production check (strict
+        // inequality on `abs`).
+        let int_ok = int_part < max_int;
+
+        match (scale_ok, int_ok) {
+            (true, true) => {
+                prop_assert!(
+                    res.is_ok(),
+                    "expected {s} to fit decimal({precision},{scale}), got {res:?}",
+                );
+            }
+            (false, _) => {
+                prop_assert!(
+                    matches!(res, Err(DefaultParseError::ScaleExceeds { .. })),
+                    "expected ScaleExceeds for {s} against decimal({precision},{scale}), got {res:?}",
+                );
+            }
+            (true, false) => {
+                prop_assert!(
+                    matches!(res, Err(DefaultParseError::OutOfRange { .. })),
+                    "expected OutOfRange for {s} against decimal({precision},{scale}), got {res:?}",
+                );
+            }
+        }
+    }
+
+    /// Strategy yielding TOML literals of any shape that's lossless
+    /// through the `toml_to_json` projection. Excludes floats (NaN
+    /// special-case is anchored separately) and Datetime (TOML keeps
+    /// its own datetime type which round-trips as a string only on
+    /// one side). Recursion depth is kept shallow to keep shrink fast.
+    fn any_round_trippable_toml_value() -> impl Strategy<Value = toml::Value> {
+        let leaf = prop_oneof![
+            any::<bool>().prop_map(toml::Value::Boolean),
+            any::<i32>().prop_map(|n| toml::Value::Integer(n as i64)),
+            ".{0,16}".prop_map(toml::Value::String),
+        ];
+        leaf.prop_recursive(3, 16, 4, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(toml::Value::Array),
+                prop::collection::vec(("[a-z]{1,4}", inner), 0..4).prop_map(|kvs| {
+                    let mut tbl = toml::map::Map::new();
+                    for (k, v) in kvs {
+                        tbl.insert(k, v);
+                    }
+                    toml::Value::Table(tbl)
+                }),
+            ]
+        })
+    }
+
+    /// `parse(_, Json)` followed by `value_to_json(Value::Json(...))`
+    /// must equal the canonical projection of the same TOML literal
+    /// taken directly through `toml_to_json`. This pins the encoder
+    /// (the independent oracle path) against its expected wire shape
+    /// across arbitrary nested input. (A direct `inner == toml_to_json(literal)`
+    /// check would be tautological — `parse(_, Json)` is implemented
+    /// as `Value::Json(toml_to_json(literal))`.)
+    #[test_strategy::proptest(ProptestConfig::with_cases(128))]
+    fn json_literal_round_trip(#[strategy(any_round_trippable_toml_value())] literal: toml::Value) {
+        let parsed = parse(&literal, &DataType::Json).expect("json parse");
+        let Value::Json(_) = &parsed else {
+            return Err(TestCaseError::fail(format!(
+                "expected Value::Json, got {parsed:?}"
+            )));
+        };
+        let direct = toml_to_json(&literal);
+        // The canonical encoder must produce the same projection as
+        // `toml_to_json` does directly. `value_to_json` is the
+        // independent path: it walks `Value`, not `toml::Value`.
+        let encoded =
+            crate::json_encode::value_to_json(&parsed).expect("value_to_json on Json variant");
+        prop_assert_eq!(encoded, direct);
+    }
+
+    /// Multibyte-character truncation honours the `chars()` count, not
+    /// the byte count. Generates a string of `N` emoji (each 4 bytes
+    /// in UTF-8) and asserts it fits a sink whose `size` equals `N`.
+    /// This anchors the "char boundary respected even at the limit"
+    /// guarantee that `text_uses_chars_not_bytes_for_length` only
+    /// hints at.
+    #[test_strategy::proptest(ProptestConfig::with_cases(64))]
+    fn default_value_text_multibyte_char_truncation(#[strategy(0u32..=32)] count: u32) {
+        // U+1F600 GRINNING FACE — 4 bytes UTF-8, 1 char per `count()`.
+        let emoji = "\u{1F600}";
+        let payload: String = emoji.repeat(count as usize);
+        let dt = DataType::Text { size: Some(count) };
+        let res = parse(&lit(&payload), &dt);
+        prop_assert!(res.is_ok(), "expected {count} emojis to fit, got {res:?}");
+        // One over the limit must be rejected.
+        let too_many = format!("{payload}{emoji}");
+        let res = parse(&lit(&too_many), &dt);
+        prop_assert!(
+            matches!(res, Err(DefaultParseError::LengthExceeds { .. })),
+            "expected LengthExceeds at {} emojis vs size={count}, got {res:?}",
+            count + 1,
         );
     }
 }

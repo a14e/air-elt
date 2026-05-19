@@ -7,7 +7,7 @@
 
 use super::error::ConvertError;
 use super::saturate::*;
-use crate::types::{DataType, Value};
+use crate::{DataType, Value};
 
 pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, ConvertError> {
     use DataType::*;
@@ -518,5 +518,93 @@ mod tests {
                 "expected ValueShapeMismatch for {src:?} → {dst:?}, got {res:?}"
             );
         }
+    }
+
+    // ---- Property-based tests --------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Signed `Int64` narrows to any smaller signed width by clamping the
+    /// input into the target's `[MIN, MAX]` range. One property covers
+    /// `i8`, `i16`, `i32` — selecting the target via a `prop_oneof!`.
+    #[test_strategy::proptest(ProptestConfig::with_cases(512))]
+    fn saturate_signed_to_smaller_signed(
+        #[strategy(any::<i64>())] v: i64,
+        #[strategy(prop_oneof![Just(8u8), Just(16u8), Just(32u8)])] target_width: u8,
+    ) {
+        let (dst, expected) = match target_width {
+            8 => (
+                DataType::Int8,
+                Value::Int8(v.clamp(i8::MIN as i64, i8::MAX as i64) as i8),
+            ),
+            16 => (
+                DataType::Int16,
+                Value::Int16(v.clamp(i16::MIN as i64, i16::MAX as i64) as i16),
+            ),
+            32 => (
+                DataType::Int32,
+                Value::Int32(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
+            ),
+            _ => unreachable!(),
+        };
+        let got = convert(Value::Int64(v), &DataType::Int64, &dst).expect("convert");
+        prop_assert_eq!(got, expected);
+    }
+
+    /// Negative signed values saturate to 0 when narrowing into any
+    /// unsigned target.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn saturate_signed_to_unsigned_clamps_negatives_to_zero(#[strategy(i64::MIN..0i64)] v: i64) {
+        let cases: &[(DataType, DataType, Value)] = &[
+            (DataType::Int64, DataType::UInt8, Value::UInt8(0)),
+            (DataType::Int64, DataType::UInt16, Value::UInt16(0)),
+            (DataType::Int64, DataType::UInt32, Value::UInt32(0)),
+            (DataType::Int64, DataType::UInt64, Value::UInt64(0)),
+        ];
+        for (src, dst, expected) in cases {
+            let got = convert(Value::Int64(v), src, dst).expect("convert");
+            prop_assert_eq!(&got, expected);
+        }
+    }
+
+    /// Unsigned `UInt64` narrows to any smaller unsigned width by
+    /// `min(v, target::MAX)`. Covers `u8`, `u16`, `u32` in one property.
+    #[test_strategy::proptest(ProptestConfig::with_cases(512))]
+    fn saturate_unsigned_to_smaller_unsigned(
+        #[strategy(any::<u64>())] v: u64,
+        #[strategy(prop_oneof![Just(8u8), Just(16u8), Just(32u8)])] target_width: u8,
+    ) {
+        let (dst, expected) = match target_width {
+            8 => (DataType::UInt8, Value::UInt8(v.min(u8::MAX as u64) as u8)),
+            16 => (
+                DataType::UInt16,
+                Value::UInt16(v.min(u16::MAX as u64) as u16),
+            ),
+            32 => (
+                DataType::UInt32,
+                Value::UInt32(v.min(u32::MAX as u64) as u32),
+            ),
+            _ => unreachable!(),
+        };
+        let got = convert(Value::UInt64(v), &DataType::UInt64, &dst).expect("convert");
+        prop_assert_eq!(got, expected);
+    }
+
+    /// A positive `UInt64` narrowing to a signed target must saturate at
+    /// the *signed* target's MAX, not at the unsigned width. Verifies the
+    /// arm dispatches to the correct primitive.
+    #[test_strategy::proptest(ProptestConfig::with_cases(512))]
+    fn saturate_unsigned_positive_to_signed_clamps_at_signed_max(
+        #[strategy(any::<u64>())] v: u64,
+        #[strategy(prop_oneof![Just(16u8), Just(32u8), Just(64u8)])] target_width: u8,
+    ) {
+        let (dst, expected) = match target_width {
+            16 => (DataType::Int16, Value::Int16(v.min(i16::MAX as u64) as i16)),
+            32 => (DataType::Int32, Value::Int32(v.min(i32::MAX as u64) as i32)),
+            64 => (DataType::Int64, Value::Int64(v.min(i64::MAX as u64) as i64)),
+            _ => unreachable!(),
+        };
+        let got = convert(Value::UInt64(v), &DataType::UInt64, &dst).expect("convert");
+        prop_assert_eq!(got, expected);
     }
 }

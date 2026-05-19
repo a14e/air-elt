@@ -22,6 +22,7 @@ members = [
     "crates/storages/postgres",
     "crates/storages/mysql",
     "crates/storages/mongodb",
+    "crates/types",
 ]
 
 [workspace.package]
@@ -34,6 +35,7 @@ authors = ["Air Elt contributors"]
 
 [workspace.dependencies]
 air-elt-core = { path = "crates/core", version = "0.1.0" }
+air-elt-types = { path = "crates/types", version = "0.1.0" }
 air-elt-commons = { path = "crates/commons/lib", version = "0.1.0" }
 air-elt-commons-pg = { path = "crates/commons/pg", version = "0.1.0" }
 air-elt-commons-mysql = { path = "crates/commons/mysql", version = "0.1.0" }
@@ -58,7 +60,7 @@ ahash = "0.8.12"
 tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "test-util"] }
 async-trait = "0.1.89"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 toml = "1.1.2"
 serde_yaml = "=0.9.33"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "macros", "migrate", "chrono", "uuid", "json", "bigdecimal", "ipnetwork"] }
@@ -96,6 +98,8 @@ base64 = "0.22.1"
 hex = "0.4.3"
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
 lz4_flex = "0.11.5"
+proptest = "1.5.0"
+test-strategy = "0.4.0"
 
 [profile.release]
 lto = "thin"

@@ -7,6 +7,8 @@ use air_elt_commons::identifier::IdentifierError;
 use crate::types::convert::ConvertError;
 use crate::types::data_type::DataType;
 
+pub use air_elt_types::error::JsonEncodeError;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file {path:?}: {source}")]
@@ -147,6 +149,16 @@ pub enum ValidationError {
         field: String,
         source_nullable: bool,
         sink_nullable: bool,
+    },
+
+    #[error(
+        "field {field:?}: lossy conversion {from:?} -> {to:?} can yield a null \
+         (e.g. NaN -> null for Float -> Bool); declare the sink column nullable or add a default"
+    )]
+    LossyConversionRequiresNullableOrDefault {
+        field: String,
+        from: DataType,
+        to: DataType,
     },
 
     #[error("access check failed for {component} {name:?}: {source}")]
@@ -324,31 +336,6 @@ pub enum ValidationError {
         "sink {sink:?}: target table {table:?} does not exist — schema introspection returned no columns"
     )]
     SinkTableNotFound { sink: String, table: String },
-}
-
-/// Errors produced by `value_to_json` and the source-side body-fill
-/// path.
-///
-/// A sibling of [`TypeError`] — JSON encoding has its own contract
-/// (depth cap, size cap, custom-type delegation) and folding it into
-/// `TypeError` would muddle the variant set used by the matrix.
-#[derive(Debug, Error)]
-pub enum JsonEncodeError {
-    /// A `Value` variant that has no JSON encoding rule, or a custom
-    /// type whose `DynValue::to_json` default fired.
-    #[error("json encode failure: {0}")]
-    Variant(String),
-
-    /// Recursive `Value::Json` payload deeper than `MAX_JSON_DEPTH`
-    /// (see `crate::types::json_encode::MAX_JSON_DEPTH`).
-    #[error("json encode depth exceeded the configured cap")]
-    DepthExceeded,
-
-    /// A `DynValue::to_json` impl returned an error. Wraps the inner
-    /// reason as a string — the trait method does not enforce a
-    /// concrete error type.
-    #[error("custom value to_json failed: {0}")]
-    CustomFailed(String),
 }
 
 #[derive(Debug, Error)]

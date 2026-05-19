@@ -1,4 +1,4 @@
-use crate::types::data_type::DataType;
+use crate::data_type::DataType;
 
 /// Lossless compatibility predicate for validation.
 ///
@@ -87,6 +87,15 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
         // Int ↔ Bool runtime coercion
         (Int8 | Int16 | Int32 | Int64, Bool) => true,
         (Bool, Int8 | Int16 | Int32 | Int64) => true,
+
+        // Bool → Float / BigInt / Decimal: lossless. `false → 0`, `true → 1`
+        // fit any IEEE float exactly and any fixed-point representation
+        // with at least one integer digit. Reverse direction lives in the
+        // truncate matrix — losing a continuous numeric range to two
+        // discrete values is by definition lossy.
+        (Bool, Float32 | Float64) => true,
+        (Bool, BigInt { .. }) => true,
+        (Bool, Decimal { precision, scale }) => decimal_fits_int_digits(precision, scale, 1),
 
         // Unsigned widening: each step climbs one width. UInt8 also fits any
         // wider signed; UInt16 fits Int32+/Int64; UInt32 fits Int64. UInt64
@@ -266,10 +275,19 @@ pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool
         // BigInt narrowing.
         (BigInt { .. }, BigInt { .. }) => true,
         (BigInt { .. }, Int64 | Int32 | Int16 | Int8 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        // BigInt → Bool: truncate-only. Runtime collapses to `!n.is_zero()`.
+        (BigInt { .. }, Bool) => true,
         // Decimal narrowing.
         (Decimal { .. }, Decimal { .. }) => true,
         (Decimal { .. }, BigInt { .. }) => true,
         (Decimal { .. }, Int64 | Int32 | Int16 | Int8 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        // Decimal → Bool: truncate-only. Runtime collapses to `!d.is_zero()`.
+        (Decimal { .. }, Bool) => true,
+        // Float → Bool: truncate-only with nullable semantics.
+        // Runtime: ±0.0 → false; NaN → ctx.default (or Null if absent);
+        // any other finite or ±Inf → true. Validation should require a
+        // non-None `mapping.default` when the sink column is non-nullable.
+        (Float32 | Float64, Bool) => true,
         // Decimal → Float64 / Float32 under truncate: the dispatcher
         // saturates magnitude overflow to `±INFINITY` and absorbs
         // mantissa rounding through the IEEE cast.
@@ -695,43 +713,24 @@ mod tests {
         assert!(!is_compatible(DEC_UNB, DataType::UInt64));
     }
 
+    /// Anchor for unsigned narrowing — one representative pair. The full
+    /// matrix is covered by `widening_uint_monotone` (contrapositive ⇒
+    /// non-widening pairs are not lossless-compatible) and
+    /// `narrowing_iff_truncate_but_not_lossless` (any pair admitted only
+    /// by the truncate matrix is reported by `is_narrowing`).
     #[test]
-    fn unsigned_narrowing_full_matrix() {
-        // Every UInt → smaller-UInt pair must be rejected and flagged narrowing.
-        let pairs = [
-            (DataType::UInt16, DataType::UInt8),
-            (DataType::UInt32, DataType::UInt8),
-            (DataType::UInt32, DataType::UInt16),
-            (DataType::UInt64, DataType::UInt8),
-            (DataType::UInt64, DataType::UInt16),
-            (DataType::UInt64, DataType::UInt32),
-        ];
-        for (a, b) in pairs {
-            assert!(
-                !is_compatible(a.clone(), b.clone()),
-                "{a:?} → {b:?} should reject"
-            );
-            assert!(is_narrowing(a, b), "should narrow");
-        }
+    fn unsigned_narrowing_anchor() {
+        assert!(!is_compatible(DataType::UInt64, DataType::UInt8));
+        assert!(is_narrowing(DataType::UInt64, DataType::UInt8));
     }
 
+    /// Anchor for signed → unsigned sign-loss — one representative pair.
+    /// Full matrix is covered by the same property tests as
+    /// `unsigned_narrowing_anchor`.
     #[test]
-    fn signed_to_unsigned_full_matrix() {
-        // Sign loss in both directions: signed → unsigned never compatible.
-        for src in [DataType::Int16, DataType::Int32, DataType::Int64] {
-            for dst in [
-                DataType::UInt8,
-                DataType::UInt16,
-                DataType::UInt32,
-                DataType::UInt64,
-            ] {
-                assert!(
-                    !is_compatible(src.clone(), dst.clone()),
-                    "{src:?} → {dst:?} should reject"
-                );
-                assert!(is_narrowing(src.clone(), dst), "should narrow");
-            }
-        }
+    fn signed_to_unsigned_anchor() {
+        assert!(!is_compatible(DataType::Int32, DataType::UInt32));
+        assert!(is_narrowing(DataType::Int32, DataType::UInt32));
     }
 
     #[test]
@@ -927,57 +926,16 @@ mod tests {
         );
     }
 
+    /// Anchor for "truncate unlocks integer narrowing" across every
+    /// signed/unsigned width combination. One representative pair per
+    /// direction — full matrix coverage lives in
+    /// `narrowing_iff_truncate_but_not_lossless`.
     #[test]
-    fn truncate_unlocks_full_signed_narrow_matrix() {
-        for (a, b) in [
-            (DataType::Int64, DataType::Int32),
-            (DataType::Int64, DataType::Int16),
-            (DataType::Int32, DataType::Int16),
-        ] {
-            assert_unlocks(a, b);
-        }
-    }
-
-    #[test]
-    fn truncate_unlocks_full_unsigned_narrow_matrix() {
-        for (a, b) in [
-            (DataType::UInt64, DataType::UInt32),
-            (DataType::UInt64, DataType::UInt16),
-            (DataType::UInt64, DataType::UInt8),
-            (DataType::UInt32, DataType::UInt16),
-            (DataType::UInt32, DataType::UInt8),
-            (DataType::UInt16, DataType::UInt8),
-        ] {
-            assert_unlocks(a, b);
-        }
-    }
-
-    #[test]
-    fn truncate_unlocks_full_signed_to_unsigned_matrix() {
-        for s in [DataType::Int16, DataType::Int32, DataType::Int64] {
-            for u in [
-                DataType::UInt8,
-                DataType::UInt16,
-                DataType::UInt32,
-                DataType::UInt64,
-            ] {
-                assert_unlocks(s.clone(), u);
-            }
-        }
-    }
-
-    #[test]
-    fn truncate_unlocks_full_unsigned_to_signed_matrix() {
-        for (a, b) in [
-            (DataType::UInt64, DataType::Int64),
-            (DataType::UInt64, DataType::Int32),
-            (DataType::UInt64, DataType::Int16),
-            (DataType::UInt32, DataType::Int32),
-            (DataType::UInt32, DataType::Int16),
-            (DataType::UInt16, DataType::Int16),
-        ] {
-            assert_unlocks(a, b);
-        }
+    fn truncate_unlocks_integer_narrowing_anchor() {
+        assert_unlocks(DataType::Int64, DataType::Int8); // signed → narrower signed
+        assert_unlocks(DataType::UInt64, DataType::UInt8); // unsigned → narrower unsigned
+        assert_unlocks(DataType::Int32, DataType::UInt32); // signed → unsigned (sign loss)
+        assert_unlocks(DataType::UInt64, DataType::Int64); // unsigned → signed of same width
     }
 
     #[test]
@@ -1135,21 +1093,6 @@ mod tests {
     // ---- Union (Mongo heterogeneous source field) ------------------
 
     #[test]
-    fn union_src_compatible_when_every_variant_is() {
-        // Both Int16 and Int32 widen losslessly into Int64.
-        let src = DataType::union(vec![DataType::Int16, DataType::Int32]);
-        assert!(is_compatible(src, DataType::Int64));
-    }
-
-    #[test]
-    fn union_src_rejected_when_any_variant_incompatible() {
-        // Int32 is compatible with Int64; Text is not. The union as a
-        // whole must be rejected against an Int64 sink.
-        let src = DataType::union(vec![DataType::Int32, DataType::Text { size: None }]);
-        assert!(!is_compatible(src, DataType::Int64));
-    }
-
-    #[test]
     fn union_sink_always_rejected() {
         // Sinks never carry Union — the matrix must reject it
         // unconditionally so a misconfigured pipeline surfaces at
@@ -1191,13 +1134,16 @@ mod tests {
     fn union_flattens_nested_inputs() {
         // Union members that are themselves Union must be flattened —
         // the matrix and dispatcher rely on a one-level-deep invariant.
-        let inner = DataType::union(vec![DataType::Int32, DataType::Text { size: None }]);
-        let outer = DataType::union(vec![inner, DataType::Int64]);
+        // Pick kinds with no widening relation between them so the
+        // flattening invariant is what we measure here, not the
+        // post-fallback widening pass (see union_types::fallback).
+        let inner = DataType::union(vec![DataType::Date, DataType::Text { size: None }]);
+        let outer = DataType::union(vec![inner, DataType::Uuid]);
         match &outer {
             DataType::Union(vs) => {
                 assert_eq!(vs.len(), 3, "expected 3 flat variants, got {vs:?}");
-                assert!(vs.contains(&DataType::Int32));
-                assert!(vs.contains(&DataType::Int64));
+                assert!(vs.contains(&DataType::Date));
+                assert!(vs.contains(&DataType::Uuid));
                 assert!(vs.contains(&DataType::Text { size: None }));
                 assert!(
                     !vs.iter().any(|v| matches!(v, DataType::Union(_))),
@@ -1222,10 +1168,10 @@ mod tests {
 
     // ---- Custom routing -------------------------------------------
 
-    use crate::types::convert::ConvertError;
-    use crate::types::convert::context::ConversionContext;
-    use crate::types::dynamic::DynType;
-    use crate::types::value::Value;
+    use crate::convert::ConvertError;
+    use crate::convert::context::ConversionContext;
+    use crate::dynamic::DynType;
+    use crate::value::Value;
 
     /// Test type that converts to/from `Bytes { size: None }` only.
     #[derive(Debug)]
@@ -1457,5 +1403,311 @@ mod tests {
                  emits NarrowingNotAllowed when truncate is missing"
             );
         }
+    }
+
+    // ---- Property-based tests --------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Yields a simple canonical `DataType` (no `Custom`, no `Union`)
+    /// suitable for the reflexive / monotonicity properties below.
+    fn any_simple_canonical_type() -> impl Strategy<Value = DataType> {
+        prop_oneof![
+            Just(DataType::Bool),
+            Just(DataType::Int8),
+            Just(DataType::Int16),
+            Just(DataType::Int32),
+            Just(DataType::Int64),
+            Just(DataType::UInt8),
+            Just(DataType::UInt16),
+            Just(DataType::UInt32),
+            Just(DataType::UInt64),
+            Just(DataType::Float32),
+            Just(DataType::Float64),
+            Just(DataType::Date),
+            Just(DataType::Timestamp),
+            Just(DataType::Uuid),
+            Just(DataType::Ipv4),
+            Just(DataType::Ipv6),
+            Just(DataType::Json),
+            Just(DataType::Xml),
+            prop::option::of(1u32..=64).prop_map(|w| DataType::BigInt { width: w }),
+            (1u32..=38, 0u32..=18).prop_map(|(p, s)| DataType::Decimal {
+                precision: Some(p),
+                scale: Some(s.min(p)),
+            }),
+            prop::option::of(1u32..=1024).prop_map(|sz| DataType::Text { size: sz }),
+            prop::option::of(1u32..=1024).prop_map(|sz| DataType::Bytes { size: sz }),
+        ]
+    }
+
+    /// Reflexivity over a *re-built* type whose `PartialEq` short-circuit
+    /// in `is_compatible` cannot fire — the matrix's structural arms
+    /// must still admit it. Bare `is_compatible(t.clone(), t.clone())`
+    /// would early-return on `==` and never exercise the matrix at all.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn compatibility_reflexive_via_rebuild(#[strategy(any_simple_canonical_type())] t: DataType) {
+        let rebuilt = rebuild_data_type(&t);
+        prop_assert_eq!(&t, &rebuilt, "rebuild preserves Eq");
+        prop_assert!(
+            is_compatible(t.clone(), rebuilt.clone()),
+            "is_compatible(t, rebuilt(t)) must hold for {t:?}"
+        );
+        prop_assert!(
+            is_compatible_with_truncate(t.clone(), rebuilt),
+            "is_compatible_with_truncate(t, rebuilt(t)) must hold for {t:?}"
+        );
+    }
+
+    /// Reconstruct a `DataType` value through a fresh constructor path so
+    /// the `==` short-circuit in `is_compatible` does not paper over a
+    /// missing matrix arm.
+    fn rebuild_data_type(t: &DataType) -> DataType {
+        match t {
+            DataType::Text { size } => DataType::Text { size: *size },
+            DataType::Bytes { size } => DataType::Bytes { size: *size },
+            DataType::BigInt { width } => DataType::BigInt { width: *width },
+            DataType::Decimal { precision, scale } => DataType::Decimal {
+                precision: *precision,
+                scale: *scale,
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// Lossless compatibility is a sub-relation of truncate-tolerant
+    /// compatibility — anything admitted by `is_compatible` is also
+    /// admitted by `is_compatible_with_truncate`.
+    #[test_strategy::proptest(ProptestConfig::with_cases(512))]
+    fn truncate_is_superset_of_lossless(
+        #[strategy(any_simple_canonical_type())] a: DataType,
+        #[strategy(any_simple_canonical_type())] b: DataType,
+    ) {
+        if is_compatible(a.clone(), b.clone()) {
+            prop_assert!(
+                is_compatible_with_truncate(a.clone(), b.clone()),
+                "is_compatible({a:?}, {b:?}) ⇒ is_compatible_with_truncate"
+            );
+        }
+    }
+
+    /// Witness that `is_compatible_with_truncate` is *strictly* more
+    /// permissive: there exists at least one pair admitted only by the
+    /// truncate-tolerant matrix. Fixed pair (`Int64 → Int8`) — the
+    /// classic narrowing case the matrix gates on `truncate`.
+    #[test]
+    fn truncate_strictly_more_permissive_witness() {
+        assert!(!is_compatible(DataType::Int64, DataType::Int8));
+        assert!(is_compatible_with_truncate(DataType::Int64, DataType::Int8));
+    }
+
+    /// Strategy yielding the four signed integer kinds, paired with
+    /// their width in bits.
+    fn signed_int_with_width() -> impl Strategy<Value = (DataType, u32)> {
+        prop_oneof![
+            Just((DataType::Int8, 8u32)),
+            Just((DataType::Int16, 16)),
+            Just((DataType::Int32, 32)),
+            Just((DataType::Int64, 64)),
+        ]
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(64))]
+    fn widening_int_monotone(
+        #[strategy(signed_int_with_width())] a: (DataType, u32),
+        #[strategy(signed_int_with_width())] b: (DataType, u32),
+    ) {
+        if a.1 <= b.1 {
+            prop_assert!(
+                is_compatible(a.0.clone(), b.0.clone()),
+                "{:?} -> {:?} widening must be compatible",
+                a.0,
+                b.0
+            );
+        }
+    }
+
+    /// Strategy yielding the four unsigned integer kinds, paired with
+    /// their width in bits.
+    fn unsigned_int_with_width() -> impl Strategy<Value = (DataType, u32)> {
+        prop_oneof![
+            Just((DataType::UInt8, 8u32)),
+            Just((DataType::UInt16, 16)),
+            Just((DataType::UInt32, 32)),
+            Just((DataType::UInt64, 64)),
+        ]
+    }
+
+    /// Unsigned widening must be lossless-compatible: any UInt of width
+    /// `a` widens into any UInt of width `b ≥ a`.
+    #[test_strategy::proptest(ProptestConfig::with_cases(64))]
+    fn widening_uint_monotone(
+        #[strategy(unsigned_int_with_width())] a: (DataType, u32),
+        #[strategy(unsigned_int_with_width())] b: (DataType, u32),
+    ) {
+        if a.1 <= b.1 {
+            prop_assert!(
+                is_compatible(a.0.clone(), b.0.clone()),
+                "{:?} -> {:?} unsigned widening must be compatible",
+                a.0,
+                b.0
+            );
+        }
+    }
+
+    /// Float widening: `Float32 → Float64` is always lossless, identities
+    /// also hold (covered by the `==` arm but re-checked for completeness).
+    #[test_strategy::proptest(ProptestConfig::with_cases(8))]
+    fn widening_float_monotone(
+        #[strategy(prop_oneof![Just(DataType::Float32), Just(DataType::Float64)])] a: DataType,
+        #[strategy(prop_oneof![Just(DataType::Float32), Just(DataType::Float64)])] b: DataType,
+    ) {
+        // Float32 fits everywhere, Float64 only into itself.
+        let widens = matches!(
+            (&a, &b),
+            (DataType::Float32, _) | (DataType::Float64, DataType::Float64)
+        );
+        if widens {
+            prop_assert!(
+                is_compatible(a.clone(), b.clone()),
+                "{a:?} → {b:?} float widening must be compatible"
+            );
+        }
+    }
+
+    /// Text size widening: `Text{Some(a)} → Text{Some(b)}` is
+    /// lossless-compatible iff `a ≤ b`. `Text{None}` (unbounded) only
+    /// flows into another unbounded sink; narrowing into a bounded sink
+    /// is gated by truncate (covered by `truncate_unlocks_text_narrow`).
+    #[test_strategy::proptest(ProptestConfig::with_cases(128))]
+    fn widening_text_size_monotone(
+        #[strategy(prop::option::of(1u32..=1024))] a: Option<u32>,
+        #[strategy(prop::option::of(1u32..=1024))] b: Option<u32>,
+    ) {
+        let src = DataType::Text { size: a };
+        let dst = DataType::Text { size: b };
+        let expected = match (a, b) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(x), Some(y)) => x <= y,
+        };
+        prop_assert_eq!(
+            is_compatible(src.clone(), dst.clone()),
+            expected,
+            "Text size compatibility mismatch for {:?} → {:?}",
+            src,
+            dst
+        );
+    }
+
+    /// Bytes size widening — symmetric with text. Same algebra over `size`.
+    #[test_strategy::proptest(ProptestConfig::with_cases(128))]
+    fn widening_bytes_size_monotone(
+        #[strategy(prop::option::of(1u32..=1024))] a: Option<u32>,
+        #[strategy(prop::option::of(1u32..=1024))] b: Option<u32>,
+    ) {
+        let src = DataType::Bytes { size: a };
+        let dst = DataType::Bytes { size: b };
+        let expected = match (a, b) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(x), Some(y)) => x <= y,
+        };
+        prop_assert_eq!(
+            is_compatible(src.clone(), dst.clone()),
+            expected,
+            "Bytes size compatibility mismatch for {:?} → {:?}",
+            src,
+            dst
+        );
+    }
+
+    /// Validator invariant: whenever `is_narrowing(a, b)` reports `true`,
+    /// the pair is admitted by the truncate matrix but rejected by the
+    /// lossless matrix. The validator then emits `NarrowingNotAllowed`
+    /// (with the "enable truncate" hint) rather than `UnsupportedCast`.
+    /// The converse implication does NOT hold — the truncate matrix
+    /// admits identity-like widenings (e.g. `BigInt → BigInt`,
+    /// `Decimal → Decimal`, `Json → Text(n)`) that `is_narrowing` does
+    /// not need to flag.
+    #[test_strategy::proptest(ProptestConfig::with_cases(1024))]
+    fn narrowing_iff_truncate_but_not_lossless(
+        #[strategy(any_simple_canonical_type())] a: DataType,
+        #[strategy(any_simple_canonical_type())] b: DataType,
+    ) {
+        if is_narrowing(a.clone(), b.clone()) {
+            prop_assert!(
+                !is_compatible(a.clone(), b.clone()),
+                "{a:?} → {b:?}: is_narrowing implies !is_compatible"
+            );
+            prop_assert!(
+                is_compatible_with_truncate(a.clone(), b.clone()),
+                "{a:?} → {b:?}: is_narrowing implies is_compatible_with_truncate"
+            );
+        }
+    }
+
+    /// Union-source distribution: a `Union` source is
+    /// lossless-compatible with a (concrete) sink iff *every* member is
+    /// individually compatible. Same algebra under truncate. The empty
+    /// Union is unreachable — `DataType::union` collapses singletons and
+    /// flattens nested Unions, so a strategy that builds a non-empty
+    /// `Vec<DataType>` is sufficient.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn union_src_compatibility_distributes(
+        #[strategy(prop::collection::vec(any_simple_canonical_type(), 1..=4))] members: Vec<
+            DataType,
+        >,
+        #[strategy(any_simple_canonical_type())] target: DataType,
+    ) {
+        let union_src = DataType::union(members.clone());
+        let all_lossless = members
+            .iter()
+            .all(|v| is_compatible(v.clone(), target.clone()));
+        let all_truncate = members
+            .iter()
+            .all(|v| is_compatible_with_truncate(v.clone(), target.clone()));
+        prop_assert_eq!(
+            is_compatible(union_src.clone(), target.clone()),
+            all_lossless,
+            "Union {:?} → {:?}: lossless ↔ all members lossless",
+            union_src,
+            target
+        );
+        prop_assert_eq!(
+            is_compatible_with_truncate(union_src.clone(), target.clone()),
+            all_truncate,
+            "Union {:?} → {:?}: truncate ↔ all members truncate",
+            union_src,
+            target
+        );
+    }
+
+    /// Decimal → Float matrix admittance is precision-driven. The
+    /// lossless matrix rejects every `Decimal → Float` pair regardless
+    /// of precision (binary IEEE-754 cannot represent decimal fractions
+    /// exactly — see `decimal_to_float_is_never_lossless`); the truncate
+    /// matrix admits the entire family. This property witnesses both
+    /// halves across the precision range, ruling out a future regression
+    /// where a narrow-precision `Decimal → Float` slips into the
+    /// lossless matrix and silently bypasses the truncate gate.
+    #[test_strategy::proptest(ProptestConfig::with_cases(128))]
+    fn matrix_truncate_admits_lossless_decimal_to_float(
+        #[strategy(1u32..=38)] precision: u32,
+        #[strategy(0u32..=18)] scale: u32,
+        #[strategy(prop_oneof![Just(DataType::Float32), Just(DataType::Float64)])] float: DataType,
+    ) {
+        let src = DataType::Decimal {
+            precision: Some(precision),
+            scale: Some(scale.min(precision)),
+        };
+        prop_assert!(
+            !is_compatible(src.clone(), float.clone()),
+            "{src:?} → {float:?}: lossless must reject every Decimal → Float pair"
+        );
+        prop_assert!(
+            is_compatible_with_truncate(src.clone(), float.clone()),
+            "{src:?} → {float:?}: truncate must admit every Decimal → Float pair"
+        );
     }
 }

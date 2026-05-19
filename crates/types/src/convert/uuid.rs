@@ -156,11 +156,22 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_bytes() {
-        let u = parse_text(SAMPLE).unwrap();
-        let raw = to_bytes(u);
-        let back = from_bytes(&raw).unwrap();
-        assert_eq!(u, back);
+    fn uuid_nil_and_max_parse_correctly() {
+        // Explicit anchors for the boundary UUIDs. The round-trip
+        // property `uuid_parse_all_formats_round_trip` already exercises
+        // the parser exhaustively; these cases nail the well-known
+        // values themselves.
+        let nil_text = "00000000-0000-0000-0000-000000000000";
+        let nil = parse_text(nil_text).unwrap();
+        assert_eq!(nil, Uuid::nil());
+        assert_eq!(to_text(nil), nil_text);
+        assert_eq!(to_bytes(nil), [0u8; 16]);
+
+        let max_text = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+        let max = parse_text(max_text).unwrap();
+        assert_eq!(max, Uuid::max());
+        assert_eq!(to_text(max), max_text);
+        assert_eq!(to_bytes(max), [0xff; 16]);
     }
 
     #[test]
@@ -230,5 +241,49 @@ mod tests {
                 got: 8
             })
         ));
+    }
+
+    // ---- Property-based tests --------------------------------------
+
+    use proptest::prelude::*;
+
+    fn any_uuid() -> impl Strategy<Value = Uuid> {
+        any::<[u8; 16]>().prop_map(Uuid::from_bytes)
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn uuid_text_36_round_trip(#[strategy(any_uuid())] u: Uuid) {
+        let text = to_text(u);
+        let parsed = parse_text(&text).expect("parse");
+        prop_assert_eq!(parsed, u);
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn uuid_binary_16_round_trip(#[strategy(any_uuid())] u: Uuid) {
+        let raw = to_bytes(u);
+        let back = from_bytes(&raw).expect("decode");
+        prop_assert_eq!(back, u);
+    }
+
+    /// All three accepted text shapes — canonical hyphenated, 32-char
+    /// hex-only, and the Microsoft `{…}`-braced variant — must parse
+    /// back to the same UUID, and rendering must always produce the
+    /// canonical form. The upper-case variant is exercised on the
+    /// canonical-hyphenated shape (the input is intrinsically hex).
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn uuid_parse_all_formats_round_trip(#[strategy(any_uuid())] u: Uuid) {
+        let canonical = to_text(u);
+        let hex_only = canonical.replace('-', "");
+        let braced = format!("{{{canonical}}}");
+        let upper = canonical.to_ascii_uppercase();
+
+        prop_assert_eq!(parse_text(&canonical).expect("canonical"), u);
+        prop_assert_eq!(parse_text(&hex_only).expect("hex-only"), u);
+        prop_assert_eq!(parse_text(&braced).expect("braced"), u);
+        prop_assert_eq!(parse_text(&upper).expect("upper"), u);
+
+        // Rendering is canonical (lower-case, hyphenated).
+        prop_assert_eq!(to_text(u).len(), 36);
+        prop_assert_eq!(to_text(u), canonical);
     }
 }
