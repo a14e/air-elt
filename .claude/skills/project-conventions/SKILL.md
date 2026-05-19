@@ -10,9 +10,14 @@ Before editing Rust code, check this list. If a utility exists for your need, us
 
 ## Commons isolation
 
-`air-elt-commons` (`crates/commons/lib`) is the foundational utility crate and **MUST NOT depend on any other `air-elt-*` crate**, including `air-elt-core`. It hosts only project-internal-dep-free helpers (`tracing_init`, `identifier`, `pool_timeouts`).
+Two foundational crates carry the no-internal-dep rule:
 
-Direction of dependency is the inverse: `core` (and connectors) depend on `commons`, never the other way around. If a type wants to bridge `commons` and `core` (e.g. `impl From<IdentifierError> for RuntimeError`), the impl belongs in `core` — `core` is allowed to know about `commons`. The `commons-pg` / `commons-mysql` / `commons-mongodb` crates legitimately depend on both core and commons; `commons-lib` does not.
+- `air-elt-commons` (`crates/commons/lib`) — utility helpers (`tracing_init`, `identifier`, `pool_timeouts`, `bool_flag`).
+- `air-elt-types` (`crates/types`) — canonical type model (`DataType`, `Value`, conversion matrix, default-literal parser, JSON encoder, `DynType` / `DynValue` traits, `JsonEncodeError`).
+
+Both **MUST NOT depend on any other `air-elt-*` crate**. Direction of dependency is the inverse: `core` (and connectors) depend on both; never the other way around. If a type wants to bridge a foundational crate and `core` (e.g. `impl From<IdentifierError> for RuntimeError`), the impl belongs in `core` — `core` is allowed to know about commons and types. The `commons-pg` / `commons-mysql` / `commons-mongodb` / `commons-clickhouse` / `commons-questdb` crates legitimately depend on both `core` and the two foundational crates; `commons-lib` and `air-elt-types` do not.
+
+Backend-specific custom `DynType` / `DynValue` impls (`mongodb.object_id`, `postgresql.hll`, `postgresql.inet`, `clickhouse.aggregate.*`, …) live in `commons-{backend}`, never in `air-elt-types` — they carry driver deps (sqlx, bson, reqwest, …) that the neutral types crate cannot pull in.
 
 ## Config naming
 

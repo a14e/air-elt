@@ -7,21 +7,21 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::types::dynamic::DynValue;
+use crate::dynamic::DynValue;
 
 /// Serialised with a `{ "type": "...", "value": ... }` internal tag so that
 /// round-tripping through JSONB (cursor storage) preserves the exact variant.
 /// Untagged serde would silently coerce e.g. `Int64(42)` → `Int16(42)`.
 ///
 /// `Value::Custom` is admitted only when the underlying [`DynType`]
-/// declares [`cursor_compatible() == true`](crate::types::dynamic::DynType::cursor_compatible).
+/// declares [`cursor_compatible() == true`](crate::dynamic::DynType::cursor_compatible).
 /// In that case the wire shape is
 /// `{ "type": "custom", "kind": "<kind>", "value": <json> }`, with
 /// `<json>` produced by [`DynValue::to_json`]. The bare
 /// `Value::Deserialize` impl does NOT decode `custom` envelopes —
 /// recovering a `Box<dyn DynValue>` needs the expected descriptor
 /// up front. The typed entry point is
-/// [`crate::types::DataType::decode_cursor_json`], driven by the
+/// [`crate::DataType::decode_cursor_json`], driven by the
 /// storage layer from the source-schema cursor types.
 /// Cursor-incompatible custom values error out on `Serialize` —
 /// validation rejects them up front, but the serializer keeps the
@@ -62,7 +62,7 @@ pub enum Value {
     /// this variant iff the underlying `DynType::cursor_compatible()`
     /// returns `true` AND the matching descriptor overrides
     /// `DynType::decode_cursor_value` (the typed reload entry, called
-    /// from [`crate::types::DataType::decode_cursor_json`]).
+    /// from [`crate::DataType::decode_cursor_json`]).
     /// `Serialize` errors out for cursor-incompatible custom values;
     /// the bare `Value::Deserialize` always errors on `custom`
     /// envelopes regardless — typed decode via `DataType` is the only
@@ -75,7 +75,7 @@ impl Value {
         matches!(self, Value::Null)
     }
 
-    /// Map this `Value` variant onto its concrete [`crate::types::DataType`].
+    /// Map this `Value` variant onto its concrete [`crate::DataType`].
     /// Returns `None` for `Value::Null` (carries no type information by
     /// design — nullability is on `Field`, not `DataType`).
     ///
@@ -86,8 +86,8 @@ impl Value {
     /// `TransformOp::Convert` (when `ColumnConversionPlan.source = None`)
     /// for schemaless sources, and by the `Union` source-side runtime
     /// re-dispatch inside the convert dispatcher.
-    pub fn data_type(&self) -> Option<crate::types::DataType> {
-        use crate::types::DataType;
+    pub fn data_type(&self) -> Option<crate::DataType> {
+        use crate::DataType;
         match self {
             Value::Null => None,
             Value::Bool(_) => Some(DataType::Bool),
@@ -377,7 +377,7 @@ impl<'de> Visitor<'de> for ValueVisitor {
                 // descriptor's `decode_cursor_value` impl, which we
                 // can only reach when the caller supplies the
                 // expected `DataType::Custom(t)` ahead of time. Use
-                // [`crate::types::DataType::decode_cursor_json`]
+                // [`crate::DataType::decode_cursor_json`]
                 // instead — the storage layer does so per cursor
                 // field, looking the expected type up on the source
                 // schema.
@@ -543,36 +543,36 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     struct StubType;
 
-    impl crate::types::dynamic::DynType for StubType {
+    impl crate::dynamic::DynType for StubType {
         fn as_any(&self) -> &dyn Any {
             self
         }
         fn kind(&self) -> &str {
             "test.stub"
         }
-        fn can_convert_to(&self, _t: &crate::types::DataType, _trunc: bool) -> bool {
+        fn can_convert_to(&self, _t: &crate::DataType, _trunc: bool) -> bool {
             false
         }
-        fn can_construct_from(&self, _t: &crate::types::DataType, _trunc: bool) -> bool {
+        fn can_construct_from(&self, _t: &crate::DataType, _trunc: bool) -> bool {
             false
         }
         fn convert(
             &self,
             _v: Value,
-            _t: &crate::types::DataType,
-            _ctx: &crate::types::convert::context::ConversionContext,
-        ) -> Result<Value, crate::types::convert::ConvertError> {
+            _t: &crate::DataType,
+            _ctx: &crate::convert::context::ConversionContext,
+        ) -> Result<Value, crate::convert::ConvertError> {
             unimplemented!()
         }
         fn construct(
             &self,
             _v: Value,
-            _t: &crate::types::DataType,
-            _ctx: &crate::types::convert::context::ConversionContext,
-        ) -> Result<Value, crate::types::convert::ConvertError> {
+            _t: &crate::DataType,
+            _ctx: &crate::convert::context::ConversionContext,
+        ) -> Result<Value, crate::convert::ConvertError> {
             unimplemented!()
         }
-        fn clone_box(&self) -> Box<dyn crate::types::dynamic::DynType> {
+        fn clone_box(&self) -> Box<dyn crate::dynamic::DynType> {
             Box::new(*self)
         }
     }
@@ -583,7 +583,7 @@ mod tests {
     struct StubValue;
 
     impl DynValue for StubValue {
-        fn dyn_type(&self) -> Box<dyn crate::types::dynamic::DynType> {
+        fn dyn_type(&self) -> Box<dyn crate::dynamic::DynType> {
             Box::new(StubType)
         }
         fn as_any(&self) -> &dyn Any {
@@ -606,7 +606,7 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     struct CursorStubType;
 
-    impl crate::types::dynamic::DynType for CursorStubType {
+    impl crate::dynamic::DynType for CursorStubType {
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -616,29 +616,29 @@ mod tests {
         fn cursor_compatible(&self) -> bool {
             true
         }
-        fn can_convert_to(&self, _t: &crate::types::DataType, _trunc: bool) -> bool {
+        fn can_convert_to(&self, _t: &crate::DataType, _trunc: bool) -> bool {
             false
         }
-        fn can_construct_from(&self, _t: &crate::types::DataType, _trunc: bool) -> bool {
+        fn can_construct_from(&self, _t: &crate::DataType, _trunc: bool) -> bool {
             false
         }
         fn convert(
             &self,
             _v: Value,
-            _t: &crate::types::DataType,
-            _ctx: &crate::types::convert::context::ConversionContext,
-        ) -> Result<Value, crate::types::convert::ConvertError> {
+            _t: &crate::DataType,
+            _ctx: &crate::convert::context::ConversionContext,
+        ) -> Result<Value, crate::convert::ConvertError> {
             unimplemented!()
         }
         fn construct(
             &self,
             _v: Value,
-            _t: &crate::types::DataType,
-            _ctx: &crate::types::convert::context::ConversionContext,
-        ) -> Result<Value, crate::types::convert::ConvertError> {
+            _t: &crate::DataType,
+            _ctx: &crate::convert::context::ConversionContext,
+        ) -> Result<Value, crate::convert::ConvertError> {
             unimplemented!()
         }
-        fn clone_box(&self) -> Box<dyn crate::types::dynamic::DynType> {
+        fn clone_box(&self) -> Box<dyn crate::dynamic::DynType> {
             Box::new(*self)
         }
     }
@@ -647,7 +647,7 @@ mod tests {
     struct CursorStubValue(u32);
 
     impl DynValue for CursorStubValue {
-        fn dyn_type(&self) -> Box<dyn crate::types::dynamic::DynType> {
+        fn dyn_type(&self) -> Box<dyn crate::dynamic::DynType> {
             Box::new(CursorStubType)
         }
         fn as_any(&self) -> &dyn Any {
@@ -728,5 +728,125 @@ mod tests {
             res.is_err(),
             "bare Value::Deserialize must refuse `custom` envelopes"
         );
+    }
+
+    // ---- Property-based tests --------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Strategy that yields any non-`Custom` `Value`, including
+    /// width-bearing carriers (`BigInt`, `Decimal`, `Text`, `Bytes`)
+    /// and the temporal / network variants that lack a derived
+    /// `Arbitrary`. NaN floats are filtered out at the strategy
+    /// level so downstream property tests don't each repeat the
+    /// `prop_assume!` preamble — `f.is_nan() != f.is_nan()` would
+    /// break every reflexivity / round-trip assertion.
+    fn any_non_custom_value() -> impl Strategy<Value = Value> {
+        let big_int_strategy =
+            any::<i128>().prop_map(|n| Value::BigInt(num_bigint::BigInt::from(n)));
+        let decimal_strategy = (any::<i64>(), 0i64..18).prop_map(|(mantissa, scale)| {
+            Value::Decimal(bigdecimal::BigDecimal::new(
+                num_bigint::BigInt::from(mantissa),
+                scale,
+            ))
+        });
+        let date_strategy = (1970i32..2100, 1u32..=12, 1u32..=28)
+            .prop_map(|(y, m, d)| Value::Date(chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap()));
+        let timestamp_strategy = any::<i64>().prop_filter_map("range", |seconds| {
+            let s = seconds % 4_000_000_000;
+            chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0).map(Value::Timestamp)
+        });
+        let uuid_strategy = any::<[u8; 16]>().prop_map(|b| Value::Uuid(uuid::Uuid::from_bytes(b)));
+        let ipv4_strategy =
+            any::<u32>().prop_map(|n| Value::Ipv4(std::net::Ipv4Addr::from(n.to_be_bytes())));
+        let ipv6_strategy =
+            any::<[u8; 16]>().prop_map(|b| Value::Ipv6(std::net::Ipv6Addr::from(b)));
+        let json_strategy = any::<i64>().prop_map(|n| Value::Json(serde_json::json!({ "n": n })));
+        let float32_strategy = any::<f32>()
+            .prop_filter("no NaN", |f| !f.is_nan())
+            .prop_map(Value::Float32);
+        let float64_strategy = any::<f64>()
+            .prop_filter("no NaN", |f| !f.is_nan())
+            .prop_map(Value::Float64);
+
+        prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i8>().prop_map(Value::Int8),
+            any::<i16>().prop_map(Value::Int16),
+            any::<i32>().prop_map(Value::Int32),
+            any::<i64>().prop_map(Value::Int64),
+            any::<u8>().prop_map(Value::UInt8),
+            any::<u16>().prop_map(Value::UInt16),
+            any::<u32>().prop_map(Value::UInt32),
+            any::<u64>().prop_map(Value::UInt64),
+            float32_strategy,
+            float64_strategy,
+            big_int_strategy,
+            decimal_strategy,
+            ".*".prop_map(Value::Text),
+            prop::collection::vec(any::<u8>(), 0..32).prop_map(Value::Bytes),
+            date_strategy,
+            timestamp_strategy,
+            uuid_strategy,
+            ipv4_strategy,
+            ipv6_strategy,
+            json_strategy,
+        ]
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn value_clone_eq_reflexive(#[strategy(any_non_custom_value())] v: Value) {
+        let cloned = v.clone();
+        prop_assert_eq!(&cloned, &v);
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn value_serde_round_trip_non_custom(#[strategy(any_non_custom_value())] v: Value) {
+        let json = serde_json::to_value(&v).expect("serialize");
+        let back: Value = serde_json::from_value(json).expect("deserialize");
+        prop_assert_eq!(back, v);
+    }
+
+    /// Property: `Value::data_type()` returns `None` for `Null` and
+    /// `Some(t)` matching the variant's canonical type for every other
+    /// non-Custom variant. Folds together what would otherwise be a
+    /// per-variant table — the variant→type mapping is the property,
+    /// not the individual cells.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn data_type_reports_canonical_for_non_custom(#[strategy(any_non_custom_value())] v: Value) {
+        use crate::DataType;
+        let got = v.data_type();
+        match &v {
+            Value::Null => prop_assert!(got.is_none()),
+            Value::Bool(_) => prop_assert_eq!(got, Some(DataType::Bool)),
+            Value::Int8(_) => prop_assert_eq!(got, Some(DataType::Int8)),
+            Value::Int16(_) => prop_assert_eq!(got, Some(DataType::Int16)),
+            Value::Int32(_) => prop_assert_eq!(got, Some(DataType::Int32)),
+            Value::Int64(_) => prop_assert_eq!(got, Some(DataType::Int64)),
+            Value::UInt8(_) => prop_assert_eq!(got, Some(DataType::UInt8)),
+            Value::UInt16(_) => prop_assert_eq!(got, Some(DataType::UInt16)),
+            Value::UInt32(_) => prop_assert_eq!(got, Some(DataType::UInt32)),
+            Value::UInt64(_) => prop_assert_eq!(got, Some(DataType::UInt64)),
+            Value::Float32(_) => prop_assert_eq!(got, Some(DataType::Float32)),
+            Value::Float64(_) => prop_assert_eq!(got, Some(DataType::Float64)),
+            Value::BigInt(_) => prop_assert_eq!(got, Some(DataType::BigInt { width: None })),
+            Value::Decimal(_) => prop_assert_eq!(
+                got,
+                Some(DataType::Decimal {
+                    precision: None,
+                    scale: None,
+                })
+            ),
+            Value::Text(_) => prop_assert_eq!(got, Some(DataType::Text { size: None })),
+            Value::Bytes(_) => prop_assert_eq!(got, Some(DataType::Bytes { size: None })),
+            Value::Date(_) => prop_assert_eq!(got, Some(DataType::Date)),
+            Value::Timestamp(_) => prop_assert_eq!(got, Some(DataType::Timestamp)),
+            Value::Uuid(_) => prop_assert_eq!(got, Some(DataType::Uuid)),
+            Value::Ipv4(_) => prop_assert_eq!(got, Some(DataType::Ipv4)),
+            Value::Ipv6(_) => prop_assert_eq!(got, Some(DataType::Ipv6)),
+            Value::Json(_) => prop_assert_eq!(got, Some(DataType::Json)),
+            Value::Custom(_) => unreachable!("strategy excludes Custom"),
+        }
     }
 }

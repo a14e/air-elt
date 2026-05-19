@@ -50,12 +50,12 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use crate::convert::ConvertError;
+use crate::convert::context::ConversionContext;
+use crate::data_type::DataType;
+use crate::default_value::DefaultParseError;
 use crate::error::JsonEncodeError;
-use crate::types::convert::ConvertError;
-use crate::types::convert::context::ConversionContext;
-use crate::types::data_type::DataType;
-use crate::types::default_value::DefaultParseError;
-use crate::types::value::Value;
+use crate::value::Value;
 
 /// Connector-defined schema-side type descriptor. See module docs for the
 /// `kind()` and `eq_dyn` contracts.
@@ -390,5 +390,31 @@ mod tests {
         let a: Box<dyn DynType> = Box::new(TestType);
         let b: Box<dyn DynType> = Box::new(TestTypeB);
         assert!(a < b);
+    }
+
+    // ---- Property-based tests --------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Pick one of the two stub `DynType`s by a coin flip. The pair
+    /// covers the only documented contract surface (`kind()` identity
+    /// is preserved through `clone_box`) — a bigger family would
+    /// duplicate the unit tests above without adding signal.
+    fn any_stub_type() -> impl Strategy<Value = Box<dyn DynType>> {
+        prop_oneof![
+            Just(Box::new(TestType) as Box<dyn DynType>),
+            Just(Box::new(TestTypeB) as Box<dyn DynType>),
+        ]
+    }
+
+    /// Cloning a `Box<dyn DynType>` through the `clone_box` plumbing
+    /// must preserve `kind()`. This is the cross-cutting invariant the
+    /// matrix and JSON encoder both rely on; a regression here would
+    /// silently change `DataType::Custom(...)` identity after a clone.
+    #[test_strategy::proptest(ProptestConfig::with_cases(64))]
+    fn box_dyn_type_clone_preserves_kind(#[strategy(any_stub_type())] t: Box<dyn DynType>) {
+        let original_kind = t.kind().to_string();
+        let cloned = t.clone();
+        prop_assert_eq!(cloned.kind(), &original_kind);
     }
 }

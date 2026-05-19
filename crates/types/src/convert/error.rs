@@ -1,4 +1,4 @@
-use crate::types::DataType;
+use crate::DataType;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConvertError {

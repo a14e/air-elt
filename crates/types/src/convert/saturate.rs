@@ -514,4 +514,99 @@ mod tests {
         assert_eq!(sat_bigint_to_width(&BigInt::from(99), 1), BigInt::from(9));
         assert_eq!(sat_bigint_to_width(&BigInt::from(-99), 1), BigInt::from(-9));
     }
+
+    // ---- Property-based tests --------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Every `sat_i64_to_u{8,16,32,64}` primitive must:
+    ///   * map any negative input to 0,
+    ///   * never exceed the target's `MAX`.
+    #[test_strategy::proptest(ProptestConfig::with_cases(512))]
+    fn sat_i64_to_unsigned_clamps_negatives_and_saturates_max(#[strategy(any::<i64>())] v: i64) {
+        let u64_out = sat_i64_to_u64(v);
+        let u32_out = sat_i64_to_u32(v);
+        let u16_out = sat_i64_to_u16(v);
+        let u8_out = sat_i64_to_u8(v);
+        if v < 0 {
+            prop_assert_eq!(u64_out, 0);
+            prop_assert_eq!(u32_out, 0);
+            prop_assert_eq!(u16_out, 0);
+            prop_assert_eq!(u8_out, 0);
+        } else {
+            let v_u = v as u64;
+            prop_assert_eq!(u64_out, v_u);
+            prop_assert_eq!(u32_out, v_u.min(u32::MAX as u64) as u32);
+            prop_assert_eq!(u16_out, v_u.min(u16::MAX as u64) as u16);
+            prop_assert_eq!(u8_out, v_u.min(u8::MAX as u64) as u8);
+        }
+    }
+
+    // Build an arbitrary `BigInt` with a wide magnitude range.
+    prop_compose! {
+        fn arb_bigint()
+            (base in any::<i128>(), exp in 0u8..30u8)
+            -> BigInt
+        {
+            let mut value = BigInt::from(base);
+            let ten = BigInt::from(10);
+            for _ in 0..exp {
+                value *= &ten;
+            }
+            value
+        }
+    }
+
+    /// `sat_bigint_to_width(b, w)` invariants:
+    ///   * `|out| <= 10^w - 1`,
+    ///   * within range: `out == b`,
+    ///   * outside range: `out == ±(10^w - 1)` matching `b`'s sign.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn sat_bigint_to_width_invariants(
+        #[strategy(arb_bigint())] b: BigInt,
+        #[strategy(0u32..=20u32)] width: u32,
+    ) {
+        use num_bigint::Sign;
+        let mut max = BigInt::from(1);
+        let ten = BigInt::from(10);
+        for _ in 0..width {
+            max *= &ten;
+        }
+        max -= 1;
+        let neg_max = -max.clone();
+        let out = sat_bigint_to_width(&b, width);
+        // Bound check.
+        prop_assert!(out <= max);
+        prop_assert!(out >= neg_max);
+        // In-range / out-of-range dispatch.
+        if b > max {
+            prop_assert_eq!(&out, &max);
+        } else if b < neg_max {
+            prop_assert_eq!(&out, &neg_max);
+        } else {
+            prop_assert_eq!(&out, &b);
+            // Sign preserved when in-range.
+            match b.sign() {
+                Sign::Minus => prop_assert!(out <= BigInt::from(0)),
+                Sign::Plus => prop_assert!(out >= BigInt::from(0)),
+                Sign::NoSign => prop_assert_eq!(out, BigInt::from(0)),
+            }
+        }
+    }
+
+    /// Any negative signed input narrowed to any unsigned target via the
+    /// primitives must yield 0 across all source/target widths.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn saturate_all_signed_to_unsigned_clamps_negatives(#[strategy(i64::MIN..0i64)] v: i64) {
+        prop_assert_eq!(sat_i64_to_u64(v), 0);
+        prop_assert_eq!(sat_i64_to_u32(v), 0);
+        prop_assert_eq!(sat_i64_to_u16(v), 0);
+        prop_assert_eq!(sat_i64_to_u8(v), 0);
+        // i8 → u* path
+        let small = (v.max(i8::MIN as i64)) as i8;
+        prop_assert_eq!(sat_i8_to_u64(small), 0);
+        prop_assert_eq!(sat_i8_to_u32(small), 0);
+        prop_assert_eq!(sat_i8_to_u16(small), 0);
+        prop_assert_eq!(sat_i8_to_u8(small), 0);
+    }
 }

@@ -12,9 +12,10 @@ use super::{
     bigint_narrow, bytes_narrow, decimal_narrow, decimal_to_float, float_narrow, int_narrow, ip,
     json_text, text_bool, text_narrow, timestamp_date, uuid as uuid_conv, xml,
 };
-use crate::types::{DataType, Value};
+use crate::{DataType, Value};
 use bigdecimal::BigDecimal;
 use num_bigint::BigInt;
+use num_traits::Zero;
 
 pub fn convert(
     value: Value,
@@ -259,6 +260,78 @@ pub fn convert(
             Value::Bool(b) => Ok(Value::Int64(b as i64)),
             _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
+
+        // ---- Bool → Float / BigInt / Decimal (lossless) ---------------
+        // `false → 0`, `true → 1`. Exact in IEEE-754 and any fixed-point
+        // representation. No truncate gate required.
+        (DataType::Bool, DataType::Float32) => match value {
+            Value::Bool(b) => Ok(Value::Float32(if b { 1.0 } else { 0.0 })),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Bool, DataType::Float64) => match value {
+            Value::Bool(b) => Ok(Value::Float64(if b { 1.0 } else { 0.0 })),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Bool, DataType::BigInt { .. }) => match value {
+            Value::Bool(b) => Ok(Value::BigInt(BigInt::from(u8::from(b)))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+        (DataType::Bool, DataType::Decimal { .. }) => match value {
+            Value::Bool(b) => Ok(Value::Decimal(BigDecimal::from(u8::from(b)))),
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+
+        // ---- BigInt / Decimal → Bool (truncate-only) ------------------
+        // `!is_zero()`. Matrix admits these only under `truncate=true`;
+        // runtime defends defensively in case a caller bypassed validation.
+        (DataType::BigInt { .. }, DataType::Bool) => {
+            if !ctx.truncate {
+                return Err(ConvertError::Unsupported {
+                    src: src.clone(),
+                    dst: dst.clone(),
+                });
+            }
+            match value {
+                Value::BigInt(n) => Ok(Value::Bool(!Zero::is_zero(&n))),
+                _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+            }
+        }
+        (DataType::Decimal { .. }, DataType::Bool) => {
+            if !ctx.truncate {
+                return Err(ConvertError::Unsupported {
+                    src: src.clone(),
+                    dst: dst.clone(),
+                });
+            }
+            match value {
+                Value::Decimal(d) => Ok(Value::Bool(!Zero::is_zero(&d))),
+                _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+            }
+        }
+
+        // ---- Float* → Bool (truncate-only, nullable) ------------------
+        // `f == 0.0` covers ±0.0 by IEEE equality. `NaN` is the absence of
+        // a meaningful value — return `ctx.default` if the operator
+        // provided one, else `Value::Null` (the validation pipeline gates
+        // this latter case on the sink column being nullable). `±Inf` and
+        // every other non-zero finite float maps to `true`.
+        (DataType::Float32 | DataType::Float64, DataType::Bool) => {
+            if !ctx.truncate {
+                return Err(ConvertError::Unsupported {
+                    src: src.clone(),
+                    dst: dst.clone(),
+                });
+            }
+            let f: f64 = match value {
+                Value::Float32(f) => f as f64,
+                Value::Float64(f) => f,
+                _ => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+            };
+            if f.is_nan() {
+                return Ok(ctx.default.clone().unwrap_or(Value::Null));
+            }
+            Ok(Value::Bool(f != 0.0))
+        }
 
         // ---- Text → Bool lexer (always allowed, no truncate gate) ------
         (DataType::Text { .. }, DataType::Bool) => text_bool::convert(value, src),
@@ -804,31 +877,12 @@ mod tests {
 
     // §6.1 Identity & widening (truncate is no-op)
 
-    #[test]
-    fn identity_int32() {
-        let ctx = passthrough();
-        let out = convert(Value::Int32(7), &DataType::Int32, &DataType::Int32, &ctx).unwrap();
-        assert_eq!(out, Value::Int32(7));
-    }
-
-    #[test]
-    fn identity_int32_with_truncate_is_noop() {
-        let ctx = truncate_ctx();
-        let out = convert(Value::Int32(7), &DataType::Int32, &DataType::Int32, &ctx).unwrap();
-        assert_eq!(out, Value::Int32(7));
-    }
-
-    #[test]
-    fn text_widening_with_truncate_is_noop() {
-        let out = convert(
-            Value::Text("hi".into()),
-            &dt_text(10),
-            &dt_text(20),
-            &truncate_ctx(),
-        )
-        .unwrap();
-        assert_eq!(out, Value::Text("hi".into()));
-    }
+    // Identity / widening anchors live below as property tests
+    // (`dispatch_identity_when_src_eq_dst`, `dispatch_text_to_text_size_widen`,
+    // `dispatch_int_widen_preserves_value`). The plain-`#[test]` cases here
+    // pin boundary semantics that the properties don't probe directly:
+    // structured-payload truncate forbiddance, default substitution, exact
+    // narrowing saturation, etc.
 
     #[test]
     fn json_to_json_truncate_forbidden() {
@@ -1625,10 +1679,223 @@ mod tests {
 
     #[test]
     fn unsupported_pair_with_no_arm() {
+        // `Date → Uuid` has no defined conversion in either matrix.
         let res = convert(
+            Value::Date(chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()),
+            &DataType::Date,
+            &DataType::Uuid,
+            &passthrough(),
+        );
+        assert!(matches!(res, Err(ConvertError::Unsupported { .. })));
+    }
+
+    // ---- Bool ↔ Float / BigInt / Decimal --------------------------
+
+    #[test]
+    fn bool_to_float32_lossless() {
+        let out = convert(
+            Value::Bool(true),
+            &DataType::Bool,
+            &DataType::Float32,
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Float32(1.0));
+        let out = convert(
+            Value::Bool(false),
+            &DataType::Bool,
+            &DataType::Float32,
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Float32(0.0));
+    }
+
+    #[test]
+    fn bool_to_float64_lossless() {
+        let out = convert(
             Value::Bool(true),
             &DataType::Bool,
             &DataType::Float64,
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Float64(1.0));
+    }
+
+    #[test]
+    fn bool_to_bigint_lossless() {
+        let out = convert(
+            Value::Bool(true),
+            &DataType::Bool,
+            &DataType::BigInt { width: None },
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::BigInt(BigInt::from(1u8)));
+        let out = convert(
+            Value::Bool(false),
+            &DataType::Bool,
+            &DataType::BigInt { width: Some(4) },
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::BigInt(BigInt::from(0u8)));
+    }
+
+    #[test]
+    fn bool_to_decimal_lossless() {
+        let out = convert(
+            Value::Bool(true),
+            &DataType::Bool,
+            &DataType::Decimal {
+                precision: Some(5),
+                scale: Some(2),
+            },
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Decimal(BigDecimal::from(1u8)));
+    }
+
+    #[test]
+    fn bigint_to_bool_truncate_zero_vs_nonzero() {
+        let zero = convert(
+            Value::BigInt(BigInt::from(0)),
+            &DataType::BigInt { width: None },
+            &DataType::Bool,
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(zero, Value::Bool(false));
+        let huge = convert(
+            Value::BigInt(BigInt::from(1_234_567_890_i64).pow(3)),
+            &DataType::BigInt { width: None },
+            &DataType::Bool,
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(huge, Value::Bool(true));
+    }
+
+    #[test]
+    fn bigint_to_bool_without_truncate_unsupported() {
+        let res = convert(
+            Value::BigInt(BigInt::from(7)),
+            &DataType::BigInt { width: None },
+            &DataType::Bool,
+            &passthrough(),
+        );
+        assert!(matches!(res, Err(ConvertError::Unsupported { .. })));
+    }
+
+    #[test]
+    fn decimal_to_bool_truncate_zero_vs_nonzero() {
+        let zero = convert(
+            Value::Decimal("0.0".parse().unwrap()),
+            &DataType::Decimal {
+                precision: Some(5),
+                scale: Some(2),
+            },
+            &DataType::Bool,
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(zero, Value::Bool(false));
+        let neg = convert(
+            Value::Decimal("-0.01".parse().unwrap()),
+            &DataType::Decimal {
+                precision: Some(5),
+                scale: Some(2),
+            },
+            &DataType::Bool,
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(neg, Value::Bool(true));
+    }
+
+    #[test]
+    fn float_to_bool_truncate_positive_zero_is_false() {
+        let out = convert(
+            Value::Float64(0.0),
+            &DataType::Float64,
+            &DataType::Bool,
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Bool(false));
+    }
+
+    /// IEEE-754 `-0.0 == 0.0` under the equality operator, so the
+    /// `f != 0.0` runtime check returns `false` for both signed zeros.
+    #[test]
+    fn float_to_bool_truncate_negative_zero_is_false() {
+        let out = convert(
+            Value::Float64(-0.0),
+            &DataType::Float64,
+            &DataType::Bool,
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Bool(false));
+    }
+
+    #[test]
+    fn float_to_bool_truncate_infinities_are_true() {
+        let pos = convert(
+            Value::Float64(f64::INFINITY),
+            &DataType::Float64,
+            &DataType::Bool,
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(pos, Value::Bool(true));
+        let neg = convert(
+            Value::Float64(f64::NEG_INFINITY),
+            &DataType::Float64,
+            &DataType::Bool,
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(neg, Value::Bool(true));
+    }
+
+    #[test]
+    fn float_to_bool_truncate_nan_returns_default_when_set() {
+        let mut ctx = truncate_ctx();
+        ctx.default = Some(Value::Bool(false));
+        let out = convert(
+            Value::Float64(f64::NAN),
+            &DataType::Float64,
+            &DataType::Bool,
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(out, Value::Bool(false));
+    }
+
+    #[test]
+    fn float_to_bool_truncate_nan_returns_null_without_default() {
+        // No default configured. Validation is expected to require a
+        // default when the sink column is non-nullable; the runtime
+        // defensively emits `Value::Null`.
+        let out = convert(
+            Value::Float64(f64::NAN),
+            &DataType::Float64,
+            &DataType::Bool,
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Null);
+    }
+
+    #[test]
+    fn float_to_bool_without_truncate_unsupported() {
+        let res = convert(
+            Value::Float64(1.0),
+            &DataType::Float64,
+            &DataType::Bool,
             &passthrough(),
         );
         assert!(matches!(res, Err(ConvertError::Unsupported { .. })));
@@ -1685,7 +1952,7 @@ mod tests {
 
     // ---- Custom routing ------------------------------------------
 
-    use crate::types::dynamic::{DynType, DynValue};
+    use crate::dynamic::{DynType, DynValue};
     use std::any::Any;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1822,13 +2089,362 @@ mod tests {
         .unwrap();
         assert_eq!(out, v);
     }
+
+    // ---- Property-based dispatcher invariants -----------------------
+    //
+    // These properties lock the high-level routing rules of `convert`
+    // without forcing per-cell exhaustive enumeration. The strategies
+    // deliberately stay narrow: `prop_oneof!` over a fixed set of
+    // (DataType, Value) concrete shapes rather than encoding the full
+    // matching relation generically. Custom / Union are excluded — those
+    // arms are exercised by the named tests above.
+
+    use proptest::prelude::*;
+
+    /// Yields a `(DataType, Value)` pair where the value variant matches
+    /// the declared type. Covers every non-Custom, non-Union simple
+    /// variant: numerics, Bool, Text/Bytes (sized + unbounded), Date,
+    /// Timestamp, Uuid, Ipv4/Ipv6, Json, Xml (Xml carries a
+    /// `Value::Text`), BigInt and Decimal (bounded + unbounded).
+    fn matching_type_and_value() -> impl Strategy<Value = (DataType, Value)> {
+        (0u32..24).prop_flat_map(matching_arm)
+    }
+
+    fn matching_arm(choice: u32) -> BoxedStrategy<(DataType, Value)> {
+        match choice {
+            0 => any::<bool>()
+                .prop_map(|b| (DataType::Bool, Value::Bool(b)))
+                .boxed(),
+            1 => any::<i8>()
+                .prop_map(|n| (DataType::Int8, Value::Int8(n)))
+                .boxed(),
+            2 => any::<i16>()
+                .prop_map(|n| (DataType::Int16, Value::Int16(n)))
+                .boxed(),
+            3 => any::<i32>()
+                .prop_map(|n| (DataType::Int32, Value::Int32(n)))
+                .boxed(),
+            4 => any::<i64>()
+                .prop_map(|n| (DataType::Int64, Value::Int64(n)))
+                .boxed(),
+            5 => any::<u8>()
+                .prop_map(|n| (DataType::UInt8, Value::UInt8(n)))
+                .boxed(),
+            6 => any::<u16>()
+                .prop_map(|n| (DataType::UInt16, Value::UInt16(n)))
+                .boxed(),
+            7 => any::<u32>()
+                .prop_map(|n| (DataType::UInt32, Value::UInt32(n)))
+                .boxed(),
+            8 => any::<u64>()
+                .prop_map(|n| (DataType::UInt64, Value::UInt64(n)))
+                .boxed(),
+            // Finite floats only — NaN equality breaks the identity assert
+            // (NaN != NaN), and the dispatcher's identity arm just hands
+            // the value back regardless. Float NaN routing is pinned by
+            // dedicated tests above.
+            9 => proptest::num::f32::NORMAL
+                .prop_map(|f| (DataType::Float32, Value::Float32(f)))
+                .boxed(),
+            10 => proptest::num::f64::NORMAL
+                .prop_map(|f| (DataType::Float64, Value::Float64(f)))
+                .boxed(),
+            11 => "[a-zA-Z0-9 ]{0,32}"
+                .prop_map(|s: String| {
+                    (
+                        DataType::Text {
+                            size: Some(s.chars().count() as u32 + 8),
+                        },
+                        Value::Text(s),
+                    )
+                })
+                .boxed(),
+            12 => "[a-zA-Z0-9 ]{0,32}"
+                .prop_map(|s: String| (DataType::Text { size: None }, Value::Text(s)))
+                .boxed(),
+            13 => proptest::collection::vec(any::<u8>(), 0..32)
+                .prop_map(|b| {
+                    (
+                        DataType::Bytes {
+                            size: Some(b.len() as u32 + 4),
+                        },
+                        Value::Bytes(b),
+                    )
+                })
+                .boxed(),
+            14 => proptest::collection::vec(any::<u8>(), 0..32)
+                .prop_map(|b| (DataType::Bytes { size: None }, Value::Bytes(b)))
+                .boxed(),
+            15 => (-30_000i64..30_000)
+                .prop_map(|days| {
+                    let d = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                        .unwrap()
+                        .checked_add_signed(chrono::Duration::days(days))
+                        .unwrap();
+                    (DataType::Date, Value::Date(d))
+                })
+                .boxed(),
+            16 => (-30_000i64..30_000, 0i64..86_400)
+                .prop_map(|(days, secs)| {
+                    let dt =
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(days * 86_400 + secs, 0)
+                            .unwrap();
+                    (DataType::Timestamp, Value::Timestamp(dt))
+                })
+                .boxed(),
+            17 => any::<[u8; 16]>()
+                .prop_map(|b| (DataType::Uuid, Value::Uuid(::uuid::Uuid::from_bytes(b))))
+                .boxed(),
+            18 => any::<[u8; 4]>()
+                .prop_map(|b| (DataType::Ipv4, Value::Ipv4(std::net::Ipv4Addr::from(b))))
+                .boxed(),
+            19 => any::<[u8; 16]>()
+                .prop_map(|b| (DataType::Ipv6, Value::Ipv6(std::net::Ipv6Addr::from(b))))
+                .boxed(),
+            20 => any::<i64>()
+                .prop_map(|n| {
+                    (
+                        DataType::Json,
+                        Value::Json(serde_json::Value::Number(serde_json::Number::from(n))),
+                    )
+                })
+                .boxed(),
+            21 => prop_oneof![
+                Just((DataType::Xml, Value::Text("<a/>".into()))),
+                Just((DataType::Xml, Value::Text("<b></b>".into()))),
+                Just((DataType::Xml, Value::Text("<root x=\"1\"/>".into()))),
+                Just((DataType::Xml, Value::Text("<a><inner/></a>".into()))),
+            ]
+            .boxed(),
+            22 => any::<i64>()
+                .prop_map(|n| {
+                    (
+                        DataType::BigInt { width: None },
+                        Value::BigInt(num_bigint::BigInt::from(n)),
+                    )
+                })
+                .boxed(),
+            _ => any::<i32>()
+                .prop_map(|n| {
+                    (
+                        DataType::Decimal {
+                            precision: None,
+                            scale: None,
+                        },
+                        Value::Decimal(bigdecimal::BigDecimal::from(n)),
+                    )
+                })
+                .boxed(),
+        }
+    }
+
+    /// `convert(v, dt, dt, ctx)` is an identity for every matching
+    /// `(DataType, Value)` pair — except for the structured-payload
+    /// truncate-forbidden combinations (`Json/Xml` with `truncate=true`)
+    /// which are pinned by dedicated `#[test]` cases above. Runs against
+    /// both passthrough and truncate contexts so the truncate-noop
+    /// behaviour for non-structured types is also covered.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn dispatch_identity_when_src_eq_dst(
+        #[strategy(matching_type_and_value())] pair: (DataType, Value),
+    ) {
+        let (dt, v) = pair;
+        let is_structured = matches!(dt, DataType::Json | DataType::Xml);
+
+        // Passthrough — always identity.
+        let out = convert(v.clone(), &dt, &dt, &passthrough());
+        prop_assert!(
+            out.is_ok(),
+            "passthrough identity failed for {dt:?}: {out:?}"
+        );
+        prop_assert_eq!(
+            out.unwrap(),
+            v.clone(),
+            "passthrough identity diverged for {:?}",
+            dt
+        );
+
+        // Truncate — identity except for the structured payloads, which
+        // must explicitly refuse rather than silently round-trip.
+        let out_t = convert(v.clone(), &dt, &dt, &truncate_ctx());
+        if is_structured {
+            prop_assert!(
+                matches!(out_t, Err(ConvertError::TruncationForbidden { .. })),
+                "expected TruncationForbidden for {dt:?} with truncate, got {out_t:?}"
+            );
+        } else {
+            prop_assert!(out_t.is_ok(), "truncate identity failed for {dt:?}");
+            prop_assert_eq!(out_t.unwrap(), v, "truncate identity diverged for {:?}", dt);
+        }
+    }
+
+    /// `Text { Some(n) } → Text { Some(m) }` with `m ≥ n` always
+    /// succeeds and preserves the value. `Text { _ } → Text { None }`
+    /// (unbounded sink) also always succeeds. Runs under both ctx
+    /// flavours so the truncate-noop is exercised too.
+    #[test_strategy::proptest(ProptestConfig::with_cases(128))]
+    fn dispatch_text_to_text_size_widen(
+        #[strategy(0u32..32)] src_size: u32,
+        #[strategy(0u32..64)] grow: u32,
+        #[strategy("[a-zA-Z0-9 ]{0,16}")] payload: String,
+        #[strategy(any::<bool>())] use_truncate: bool,
+        #[strategy(any::<bool>())] unbounded_sink: bool,
+    ) {
+        let src = DataType::Text {
+            size: Some(src_size + 1),
+        };
+        let dst = if unbounded_sink {
+            DataType::Text { size: None }
+        } else {
+            DataType::Text {
+                size: Some(src_size + 1 + grow),
+            }
+        };
+        let ctx = if use_truncate {
+            truncate_ctx()
+        } else {
+            passthrough()
+        };
+        let out = convert(Value::Text(payload.clone()), &src, &dst, &ctx);
+        prop_assert!(out.is_ok(), "widen {src:?} → {dst:?} failed: {out:?}");
+        prop_assert_eq!(out.unwrap(), Value::Text(payload));
+    }
+
+    /// Widening between fixed-width signed integer pairs preserves the
+    /// underlying i64 value. The strategy emits an `(src_dt, dst_dt,
+    /// src_value)` triple where src ≤ dst in width and the value fits
+    /// the source's signed range.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn dispatch_int_widen_preserves_value(
+        #[strategy(int_widening_pair())] triple: (DataType, DataType, i64),
+    ) {
+        let (src, dst, n) = triple;
+        let src_value = match &src {
+            DataType::Int8 => Value::Int8(n as i8),
+            DataType::Int16 => Value::Int16(n as i16),
+            DataType::Int32 => Value::Int32(n as i32),
+            DataType::Int64 => Value::Int64(n),
+            _ => unreachable!(),
+        };
+        let out = convert(src_value, &src, &dst, &passthrough())
+            .unwrap_or_else(|e| panic!("widening {src:?} → {dst:?} failed: {e:?}"));
+        let widened: i64 = match out {
+            Value::Int8(x) => i64::from(x),
+            Value::Int16(x) => i64::from(x),
+            Value::Int32(x) => i64::from(x),
+            Value::Int64(x) => x,
+            other => panic!("expected integer Value, got {other:?}"),
+        };
+        prop_assert_eq!(widened, n, "widening {:?} → {:?} changed value", src, dst);
+    }
+
+    /// Strategy yielding `(src, dst, value_in_src_range)` for signed
+    /// integer widening pairs (src width ≤ dst width).
+    fn int_widening_pair() -> impl Strategy<Value = (DataType, DataType, i64)> {
+        let pairs: Vec<(DataType, DataType, i64, i64)> = vec![
+            (
+                DataType::Int8,
+                DataType::Int8,
+                i64::from(i8::MIN),
+                i64::from(i8::MAX),
+            ),
+            (
+                DataType::Int8,
+                DataType::Int16,
+                i64::from(i8::MIN),
+                i64::from(i8::MAX),
+            ),
+            (
+                DataType::Int8,
+                DataType::Int32,
+                i64::from(i8::MIN),
+                i64::from(i8::MAX),
+            ),
+            (
+                DataType::Int8,
+                DataType::Int64,
+                i64::from(i8::MIN),
+                i64::from(i8::MAX),
+            ),
+            (
+                DataType::Int16,
+                DataType::Int16,
+                i64::from(i16::MIN),
+                i64::from(i16::MAX),
+            ),
+            (
+                DataType::Int16,
+                DataType::Int32,
+                i64::from(i16::MIN),
+                i64::from(i16::MAX),
+            ),
+            (
+                DataType::Int16,
+                DataType::Int64,
+                i64::from(i16::MIN),
+                i64::from(i16::MAX),
+            ),
+            (
+                DataType::Int32,
+                DataType::Int32,
+                i64::from(i32::MIN),
+                i64::from(i32::MAX),
+            ),
+            (
+                DataType::Int32,
+                DataType::Int64,
+                i64::from(i32::MIN),
+                i64::from(i32::MAX),
+            ),
+            (DataType::Int64, DataType::Int64, i64::MIN, i64::MAX),
+        ];
+        proptest::sample::select(pairs)
+            .prop_flat_map(|(src, dst, lo, hi)| (Just(src), Just(dst), lo..=hi))
+    }
+
+    /// Known narrowing pair (`Int64 → Int8`) with an out-of-range value
+    /// errors with `Unsupported` when `truncate=false`. Adding consent
+    /// (`truncate=true`) flips it to a successful saturating cast — the
+    /// property doesn't assert the saturated value (that is the job of
+    /// the named anchors above), only that the dispatcher gates on
+    /// `truncate`.
+    #[test_strategy::proptest(ProptestConfig::with_cases(128))]
+    fn dispatch_truncate_off_blocks_narrowing(
+        #[strategy(prop_oneof![
+            (i64::from(i8::MAX) + 1)..=i64::MAX,
+            i64::MIN..=(i64::from(i8::MIN) - 1),
+        ])]
+        out_of_range: i64,
+    ) {
+        let res = convert(
+            Value::Int64(out_of_range),
+            &DataType::Int64,
+            &DataType::Int8,
+            &passthrough(),
+        );
+        prop_assert!(
+            matches!(res, Err(ConvertError::Unsupported { .. })),
+            "narrowing Int64({out_of_range}) → Int8 must require truncate, got {res:?}"
+        );
+
+        let ok = convert(
+            Value::Int64(out_of_range),
+            &DataType::Int64,
+            &DataType::Int8,
+            &truncate_ctx(),
+        );
+        prop_assert!(
+            ok.is_ok(),
+            "narrowing with truncate must succeed, got {ok:?}"
+        );
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod ip_dispatch_tests {
     use super::*;
-    use crate::types::Value;
+    use crate::Value;
 
     fn pt() -> ConversionContext {
         ConversionContext::passthrough()

@@ -12,13 +12,13 @@
 //! flows) can reach for the same primitive without depending on
 //! `matrix`'s compatibility internals.
 
-use crate::types::data_type::DataType;
+use crate::data_type::DataType;
 
 /// Collapse a multiset of observed `DataType`s into a single "wider"
 /// `DataType` when widening rules permit; otherwise return
 /// `DataType::Union(unique members)`.
 ///
-/// Rules mirror [`crate::types::matrix::is_compatible`]:
+/// Rules mirror [`crate::matrix::is_compatible`]:
 /// * Int8..Int64 widen to the max width seen.
 /// * UInt8..UInt64 widen to the max width seen.
 /// * Float32 + Float64 → Float64.
@@ -61,6 +61,16 @@ where
 /// observation-order-independent equality guarantee, and a 1-element
 /// collapse is honoured for the case where two heterogeneous-kind
 /// inputs reduce to a single variant after dedup.
+///
+/// After sort+dedup the same-kind families become adjacent (derived
+/// `Ord` groups discriminants together), so a single pairwise pass
+/// finishes any widening the left-to-right outer loop missed because
+/// of input ordering. Example: `[Int16, UInt8, Int8]` hits fallback at
+/// `Int16 + UInt8` with `[Int8]` still pending; without the pass the
+/// result would be `Union([Int8, Int16, UInt8])` which still contains
+/// `Int8 + Int16` — exactly the situation widening rules are supposed
+/// to collapse. The pairwise pass turns that into `Union([Int16, UInt8])`,
+/// making `collapse_union` idempotent on the first re-feed.
 fn fallback<I>(acc: DataType, offending: DataType, rest: I) -> DataType
 where
     I: IntoIterator<Item = DataType>,
@@ -74,10 +84,29 @@ where
     // discriminant + fields), unlike a `format!`-based sort key.
     collected.sort();
     collected.dedup();
-    if collected.len() == 1 {
-        return collected.into_iter().next().expect("len==1");
+
+    // Walk the sorted set as a stack: try to widen the top against
+    // each incoming element. Bounded by `collected.len()` — every
+    // successful widen drops one element, every failure pushes both
+    // back and moves on. Termination is trivially `O(n)`.
+    let mut reduced: Vec<DataType> = Vec::with_capacity(collected.len());
+    for next in collected {
+        match reduced.pop() {
+            None => reduced.push(next),
+            Some(top) => match try_widen(top, next) {
+                Ok(widened) => reduced.push(widened),
+                Err((top_back, next_back)) => {
+                    reduced.push(top_back);
+                    reduced.push(next_back);
+                }
+            },
+        }
     }
-    DataType::Union(collected)
+
+    if reduced.len() == 1 {
+        return reduced.into_iter().next().expect("len==1");
+    }
+    DataType::Union(reduced)
 }
 
 /// Flatten one level of `Union(inner)` into a leaf iterator. Returns
@@ -293,5 +322,86 @@ mod tests {
             DataType::Int32,
         ]);
         assert_eq!(r, DataType::Int32);
+    }
+
+    // ---- Property-based tests --------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Strategy yielding any of the four signed integer kinds along
+    /// with the bit width that distinguishes them.
+    fn signed_int_with_width() -> impl Strategy<Value = (DataType, u32)> {
+        prop_oneof![
+            Just((DataType::Int8, 8u32)),
+            Just((DataType::Int16, 16)),
+            Just((DataType::Int32, 32)),
+            Just((DataType::Int64, 64)),
+        ]
+    }
+
+    /// Map a numeric width back to the matching signed `DataType` arm.
+    fn signed_for_width(w: u32) -> DataType {
+        match w {
+            8 => DataType::Int8,
+            16 => DataType::Int16,
+            32 => DataType::Int32,
+            _ => DataType::Int64,
+        }
+    }
+
+    #[test_strategy::proptest(ProptestConfig::with_cases(128))]
+    fn collapse_int_family_yields_max_width(
+        #[strategy(prop::collection::vec(signed_int_with_width(), 1..=8))] bag: Vec<(
+            DataType,
+            u32,
+        )>,
+    ) {
+        let max_width = bag.iter().map(|(_, w)| *w).max().unwrap();
+        let types: Vec<DataType> = bag.iter().map(|(t, _)| t.clone()).collect();
+        let collapsed = collapse_union(types);
+        prop_assert_eq!(collapsed, signed_for_width(max_width));
+    }
+
+    /// Strategy yielding mixed inputs across kinds, used to test
+    /// idempotence of `collapse_union` regardless of the outcome shape.
+    fn any_collapse_input() -> impl Strategy<Value = DataType> {
+        prop_oneof![
+            Just(DataType::Int8),
+            Just(DataType::Int16),
+            Just(DataType::Int32),
+            Just(DataType::Int64),
+            Just(DataType::UInt8),
+            Just(DataType::UInt16),
+            Just(DataType::UInt32),
+            Just(DataType::UInt64),
+            Just(DataType::Float32),
+            Just(DataType::Float64),
+            Just(DataType::Bool),
+            prop::option::of(1u32..=64).prop_map(|sz| DataType::Text { size: sz }),
+            prop::option::of(1u32..=64).prop_map(|sz| DataType::Bytes { size: sz }),
+        ]
+    }
+
+    /// `collapse_union` is idempotent: re-feeding its own result returns
+    /// the same value. The fallback path's post-sort pairwise widening
+    /// pass guarantees that even pathological input orderings (e.g.
+    /// `[Int16, UInt8, Int8]`) reach a fixed point on the first pass.
+    #[test_strategy::proptest(ProptestConfig::with_cases(128))]
+    fn collapse_idempotent(
+        #[strategy(prop::collection::vec(any_collapse_input(), 1..=6))] xs: Vec<DataType>,
+    ) {
+        let once = collapse_union(xs.clone());
+        let twice = collapse_union(vec![once.clone()]);
+        prop_assert_eq!(once, twice);
+    }
+
+    /// Regression for the `fallback` widening-order bug: `[Int16, UInt8, Int8]`
+    /// hits the heterogeneous arm at `Int16 + UInt8` with `Int8` still
+    /// pending, but the post-sort pairwise pass must still absorb
+    /// `Int8 + Int16 → Int16` before union-packing.
+    #[test]
+    fn fallback_reabsorbs_same_kind_after_sort() {
+        let r = collapse_union(vec![DataType::Int16, DataType::UInt8, DataType::Int8]);
+        assert_eq!(r, DataType::Union(vec![DataType::Int16, DataType::UInt8]));
     }
 }

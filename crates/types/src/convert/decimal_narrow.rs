@@ -5,7 +5,7 @@
 
 use super::error::ConvertError;
 use super::saturate::*;
-use crate::types::{DataType, Value};
+use crate::{DataType, Value};
 use bigdecimal::{BigDecimal, RoundingMode};
 
 pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, ConvertError> {
@@ -205,5 +205,74 @@ mod tests {
         let d: BigDecimal = "-12.3499".parse().unwrap();
         let out = narrow_decimal(d, Some(10), Some(2));
         assert_eq!(out, BigDecimal::from_str("-12.34").unwrap());
+    }
+
+    // ---- Property-based tests --------------------------------------
+
+    use num_bigint::BigInt;
+    use proptest::prelude::*;
+
+    // Construct a `BigDecimal` with a bounded mantissa and `src_scale`
+    // decimal places. Used to drive scale-narrowing properties.
+    prop_compose! {
+        fn arb_decimal_with_scale()
+            (mantissa in any::<i64>(), src_scale in 0u32..12u32)
+            -> (BigDecimal, u32)
+        {
+            (BigDecimal::new(BigInt::from(mantissa), src_scale as i64), src_scale)
+        }
+    }
+
+    /// Narrowing a Decimal's scale from `src_scale` to a strictly smaller
+    /// `dst_scale` (with ample precision) must:
+    ///   * produce a result whose stored scale equals `dst_scale`, and
+    ///   * never increase the magnitude (truncation toward zero).
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn decimal_scale_narrow_truncates_toward_zero(
+        #[strategy(arb_decimal_with_scale())] sample: (BigDecimal, u32),
+        #[strategy(0u32..12u32)] dst_scale_input: u32,
+    ) {
+        let (src_value, src_scale) = sample;
+        // Restrict to dst_scale < src_scale; pick precision = 38 (ample).
+        prop_assume!(dst_scale_input < src_scale);
+        let dst_scale = dst_scale_input;
+        let out = narrow_decimal(src_value.clone(), Some(38), Some(dst_scale));
+        // Property 1: result scale equals dst_scale (BigDecimal's exponent
+        // is `-scale` after `with_scale_round(s, Down)`).
+        let (_, exp) = out.clone().into_bigint_and_exponent();
+        prop_assert_eq!(exp, dst_scale as i64);
+        // Property 2: magnitude does not exceed the source magnitude.
+        let abs_out = out.abs();
+        let abs_src = src_value.abs();
+        prop_assert!(abs_out <= abs_src);
+    }
+
+    /// Narrowing precision below the actual integer width must saturate
+    /// the mantissa to `±(10^precision - 1)` and preserve the sign.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn decimal_precision_narrow_saturates_at_max(
+        #[strategy(any::<i64>())] mantissa: i64,
+        #[strategy(1u32..=5u32)] precision: u32,
+    ) {
+        // Always scale=0 so the precision applies to the integer part.
+        let src = BigDecimal::new(BigInt::from(mantissa), 0);
+        let out = narrow_decimal(src, Some(precision), Some(0));
+        // Compute the saturation cap.
+        let mut max = BigInt::from(1);
+        let ten = BigInt::from(10);
+        for _ in 0..precision {
+            max *= &ten;
+        }
+        max -= 1;
+        let (out_mantissa, _) = out.into_bigint_and_exponent();
+        let abs_mantissa = out_mantissa.clone();
+        prop_assert!(abs_mantissa.clone() <= max);
+        prop_assert!(abs_mantissa >= -max);
+        // Sign preservation: if mantissa != 0, sign matches.
+        if mantissa > 0 {
+            prop_assert!(out_mantissa >= BigInt::from(0));
+        } else if mantissa < 0 {
+            prop_assert!(out_mantissa <= BigInt::from(0));
+        }
     }
 }

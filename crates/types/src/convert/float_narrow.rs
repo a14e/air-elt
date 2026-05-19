@@ -6,7 +6,7 @@
 
 use super::error::ConvertError;
 use super::saturate::*;
-use crate::types::{DataType, Value};
+use crate::{DataType, Value};
 
 pub fn convert(value: Value, src: &DataType, dst: &DataType) -> Result<Value, ConvertError> {
     use DataType::*;
@@ -214,5 +214,106 @@ mod tests {
     fn unsupported_target_rejected() {
         let res = convert(Value::Float64(1.0), &DataType::Float64, &DataType::Bool);
         assert!(matches!(res, Err(ConvertError::Unsupported { .. })));
+    }
+
+    // ---- Property-based tests --------------------------------------
+
+    use proptest::prelude::*;
+
+    /// NaN input must surface `Overflow` for *every* integer target —
+    /// signed and unsigned, every width.
+    #[test_strategy::proptest(ProptestConfig::with_cases(32))]
+    fn float_narrow_nan_to_int_overflows(
+        #[strategy(prop_oneof![
+            Just(DataType::Int8),
+            Just(DataType::Int16),
+            Just(DataType::Int32),
+            Just(DataType::Int64),
+            Just(DataType::UInt8),
+            Just(DataType::UInt16),
+            Just(DataType::UInt32),
+            Just(DataType::UInt64),
+        ])]
+        dst: DataType,
+    ) {
+        let res = convert(Value::Float64(f64::NAN), &DataType::Float64, &dst);
+        let is_overflow = matches!(res, Err(ConvertError::Overflow { .. }));
+        prop_assert!(is_overflow);
+        // Same for Float32 NaN.
+        let res_f32 = convert(Value::Float32(f32::NAN), &DataType::Float32, &dst);
+        let is_overflow_f32 = matches!(res_f32, Err(ConvertError::Overflow { .. }));
+        prop_assert!(is_overflow_f32);
+    }
+
+    /// Subnormal floats (smaller-than-`f32::MIN_POSITIVE` magnitudes that
+    /// are still finite) must preserve sign when narrowed `f64 → f32`.
+    /// We assert on `is_sign_negative()` / `is_sign_positive()` rather
+    /// than `<= 0.0` / `>= 0.0` because the IEEE-754 ordering operator
+    /// treats `+0.0 == -0.0`: a bug that flushed a negative subnormal
+    /// to `+0.0` would pass `f <= 0.0`. `is_sign_negative()` inspects
+    /// the sign bit directly and distinguishes `-0.0` from `+0.0`.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn float_narrow_subnormal_preserves_sign(
+        #[strategy(1u32..=20u32)] shift: u32,
+        #[strategy(any::<bool>())] negative: bool,
+    ) {
+        // Construct a subnormal-ish f64 below f32::MIN_POSITIVE.
+        let magnitude = f32::MIN_POSITIVE as f64 / (1u64 << shift) as f64;
+        let value = if negative { -magnitude } else { magnitude };
+        let out = convert(
+            Value::Float64(value),
+            &DataType::Float64,
+            &DataType::Float32,
+        )
+        .expect("convert");
+        match out {
+            Value::Float32(f) => {
+                // Either f is also subnormal-or-zero with matching sign,
+                // or it flushed to zero — in which case the sign bit of
+                // the resulting zero must still match the input.
+                if negative {
+                    prop_assert!(
+                        f.is_sign_negative(),
+                        "expected negative sign bit, got {f} (bits={:#x})",
+                        f.to_bits()
+                    );
+                } else {
+                    prop_assert!(
+                        f.is_sign_positive(),
+                        "expected positive sign bit, got {f} (bits={:#x})",
+                        f.to_bits()
+                    );
+                }
+            }
+            _ => prop_assert!(false, "expected Float32"),
+        }
+    }
+
+    /// `Float64 → Float32` saturates magnitudes above `+f32::MAX` to
+    /// `f32::MAX` rather than `+Infinity` under truncate semantics.
+    #[test]
+    fn float64_to_float32_positive_overflow_saturates_to_f32_max() {
+        // 1e40 sits comfortably above f32::MAX (~3.4e38) and well
+        // inside f64::MAX.
+        let out = convert(
+            Value::Float64(1e40_f64),
+            &DataType::Float64,
+            &DataType::Float32,
+        )
+        .unwrap();
+        assert_eq!(out, Value::Float32(f32::MAX));
+    }
+
+    /// `Float64 → Float32` saturates magnitudes below `-f32::MAX` to
+    /// `f32::MIN` rather than `-Infinity` under truncate semantics.
+    #[test]
+    fn float64_to_float32_negative_overflow_saturates_to_f32_min() {
+        let out = convert(
+            Value::Float64(-1e40_f64),
+            &DataType::Float64,
+            &DataType::Float32,
+        )
+        .unwrap();
+        assert_eq!(out, Value::Float32(f32::MIN));
     }
 }

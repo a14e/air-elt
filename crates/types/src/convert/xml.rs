@@ -17,7 +17,7 @@ use quick_xml::events::Event;
 
 use super::error::ConvertError;
 use super::text_truncate::truncate_chars;
-use crate::types::{DataType, Value};
+use crate::{DataType, Value};
 
 pub fn validate(s: &str) -> Result<(), String> {
     if s.trim().is_empty() {

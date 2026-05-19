@@ -7,7 +7,7 @@
 //! flows. The default value is parsed against the *sink* `DataType` at
 //! validation time, so the runner sees a ready-to-bind value.
 
-use crate::types::Value;
+use crate::Value;
 
 #[derive(Debug, Clone, Default)]
 pub struct ConversionContext {

@@ -13,11 +13,11 @@
 //!   in `float_narrow`.
 //!
 //! Lossless-vs-narrowing classification (precision ≤ 15 for Float64,
-//! ≤ 7 for Float32) lives in `core::types::matrix`; this module only
+//! ≤ 7 for Float32) lives in `crate::matrix`; this module only
 //! implements the conversion itself.
 
 use super::error::ConvertError;
-use crate::types::{DataType, Value};
+use crate::{DataType, Value};
 use bigdecimal::ToPrimitive;
 use num_bigint::Sign;
 
@@ -207,5 +207,98 @@ mod tests {
     fn decimal_to_f32_value_shape_mismatch() {
         let res = convert_to_f32(Value::Int32(1), &dec(7, 2), false);
         assert!(matches!(res, Err(ConvertError::ValueShapeMismatch { .. })));
+    }
+
+    // ---- Property-based tests --------------------------------------
+
+    use num_bigint::BigInt;
+    use proptest::prelude::*;
+
+    // Build a `BigDecimal` whose mantissa magnitude fits losslessly in
+    // f64 (15 significant decimal digits) and whose scale is small.
+    prop_compose! {
+        fn arb_small_decimal()
+            // 15 digits ≈ ±999_999_999_999_999.
+            (mantissa in -999_999_999_999_999i64..=999_999_999_999_999i64,
+             scale in 0u32..=10u32)
+            -> BigDecimal
+        {
+            BigDecimal::new(BigInt::from(mantissa), scale as i64)
+        }
+    }
+
+    /// A `BigDecimal` whose precision is ≤ 15 fits losslessly in an f64
+    /// mantissa — round-tripping through `convert_to_f64` must agree
+    /// within one ULP against an INDEPENDENT oracle: parsing the
+    /// decimal's textual form through `f64::from_str`. Using
+    /// `d.to_f64()` here would be tautological — the production path
+    /// calls the same routine, so the assertion would be structurally
+    /// guaranteed.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn decimal_to_float_lossless_when_fits_f64_mantissa(
+        #[strategy(arb_small_decimal())] d: BigDecimal,
+    ) {
+        // Independent oracle: stringify, then re-parse via the libcore
+        // float parser. This is a separate code path from `to_f64`.
+        let expected: f64 = d.to_string().parse().unwrap();
+        let out = convert_to_f64(Value::Decimal(d), &dec(38, 10), false).expect("convert");
+        match out {
+            Value::Float64(f) => {
+                prop_assert!(f.is_finite());
+                prop_assert!(
+                    (f - expected).abs() <= expected.abs() * 1e-12 + 1e-12,
+                    "got {f}, expected {expected}"
+                );
+            }
+            _ => prop_assert!(false, "expected Float64"),
+        }
+    }
+
+    fn ten_to_350_local() -> BigDecimal {
+        let mut digits = String::from("1");
+        for _ in 0..350 {
+            digits.push('0');
+        }
+        BigDecimal::from_str(&digits).unwrap()
+    }
+
+    /// Overflowing positive magnitude — `truncate=false` raises
+    /// `Overflow`; `truncate=true` saturates to `+Infinity`.
+    #[test]
+    fn decimal_to_float_overflow_positive_saturates_to_pos_infinity() {
+        let value = ten_to_350_local();
+        let res_strict = convert_to_f64(Value::Decimal(value.clone()), &dec(38, 0), false);
+        assert!(matches!(res_strict, Err(ConvertError::Overflow { .. })));
+        let res_trunc = convert_to_f64(Value::Decimal(value), &dec(38, 0), true).unwrap();
+        assert_eq!(res_trunc, Value::Float64(f64::INFINITY));
+    }
+
+    /// Overflowing negative magnitude — `truncate=false` raises
+    /// `Overflow`; `truncate=true` saturates to `-Infinity`.
+    #[test]
+    fn decimal_to_float_overflow_negative_saturates_to_neg_infinity() {
+        let value = -ten_to_350_local();
+        let res_strict = convert_to_f64(Value::Decimal(value.clone()), &dec(38, 0), false);
+        assert!(matches!(res_strict, Err(ConvertError::Overflow { .. })));
+        let res_trunc = convert_to_f64(Value::Decimal(value), &dec(38, 0), true).unwrap();
+        assert_eq!(res_trunc, Value::Float64(f64::NEG_INFINITY));
+    }
+
+    /// Sign preservation across small (lossless) decimals.
+    #[test_strategy::proptest(ProptestConfig::with_cases(256))]
+    fn decimal_to_float_sign_preserved(#[strategy(arb_small_decimal())] d: BigDecimal) {
+        let sign_in = d.sign();
+        let out = convert_to_f64(Value::Decimal(d), &dec(38, 10), false).expect("convert");
+        match out {
+            Value::Float64(f) => {
+                use num_bigint::Sign;
+                match sign_in {
+                    Sign::Minus => prop_assert!(f <= 0.0),
+                    Sign::Plus => prop_assert!(f >= 0.0),
+                    Sign::NoSign => prop_assert_eq!(f, 0.0),
+                }
+            }
+            _ => prop_assert!(false, "expected Float64"),
+        }
     }
 }

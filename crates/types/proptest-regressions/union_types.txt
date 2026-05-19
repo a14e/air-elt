@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 61e04b03571642a141dbb9a0f230709024613fa4e3b80e4d24a8ebfe76804da7 # shrinks to input = _CollapseIdempotentArgs { xs: [Int16, UInt8, Int8] }
