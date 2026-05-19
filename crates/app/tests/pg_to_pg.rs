@@ -662,3 +662,131 @@ label = {{ from = "active", switch = {{ true = "yes", false = "no" }} }}
 
     pg.pool.close().await;
 }
+
+/// PG → PG IPv4 / IPv6 round-trip via `inet` columns + the canonical
+/// IP convert path.
+///
+/// Source carries both bare host addresses and a subnet-masked
+/// network address (the latter only survives losslessly through the
+/// `Inet → Inet` identity path; the canonical `Ipv4`/`Ipv6` slots
+/// drop the mask under `truncate = true`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_to_pg_ip_round_trip() {
+    let src_handle = pg_pool().await;
+    let dst_handle = pg_pool().await;
+
+    let src_schema = format!("{}_ip_src", src_handle.schema);
+    let dst_schema = format!("{}_ip_dst", dst_handle.schema);
+
+    src_handle
+        .pool
+        .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
+        .await
+        .unwrap();
+    src_handle
+        .pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{src_schema}\".ip_rows (
+                    id   BIGINT PRIMARY KEY,
+                    net  INET NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+    src_handle
+        .pool
+        .execute(
+            format!(
+                "INSERT INTO \"{src_schema}\".ip_rows(id, net) VALUES \
+                 (1, '192.0.2.1'::inet), \
+                 (2, '2001:db8::1'::inet), \
+                 (3, '192.0.2.0/24'::inet)"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    dst_handle
+        .pool
+        .execute(format!("CREATE SCHEMA \"{dst_schema}\"").as_str())
+        .await
+        .unwrap();
+    dst_handle
+        .pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{dst_schema}\".ip_rows (
+                    id   BIGINT PRIMARY KEY,
+                    net  INET NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let src_url = src_handle.url_with_search_path();
+    let dst_url = dst_handle.url_with_search_path();
+    let config_toml = format!(
+        r#"
+[[sources]]
+name = "pg_src"
+type = "postgres"
+config = {{ url = "{src_url}" }}
+
+[[sinks]]
+name = "pg_sink"
+type = "postgres"
+config = {{ url = "{dst_url}" }}
+
+[[storages]]
+name = "pg_state"
+type = "postgres"
+config = {{ url = "{src_url}" }}
+
+[flow.ip]
+source = "pg_src"
+sink = "pg_sink"
+storage = "pg_state"
+from = "{src_schema}.ip_rows"
+to = "{dst_schema}.ip_rows"
+batch-limit = 8
+
+cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
+
+[flow.ip.mapping]
+id = "id"
+net = "net"
+"#
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    std::fs::write(&path, &config_toml).unwrap();
+    let app = App::from_path(&path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
+
+    // text(inet) keeps the prefix; host /32 and /128 are normalised
+    // by PG to the bare address form on read, mask stays for /24.
+    let rows: Vec<(i64, String)> = sqlx::query_as(&format!(
+        "SELECT id, text(net) FROM \"{dst_schema}\".ip_rows ORDER BY id"
+    ))
+    .fetch_all(&dst_handle.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "192.0.2.1/32".to_string()),
+            (2, "2001:db8::1/128".to_string()),
+            (3, "192.0.2.0/24".to_string()),
+        ]
+    );
+
+    src_handle.pool.close().await;
+    dst_handle.pool.close().await;
+}

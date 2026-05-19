@@ -174,24 +174,16 @@ async fn dry_run_does_not_persist_a_row() {
     };
     sink.validate_access(&spec).await.expect("validate_access");
 
-    // Poll a couple of seconds in case WAL apply lag would have surfaced
-    // a stray row from a buggy dry-run path.
-    let mut count: i64 = -1;
-    for _ in 0..30 {
-        let row = sqlx::query("SELECT count() AS c FROM bench_dry_run_no_rows")
-            .fetch_one(&h.pool)
-            .await
-            .expect("count");
-        count = row.try_get::<i64, _>("c").expect("count decode");
-        if count != 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert_eq!(
-        count, 0,
-        "dry-run probe must not persist any row (WAL-apply lag included)"
-    );
+    // validate_access returns only after the dry-run probe finishes —
+    // any buggy path that actually wrote a row would have flushed it
+    // to the WAL before returning. A single `count()` is sufficient
+    // and follows `testing-guidelines` (no sleep-on-happy-path).
+    let row = sqlx::query("SELECT count() AS c FROM bench_dry_run_no_rows")
+        .fetch_one(&h.pool)
+        .await
+        .expect("count");
+    let count: i64 = row.try_get("c").expect("count decode");
+    assert_eq!(count, 0, "dry-run probe must not persist any row");
 
     h.drop_table("bench_dry_run_no_rows").await;
     h.pool.close().await;

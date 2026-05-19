@@ -43,7 +43,6 @@ use crate::types::enums::{ChEnum8Type, ChEnum16Type, ChEnumValue};
 use crate::types::fixed_string::{ChFixedStringType, ChFixedStringValue};
 use crate::types::int128::{ChInt128Type, ChInt128Value, ChUInt128Type, ChUInt128Value};
 use crate::types::int256::{ChInt256Type, ChInt256Value, ChUInt256Type, ChUInt256Value};
-use crate::types::ip::{ChIpv4Type, ChIpv4Value, ChIpv6Type, ChIpv6Value};
 use crate::types::map::{ChMapType, ChMapValue};
 use crate::types::tuple::{ChTupleType, ChTupleValue};
 
@@ -267,43 +266,29 @@ fn encode_typed(
         DataType::Decimal { precision, scale } => {
             encode_decimal(out, column, *precision, *scale, value)
         }
+        DataType::Ipv4 => match value {
+            // CH RowBinary stores IPv4 as a little-endian UInt32.
+            // `Ipv4Addr::octets()` returns network-order bytes
+            // (192.168.0.1 → [0xC0, 0xA8, 0x00, 0x01]); CH wants them
+            // reversed (→ 0x01 0x00 0xA8 0xC0). See
+            // https://clickhouse.com/docs/interfaces/formats/RowBinary
+            Value::Ipv4(a) => {
+                let n: u32 = (*a).into();
+                out.extend_from_slice(&n.to_le_bytes());
+                Ok(())
+            }
+            _ => mismatch(column, dt, value),
+        },
+        DataType::Ipv6 => match value {
+            // CH RowBinary stores IPv6 as 16 BE bytes (network order),
+            // which is exactly what `octets()` returns.
+            Value::Ipv6(a) => {
+                out.extend_from_slice(&a.octets());
+                Ok(())
+            }
+            _ => mismatch(column, dt, value),
+        },
         DataType::Custom(t) => match t.kind() {
-            ChIpv4Type::KIND => match value {
-                Value::Custom(b) => {
-                    let v = b.as_any().downcast_ref::<ChIpv4Value>().ok_or_else(|| {
-                        EncodeError::Mismatch {
-                            column: column.to_string(),
-                            expected: "IPv4".to_string(),
-                            got: "Custom(non-IPv4)",
-                        }
-                    })?;
-                    // CH RowBinary stores IPv4 as a little-endian UInt32.
-                    // `Ipv4Addr::octets()` returns network-order bytes
-                    // (192.168.0.1 → [0xC0, 0xA8, 0x00, 0x01]); CH wants
-                    // them reversed (→ 0x01 0x00 0xA8 0xC0). See
-                    // https://clickhouse.com/docs/interfaces/formats/RowBinary
-                    let n: u32 = v.0.into();
-                    out.extend_from_slice(&n.to_le_bytes());
-                    Ok(())
-                }
-                _ => mismatch(column, dt, value),
-            },
-            ChIpv6Type::KIND => match value {
-                Value::Custom(b) => {
-                    let v = b.as_any().downcast_ref::<ChIpv6Value>().ok_or_else(|| {
-                        EncodeError::Mismatch {
-                            column: column.to_string(),
-                            expected: "IPv6".to_string(),
-                            got: "Custom(non-IPv6)",
-                        }
-                    })?;
-                    // CH RowBinary stores IPv6 as 16 BE bytes (network
-                    // order), which is exactly what `octets()` returns.
-                    out.extend_from_slice(&v.0.octets());
-                    Ok(())
-                }
-                _ => mismatch(column, dt, value),
-            },
             ChFixedStringType::KIND => match value {
                 Value::Custom(b) => {
                     let v = b
@@ -740,6 +725,8 @@ fn value_variant(v: &Value) -> &'static str {
         Value::Date(_) => "Date",
         Value::Timestamp(_) => "Timestamp",
         Value::Uuid(_) => "Uuid",
+        Value::Ipv4(_) => "Ipv4",
+        Value::Ipv6(_) => "Ipv6",
         Value::Json(_) => "Json",
         Value::Custom(_) => "Custom",
     }

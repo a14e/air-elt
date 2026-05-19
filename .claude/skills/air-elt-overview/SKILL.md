@@ -67,7 +67,7 @@ Validation-time hooks: `Source::body_data_type() -> DataType` (default `Json`; M
 
 ## Type model — canonical pivot, N+N matrix
 
-Each source maps `native → DataType` on read, each sink maps `DataType → native` on write. This gives N+N mappings instead of N×N. The internal type set covers integers (signed + unsigned for MySQL/MariaDB UNSIGNED columns), floats, `BigInt { width }` and `Decimal { precision, scale }` for SQL `numeric`, sized `Text`/`Bytes`, `Date`, `Timestamp` (UTC), `Uuid`, `Json`, `Xml`. Nullability is a property of `Field`, not of `DataType` — `Value::Null` carries "no data".
+Each source maps `native → DataType` on read, each sink maps `DataType → native` on write. This gives N+N mappings instead of N×N. The internal type set covers integers (signed + unsigned for MySQL/MariaDB UNSIGNED columns), floats, `BigInt { width }` and `Decimal { precision, scale }` for SQL `numeric`, sized `Text`/`Bytes`, `Date`, `Timestamp` (UTC), `Uuid`, `Ipv4` / `Ipv6` (host addresses; PG `inet` with subnet masks lives in `PgInetType` custom), `Json`, `Xml`. Nullability is a property of `Field`, not of `DataType` — `Value::Null` carries "no data".
 
 Compatibility is checked at validation time by `core::types::matrix::is_compatible` (lossless) or `is_compatible_with_truncate` (when a mapping has `truncate=true`). Reverse paths (`BigInt/Decimal → Int*`, `Float ↔ BigInt/Decimal`) are deliberately rejected without `truncate`. Runtime per-cell conversion happens inside the Transform layer via `TransformOp::Convert` carrying a `ColumnConversionPlan`; identity columns lower to a bare `Take` (no convert).
 

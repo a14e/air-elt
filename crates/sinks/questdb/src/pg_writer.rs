@@ -20,7 +20,6 @@ use uuid::Uuid;
 
 use air_elt_commons_questdb::pg_bind::bind_value_separated_pg;
 use air_elt_commons_questdb::types::geohash::QuestDbGeohashValue;
-use air_elt_commons_questdb::types::ipv4::QuestDbIpv4Value;
 use air_elt_commons_questdb::types::long256::QuestDbLong256Value;
 use air_elt_commons_questdb::types::symbol::QuestDbSymbolValue;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
@@ -203,6 +202,7 @@ fn dry_run_dummy_value(field: &Field) -> Value {
         }
         DataType::Timestamp => Value::Timestamp(Utc::now()),
         DataType::Uuid => Value::Uuid(Uuid::nil()),
+        DataType::Ipv4 => Value::Ipv4(std::net::Ipv4Addr::LOCALHOST),
         DataType::Json => Value::Json(serde_json::Value::Null),
         DataType::Custom(t) => dummy_custom_value(t.as_ref()),
         // Unsupported types reach here only as Null because `type_supported`
@@ -214,7 +214,6 @@ fn dry_run_dummy_value(field: &Field) -> Value {
 
 fn dummy_custom_value(t: &dyn air_elt_core::types::dynamic::DynType) -> Value {
     use air_elt_commons_questdb::types::geohash::QuestDbGeohashType;
-    use air_elt_commons_questdb::types::ipv4::QuestDbIpv4Type;
     use air_elt_commons_questdb::types::long256::QuestDbLong256Type;
     use air_elt_commons_questdb::types::symbol::QuestDbSymbolType;
 
@@ -224,9 +223,6 @@ fn dummy_custom_value(t: &dyn air_elt_core::types::dynamic::DynType) -> Value {
     }
     if kind == QuestDbLong256Type::KIND {
         return Value::Custom(Box::new(QuestDbLong256Value([0u8; 32])));
-    }
-    if kind == QuestDbIpv4Type::KIND {
-        return Value::Custom(Box::new(QuestDbIpv4Value(std::net::Ipv4Addr::LOCALHOST)));
     }
     if let Some(g) = t.as_any().downcast_ref::<QuestDbGeohashType>() {
         return Value::Custom(Box::new(QuestDbGeohashValue {

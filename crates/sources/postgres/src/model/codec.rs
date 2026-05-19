@@ -5,7 +5,7 @@ use sqlx::postgres::PgRow;
 use uuid::Uuid;
 
 use air_elt_commons_pg::null_bind;
-use air_elt_commons_pg::types::{PgHllType, PgHllValue};
+use air_elt_commons_pg::types::{PgHllType, PgHllValue, PgInetType, PgInetValue};
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::types::{DataType, Value};
 
@@ -47,6 +47,21 @@ pub fn decode_column(row: &PgRow, index: usize, data_type: DataType) -> RuntimeR
             .map(|o| o.map(Value::Timestamp).unwrap_or(Value::Null)),
         DataType::Uuid => {
             nullable::<Uuid>(row, index).map(|o| o.map(Value::Uuid).unwrap_or(Value::Null))
+        }
+        // Canonical IPv4/IPv6 columns are unusual on the PG side
+        // (the canonical pivot for `inet` is `PgInetType` — see
+        // below). These arms still need to exist because a user can
+        // declare an `inet` column in the source schema and map it
+        // through a `convert` to `Ipv4`/`Ipv6` before the data
+        // reaches the sink — but for plain reads the schema
+        // discriminator routes to the Custom(PgInetType) arm. We
+        // decode via IpAddr and emit the matching variant.
+        DataType::Ipv4 | DataType::Ipv6 => {
+            match nullable::<sqlx::types::ipnetwork::IpNetwork>(row, index)? {
+                None => Ok(Value::Null),
+                Some(sqlx::types::ipnetwork::IpNetwork::V4(n)) => Ok(Value::Ipv4(n.ip())),
+                Some(sqlx::types::ipnetwork::IpNetwork::V6(n)) => Ok(Value::Ipv6(n.ip())),
+            }
         }
         DataType::Json => nullable::<serde_json::Value>(row, index)
             .map(|o| o.map(Value::Json).unwrap_or(Value::Null)),
@@ -99,6 +114,16 @@ pub fn decode_column(row: &PgRow, index: usize, data_type: DataType) -> RuntimeR
                 Some(bytes) => Ok(Value::Custom(Box::new(PgHllValue(bytes)))),
             }
         }
+        // PG `inet`: decode as IpNetwork (preserves the netmask
+        // losslessly) and wrap in PgInetValue. Downstream conversions
+        // to canonical Ipv4/Ipv6 are mask-dropping and gated on
+        // `truncate=true` in the convert dispatcher.
+        DataType::Custom(t) if t.kind() == PgInetType::KIND => {
+            match nullable::<sqlx::types::ipnetwork::IpNetwork>(row, index)? {
+                None => Ok(Value::Null),
+                Some(net) => Ok(Value::Custom(Box::new(PgInetValue(net)))),
+            }
+        }
         DataType::Custom(t) => Err(RuntimeError::Other(format!(
             "postgres source has no decoder for custom type {kind:?}",
             kind = t.kind()
@@ -139,14 +164,33 @@ pub fn bind_cursor_value<'q>(
         Value::Date(d) => query.bind(*d),
         Value::Timestamp(ts) => query.bind(*ts),
         Value::Uuid(u) => query.bind(*u),
+        Value::Ipv4(a) => {
+            let net = sqlx::types::ipnetwork::IpNetwork::new(std::net::IpAddr::V4(*a), 32)
+                .expect("/32 prefix always valid");
+            query.bind(net)
+        }
+        Value::Ipv6(a) => {
+            let net = sqlx::types::ipnetwork::IpNetwork::new(std::net::IpAddr::V6(*a), 128)
+                .expect("/128 prefix always valid");
+            query.bind(net)
+        }
         Value::Json(j) => query.bind(j),
         Value::BigInt(b) => query.bind(BigDecimal::new(b.clone(), 0)),
         Value::Decimal(d) => query.bind(d.clone()),
         Value::UInt8(_) | Value::UInt16(_) | Value::UInt32(_) | Value::UInt64(_) => {
             unreachable!("postgres has no unsigned int columns; cursor cannot carry unsigned")
         }
-        Value::Custom(_) => unreachable!(
-            "Value::Custom must be handled by the connector before reaching bind_cursor_value"
-        ),
+        Value::Custom(c) => {
+            // PG `inet` is cursor-compatible — wrap the IpNetwork
+            // directly. Other custom types (HLL) are not cursor-
+            // compatible and validation rejects them upstream.
+            if let Some(inet) = c.as_any().downcast_ref::<PgInetValue>() {
+                query.bind(inet.0)
+            } else {
+                unreachable!(
+                    "Value::Custom must be handled by the connector before reaching bind_cursor_value"
+                )
+            }
+        }
     }
 }

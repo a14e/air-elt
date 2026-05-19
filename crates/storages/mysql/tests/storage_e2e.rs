@@ -104,6 +104,8 @@ async fn cursor_roundtrip_all_value_variants() {
         ("c_date", Value::Date(date)),
         ("c_ts", Value::Timestamp(ts)),
         ("c_uuid", Value::Uuid(uuid)),
+        ("c_ipv4", Value::Ipv4(std::net::Ipv4Addr::new(192, 0, 2, 1))),
+        ("c_ipv6", Value::Ipv6("2001:db8::1".parse().unwrap())),
         ("c_json", Value::Json(json.clone())),
         ("c_bytes_empty", Value::Bytes(vec![])),
         ("c_text_empty", Value::Text(String::new())),

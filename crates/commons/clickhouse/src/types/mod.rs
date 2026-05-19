@@ -10,6 +10,5 @@ pub mod enums;
 pub mod fixed_string;
 pub mod int128;
 pub mod int256;
-pub mod ip;
 pub mod map;
 pub mod tuple;

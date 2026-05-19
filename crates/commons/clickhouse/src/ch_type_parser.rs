@@ -51,7 +51,6 @@ use crate::types::enums::{ChEnum8Type, ChEnum16Type};
 use crate::types::fixed_string::ChFixedStringType;
 use crate::types::int128::{ChInt128Type, ChUInt128Type};
 use crate::types::int256::{ChInt256Type, ChUInt256Type};
-use crate::types::ip::{ChIpv4Type, ChIpv6Type};
 use crate::types::map::ChMapType;
 use crate::types::tuple::ChTupleType;
 
@@ -286,8 +285,8 @@ impl<'a> Parser<'a> {
                 }
                 Ok(DataType::Json)
             }
-            "IPv4" => Ok(DataType::Custom(Box::new(ChIpv4Type))),
-            "IPv6" => Ok(DataType::Custom(Box::new(ChIpv6Type))),
+            "IPv4" => Ok(DataType::Ipv4),
+            "IPv6" => Ok(DataType::Ipv6),
             "Decimal32" => {
                 let scale = self.parse_single_uint_arg("Decimal32")?;
                 Ok(DataType::Decimal {
@@ -838,15 +837,9 @@ mod tests {
     #[test]
     fn ipv4_ipv6() {
         let p = parse("IPv4");
-        match &p.data_type {
-            DataType::Custom(t) => assert_eq!(t.kind(), "clickhouse.ipv4"),
-            _ => panic!("expected custom"),
-        }
+        assert_eq!(p.data_type, DataType::Ipv4);
         let p = parse("IPv6");
-        match &p.data_type {
-            DataType::Custom(t) => assert_eq!(t.kind(), "clickhouse.ipv6"),
-            _ => panic!("expected custom"),
-        }
+        assert_eq!(p.data_type, DataType::Ipv6);
     }
 
     #[test]

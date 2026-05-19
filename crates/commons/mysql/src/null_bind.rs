@@ -32,6 +32,8 @@ pub fn bind_typed_null<'q>(
         // sink). NULLs are bound as `Option<String>` to keep the wire-type
         // OID consistent with the non-null path which sends canonical text.
         DataType::Uuid => query.bind::<Option<String>>(None),
+        // Canonical IPv4/IPv6 bind as VARCHAR-style text NULLs.
+        DataType::Ipv4 | DataType::Ipv6 => query.bind::<Option<String>>(None),
         DataType::Json => query.bind::<Option<serde_json::Value>>(None),
         DataType::BigInt { .. } | DataType::Decimal { .. } => {
             query.bind::<Option<BigDecimal>>(None)

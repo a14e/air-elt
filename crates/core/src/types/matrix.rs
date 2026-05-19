@@ -165,6 +165,22 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
         // well-defined and small. Runtime may still raise `InvalidBool`.
         (Text { .. }, Bool) => true,
 
+        // IP families. Ipv4 → Ipv6 is always lossless (IPv4-mapped
+        // ::ffff:a.b.c.d). The reverse only succeeds for IPv4-mapped
+        // addresses, so it requires truncate and lives in the truncate
+        // matrix below.
+        (Ipv4, Ipv6) => true,
+        // IP ↔ Text — canonical decimal/colon-hex form ≤ 15 / 39 chars.
+        (Ipv4, Text { size: b }) => b.is_none_or(|n| n >= 15),
+        (Text { size: a }, Ipv4) => a.is_none_or(|n| n >= 7),
+        (Ipv6, Text { size: b }) => b.is_none_or(|n| n >= 39),
+        (Text { size: a }, Ipv6) => a.is_none_or(|n| n >= 2),
+        // IP ↔ Bytes — network byte order (BE) octets per RFC 791/8200.
+        (Ipv4, Bytes { size: b }) => b.is_none_or(|n| n >= 4),
+        (Bytes { size: a }, Ipv4) => a.is_none_or(|n| n >= 4),
+        (Ipv6, Bytes { size: b }) => b.is_none_or(|n| n >= 16),
+        (Bytes { size: a }, Ipv6) => a.is_none_or(|n| n >= 16),
+
         // Narrowing from BigInt/Decimal back into fixed-width or integer
         // types is *not* supported — every reverse path is potentially
         // lossy. Users adding such pipelines must do an explicit transform.
@@ -264,6 +280,10 @@ pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool
         (Xml, Text { size: Some(_) }) => true,
         // Timestamp → Date.
         (Timestamp, Date) => true,
+        // Ipv6 → Ipv4: only IPv4-mapped (`::ffff:a.b.c.d`) succeeds at
+        // runtime; the matrix admits the pair, dispatcher raises
+        // `IpV6NotMappable` for non-mapped addresses.
+        (Ipv6, Ipv4) => true,
         _ => false,
     }
 }
@@ -385,6 +405,8 @@ pub fn is_narrowing(source_t: DataType, sink_t: DataType) -> bool {
             | (Int64, UInt8 | UInt16 | UInt32 | UInt64)
             // Unsigned → smaller signed also narrowing.
             | (UInt8, Int8)
+            // IPv6 → IPv4: mask info loss + family narrowing.
+            | (Ipv6, Ipv4)
     )
 }
 
@@ -1053,6 +1075,8 @@ mod tests {
             DataType::Date,
             DataType::Timestamp,
             DataType::Uuid,
+            DataType::Ipv4,
+            DataType::Ipv6,
             DataType::Json,
             DataType::Xml,
         ];
@@ -1292,6 +1316,120 @@ mod tests {
     /// matrix rejects, the truncate matrix admits, and `is_narrowing`
     /// reports `true` so the validator surfaces `NarrowingNotAllowed`
     /// (with the "enable truncate" hint) — not `UnsupportedCast`.
+    // ---- IPv4 / IPv6 matrix coverage ------------------------------
+
+    #[test]
+    fn ip_identity_compatible() {
+        assert!(is_compatible(DataType::Ipv4, DataType::Ipv4));
+        assert!(is_compatible(DataType::Ipv6, DataType::Ipv6));
+    }
+
+    #[test]
+    fn ip_widening_v4_to_v6_lossless() {
+        // IPv4 → IPv6 is always lossless via IPv4-mapped form
+        // (::ffff:a.b.c.d).
+        assert!(is_compatible(DataType::Ipv4, DataType::Ipv6));
+    }
+
+    #[test]
+    fn ip_narrowing_v6_to_v4_only_under_truncate() {
+        // The lossless matrix rejects v6 → v4 because most v6 cells
+        // are not extractable. truncate=true unlocks the runtime
+        // IPv4-mapped check (dispatcher raises IpV6NotMappable for
+        // non-mapped addresses).
+        assert!(!is_compatible(DataType::Ipv6, DataType::Ipv4));
+        assert!(is_compatible_with_truncate(DataType::Ipv6, DataType::Ipv4));
+        assert!(is_narrowing(DataType::Ipv6, DataType::Ipv4));
+    }
+
+    #[test]
+    fn ip_to_text_requires_canonical_width() {
+        // IPv4 canonical max = "255.255.255.255" = 15 chars.
+        assert!(is_compatible(DataType::Ipv4, text(15)));
+        assert!(is_compatible(DataType::Ipv4, text(20)));
+        assert!(is_compatible(DataType::Ipv4, TEXT));
+        assert!(!is_compatible(DataType::Ipv4, text(14)));
+        // IPv6 RFC 5952 canonical max = 39 chars.
+        assert!(is_compatible(DataType::Ipv6, text(39)));
+        assert!(is_compatible(DataType::Ipv6, text(45)));
+        assert!(is_compatible(DataType::Ipv6, TEXT));
+        assert!(!is_compatible(DataType::Ipv6, text(38)));
+    }
+
+    #[test]
+    fn text_to_ip_admit_liberal_parser_validates_at_runtime() {
+        // Text → IP admits liberally; the parser raises InvalidIp at
+        // runtime for malformed addresses. Sizes 7 (v4 minimum
+        // "0.0.0.0") and 2 (v6 minimum "::") are the floor.
+        assert!(is_compatible(text(7), DataType::Ipv4));
+        assert!(is_compatible(TEXT, DataType::Ipv4));
+        assert!(!is_compatible(text(6), DataType::Ipv4));
+        assert!(is_compatible(text(2), DataType::Ipv6));
+        assert!(is_compatible(TEXT, DataType::Ipv6));
+        assert!(!is_compatible(text(1), DataType::Ipv6));
+    }
+
+    #[test]
+    fn ip_to_bytes_network_order_widths() {
+        // Network byte order (BE) octets per RFC 791/8200 —
+        // v4 = 4 bytes, v6 = 16 bytes.
+        assert!(is_compatible(DataType::Ipv4, bytes(4)));
+        assert!(is_compatible(DataType::Ipv4, bytes(16)));
+        assert!(is_compatible(DataType::Ipv4, BYTES));
+        assert!(!is_compatible(DataType::Ipv4, bytes(3)));
+        assert!(is_compatible(DataType::Ipv6, bytes(16)));
+        assert!(is_compatible(DataType::Ipv6, BYTES));
+        assert!(!is_compatible(DataType::Ipv6, bytes(15)));
+    }
+
+    #[test]
+    fn bytes_to_ip_admit_with_minimum_width() {
+        assert!(is_compatible(bytes(4), DataType::Ipv4));
+        assert!(is_compatible(BYTES, DataType::Ipv4));
+        assert!(!is_compatible(bytes(3), DataType::Ipv4));
+        assert!(is_compatible(bytes(16), DataType::Ipv6));
+        assert!(is_compatible(BYTES, DataType::Ipv6));
+        assert!(!is_compatible(bytes(15), DataType::Ipv6));
+    }
+
+    #[test]
+    fn ip_rejected_against_unrelated_canonical_types() {
+        for unrelated in [
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Bool,
+            DataType::Date,
+            DataType::Timestamp,
+            DataType::Uuid,
+            DataType::Json,
+            DataType::Xml,
+            dec(10, 2),
+            bigint(20),
+        ] {
+            assert!(
+                !is_compatible(DataType::Ipv4, unrelated.clone()),
+                "Ipv4 → {unrelated:?} should reject"
+            );
+            assert!(
+                !is_compatible(DataType::Ipv6, unrelated.clone()),
+                "Ipv6 → {unrelated:?} should reject"
+            );
+            assert!(
+                !is_compatible(unrelated.clone(), DataType::Ipv4),
+                "{unrelated:?} → Ipv4 should reject"
+            );
+            assert!(!is_compatible(unrelated, DataType::Ipv6), "should reject");
+        }
+    }
+
+    #[test]
+    fn truncate_admits_ip_identity_and_widening() {
+        assert!(is_compatible_with_truncate(DataType::Ipv4, DataType::Ipv4));
+        assert!(is_compatible_with_truncate(DataType::Ipv6, DataType::Ipv6));
+        assert!(is_compatible_with_truncate(DataType::Ipv4, DataType::Ipv6));
+    }
+
     #[test]
     fn float32_to_int_admitted_under_truncate() {
         let sinks = [

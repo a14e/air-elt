@@ -85,6 +85,8 @@ pub enum SwitchKey {
     Date(chrono::NaiveDate),
     Timestamp(chrono::DateTime<chrono::Utc>),
     Uuid(uuid::Uuid),
+    Ipv4(std::net::Ipv4Addr),
+    Ipv6(std::net::Ipv6Addr),
     /// `BigDecimal`'s default Hash impl is missing, so we project to
     /// the normalised decimal-string form — same shape the cursor
     /// JSON storage uses.
@@ -136,6 +138,8 @@ impl SwitchKey {
             Date(d) => SwitchKey::Date(*d),
             Timestamp(t) => SwitchKey::Timestamp(*t),
             Uuid(u) => SwitchKey::Uuid(*u),
+            Ipv4(a) => SwitchKey::Ipv4(*a),
+            Ipv6(a) => SwitchKey::Ipv6(*a),
             Decimal(d) => SwitchKey::Decimal(d.normalized().to_string()),
             Json(_) | Custom(_) => return None,
         })
@@ -164,6 +168,8 @@ impl PartialEq for SwitchKey {
             (Date(a), Date(b)) => a == b,
             (Timestamp(a), Timestamp(b)) => a == b,
             (Uuid(a), Uuid(b)) => a == b,
+            (Ipv4(a), Ipv4(b)) => a == b,
+            (Ipv6(a), Ipv6(b)) => a == b,
             (Decimal(a), Decimal(b)) => a == b,
             _ => false,
         }
@@ -226,6 +232,14 @@ impl Hash for SwitchKey {
             Decimal(s) => {
                 8u8.hash(state);
                 s.hash(state);
+            }
+            Ipv4(a) => {
+                9u8.hash(state);
+                a.hash(state);
+            }
+            Ipv6(a) => {
+                10u8.hash(state);
+                a.hash(state);
             }
         }
     }
@@ -418,6 +432,8 @@ pub(crate) fn is_switchable_source(dt: &DataType) -> bool {
             | DataType::Date
             | DataType::Timestamp
             | DataType::Uuid
+            | DataType::Ipv4
+            | DataType::Ipv6
     )
 }
 
@@ -544,6 +560,18 @@ fn parse_key_text(key: &str, source: &DataType) -> Result<Value, DefaultParseErr
                     reason: e.to_string(),
                 })
         }
+        DataType::Ipv4 => std::net::Ipv4Addr::from_str(key.trim())
+            .map(Value::Ipv4)
+            .map_err(|e| DefaultParseError::InvalidIp {
+                family: "ipv4",
+                reason: e.to_string(),
+            }),
+        DataType::Ipv6 => std::net::Ipv6Addr::from_str(key.trim())
+            .map(Value::Ipv6)
+            .map_err(|e| DefaultParseError::InvalidIp {
+                family: "ipv6",
+                reason: e.to_string(),
+            }),
         DataType::Json | DataType::Xml | DataType::Union(_) | DataType::Custom(_) => {
             Err(DefaultParseError::TypeMismatch {
                 dst: source.clone(),
@@ -1570,5 +1598,132 @@ mod tests {
         .unwrap();
         let key = SwitchKey::from_value(&Value::Int32(1)).unwrap();
         assert_eq!(res.cases.get(&key), Some(&Value::Bytes(vec![0xde, 0xad])));
+    }
+
+    #[test]
+    fn switch_dispatches_on_ipv4_key() {
+        let cases = vec![
+            SwitchCase {
+                key: "127.0.0.1".into(),
+                value: toml::Value::String("loopback".into()),
+            },
+            SwitchCase {
+                key: "192.0.2.1".into(),
+                value: toml::Value::String("doc".into()),
+            },
+        ];
+        let default = toml::Value::String("other".into());
+        let res = compile_switch(
+            "f",
+            "label",
+            &cases,
+            Some(&default),
+            false,
+            &DataType::Ipv4,
+            &DataType::Text { size: None },
+            false,
+        )
+        .unwrap();
+        let lookup = |s: &str| {
+            let v = Value::Ipv4(std::net::Ipv4Addr::from_str(s).unwrap());
+            let key = SwitchKey::from_value(&v).unwrap();
+            res.cases
+                .get(&key)
+                .cloned()
+                .unwrap_or(res.default.clone().unwrap())
+        };
+        assert_eq!(lookup("127.0.0.1"), Value::Text("loopback".into()));
+        assert_eq!(lookup("192.0.2.1"), Value::Text("doc".into()));
+        assert_eq!(lookup("10.0.0.1"), Value::Text("other".into()));
+    }
+
+    #[test]
+    fn switch_dispatches_on_ipv6_key() {
+        let cases = vec![
+            SwitchCase {
+                key: "::1".into(),
+                value: toml::Value::String("local".into()),
+            },
+            SwitchCase {
+                key: "2001:db8::1".into(),
+                value: toml::Value::String("doc".into()),
+            },
+        ];
+        let default = toml::Value::String("other".into());
+        let res = compile_switch(
+            "f",
+            "label",
+            &cases,
+            Some(&default),
+            false,
+            &DataType::Ipv6,
+            &DataType::Text { size: None },
+            false,
+        )
+        .unwrap();
+        let lookup = |s: &str| {
+            let v = Value::Ipv6(s.parse().unwrap());
+            let key = SwitchKey::from_value(&v).unwrap();
+            res.cases
+                .get(&key)
+                .cloned()
+                .unwrap_or(res.default.clone().unwrap())
+        };
+        assert_eq!(lookup("::1"), Value::Text("local".into()));
+        assert_eq!(lookup("2001:db8::1"), Value::Text("doc".into()));
+        assert_eq!(lookup("fe80::1"), Value::Text("other".into()));
+    }
+
+    #[test]
+    fn switch_ipv6_canonical_form_matches_uncompressed_key() {
+        let cases = vec![SwitchCase {
+            key: "2001:db8::1".into(),
+            value: toml::Value::String("doc".into()),
+        }];
+        let res = compile_switch(
+            "f",
+            "label",
+            &cases,
+            None,
+            false,
+            &DataType::Ipv6,
+            &DataType::Text { size: None },
+            false,
+        )
+        .unwrap();
+        // Uncompressed source canonicalises to the same Ipv6Addr value
+        // as the compressed key, so the lookup must hit.
+        let v: std::net::Ipv6Addr = "2001:0db8::0001".parse().unwrap();
+        let probe = SwitchKey::from_value(&Value::Ipv6(v)).unwrap();
+        assert_eq!(res.cases.get(&probe), Some(&Value::Text("doc".into())));
+    }
+
+    #[test]
+    fn switch_rejects_invalid_ipv4_key() {
+        let cases = vec![SwitchCase {
+            key: "not.an.ip".into(),
+            value: toml::Value::String("nope".into()),
+        }];
+        let err = compile_switch(
+            "f",
+            "label",
+            &cases,
+            None,
+            false,
+            &DataType::Ipv4,
+            &DataType::Text { size: None },
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ValidationError::SwitchKeyTypeMismatch { .. }),
+            "expected SwitchKeyTypeMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn is_switchable_source_admits_ip() {
+        assert!(is_switchable_source(&DataType::Ipv4));
+        assert!(is_switchable_source(&DataType::Ipv6));
     }
 }

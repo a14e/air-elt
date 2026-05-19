@@ -40,6 +40,11 @@ pub enum DefaultParseError {
     InvalidTimestamp { reason: String },
     #[error("invalid uuid literal: {reason}")]
     InvalidUuid { reason: String },
+    #[error("invalid {family} literal: {reason}")]
+    InvalidIp {
+        family: &'static str,
+        reason: String,
+    },
     #[error("invalid xml literal: {reason}")]
     InvalidXml { reason: String },
     #[error("default literal type does not match sink {dst}")]
@@ -75,6 +80,8 @@ pub fn parse(literal: &toml::Value, sink: &DataType) -> Result<Value, DefaultPar
         DataType::Date => parse_date(literal),
         DataType::Timestamp => parse_timestamp(literal),
         DataType::Uuid => parse_uuid(literal),
+        DataType::Ipv4 => parse_ipv4(literal),
+        DataType::Ipv6 => parse_ipv6(literal),
         DataType::Json => Ok(Value::Json(toml_to_json(literal))),
         DataType::Xml => parse_xml(literal),
         // Defaults are parsed against the sink's concrete type. Sinks
@@ -336,6 +343,30 @@ fn parse_uuid(literal: &toml::Value) -> Result<Value, DefaultParseError> {
         })
 }
 
+fn parse_ipv4(literal: &toml::Value) -> Result<Value, DefaultParseError> {
+    let s = literal.as_str().ok_or(DefaultParseError::TypeMismatch {
+        dst: DataType::Ipv4,
+    })?;
+    std::net::Ipv4Addr::from_str(s.trim())
+        .map(Value::Ipv4)
+        .map_err(|e| DefaultParseError::InvalidIp {
+            family: "ipv4",
+            reason: e.to_string(),
+        })
+}
+
+fn parse_ipv6(literal: &toml::Value) -> Result<Value, DefaultParseError> {
+    let s = literal.as_str().ok_or(DefaultParseError::TypeMismatch {
+        dst: DataType::Ipv6,
+    })?;
+    std::net::Ipv6Addr::from_str(s.trim())
+        .map(Value::Ipv6)
+        .map_err(|e| DefaultParseError::InvalidIp {
+            family: "ipv6",
+            reason: e.to_string(),
+        })
+}
+
 fn parse_xml(literal: &toml::Value) -> Result<Value, DefaultParseError> {
     let s = literal
         .as_str()
@@ -516,6 +547,36 @@ mod tests {
         assert!(matches!(v, Value::Uuid(_)));
         let res = parse(&lit("garbage"), &DataType::Uuid);
         assert!(matches!(res, Err(DefaultParseError::InvalidUuid { .. })));
+    }
+
+    #[test]
+    fn ipv4_ok_invalid_rejected() {
+        let v = parse(&lit("192.0.2.1"), &DataType::Ipv4).unwrap();
+        assert_eq!(v, Value::Ipv4(std::net::Ipv4Addr::new(192, 0, 2, 1)));
+        let res = parse(&lit("not-an-ip"), &DataType::Ipv4);
+        assert!(matches!(
+            res,
+            Err(DefaultParseError::InvalidIp { family: "ipv4", .. })
+        ));
+    }
+
+    #[test]
+    fn ipv6_ok_invalid_rejected() {
+        let v = parse(&lit("2001:db8::1"), &DataType::Ipv6).unwrap();
+        assert_eq!(v, Value::Ipv6("2001:db8::1".parse().unwrap()));
+        let res = parse(&lit("zz::"), &DataType::Ipv6);
+        assert!(matches!(
+            res,
+            Err(DefaultParseError::InvalidIp { family: "ipv6", .. })
+        ));
+    }
+
+    #[test]
+    fn ip_non_string_rejected() {
+        let res = parse(&toml::Value::Integer(0), &DataType::Ipv4);
+        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+        let res = parse(&toml::Value::Integer(0), &DataType::Ipv6);
+        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
     }
 
     #[test]

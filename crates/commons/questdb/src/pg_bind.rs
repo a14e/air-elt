@@ -23,7 +23,6 @@ use air_elt_core::types::data_type::DataType;
 use air_elt_core::types::value::Value;
 
 use crate::types::geohash::QuestDbGeohashValue;
-use crate::types::ipv4::QuestDbIpv4Value;
 use crate::types::is_questdb_native_kind;
 use crate::types::long256::QuestDbLong256Value;
 use crate::types::symbol::QuestDbSymbolValue;
@@ -135,6 +134,16 @@ pub fn bind_value_separated_pg(
             chain.push_bind(*u);
             Ok(())
         }
+        Value::Ipv4(a) => {
+            // QuestDB IPv4 column accepts dotted-quad text over pg-wire.
+            chain.push_bind(a.to_string());
+            Ok(())
+        }
+        Value::Ipv6(_) => Err(BindError::UnsupportedType {
+            column: column.to_string(),
+            expected: format!("{dt}"),
+            got_kind: "Ipv6 (QuestDB has no IPv6 column type)".to_string(),
+        }),
         Value::Json(j) => {
             // QuestDB does not have a native JSON column — operators
             // route JSON into STRING. Serialise through the canonical
@@ -186,10 +195,6 @@ fn bind_custom(
     }
     if let Some(long256) = any.downcast_ref::<QuestDbLong256Value>() {
         chain.push_bind(long256.to_hex());
-        return Ok(());
-    }
-    if let Some(ipv4) = any.downcast_ref::<QuestDbIpv4Value>() {
-        chain.push_bind(ipv4.0.to_string());
         return Ok(());
     }
     if let Some(geohash) = any.downcast_ref::<QuestDbGeohashValue>() {
@@ -246,6 +251,9 @@ fn bind_null(
         DataType::Uuid => {
             chain.push_bind::<Option<Uuid>>(None);
         }
+        DataType::Ipv4 => {
+            chain.push_bind::<Option<String>>(None);
+        }
         DataType::Custom(t) if is_questdb_native_kind(t.kind()) => {
             chain.push_bind::<Option<String>>(None);
         }
@@ -268,7 +276,6 @@ fn bind_null(
 mod tests {
     use super::*;
     use crate::types::geohash::QuestDbGeohashType;
-    use crate::types::ipv4::QuestDbIpv4Type;
     use crate::types::long256::QuestDbLong256Type;
     use crate::types::symbol::QuestDbSymbolType;
     use chrono::TimeZone;
@@ -354,10 +361,10 @@ mod tests {
             &Value::Custom(Box::new(QuestDbLong256Value([0u8; 32]))),
         )
         .unwrap();
-        // IPv4.
+        // IPv4 — now canonical, dispatched directly as Value::Ipv4.
         run_bind(
-            &field("ip", DataType::Custom(Box::new(QuestDbIpv4Type)), false),
-            &Value::Custom(Box::new(QuestDbIpv4Value(std::net::Ipv4Addr::LOCALHOST))),
+            &field("ip", DataType::Ipv4, false),
+            &Value::Ipv4(std::net::Ipv4Addr::LOCALHOST),
         )
         .unwrap();
         // GEOHASH.
@@ -409,12 +416,12 @@ mod tests {
         assert_eq!(hex.len(), 2 + 64);
     }
 
-    /// Non-loopback IPv4 round-trips via `.to_string()` — the textual
-    /// dotted-quad QuestDB expects on the IPv4 column.
+    /// IPv4 → dotted-quad bind path: confirm the canonical address
+    /// round-trips through `bind_value_separated_pg` without error.
     #[test]
-    fn ipv4_renders_documentation_address() {
-        let v = QuestDbIpv4Value(std::net::Ipv4Addr::new(203, 0, 113, 42));
-        assert_eq!(v.0.to_string(), "203.0.113.42");
+    fn ipv4_bind_round_trip_documentation_address() {
+        let a = std::net::Ipv4Addr::new(203, 0, 113, 42);
+        run_bind(&field("ip", DataType::Ipv4, false), &Value::Ipv4(a)).unwrap();
     }
 
     /// Non-zero geohash: a packed 35-bit value should re-emit "u4pruyd".

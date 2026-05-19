@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use air_elt_core::types::{DataType, Value};
 
-use crate::types::{PgHllType, PgHllValue};
+use crate::types::{PgHllType, PgHllValue, PgInetType, PgInetValue};
 
 pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Value, dt: &DataType) {
     // Fraud-detector (anti-shortcut #6): SQL sinks can only consume
@@ -39,7 +39,7 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
         if let Value::Custom(c) = v {
             let dt = c.dyn_type();
             let kind = dt.kind();
-            if kind != PgHllType::KIND {
+            if kind != PgHllType::KIND && kind != PgInetType::KIND {
                 panic!(
                     "SQL sink received unexpected Value::Custom(kind={kind}); matrix conversion to Json missing"
                 );
@@ -85,6 +85,11 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
             DataType::Uuid => {
                 sep.push_bind::<Option<Uuid>>(None);
             }
+            DataType::Ipv4 | DataType::Ipv6 => {
+                // sqlx-postgres binds canonical IPv4/IPv6 against the
+                // `inet` OID by routing through `IpNetwork` host bits.
+                sep.push_bind::<Option<sqlx::types::ipnetwork::IpNetwork>>(None);
+            }
             DataType::Json => {
                 sep.push_bind::<Option<serde_json::Value>>(None);
             }
@@ -112,6 +117,9 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
             DataType::Custom(t) if t.kind() == PgHllType::KIND => {
                 sep.push_bind::<Option<Vec<u8>>>(None);
                 sep.push_unseparated("::hll");
+            }
+            DataType::Custom(t) if t.kind() == PgInetType::KIND => {
+                sep.push_bind::<Option<sqlx::types::ipnetwork::IpNetwork>>(None);
             }
             DataType::Custom(_) => unreachable!(
                 "DataType::Custom must be handled by the connector before reaching sink_bind"
@@ -161,6 +169,18 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
         Value::Uuid(u) => {
             sep.push_bind(*u);
         }
+        Value::Ipv4(a) => {
+            // Bind through IpNetwork host (/32) — sqlx-postgres
+            // recognises this as the `inet` OID payload.
+            let net = sqlx::types::ipnetwork::IpNetwork::new(std::net::IpAddr::V4(*a), 32)
+                .expect("/32 prefix always valid for any IPv4 address");
+            sep.push_bind(net);
+        }
+        Value::Ipv6(a) => {
+            let net = sqlx::types::ipnetwork::IpNetwork::new(std::net::IpAddr::V6(*a), 128)
+                .expect("/128 prefix always valid for any IPv6 address");
+            sep.push_bind(net);
+        }
         Value::Json(j) => {
             sep.push_bind(j.clone());
         }
@@ -188,6 +208,10 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
             if let Some(hll) = v.as_any().downcast_ref::<PgHllValue>() {
                 sep.push_bind(hll.0.clone());
                 sep.push_unseparated("::hll");
+            } else if let Some(inet) = v.as_any().downcast_ref::<PgInetValue>() {
+                // Bind the IpNetwork (host or CIDR) — sqlx-postgres
+                // routes it to the `inet` OID directly.
+                sep.push_bind(inet.0);
             } else {
                 unreachable!(
                     "postgres sink received unsupported custom value kind {:?}",

@@ -441,3 +441,142 @@ flow:
 
     pg.pool.close().await;
 }
+
+/// PG → CH IPv4 / IPv6 round-trip. PG side carries an `inet` column
+/// with both v4 and v6 host addresses; the runner narrows
+/// `postgresql.inet → Ipv4/Ipv6` under per-column `truncate = true`
+/// and the CH sink encodes via RowBinary (`Ipv4` LE u32, `Ipv6` 16
+/// BE octets). The CH side stores them in dedicated `IPv4` / `IPv6`
+/// columns — separate rows because PG `inet` is a single column
+/// carrying either family.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_to_clickhouse_ip_round_trip() {
+    let pg = pg_pool().await;
+    let ch = clickhouse_handle().await;
+
+    let src_schema = format!("{}_ip", pg.schema);
+
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{src_schema}\".v4_rows (
+                    id BIGINT PRIMARY KEY,
+                    addr INET NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{src_schema}\".v6_rows (
+                    id BIGINT PRIMARY KEY,
+                    addr INET NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                "INSERT INTO \"{src_schema}\".v4_rows(id, addr) VALUES \
+                 (1, '192.0.2.1'::inet), (2, '203.0.113.42'::inet)"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                "INSERT INTO \"{src_schema}\".v6_rows(id, addr) VALUES \
+                 (1, '2001:db8::1'::inet), (2, 'fe80::1'::inet)"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    ch.exec("CREATE TABLE v4_rows (id Int64, addr IPv4) ENGINE = MergeTree() ORDER BY id")
+        .await
+        .unwrap();
+    ch.exec("CREATE TABLE v6_rows (id Int64, addr IPv6) ENGINE = MergeTree() ORDER BY id")
+        .await
+        .unwrap();
+
+    let pg_url = pg.url_with_search_path();
+    let ch_url = &ch.url;
+    let config_toml = format!(
+        r#"
+[[sources]]
+name = "pg_src"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[sinks]]
+name = "ch_sink"
+type = "clickhouse"
+config = {{ url = "{ch_url}", database = "{ch_db}", user = "default", password = "" }}
+
+[[storages]]
+name = "pg_state"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[flow.v4]
+source = "pg_src"
+sink = "ch_sink"
+storage = "pg_state"
+from = "{src_schema}.v4_rows"
+to = "v4_rows"
+batch-limit = 8
+cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
+[flow.v4.mapping]
+id = "id"
+addr = {{ from = "addr", truncate = true }}
+
+[flow.v6]
+source = "pg_src"
+sink = "ch_sink"
+storage = "pg_state"
+from = "{src_schema}.v6_rows"
+to = "v6_rows"
+batch-limit = 8
+cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
+[flow.v6.mapping]
+id = "id"
+addr = {{ from = "addr", truncate = true }}
+"#,
+        ch_db = ch.database,
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    std::fs::write(&path, &config_toml).unwrap();
+    let app = App::from_path(&path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
+
+    let v4_out = ch
+        .exec("SELECT id, toString(addr) FROM v4_rows ORDER BY id FORMAT TabSeparated")
+        .await
+        .unwrap();
+    let v4_lines: Vec<&str> = v4_out.trim().split('\n').collect();
+    assert_eq!(v4_lines, vec!["1\t192.0.2.1", "2\t203.0.113.42"]);
+
+    let v6_out = ch
+        .exec("SELECT id, toString(addr) FROM v6_rows ORDER BY id FORMAT TabSeparated")
+        .await
+        .unwrap();
+    let v6_lines: Vec<&str> = v6_out.trim().split('\n').collect();
+    assert_eq!(v6_lines, vec!["1\t2001:db8::1", "2\tfe80::1"]);
+
+    pg.pool.close().await;
+}

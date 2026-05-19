@@ -5,7 +5,6 @@ use chrono::{NaiveDate, TimeZone, Utc};
 use sqlx::Row as _;
 
 use air_elt_commons_questdb::types::geohash::QuestDbGeohashValue;
-use air_elt_commons_questdb::types::ipv4::QuestDbIpv4Value;
 use air_elt_commons_questdb::types::long256::QuestDbLong256Value;
 use air_elt_commons_testing::questdb::questdb_pool;
 use air_elt_core::model::{Batch, Row, WriteSpec};
@@ -273,10 +272,7 @@ async fn ipv4_round_trip() {
         .single()
         .expect("ts");
     let addr = Ipv4Addr::new(203, 0, 113, 42);
-    let row = Row::upsert(vec![
-        Value::Timestamp(ts),
-        Value::Custom(Box::new(QuestDbIpv4Value(addr))),
-    ]);
+    let row = Row::upsert(vec![Value::Timestamp(ts), Value::Ipv4(addr)]);
     sink.write_batch(
         &spec,
         &ctx,

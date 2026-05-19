@@ -171,3 +171,48 @@ async fn resume_token_round_trip_and_reopen() {
 
     handle.client.clone().shutdown().await;
 }
+
+/// IP cursor types round-trip through the Mongo storage envelope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_and_load_cursor_ip_round_trip() {
+    let handle = mongo_pool().await;
+    let storage = MongoStorage::connect(MongoStorageConfig {
+        url: handle.url.clone(),
+        database: Some(handle.database.clone()),
+        ..Default::default()
+    })
+    .await
+    .expect("connect");
+    storage.migrate().await.expect("migrate");
+
+    // IPv4.
+    let v4 = Value::Ipv4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+    let state = CursorState::new(vec![CursorFieldValue {
+        name: "ip".into(),
+        value: v4.clone(),
+    }]);
+    storage.save_cursor("flow_v4", &state, false).await.unwrap();
+    let loaded = storage
+        .load_cursor("flow_v4", &[air_elt_core::types::DataType::Ipv4])
+        .await
+        .unwrap()
+        .expect("present");
+    assert_eq!(loaded.fields[0].value, v4);
+
+    // IPv6.
+    let v6 = Value::Ipv6("2001:db8::1".parse().unwrap());
+    let state = CursorState::new(vec![CursorFieldValue {
+        name: "ip".into(),
+        value: v6.clone(),
+    }]);
+    storage.save_cursor("flow_v6", &state, false).await.unwrap();
+    let loaded = storage
+        .load_cursor("flow_v6", &[air_elt_core::types::DataType::Ipv6])
+        .await
+        .unwrap()
+        .expect("present");
+    assert_eq!(loaded.fields[0].value, v6);
+
+    // No client.shutdown(): project-conventions Testing rule says it
+    // deadlocks against live Arc clones; runtime tear-down handles it.
+}

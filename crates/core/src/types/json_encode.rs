@@ -82,6 +82,8 @@ fn encode_value_at_depth(v: &Value, depth: usize) -> Result<serde_json::Value, J
             serde_json::Value::String(ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         }
         Value::Uuid(u) => serde_json::Value::String(u.to_string()),
+        Value::Ipv4(a) => serde_json::Value::String(a.to_string()),
+        Value::Ipv6(a) => serde_json::Value::String(a.to_string()),
         Value::Json(inner) => encode_serde_json_at_depth(inner, depth + 1)?,
         Value::Custom(c) => c.to_json()?,
     };
@@ -206,6 +208,14 @@ mod tests {
             (
                 Value::Uuid(uuid),
                 json!("00000000-0000-0000-0000-000000000000"),
+            ),
+            (
+                Value::Ipv4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                json!("192.0.2.1"),
+            ),
+            (
+                Value::Ipv6("2001:db8::1".parse().unwrap()),
+                json!("2001:db8::1"),
             ),
             (
                 Value::Json(json!({"k": [1, 2, 3]})),

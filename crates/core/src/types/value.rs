@@ -55,6 +55,8 @@ pub enum Value {
     Date(NaiveDate),
     Timestamp(DateTime<Utc>),
     Uuid(Uuid),
+    Ipv4(std::net::Ipv4Addr),
+    Ipv6(std::net::Ipv6Addr),
     Json(serde_json::Value),
     /// Connector-specific opaque value. Cursor JSON storage admits
     /// this variant iff the underlying `DynType::cursor_compatible()`
@@ -109,6 +111,8 @@ impl Value {
             Value::Date(_) => Some(DataType::Date),
             Value::Timestamp(_) => Some(DataType::Timestamp),
             Value::Uuid(_) => Some(DataType::Uuid),
+            Value::Ipv4(_) => Some(DataType::Ipv4),
+            Value::Ipv6(_) => Some(DataType::Ipv6),
             Value::Json(_) => Some(DataType::Json),
             Value::Custom(v) => Some(DataType::Custom(v.dyn_type())),
         }
@@ -137,6 +141,8 @@ impl Clone for Value {
             Value::Date(d) => Value::Date(*d),
             Value::Timestamp(t) => Value::Timestamp(*t),
             Value::Uuid(u) => Value::Uuid(*u),
+            Value::Ipv4(a) => Value::Ipv4(*a),
+            Value::Ipv6(a) => Value::Ipv6(*a),
             Value::Json(j) => Value::Json(j.clone()),
             Value::Custom(v) => Value::Custom((**v).clone_box()),
         }
@@ -166,6 +172,8 @@ impl PartialEq for Value {
             (Date(a), Date(b)) => a == b,
             (Timestamp(a), Timestamp(b)) => a == b,
             (Uuid(a), Uuid(b)) => a == b,
+            (Ipv4(a), Ipv4(b)) => a == b,
+            (Ipv6(a), Ipv6(b)) => a == b,
             (Json(a), Json(b)) => a == b,
             (Custom(a), Custom(b)) => (**a).eq_dyn(&**b),
             _ => false,
@@ -223,6 +231,8 @@ impl Serialize for Value {
             Value::Date(d) => emit(serializer, "date", d),
             Value::Timestamp(t) => emit(serializer, "timestamp", t),
             Value::Uuid(u) => emit(serializer, "uuid", u),
+            Value::Ipv4(a) => emit(serializer, "ipv4", &a.to_string()),
+            Value::Ipv6(a) => emit(serializer, "ipv6", &a.to_string()),
             Value::Json(j) => emit(serializer, "json", j),
             Value::Custom(inner) => {
                 let dt = inner.dyn_type();
@@ -348,6 +358,18 @@ impl<'de> Visitor<'de> for ValueVisitor {
             "date" => decode(v).map(Value::Date),
             "timestamp" => decode(v).map(Value::Timestamp),
             "uuid" => decode(v).map(Value::Uuid),
+            "ipv4" => {
+                let s: String = decode(v)?;
+                std::net::Ipv4Addr::from_str(&s)
+                    .map(Value::Ipv4)
+                    .map_err(de::Error::custom)
+            }
+            "ipv6" => {
+                let s: String = decode(v)?;
+                std::net::Ipv6Addr::from_str(&s)
+                    .map(Value::Ipv6)
+                    .map_err(de::Error::custom)
+            }
             "json" => Ok(Value::Json(v)),
             "custom" => {
                 // Custom values can't deserialize through the bare
@@ -388,6 +410,8 @@ impl<'de> Visitor<'de> for ValueVisitor {
                     "date",
                     "timestamp",
                     "uuid",
+                    "ipv4",
+                    "ipv6",
                     "json",
                 ],
             )),
@@ -492,6 +516,14 @@ mod tests {
             (
                 Value::Uuid(uuid::Uuid::nil()),
                 serde_json::json!({"type":"uuid","value":"00000000-0000-0000-0000-000000000000"}),
+            ),
+            (
+                Value::Ipv4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                serde_json::json!({"type":"ipv4","value":"192.0.2.1"}),
+            ),
+            (
+                Value::Ipv6("2001:db8::1".parse().unwrap()),
+                serde_json::json!({"type":"ipv6","value":"2001:db8::1"}),
             ),
             (
                 Value::Json(serde_json::json!({"k":1})),

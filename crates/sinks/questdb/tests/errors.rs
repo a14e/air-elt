@@ -6,7 +6,6 @@
 //! canonical type that QuestDB declines and assert the rejection.
 
 use air_elt_commons_questdb::types::geohash::QuestDbGeohashType;
-use air_elt_commons_questdb::types::ipv4::QuestDbIpv4Type;
 use air_elt_commons_questdb::types::long256::QuestDbLong256Type;
 use air_elt_commons_questdb::types::symbol::QuestDbSymbolType;
 use air_elt_core::types::data_type::DataType;
@@ -56,7 +55,6 @@ fn questdb_native_customs_are_accepted() {
     let cases: Vec<DataType> = vec![
         DataType::Custom(Box::new(QuestDbSymbolType)),
         DataType::Custom(Box::new(QuestDbLong256Type)),
-        DataType::Custom(Box::new(QuestDbIpv4Type)),
         DataType::Custom(Box::new(QuestDbGeohashType { bits: 35 })),
     ];
     for dt in cases {
@@ -82,6 +80,7 @@ fn canonical_supported_types_are_accepted() {
         DataType::Date,
         DataType::Timestamp,
         DataType::Uuid,
+        DataType::Ipv4,
         DataType::Json,
     ] {
         assert!(
@@ -89,4 +88,12 @@ fn canonical_supported_types_are_accepted() {
             "canonical type {dt:?} must be accepted"
         );
     }
+}
+
+#[test]
+fn ipv6_rejected_no_native_questdb_column() {
+    assert!(
+        !type_supported(&DataType::Ipv6),
+        "QuestDB has no IPv6 column type"
+    );
 }
