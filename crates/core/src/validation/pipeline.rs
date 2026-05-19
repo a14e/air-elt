@@ -1,9 +1,31 @@
+//! Validation pipeline — `assemble` (no I/O) + `validate` (probes,
+//! schema introspection, matrix, sampling).
+//!
+//! ## Schemaless sources
+//!
+//! When `Source::schemaless() == true` (Mongo and its CDC variant),
+//! the sampled schema is treated as a validation-time **hypothesis**,
+//! not a runtime contract. Consequences:
+//!
+//! * The per-flow `[flow.<name>.validation] fields` toggle, if left
+//!   unset by the operator, resolves to `false` for schemaless sources
+//!   — the matrix narrowing check and nullability check are skipped.
+//!   Access probes, sink-side checks, and cursor presence still run.
+//! * The Transform compiler emits dynamic-source `TransformOp::Convert`
+//!   ops (with `plan.source = None`); the runtime resolves the source
+//!   `DataType` per cell from the actual `Value` variant.
+//! * Explicit `fields = true` is still honoured — operators who want
+//!   the matrix check against the sampled schema opt in there.
+//!
+//! For typed sources (pg, mysql, ...) `information_schema` is the
+//! contract and the static plan path is left as-is.
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ahash::AHashMap;
-use futures::future::join_all;
+use futures::StreamExt;
 use tracing::info;
 
 use crate::config::model::ComponentConfig;
@@ -21,6 +43,8 @@ use crate::traits::{Sink, Source, Storage};
 use crate::types::{ConversionContext, DataType};
 use crate::validation::checks;
 use crate::validation::compatibility::CompatibilityValidator;
+
+use crate::util::retry_transient;
 
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -69,7 +93,12 @@ pub async fn assemble(
     }
 
     // Phase 2: build each referenced component exactly once via O(1)
-    // index lookup. Unreferenced components are skipped.
+    // index lookup. Unreferenced components are skipped. Alongside the
+    // build we register each component in the shared
+    // `ConcurrencyManager` with permits = `max_connections()` — see the
+    // project-conventions skill ("Concurrency: semaphores +
+    // canonical-order acquire").
+    let mut concurrency = crate::util::ConcurrencyManager::new();
     let mut sources: AHashMap<&str, Arc<dyn Source>> = AHashMap::new();
     for &name in &source_names {
         let cfg = source_index[name];
@@ -80,6 +109,7 @@ pub async fn assemble(
                 source: Box::new(e),
             }
         })?);
+        concurrency.register_source(name, built.max_connections());
         sources.insert(name, built);
     }
     let mut sinks: AHashMap<&str, Arc<dyn Sink>> = AHashMap::new();
@@ -92,6 +122,7 @@ pub async fn assemble(
                 source: Box::new(e),
             }
         })?);
+        concurrency.register_sink(name, built.max_connections());
         sinks.insert(name, built);
     }
     let mut storages: AHashMap<&str, Arc<dyn Storage>> = AHashMap::new();
@@ -105,8 +136,15 @@ pub async fn assemble(
                     source: Box::new(e),
                 }
             })?);
+        concurrency.register_storage(name, built.max_connections());
         storages.insert(name, built);
     }
+    // assemble is done populating the manager — log per-component
+    // budgets once so an operator can verify the configured
+    // `max-connections` lined up with the live semaphore caps. After
+    // this the manager is read-only; we only use it to issue
+    // per-flow `FlowLockHandle`s below.
+    crate::util::log_concurrency_budgets(&concurrency);
 
     // Phase 3: assemble each flow by attaching shared Arcs via O(1)
     // map lookups.
@@ -209,6 +247,11 @@ pub async fn assemble(
         };
 
         let interval = flow.cursor.interval;
+        // Resolve `cursor.jitter` once at assemble — the loader has
+        // already validated its upper bound against `interval`; the
+        // default (`min(interval, 5min)`) is applied here when the
+        // operator omitted the field.
+        let jitter = flow.cursor.effective_jitter();
         let query_timeout = flow.query_timeout.unwrap_or(DEFAULT_QUERY_TIMEOUT);
 
         let backend_default = registry.sampling_default(&source_cfg.kind);
@@ -223,6 +266,7 @@ pub async fn assemble(
             config_read_spec,
             config_write_spec,
             interval,
+            jitter,
             query_timeout,
             sampling,
             access_check: flow.validation.access,
@@ -233,6 +277,11 @@ pub async fn assemble(
             } else {
                 crate::model::CursorPersistence::ColumnCursor
             },
+            // Per-flow lock handle: pre-resolves the three (kind,
+            // name) keys against the shared manager and caches the
+            // canonical-sorted slots. `acquire()` is a plain walk —
+            // no per-tick sort, no per-tick hashmap lookup.
+            lock_handle: concurrency.handle(source_name, flow.sink.as_str(), flow.storage.as_str()),
         });
     }
 
@@ -242,64 +291,93 @@ pub async fn assemble(
 /// I/O validation: access checks, schema introspection, type compatibility,
 /// and (when configured) sampling-validation.
 ///
-/// Flows are grouped by source and validated in parallel — one async
-/// worker per source, sequential within a source. The latter matters
-/// because flows that share a source pool would otherwise contend on
-/// the same connections. We log the worker count to stdout via the
-/// `tracing` info channel so operators can see how the work was
-/// scheduled.
+/// **Concurrency model.** Every assembled flow is fed through one
+/// `futures::stream::iter(...).for_each_concurrent(None, …)` — no
+/// per-source grouping. Backend contention is bounded purely by the
+/// per-component `tokio::sync::Semaphore`s built in
+/// [`assemble`], sized to each backend's `max-connections`. Each flow
+/// acquires permits on its source / sink / storage **before** any
+/// I/O, in canonical `(component_type, component_name)` order so
+/// flows with overlapping permit sets cannot deadlock. See the
+/// `project-conventions` skill ("Validation concurrency: semaphores +
+/// canonical-order acquire").
 ///
 /// Output ordering is deterministic: results are merged back into the
 /// flows' original config-order, so a reproducible failure produces
-/// reproducible CLI output regardless of which worker finished first.
+/// reproducible CLI output regardless of which task finished first.
 pub async fn validate(assembled: Vec<AssembledFlow>) -> Result<Vec<FlowState>, ValidationError> {
     if assembled.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Track each flow's original index to preserve config order on
-    // output. Group by source name with first-seen ordering.
     let total = assembled.len();
-    let mut group_order: Vec<String> = Vec::new();
-    let mut groups: AHashMap<String, Vec<(usize, AssembledFlow)>> = AHashMap::new();
-    for (idx, flow) in assembled.into_iter().enumerate() {
-        let source_name = flow.source.name().to_string();
-        if !groups.contains_key(&source_name) {
-            group_order.push(source_name.clone());
-        }
-        groups.entry(source_name).or_default().push((idx, flow));
+
+    info!(
+        flows = total,
+        "running validation for {total} flows (semaphores cap concurrency per component)"
+    );
+
+    let results: Arc<tokio::sync::Mutex<Vec<(usize, FlowState)>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(total)));
+    // Collect ALL errors with their config-order index, sort, return
+    // the lowest. Using "first finisher" (the previous design) made
+    // the surfaced error nondeterministic — two equally invalid flows
+    // would surface whichever completed first, differing between runs.
+    let errors: Arc<tokio::sync::Mutex<Vec<(usize, ValidationError)>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let any_error: Arc<std::sync::atomic::AtomicBool> =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    {
+        let results = results.clone();
+        let errors = errors.clone();
+        let any_error = any_error.clone();
+        let indexed = assembled.into_iter().enumerate();
+        futures::stream::iter(indexed)
+            .for_each_concurrent(None, |(idx, flow)| {
+                let results = results.clone();
+                let errors = errors.clone();
+                let any_error = any_error.clone();
+                async move {
+                    // Short-circuit: once any flow has produced a hard
+                    // error we stop spending budget on probes that
+                    // haven't started yet. In-flight probes still
+                    // finish — that's what makes the error set
+                    // deterministic regardless of scheduler timing.
+                    if any_error.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    match validate_flow(flow).await {
+                        Ok(state) => {
+                            results.lock().await.push((idx, state));
+                        }
+                        Err(e) => {
+                            any_error.store(true, std::sync::atomic::Ordering::Relaxed);
+                            errors.lock().await.push((idx, e));
+                        }
+                    }
+                }
+            })
+            .await;
     }
 
-    let workers = group_order.len();
-    info!(workers, "running validation in {workers} workers");
-
-    let mut futures = Vec::with_capacity(workers);
-    for source_name in &group_order {
-        let flows = groups.remove(source_name).unwrap_or_default();
-        futures.push(validate_source_group(flows));
+    let mut collected_errors = Arc::try_unwrap(errors)
+        .map_err(|_| ())
+        .expect("validate: errors Arc must be unique after for_each_concurrent")
+        .into_inner();
+    if !collected_errors.is_empty() {
+        // Sort by config-order index and return the lowest. Stable
+        // across reruns: the same two invalid flows always surface
+        // the same first error.
+        collected_errors.sort_by_key(|(idx, _)| *idx);
+        return Err(collected_errors.into_iter().next().expect("non-empty").1);
     }
-
-    let results = join_all(futures).await;
-    let mut indexed: Vec<(usize, FlowState)> = Vec::with_capacity(total);
-    for group_result in results {
-        match group_result {
-            Ok(states) => indexed.extend(states),
-            Err(e) => return Err(e),
-        }
-    }
+    let mut indexed = Arc::try_unwrap(results)
+        .map_err(|_| ())
+        .expect("validate: results Arc must be unique after for_each_concurrent")
+        .into_inner();
     indexed.sort_by_key(|(idx, _)| *idx);
     Ok(indexed.into_iter().map(|(_, s)| s).collect())
-}
-
-async fn validate_source_group(
-    flows: Vec<(usize, AssembledFlow)>,
-) -> Result<Vec<(usize, FlowState)>, ValidationError> {
-    let mut out = Vec::with_capacity(flows.len());
-    for (idx, flow) in flows {
-        let state = validate_flow(flow).await?;
-        out.push((idx, state));
-    }
-    Ok(out)
 }
 
 /// Build identity passthrough plans (`source = sink = Json`,
@@ -329,7 +407,7 @@ fn passthrough_plans(
                 });
             }
             Ok(ColumnConversionPlan {
-                source: DataType::Json,
+                source: Some(DataType::Json),
                 sink: DataType::Json,
                 ctx: ConversionContext::passthrough(),
                 switch: None,
@@ -438,19 +516,42 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
             .iter()
             .any(|r| matches!(r, ColumnMapping::Body { .. }));
 
+    // Each backend call below scopes its own per-component permit —
+    // hold for the duration of that I/O, release before the next call.
+    // No call site ever holds two permits at once, so deadlock is
+    // structurally impossible (no canonical lock order needed).
+    let lock_handle = flow.lock_handle.clone();
+    let acquire_err = |e: RuntimeError, comp: &'static str| ValidationError::AccessFailed {
+        component: comp,
+        name: flow.name.clone(),
+        source: Box::new(e),
+    };
+
     let (src_schema, dst_schema): (Option<Schema>, Option<Schema>) = if needs_schemas {
         let src = if src_schemaless {
             if needs_source_sample {
+                let _g = lock_handle
+                    .acquire_source()
+                    .await
+                    .map_err(|e| acquire_err(e, "source-semaphore"))?;
                 Some(fetch_source_schema(&flow).await?)
             } else {
                 None
             }
         } else {
+            let _g = lock_handle
+                .acquire_source()
+                .await
+                .map_err(|e| acquire_err(e, "source-semaphore"))?;
             Some(fetch_source_schema(&flow).await?)
         };
         let dst = if dst_schemaless {
             None
         } else {
+            let _g = lock_handle
+                .acquire_sink()
+                .await
+                .map_err(|e| acquire_err(e, "sink-semaphore"))?;
             Some(fetch_sink_schema(&flow).await?)
         };
         // Wildcard / json-pack against a fully schemaless source where
@@ -531,29 +632,44 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
     };
 
     // ---- access probes -----------------------------------------------
+    // Each probe under its own component permit, taken right before
+    // and released right after — no holding while sibling probes run.
     if flow.access_check {
-        flow.storage
-            .validate_access()
-            .await
-            .map_err(|e| ValidationError::AccessFailed {
-                component: "storage",
-                name: flow.name.clone(),
-                source: Box::new(e),
-            })?;
-        flow.source
-            .validate_access(&probe_read_spec)
-            .await
-            .map_err(|e| ValidationError::AccessFailed {
-                component: "source",
-                name: flow.name.clone(),
-                source: Box::new(e),
-            })?;
+        {
+            let _g = lock_handle
+                .acquire_storage()
+                .await
+                .map_err(|e| acquire_err(e, "storage-semaphore"))?;
+            retry_transient(|| flow.storage.validate_access())
+                .await
+                .map_err(|e| ValidationError::AccessFailed {
+                    component: "storage",
+                    name: flow.name.clone(),
+                    source: Box::new(e),
+                })?;
+        }
+        {
+            let _g = lock_handle
+                .acquire_source()
+                .await
+                .map_err(|e| acquire_err(e, "source-semaphore"))?;
+            retry_transient(|| flow.source.validate_access(&probe_read_spec))
+                .await
+                .map_err(|e| ValidationError::AccessFailed {
+                    component: "source",
+                    name: flow.name.clone(),
+                    source: Box::new(e),
+                })?;
+        }
     } else {
         info!(flow = %flow.name, "validation.access disabled — skipping source/storage probes");
     }
     if flow.inserts_check {
-        flow.sink
-            .validate_access(&probe_write_spec)
+        let _g = lock_handle
+            .acquire_sink()
+            .await
+            .map_err(|e| acquire_err(e, "sink-semaphore"))?;
+        retry_transient(|| flow.sink.validate_access(&probe_write_spec))
             .await
             .map_err(|e| ValidationError::AccessFailed {
                 component: "sink",
@@ -564,8 +680,7 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
             && flow.config_write_spec.conflict.is_some()
             && flow.sink.supports_deletes()
         {
-            flow.sink
-                .validate_delete_access(&probe_write_spec)
+            retry_transient(|| flow.sink.validate_delete_access(&probe_write_spec))
                 .await
                 .map_err(|e| ValidationError::AccessFailed {
                     component: "sink:delete",
@@ -586,7 +701,13 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
     let derived = if flow.fields_check {
         let src_schema_full = match src_schema {
             Some(s) => s,
-            None => fetch_source_schema(&flow).await?,
+            None => {
+                let _g = lock_handle
+                    .acquire_source()
+                    .await
+                    .map_err(|e| acquire_err(e, "source-semaphore"))?;
+                fetch_source_schema(&flow).await?
+            }
         };
         let dst_schema_full = match dst_schema {
             Some(s) => s,
@@ -597,7 +718,13 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
                 // checks below; build the same one the helper would.
                 Schema::default()
             }
-            None => fetch_sink_schema(&flow).await?,
+            None => {
+                let _g = lock_handle
+                    .acquire_sink()
+                    .await
+                    .map_err(|e| acquire_err(e, "sink-semaphore"))?;
+                fetch_sink_schema(&flow).await?
+            }
         };
 
         // Cursor presence + cursor-typability.
@@ -608,7 +735,7 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
         )?;
         for field_name in &flow.config_read_spec.cursor_fields {
             if let Some(field) = src_schema_full.find(field_name)
-                && !field.data_type.can_be_cursor()
+                && !field.data_type.cursor_compatible()
             {
                 return Err(ValidationError::CursorTypeUnsupported {
                     field: field_name.clone(),
@@ -618,18 +745,31 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
         }
 
         if !is_root_passthrough {
-            // Run the matrix on direct mappings (schemaless sinks
-            // bypass the matrix — no real dst schema to narrow against).
-            if !flow.sink.schemaless() {
+            // Schemaless sinks bypass the matrix — no real dst schema
+            // to narrow against. Schemaless sources bypass the matrix
+            // narrowing / nullability check too — the sampled
+            // "source type" is a hypothesis, not a contract, and the
+            // Transform compiler emits dynamic-dispatch Convert ops
+            // keyed off the sink type only.
+            if !flow.sink.schemaless() && !flow.source.schemaless() {
                 checks::check_mapping(&src_schema_full, &dst_schema_full, &expanded.direct)?;
+            } else if flow.source.schemaless() && !src_schema_full.fields().is_empty() {
+                // Schemaless source with a non-empty sample — still
+                // catch typo'd `from` against the sampled fields.
+                // Nullability is NOT enforced (sampling is non-
+                // exhaustive). An empty sample skips this check
+                // because we have no information either way.
+                checks::check_mapping_sources_exist(&src_schema_full, &expanded.direct)?;
+            }
 
-                // Body / wildcard-pack target type check — every body
-                // target sink column must accept the source's body
-                // `DataType` (Json for relational sources, Json for
-                // mongo too — the Custom `BsonObjectValue` wrapping
-                // happens at apply time, validation operates on the
-                // canonical pivot). Schemaless sinks (Mongo) bypass
-                // this branch (no real dst schema).
+            // Body / wildcard-pack target type check — every body
+            // target sink column must accept the source's body
+            // `DataType` (Json for relational sources, Json for
+            // mongo too — the Custom `BsonObjectValue` wrapping
+            // happens at apply time, validation operates on the
+            // canonical pivot). Schemaless sinks (Mongo) bypass
+            // this branch (no real dst schema).
+            if !flow.sink.schemaless() {
                 let carrier = flow.source.body_data_type();
                 for target in expanded.body.as_ref().into_iter().flat_map(|p| &p.targets) {
                     let sink_field = dst_schema_full.find(target).ok_or_else(|| {
@@ -783,6 +923,7 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
             &conversions,
             &[],
             &read_columns,
+            flow.source.schemaless(),
         )?;
         DerivedPlans {
             read_spec,
@@ -792,6 +933,9 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
     };
 
     if let SamplingConfig::Enabled { size } = flow.sampling {
+        // Sampling probe runs through `runner::tick(dry_run = true)`,
+        // which acquires the per-phase permits itself. No outer lock
+        // to drop here.
         run_sampling_via_tick(&flow, &derived, size).await?;
     }
 
@@ -842,12 +986,20 @@ mod tests {
                 conflict: None,
             },
             interval: Duration::from_millis(10),
+            jitter: Duration::ZERO,
             query_timeout: Duration::from_secs(5),
             sampling: SamplingConfig::Disabled,
             access_check: false,
             fields_check,
             inserts_check: false,
             cursor_persistence: crate::model::CursorPersistence::ColumnCursor,
+            lock_handle: {
+                let mut m = crate::util::ConcurrencyManager::new();
+                m.register_source("test-source", u32::MAX);
+                m.register_sink("test-sink", u32::MAX);
+                m.register_storage("test-storage", u32::MAX);
+                m.handle("test-source", "test-sink", "test-storage")
+            },
         }
     }
 
@@ -1169,7 +1321,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cursor_guard_rejects_custom_without_can_be_cursor() {
+    async fn cursor_guard_rejects_custom_without_cursor_compatible() {
         let flow = flow_for_cursor_test(DataType::Custom(Box::new(NonCursorCustom)));
         let res = validate_flow(flow).await;
         let err = match res {
@@ -1368,5 +1520,132 @@ mod tests {
             matches!(&err, ValidationError::MissingField { side: "source", field, .. } if field == "missing"),
             "got {err:?}"
         );
+    }
+
+    // ---- Schemaless source — sample is non-authoritative -----------
+
+    /// A schemaless source whose sample claims `Int64` but whose
+    /// mapping targets a sink column of type `Int32` must validate
+    /// successfully — the matrix narrowing check is implicit-off for
+    /// schemaless sources (the sampled "source type" is a hypothesis,
+    /// not a contract). The companion runtime test
+    /// `schemaless_flow_accepts_cross_batch_value_drift` proves the
+    /// per-cell dispatch handles the actual variant at apply time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn schemaless_source_skips_matrix_narrowing_check() {
+        let src_schema = Schema::new(vec![Field {
+            name: "n".into(),
+            data_type: DataType::Int64,
+            nullable: true,
+        }]);
+        let dst_schema = Schema::new(vec![Field {
+            name: "n".into(),
+            data_type: DataType::Int32,
+            nullable: true,
+        }]);
+        let mut source = raw_passthrough_source_mock();
+        source.expect_name().return_const("src".to_string());
+        let s = src_schema.clone();
+        source
+            .expect_describe_schema()
+            .returning(move |_| Ok(s.clone()));
+        let mut sink = MockSink::new();
+        sink.expect_schemaless().return_const(false);
+        let d = dst_schema.clone();
+        sink.expect_describe_schema()
+            .returning(move |_| Ok(d.clone()));
+        let storage = MockStorage::new();
+        let mut flow = flow_with(source, sink, storage, vec![rule_direct("n", "n")], true);
+        flow.config_read_spec.cursor_fields = vec!["n".into()];
+        let state = validate_flow(flow).await.expect("schemaless validates");
+        // The compiled transform must emit a dynamic-source `Convert`
+        // (`plan.source = None`), not a bare `Take` or a static
+        // `Convert` — that's the whole point.
+        match &state.derived().transform.cols[0] {
+            crate::transform::TransformOp::Convert { plan, .. } => {
+                assert!(
+                    plan.source.is_none(),
+                    "schemaless source must emit dynamic-source Convert"
+                );
+            }
+            other => panic!("expected dynamic Convert, got {other:?}"),
+        }
+    }
+
+    /// Companion: a typed source whose sample is nullable feeding a
+    /// NOT NULL sink without a `default` still triggers
+    /// `NullabilityMismatch` — confirms the schemaless skip is scoped
+    /// to the schemaless flag and does not silently weaken the typed-
+    /// source `check_mapping` branch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn typed_source_keeps_nullability_check() {
+        let src_schema = Schema::new(vec![Field {
+            name: "n".into(),
+            data_type: DataType::Int64,
+            nullable: true,
+        }]);
+        let dst_schema = Schema::new(vec![Field {
+            name: "n".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+        }]);
+        let mut source = default_source_mock();
+        source.expect_name().return_const("src".to_string());
+        let s = src_schema.clone();
+        source
+            .expect_describe_schema()
+            .returning(move |_| Ok(s.clone()));
+        let mut sink = MockSink::new();
+        sink.expect_schemaless().return_const(false);
+        let d = dst_schema.clone();
+        sink.expect_describe_schema()
+            .returning(move |_| Ok(d.clone()));
+        let storage = MockStorage::new();
+        let mut flow = flow_with(source, sink, storage, vec![rule_direct("n", "n")], true);
+        flow.config_read_spec.cursor_fields = vec!["n".into()];
+        let err = validate_flow(flow).await.unwrap_err();
+        assert!(
+            matches!(err, ValidationError::NullabilityMismatch { .. }),
+            "typed source must still flag nullable→NOT-NULL, got {err:?}"
+        );
+    }
+
+    /// And the schemaless companion of the above: the same
+    /// nullable-source → NOT-NULL-sink shape is permitted under a
+    /// schemaless source because the sampled `nullable` flag is non-
+    /// authoritative (a sample can never prove NOT NULL or refute it
+    /// authoritatively). The Transform compiler emits a dynamic-source
+    /// `Convert` (`plan.source = None`) and the runtime's null-handling
+    /// path applies a default if any
+    /// was declared — there is no validation-time signal to fire on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn schemaless_source_skips_nullability_check() {
+        let src_schema = Schema::new(vec![Field {
+            name: "n".into(),
+            data_type: DataType::Int64,
+            nullable: true,
+        }]);
+        let dst_schema = Schema::new(vec![Field {
+            name: "n".into(),
+            data_type: DataType::Int64,
+            nullable: false,
+        }]);
+        let mut source = raw_passthrough_source_mock();
+        source.expect_name().return_const("src".to_string());
+        let s = src_schema.clone();
+        source
+            .expect_describe_schema()
+            .returning(move |_| Ok(s.clone()));
+        let mut sink = MockSink::new();
+        sink.expect_schemaless().return_const(false);
+        let d = dst_schema.clone();
+        sink.expect_describe_schema()
+            .returning(move |_| Ok(d.clone()));
+        let storage = MockStorage::new();
+        let mut flow = flow_with(source, sink, storage, vec![rule_direct("n", "n")], true);
+        flow.config_read_spec.cursor_fields = vec!["n".into()];
+        validate_flow(flow)
+            .await
+            .expect("schemaless skips the nullability check");
     }
 }

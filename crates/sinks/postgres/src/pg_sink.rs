@@ -64,25 +64,28 @@ impl SchemaProvider for PgSinkCtx {
 pub struct PgSink {
     pool: PgPool,
     dialect: Dialect,
+    pool_max_connections: u32,
 }
 
 impl PgSink {
     pub async fn connect(config: PgSinkConfig) -> RuntimeResult<Self> {
         let dialect = config.dialect;
-        let pool = pool::connect(
-            &config.url,
-            pool::PoolSettings::from_options(
-                config.connect_timeout,
-                config.acquire_timeout,
-                config.idle_timeout,
-                config.max_lifetime,
-                config.statement_timeout,
-                config.max_connections,
-                config.min_connections,
-            ),
-        )
-        .await?;
-        Ok(Self { pool, dialect })
+        let pool_settings = pool::PoolSettings::from_options(
+            config.connect_timeout,
+            config.acquire_timeout,
+            config.idle_timeout,
+            config.max_lifetime,
+            config.statement_timeout,
+            config.max_connections,
+            config.min_connections,
+        )?;
+        let pool_max_connections = pool_settings.max_connections;
+        let pool = pool::connect(&config.url, pool_settings).await?;
+        Ok(Self {
+            pool,
+            dialect,
+            pool_max_connections,
+        })
     }
 
     async fn ensure_connection_alive(&self) -> RuntimeResult<()> {
@@ -127,6 +130,10 @@ impl PgSink {
 
 #[async_trait]
 impl Sink for PgSink {
+    fn max_connections(&self) -> u32 {
+        self.pool_max_connections
+    }
+
     async fn validate_access(&self, spec: &WriteSpec) -> RuntimeResult<()> {
         self.ensure_connection_alive().await?;
         self.assert_table_writable(spec).await?;

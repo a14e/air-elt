@@ -46,7 +46,7 @@ The same field set applies to `"postgres"`, `"cockroachdb"`, and `"mysql"` — o
 | `idle-timeout` | Duration | `"5m"` | Idle connection lifetime |
 | `max-lifetime` | Duration | `"30m"` | Max connection age |
 | `statement-timeout` | Duration | `"30s"` | Postgres `SET statement_timeout` |
-| `max-connections` | u32 | 5 | Pool size (capped at 100) |
+| `max-connections` | u32 | 5 | Pool size (capped at 100). Also the **validation AND runtime** concurrency cap for this component — `assemble` builds a `tokio::sync::Semaphore` of this many permits, and every flow referencing this component acquires one permit before running its access probes / sampling (validation) and across each tick's `read_batch → transform → write_batch → save_cursor` (runtime). The semaphore keeps simultaneous pool acquisitions below the operator-declared budget so the underlying `acquire-timeout` is only a safety backstop. |
 | `min-connections` | u32 | 0 | Minimum idle connections |
 
 ### MongoDB connector config (`config = { ... }`)
@@ -60,7 +60,7 @@ The same field set covers `[[sources]]`, `[[sinks]]`, and `[[storages]]` of `typ
 | `connect-timeout` | Duration | `"5s"` | TCP connect timeout |
 | `acquire-timeout` | Duration | `"10s"` | Server-selection timeout |
 | `idle-timeout` | Duration | `"5m"` | Idle connection lifetime |
-| `max-connections` | u32 | 5 | Driver pool size cap (≤100) |
+| `max-connections` | u32 | 5 | Driver pool size cap (≤100). Doubles as the validation AND runtime concurrency cap for this component (see Postgres `max-connections` for details). |
 | `min-connections` | u32 | 0 | Minimum pool size |
 | `schema-sample-size` | usize | 100 | (source only) Documents pulled by `describe_schema` for type inference |
 | `operation-timeout` | Duration | `"30s"` | (source only) Per-op `maxTimeMS` applied to driver calls that support it (Find / Aggregate / FindOne). Bounds server-side work after the runner detaches a spawned future on shutdown / timeout. |
@@ -82,12 +82,12 @@ INSERTs use the HTTP `RowBinary` format. Authentication is over standard CH `X-C
 |-------|------|---------|-------------|
 | `url` | string | required | HTTP endpoint URL (e.g. `http://localhost:8123`). Use `https://` for TLS. No trailing slash. |
 | `database` | string | required | Default database. Applied as `X-ClickHouse-Database`; flow `to` may still be `db.table` qualified to override per flow. |
-| `user` | string | none | Optional username. |
-| `password` | string | none | Optional password. Pair with `[secrets]` to avoid leaking it in the config file. |
+| `user` | string | required | CH username. Required at deserialize time — omitting it surfaces `missing field 'user'` before any I/O. For the authless variant (CH with `<networks><ip>::/0</ip></networks>` open for the `default` user) write `user = "default"` and `password = ""`. |
+| `password` | string | required | Password matching `user`. Required at deserialize time. Use `""` for the authless variant. Pair with `[secrets]` to avoid leaking it in the config file. |
 | `connect-timeout` | Duration | `"5s"` | TCP connect timeout. |
 | `idle-timeout` | Duration | `"5m"` | Idle HTTP connection lifetime. |
 | `request-timeout` | Duration | `"30s"` | Whole-request cap (connect + send + server compute + body download). CH has no per-statement timeout exposed over HTTP. |
-| `max-connections` | u32 | 5 | HTTP pool size cap. |
+| `max-connections` | u32 | 5 | HTTP pool size cap. Doubles as the validation AND runtime concurrency cap for this component (see Postgres `max-connections` for details). |
 
 **Unsupported pool fields.** Because the CH sink uses an HTTP client (reqwest) rather than a database connection pool, the fields `acquire-timeout`, `max-lifetime`, and `min-connections` — present in the Postgres / MySQL / MongoDB connectors — are **not supported**. Specifying any of them raises a `ConfigError::Invalid` at load time naming the offending field. This is intentional: silently ignoring a timeout the operator set would be misleading.
 
@@ -236,7 +236,7 @@ status_label = { from = "status", switch = { ACTIVE = "active", FINISHED = "fini
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `from` | string | required | Source column name |
-| `truncate` | bool | `false` | Opt the column into narrowing conversions: text/bytes shrink (UTF-safe for text), integer/float saturate to target's max/min, decimal scale drop, json/xml → `text(n)` serialize. Forbidden combinations (`Json → Json`, `Xml → Xml`, UUID truncations, `Date → Timestamp`) remain rejected. |
+| `truncate` | bool | `false` | Opt the column into narrowing conversions: text/bytes shrink (UTF-safe for text), integer/float saturate to target's max/min, decimal scale drop, decimal → float magnitude overflow saturates to `±INFINITY`, json/xml → `text(n)` serialize. `Decimal → Float64`/`Float32` is lossless without `truncate` when the declared precision fits the target's mantissa (≤ 15 / ≤ 7 respectively); wider or unbounded Decimal requires `truncate = true`. Forbidden combinations (`Json → Json`, `Xml → Xml`, UUID truncations, `Date → Timestamp`, `Float → Decimal/BigInt`) remain rejected. |
 | `default` | scalar / table | none | Fallback value substituted when the source value is `Null` and when `switch` produces no match. Permits mapping a nullable source into a `NOT NULL` sink. On the Direct path validation rejects `default` if the source column is `NOT NULL`. The literal is parsed against the resolved sink `DataType` (see grammar below). |
 | `switch` | inline table | none | Value-to-value lookup. Keys (inline-table keys — always strings in TOML) are parsed against the source column's `DataType`; values are parsed against the sink column's `DataType` (or contribute to union-collapse for schemaless sinks). Output: the matched value, or `default` on miss / NULL input, or `Value::Null` if no `default`. See **Switch** below. |
 
@@ -348,6 +348,7 @@ Custom values delegate to `DynValue::to_json()`. New custom types must implement
 | `fields` | `[string]` | required | Cursor column(s), must be subset of mapping. With `"*"` or `"*:body"` the loader defers this check; the validate-pipeline re-runs it post-expansion against `direct.from`. |
 | `order` | `"asc"` / `"desc"` | `"asc"` | Cursor direction |
 | `interval` | Duration | `"1s"` | Idle interval between drain ticks |
+| `jitter` | Duration | `min(interval, 5min)` | Deterministic per-flow startup offset. The runner sleeps `hash(flow.name) mod jitter` before the first tick, spreading concurrent flows across the cadence period so a fleet sharing one `interval` doesn't pile up on the same second-boundary. Max = `interval` (loader rejects `jitter > interval`). Set to `"0s"` to disable jitter entirely. |
 
 ### Duration format
 
@@ -363,6 +364,7 @@ All Duration fields accept two formats, routed by prefix:
 - `batch-limit ≥ 1`
 - `batch-limit × mapping_cols ≤ 60,000`
 - `cursor.interval > 0` (zero interval causes spin-loop)
+- `cursor.jitter ≤ cursor.interval` when explicitly set (`"0s"` accepted; default `min(interval, 5min)` always passes)
 - `query-timeout > 0` when specified
 - Cursor fields ⊆ mapping `from` columns
 - `conflict.key` ⊆ mapping `to` columns (when `[flow.<name>.conflict]` is set)

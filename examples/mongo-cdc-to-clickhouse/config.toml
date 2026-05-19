@@ -27,7 +27,7 @@ config = { url = "${MONGO_SRC_URL}", database = "appdb", max-await-time = "1s" }
 [[sinks]]
 name = "clickhouse_sink"
 type = "clickhouse"
-config = { url = "${CLICKHOUSE_URL}", database = "analytics" }
+config = { url = "${CLICKHOUSE_URL}", database = "analytics", user = "default", password = "" }
 
 [[storages]]
 name = "pg_state"

@@ -1,0 +1,49 @@
+[flow.users]
+source  = "mongo_src"
+sink    = "pg_sink"
+storage = "pg_state"
+
+from = "users"
+to   = "public.users"
+
+batch-limit = 256
+
+# `email` is NOT NULL in the sink (see migrate.sql) but the mongodb source
+# treats every non-`_id` field as nullable (sampling-based inference). The
+# `default` clause makes the field-nullability matrix accept the wiring at
+# validate time — the value never actually fires because the load script
+# always sets `email`.
+[flow.users.mapping]
+id          = "_id"
+email       = { from = "email", default = "<unknown>" }
+seq         = "seq"
+name        = "name"
+is_active   = "is_active"
+age         = "age"
+score       = "score"
+balance     = "balance"
+tags        = "tags"
+inserted_at = "inserted_at"
+
+# Cursor on `_id`. `MongoObjectIdType::cursor_compatible() == true`, so the
+# cursor JSON envelope round-trips ObjectIds through the
+# `{type:"custom", kind:"mongodb.object_id", value:"<hex>"}` shape registered
+# in `cursor_codec`. ObjectIds carry monotonic counters / timestamps,
+# which is good enough for pagination ordering.
+# interval = "1s": drain semantics (per air-elt-overview) keep batches
+# back-to-back as long as the source has rows; interval is only the
+# idle-poll latency once we've caught up. 200ms made the lag dashboard
+# look prettier on a demo but burned 5× more wake-ups for no benefit
+# under steady load.
+[flow.users.cursor]
+fields   = ["_id"]
+order    = "asc"
+interval = "1s"
+
+# Sampling validation is on — after the App::migrate split (storage.migrate
+# now runs before flows_validated()), sampling can probe the source without
+# tripping on a missing `air_elt_cursors` table.
+
+[flow.users.conflict]
+key      = ["id"]
+strategy = "overwrite"

@@ -72,10 +72,31 @@ pub trait DynType: fmt::Debug + Send + Sync + 'static {
         self.kind().to_string()
     }
 
-    /// Whether values of this type can serve as a cursor field. Default
-    /// `false`; implementations override to opt in.
-    fn can_be_cursor(&self) -> bool {
+    /// Whether values of this type can serve as a cursor field —
+    /// i.e. they have a canonical linear order AND
+    /// [`Self::decode_cursor_value`] can round-trip them through JSON.
+    /// Default `false`; implementations override to opt in. Every
+    /// `DynType` returning `true` MUST also override
+    /// [`Self::decode_cursor_value`].
+    fn cursor_compatible(&self) -> bool {
         false
+    }
+
+    /// Decode a cursor-JSON payload back into a connector-specific
+    /// [`DynValue`]. The `serde_json::Value` passed in is whatever the
+    /// matching [`DynValue::to_json`] produced at serialize time.
+    ///
+    /// Default returns an error. Every `DynType` that returns
+    /// [`Self::cursor_compatible`] `== true` MUST override this — the
+    /// caller resolves the expected `DataType` from the source schema
+    /// (cursor fields are looked up there) and dispatches into the
+    /// matching descriptor; no global registry is consulted.
+    fn decode_cursor_value(&self, _json: &serde_json::Value) -> Result<Box<dyn DynValue>, String> {
+        Err(format!(
+            "DynType::decode_cursor_value not implemented for kind={:?} — \
+             type is not cursor-compatible",
+            self.kind()
+        ))
     }
 
     /// Whether values of this type are document/object-shaped. The

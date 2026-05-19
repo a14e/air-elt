@@ -141,6 +141,14 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
             },
         ) => decimal_fits_decimal(pa, sa, pb, sb),
 
+        // Decimal → Float64 / Float32 is NEVER lossless: even at
+        // precision ≤ 15, fractional decimals like `0.1` have no exact
+        // IEEE-754 binary representation. Operators who accept the
+        // rounding must opt in via `truncate = true`; see
+        // `is_compatible_with_truncate`. Reverse direction
+        // (Float → Decimal) stays rejected on both matrices: lossy
+        // float-to-fixed-point binding has no clean defaulting rule.
+
         // Xml/Json → unbounded text. Identity covers Xml→Xml and Json→Json.
         // `Xml → Text*` and `Json → Text*` (unbounded sink) are allowed
         // without truncate because no truncation is ever needed.
@@ -246,6 +254,10 @@ pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool
         (Decimal { .. }, Decimal { .. }) => true,
         (Decimal { .. }, BigInt { .. }) => true,
         (Decimal { .. }, Int64 | Int32 | Int16 | Int8 | UInt64 | UInt32 | UInt16 | UInt8) => true,
+        // Decimal → Float64 / Float32 under truncate: the dispatcher
+        // saturates magnitude overflow to `±INFINITY` and absorbs
+        // mantissa rounding through the IEEE cast.
+        (Decimal { .. }, Float64 | Float32) => true,
         // Json → Text(n).
         (Json, Text { size: Some(_) }) => true,
         // Xml → Text(n).
@@ -336,6 +348,14 @@ pub fn is_narrowing(source_t: DataType, sink_t: DataType) -> bool {
         return true;
     }
     if let (Bytes { size: None }, Bytes { size: Some(_) }) = (&source_t, &sink_t) {
+        return true;
+    }
+    // Decimal → Float32/Float64 is always narrowing (IEEE binary
+    // floats cannot exactly represent decimal fractions like `0.1`).
+    // Admitted by the truncate matrix only; the validator emits
+    // `NarrowingNotAllowed` so operators get the "enable truncate"
+    // hint rather than `UnsupportedCast`.
+    if matches!((&source_t, &sink_t), (Decimal { .. }, Float64 | Float32)) {
         return true;
     }
     matches!(
@@ -693,12 +713,58 @@ mod tests {
     }
 
     #[test]
-    fn float_to_decimal_or_bigint_rejected_both_directions() {
+    fn float_to_decimal_or_bigint_rejected() {
+        // Float → fixed-point (Decimal / BigInt) rejected by the lossless
+        // matrix in both directions — runtime semantics for the cast are
+        // ambiguous (round vs truncate vs error). Wide / unbounded
+        // Decimal → Float is also rejected losslessly; see
+        // `decimal_narrow_to_float_lossless_only_when_precision_fits`
+        // for the bounded-narrow-precision allow path.
         assert!(!is_compatible(DataType::Float32, dec(10, 2)));
         assert!(!is_compatible(DataType::Float64, dec(20, 4)));
         assert!(!is_compatible(DataType::Float32, BIGINT_UNB));
-        assert!(!is_compatible(dec(10, 2), DataType::Float64));
         assert!(!is_compatible(BIGINT_UNB, DataType::Float64));
+    }
+
+    #[test]
+    fn decimal_to_float_is_never_lossless() {
+        // Even at precision ≤ 15, fractional decimals like `0.1` have
+        // no exact IEEE-754 binary representation. Every Decimal →
+        // Float pair must require `truncate = true`.
+        assert!(!is_compatible(dec(12, 2), DataType::Float64));
+        assert!(!is_compatible(dec(15, 0), DataType::Float64));
+        assert!(!is_compatible(dec(16, 0), DataType::Float64));
+        assert!(!is_compatible(DEC_UNB, DataType::Float64));
+
+        assert!(!is_compatible(dec(7, 2), DataType::Float32));
+        assert!(!is_compatible(dec(8, 2), DataType::Float32));
+        assert!(!is_compatible(DEC_UNB, DataType::Float32));
+    }
+
+    #[test]
+    fn decimal_to_float_unlocks_under_truncate() {
+        // The truncate matrix admits every Decimal → Float pair.
+        // The runtime dispatcher saturates magnitude overflow to
+        // ±INFINITY and absorbs mantissa loss through the IEEE cast.
+        assert_unlocks(dec(12, 2), DataType::Float64);
+        assert_unlocks(dec(38, 0), DataType::Float64);
+        assert_unlocks(DEC_UNB, DataType::Float64);
+        assert_unlocks(dec(7, 2), DataType::Float32);
+        assert_unlocks(dec(38, 0), DataType::Float32);
+        assert_unlocks(DEC_UNB, DataType::Float32);
+    }
+
+    #[test]
+    fn decimal_to_float_is_always_narrowing() {
+        // Every Decimal → Float pair is narrowing (admitted by
+        // truncate matrix, rejected losslessly) so the validator
+        // emits `NarrowingNotAllowed` with the "enable truncate" hint
+        // rather than `UnsupportedCast`.
+        assert!(is_narrowing(dec(12, 2), DataType::Float64));
+        assert!(is_narrowing(dec(38, 0), DataType::Float64));
+        assert!(is_narrowing(DEC_UNB, DataType::Float64));
+        assert!(is_narrowing(dec(7, 2), DataType::Float32));
+        assert!(is_narrowing(dec(8, 2), DataType::Float32));
     }
 
     // ---- Xml + truncate matrix coverage ----

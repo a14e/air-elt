@@ -80,6 +80,8 @@ sinks:
     config:
       url: "{ch_url}"
       database: "{ch_db}"
+      user: "default"
+      password: ""
 
 storages:
   - name: st
@@ -311,6 +313,8 @@ sinks:
     config:
       url: "{ch_url}"
       database: "{ch_db}"
+      user: "default"
+      password: ""
 
 storages:
   - name: st

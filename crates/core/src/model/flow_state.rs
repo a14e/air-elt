@@ -38,6 +38,12 @@ pub struct AssembledFlow {
     pub config_read_spec: ConfigReadSpec,
     pub config_write_spec: ConfigWriteSpec,
     pub interval: Duration,
+    /// Resolved per-flow startup jitter ceiling — `min(interval, 5min)`
+    /// when the operator omits `cursor.jitter`, or the explicit value
+    /// otherwise. Zero disables jitter. The runner shifts the first
+    /// tick by `deterministic_hash(flow.name) % jitter` before draining;
+    /// subsequent ticks proceed at `interval` cadence as before.
+    pub jitter: Duration,
     pub query_timeout: Duration,
     /// Operator-resolved sampling-validation decision (after applying
     /// the per-backend factory default for `Unset`).
@@ -53,6 +59,16 @@ pub struct AssembledFlow {
     pub inserts_check: bool,
     /// Persistence strategy for the source's cursor state.
     pub cursor_persistence: CursorPersistence,
+    /// Per-flow concurrency lock. Built once by
+    /// `validation::pipeline::assemble` from the shared
+    /// `ConcurrencyManager`. Exposes one `acquire_*` method per
+    /// component kind; callers scope the returned permit to exactly
+    /// the I/O unit that touches that component. No call site ever
+    /// holds more than one permit at a time, so cross-flow deadlock
+    /// is structurally impossible — there is no canonical lock order.
+    /// See the `project-conventions` skill ("Concurrency:
+    /// per-component semaphores").
+    pub lock_handle: crate::util::FlowLockHandle,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,6 +83,12 @@ pub enum CursorPersistence {
 /// default value). Built by `validation::pipeline::validate` after schema
 /// introspection.
 ///
+/// `source` is `Option<DataType>`: `Some(t)` is the static fast path used
+/// when the source side has an authoritative type (`information_schema`
+/// for SQL connectors); `None` means "derive at apply time from the
+/// actual `Value` variant" and is emitted for schemaless sources whose
+/// sampled types are non-authoritative.
+///
 /// When `switch.is_some()`, the lowered transform op is a
 /// `TransformOp::Switch` (no further `Convert` wrapping — switch values
 /// are already in the sink's `DataType` after compile-time
@@ -75,7 +97,7 @@ pub enum CursorPersistence {
 /// plan's `ctx.default` is only consulted on the `Direct` path.
 #[derive(Debug, Clone)]
 pub struct ColumnConversionPlan {
-    pub source: DataType,
+    pub source: Option<DataType>,
     pub sink: DataType,
     pub ctx: ConversionContext,
     pub switch: Option<SwitchTable>,
@@ -85,7 +107,7 @@ impl ColumnConversionPlan {
     /// Build an identity plan (no truncate, no default). Test helper.
     pub fn identity(dt: DataType) -> Self {
         Self {
-            source: dt.clone(),
+            source: Some(dt.clone()),
             sink: dt,
             ctx: ConversionContext::passthrough(),
             switch: None,
@@ -93,7 +115,7 @@ impl ColumnConversionPlan {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.source == self.sink
+        self.source.as_ref() == Some(&self.sink)
             && !self.ctx.truncate
             && self.ctx.default.is_none()
             && self.switch.is_none()
@@ -249,6 +271,7 @@ pub fn build_derived_plans_from_expanded(
         &conversions,
         &body_conversions,
         &columns,
+        flow.source.schemaless(),
     )?;
     Ok(DerivedPlans {
         read_spec,
@@ -286,7 +309,7 @@ fn build_body_conversions(
             }
         };
         plans.push(ColumnConversionPlan {
-            source: body_data_type.clone(),
+            source: Some(body_data_type.clone()),
             sink: sink_dt,
             ctx: ConversionContext::passthrough(),
             switch: None,
@@ -333,6 +356,7 @@ fn build_conversions(
 ) -> Result<Vec<ColumnConversionPlan>, ValidationError> {
     let flow_name = &flow.name;
     let dst_schemaless = flow.sink.schemaless();
+    let src_schemaless = flow.source.schemaless();
     let mut plans: Vec<ColumnConversionPlan> = Vec::with_capacity(expanded.direct.len());
     for m in &expanded.direct {
         let DirectMapping {
@@ -342,19 +366,30 @@ fn build_conversions(
             default_literal,
             switch,
         } = m;
-        let src = src_schema.ok_or_else(|| ValidationError::AccessFailed {
-            component: "source:schema",
-            name: flow_name.clone(),
-            source: Box::new(crate::error::RuntimeError::Other(format!(
-                "rebuild_derived: missing source schema for direct mapping {from:?} → {to:?}"
-            ))),
-        })?;
-        let src_field = src
-            .find(from)
-            .ok_or_else(|| ValidationError::MissingField {
-                side: "source",
-                field: from.clone(),
+        // Look up the source field from the sample-derived schema, if
+        // any. For schemaless sources the sample is non-authoritative —
+        // missing field is fine (per-cell dispatch handles it) and the
+        // sampled `data_type` is informational only. Typed sources
+        // demand a real `information_schema` lookup.
+        let src_field_opt = src_schema.and_then(|s| s.find(from));
+        let src_field = if src_schemaless {
+            src_field_opt
+        } else {
+            let src = src_schema.ok_or_else(|| ValidationError::AccessFailed {
+                component: "source:schema",
+                name: flow_name.clone(),
+                source: Box::new(crate::error::RuntimeError::Other(format!(
+                    "rebuild_derived: missing source schema for direct mapping {from:?} → {to:?}"
+                ))),
             })?;
+            Some(
+                src.find(from)
+                    .ok_or_else(|| ValidationError::MissingField {
+                        side: "source",
+                        field: from.clone(),
+                    })?,
+            )
+        };
         let sink_dt = match dst_schema.and_then(|s| s.find(to)) {
             Some(f) => f.data_type.clone(),
             None => {
@@ -373,7 +408,15 @@ fn build_conversions(
         // nullable. With `switch` present the same literal becomes the
         // switch's miss-fallback (default arm), which fires on EVERY
         // unmatched key regardless of nullability — skip the guard.
-        if default_literal.is_some() && switch.is_none() && !src_field.nullable {
+        // For schemaless sources the sampled `nullable` flag is non-
+        // authoritative (a sample can never prove NOT NULL), so the
+        // guard is skipped: any field could legitimately carry NULL.
+        if default_literal.is_some()
+            && switch.is_none()
+            && !src_schemaless
+            && let Some(f) = &src_field
+            && !f.nullable
+        {
             return Err(ValidationError::DefaultOnNotNullSource {
                 flow: flow_name.clone(),
                 column: from.clone(),
@@ -401,16 +444,28 @@ fn build_conversions(
             });
         }
         let switch_table = match switch {
-            Some(spec) => Some(crate::transform::compile_switch(
-                flow_name,
-                to,
-                &spec.cases,
-                default_literal.as_ref(),
-                *truncate,
-                &src_field.data_type,
-                &sink_dt,
-                dst_schemaless,
-            )?),
+            Some(spec) => {
+                // Switch RHS canonicalisation needs a source `DataType`.
+                // For typed sources the sample is the contract; for
+                // schemaless sources fall back to the sink type — the
+                // switch operates on canonical keys (`SwitchKey::from_value`
+                // dispatches on the actual `Value` at runtime), so the
+                // declared source type only narrows literal parsing.
+                let src_dt = src_field
+                    .as_ref()
+                    .map(|f| f.data_type.clone())
+                    .unwrap_or_else(|| sink_dt.clone());
+                Some(crate::transform::compile_switch(
+                    flow_name,
+                    to,
+                    &spec.cases,
+                    default_literal.as_ref(),
+                    *truncate,
+                    &src_dt,
+                    &sink_dt,
+                    dst_schemaless,
+                )?)
+            }
             None => None,
         };
         let parsed_default = if switch.is_some() {
@@ -430,8 +485,24 @@ fn build_conversions(
         let mut ctx = ConversionContext::passthrough();
         ctx.truncate = *truncate;
         ctx.default = parsed_default;
+        // For schemaless sources the sampled `source` type is non-
+        // authoritative — we set `plan.source = None` so the unified
+        // `TransformOp::Convert` dispatches on the actual `Value`
+        // variant per cell at apply time. For typed sources we record
+        // the resolved source `DataType` so the static fast path can
+        // skip per-cell type resolution.
+        let plan_source_dt = if src_schemaless {
+            None
+        } else {
+            Some(
+                src_field
+                    .as_ref()
+                    .map(|f| f.data_type.clone())
+                    .unwrap_or_else(|| sink_dt.clone()),
+            )
+        };
         plans.push(ColumnConversionPlan {
-            source: src_field.data_type.clone(),
+            source: plan_source_dt,
             sink: sink_dt,
             ctx,
             switch: switch_table,
@@ -478,12 +549,14 @@ mod tests {
     use crate::mapping::ColumnMapping;
     use crate::model::{Field, Schema};
     use crate::traits::{MockSink, MockSource, MockStorage};
+    use crate::util::ConcurrencyManager;
 
     fn assembled(rules: Vec<ColumnMapping>) -> AssembledFlow {
         let mut src = MockSource::new();
         src.expect_schemaless().return_const(false);
         src.expect_body_data_type()
             .returning(|| crate::types::DataType::Json);
+        src.expect_name().return_const("test-source".to_string());
         let mut sink = MockSink::new();
         sink.expect_schemaless().return_const(false);
         AssembledFlow {
@@ -504,12 +577,20 @@ mod tests {
                 conflict: None,
             },
             interval: Duration::from_millis(10),
+            jitter: Duration::ZERO,
             query_timeout: Duration::from_secs(5),
             sampling: SamplingConfig::Disabled,
             access_check: false,
             fields_check: true,
             inserts_check: false,
             cursor_persistence: CursorPersistence::ColumnCursor,
+            lock_handle: {
+                let mut m = ConcurrencyManager::new();
+                m.register_source("test-source", u32::MAX);
+                m.register_sink("test-sink", u32::MAX);
+                m.register_storage("test-storage", u32::MAX);
+                m.handle("test-source", "test-sink", "test-storage")
+            },
         }
     }
 

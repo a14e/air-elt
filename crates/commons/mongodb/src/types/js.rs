@@ -17,7 +17,7 @@
 //!
 //! ## Cursor
 //!
-//! `can_be_cursor() = false`. JavaScript code is a free-form string
+//! `cursor_compatible() = false`. JavaScript code is a free-form string
 //! with no useful order semantics for ELT purposes.
 
 use std::any::Any;
@@ -52,7 +52,7 @@ impl DynType for MongoJsType {
         Self::KIND
     }
 
-    fn can_be_cursor(&self) -> bool {
+    fn cursor_compatible(&self) -> bool {
         false
     }
 
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn cannot_be_cursor() {
-        assert!(!MongoJsType.can_be_cursor());
+        assert!(!MongoJsType.cursor_compatible());
     }
 
     #[test]

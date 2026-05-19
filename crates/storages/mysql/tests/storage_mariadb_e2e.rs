@@ -46,7 +46,7 @@ async fn migrate_and_upsert_cursor_on_mariadb() {
         .expect("save 2 (upsert)");
 
     let loaded = storage
-        .load_cursor(flow)
+        .load_cursor(flow, &[air_elt_core::types::DataType::Int64])
         .await
         .expect("load")
         .expect("present");

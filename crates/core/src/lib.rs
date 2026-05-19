@@ -7,6 +7,7 @@ pub mod registry;
 pub mod traits;
 pub mod transform;
 pub mod types;
+pub mod util;
 pub mod validation;
 
 pub use model::{

@@ -175,7 +175,7 @@ config = {{ url = "{mongo_url}", database = "{src_db}", max-await-time = "200ms"
 [[sinks]]
 name = "ch_sink"
 type = "clickhouse"
-config = {{ url = "{ch_url}", database = "{ch_db}" }}
+config = {{ url = "{ch_url}", database = "{ch_db}", user = "default", password = "" }}
 
 [[storages]]
 name = "mongo_state"

@@ -186,7 +186,7 @@ mod tests {
         let src = schema_of(&[("a", DataType::Int16)]);
         let sink = schema_of(&[("a", DataType::Int64)]);
         let plan = ColumnConversionPlan {
-            source: DataType::Int16,
+            source: Some(DataType::Int16),
             sink: DataType::Int64,
             ctx: ConversionContext::passthrough(),
             switch: None,
@@ -388,7 +388,7 @@ mod tests {
         let src = schema_of(&[("t", DataType::Timestamp)]);
         let sink = schema_of(&[("t", DataType::Date)]);
         let plan = ColumnConversionPlan {
-            source: DataType::Timestamp,
+            source: Some(DataType::Timestamp),
             sink: DataType::Date,
             ctx: ConversionContext::passthrough(),
             switch: None,
@@ -415,7 +415,7 @@ mod tests {
         let src = schema_of(&[("v", DataType::Int64)]);
         let sink = schema_of(&[("v", DataType::Int32)]);
         let plan = ColumnConversionPlan {
-            source: DataType::Int64,
+            source: Some(DataType::Int64),
             sink: DataType::Int32,
             ctx: ConversionContext::passthrough(),
             switch: None,

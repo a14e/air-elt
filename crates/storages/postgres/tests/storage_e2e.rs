@@ -43,7 +43,14 @@ async fn migrate_and_upsert_cursor() {
         .expect("validate_access post-migrate");
 
     let flow = "flow_one";
-    assert!(storage.load_cursor(flow).await.unwrap().is_none());
+    let cursor_types = [air_elt_core::types::DataType::Int64];
+    assert!(
+        storage
+            .load_cursor(flow, &cursor_types)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let state = CursorState::new(vec![CursorFieldValue {
         name: "id".into(),
@@ -53,7 +60,14 @@ async fn migrate_and_upsert_cursor() {
         .save_cursor(flow, &state, false)
         .await
         .expect("save_cursor");
-    assert_eq!(storage.load_cursor(flow).await.unwrap().unwrap(), state);
+    assert_eq!(
+        storage
+            .load_cursor(flow, &cursor_types)
+            .await
+            .unwrap()
+            .unwrap(),
+        state
+    );
 
     let state2 = CursorState::new(vec![CursorFieldValue {
         name: "id".into(),
@@ -64,7 +78,13 @@ async fn migrate_and_upsert_cursor() {
         .await
         .expect("upsert");
     assert_eq!(
-        storage.load_cursor(flow).await.unwrap().unwrap().fields[0].value,
+        storage
+            .load_cursor(flow, &cursor_types)
+            .await
+            .unwrap()
+            .unwrap()
+            .fields[0]
+            .value,
         Value::Int64(43)
     );
 
@@ -128,8 +148,18 @@ async fn cursor_roundtrip_all_value_variants() {
             .save_cursor(flow, &state, false)
             .await
             .unwrap_or_else(|e| panic!("save {flow}: {e}"));
+        // Each variant's expected `DataType` mirrors `Value::data_type()`.
+        // `Null` carries no type; loading a null cursor falls back to a
+        // freely-typed `Json` slot — the envelope itself self-describes
+        // and the canonical decode path doesn't inspect the dispatcher
+        // type for non-Custom envelopes.
+        let types = vec![
+            value
+                .data_type()
+                .unwrap_or(air_elt_core::types::DataType::Json),
+        ];
         let loaded = storage
-            .load_cursor(flow)
+            .load_cursor(flow, &types)
             .await
             .unwrap_or_else(|e| panic!("load {flow}: {e}"))
             .unwrap_or_else(|| panic!("missing cursor for {flow}"));
@@ -208,13 +238,18 @@ async fn save_cursor_and_resume_token_dry_run_skip_writes() {
         name: "id".into(),
         value: Value::Int64(7),
     }]);
+    let cursor_types = [air_elt_core::types::DataType::Int64];
 
     storage
         .save_cursor(flow, &state, true)
         .await
         .expect("dry-run save_cursor");
     assert!(
-        storage.load_cursor(flow).await.unwrap().is_none(),
+        storage
+            .load_cursor(flow, &cursor_types)
+            .await
+            .unwrap()
+            .is_none(),
         "dry-run save_cursor must not persist a row"
     );
 
@@ -222,7 +257,14 @@ async fn save_cursor_and_resume_token_dry_run_skip_writes() {
         .save_cursor(flow, &state, false)
         .await
         .expect("real save_cursor");
-    assert_eq!(storage.load_cursor(flow).await.unwrap().unwrap(), state);
+    assert_eq!(
+        storage
+            .load_cursor(flow, &cursor_types)
+            .await
+            .unwrap()
+            .unwrap(),
+        state
+    );
 
     let token = serde_json::json!({ "_data": "82DRY" });
     storage
@@ -260,7 +302,14 @@ async fn cockroach_migrate_and_save_load_round_trip() {
     storage.migrate().await.expect("cockroach migrate");
 
     let flow = "flow_x";
-    assert!(storage.load_cursor(flow).await.unwrap().is_none());
+    let cursor_types = [air_elt_core::types::DataType::Int64];
+    assert!(
+        storage
+            .load_cursor(flow, &cursor_types)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     let state = CursorState::new(vec![CursorFieldValue {
         name: "id".into(),
@@ -270,7 +319,14 @@ async fn cockroach_migrate_and_save_load_round_trip() {
         .save_cursor(flow, &state, false)
         .await
         .expect("cockroach save_cursor");
-    assert_eq!(storage.load_cursor(flow).await.unwrap().unwrap(), state);
+    assert_eq!(
+        storage
+            .load_cursor(flow, &cursor_types)
+            .await
+            .unwrap()
+            .unwrap(),
+        state
+    );
 
     let token = serde_json::json!({ "_data": "82AABB" });
     storage

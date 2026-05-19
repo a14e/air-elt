@@ -6,6 +6,7 @@ use crate::error::RuntimeResult;
 use crate::model::{
     Batch, CursorState, ReadSpec, Schema, SinkCtx, SourceCtx, WriteReport, WriteSpec,
 };
+use crate::types::DataType;
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
@@ -61,12 +62,29 @@ pub trait Source: Send + Sync {
         false
     }
 
-    /// `true` for sources that have no authoritative column schema —
+    /// `true` iff this source's schema is sampled / unauthoritative —
     /// notably MongoDB, where collections accept any BSON shape.
-    /// Mirrors `Sink::schemaless()`. Used by the `*` wildcard expansion:
-    /// when **both** source and sink are schemaless, wildcard
-    /// expansion falls back to raw passthrough rather than column
-    /// enumeration. SQL connectors keep the default `false`.
+    /// Mirrors `Sink::schemaless()`.
+    ///
+    /// Two consequences for schemaless sources:
+    ///
+    /// 1. **Wildcard expansion**: when **both** source and sink are
+    ///    schemaless, `*` falls back to raw passthrough rather than
+    ///    column enumeration.
+    /// 2. **Transform compile**: the per-column conversion plan keys
+    ///    off the **sink** column type only (the authoritative side).
+    ///    The compiler emits dynamic-source `TransformOp::Convert` ops
+    ///    (with `ColumnConversionPlan.source = None`); the runtime
+    ///    resolves the source `DataType` per cell from the actual
+    ///    `Value` variant.
+    ///    This stops a sample-derived "source type" hypothesis from
+    ///    blowing up the runtime on legitimate cross-doc shape drift
+    ///    (e.g. 99 docs with `Int32` + one `Int64`).
+    ///
+    /// SQL connectors keep the default `false`: `information_schema`
+    /// is an authoritative DDL contract, and a row with a different
+    /// type from what was declared is a database integrity violation,
+    /// correctly surfaced at the Convert layer.
     fn schemaless(&self) -> bool {
         false
     }
@@ -81,6 +99,21 @@ pub trait Source: Send + Sync {
     /// to `DataType::Custom(BsonObjectType)`.
     fn body_data_type(&self) -> crate::types::DataType {
         crate::types::DataType::Json
+    }
+
+    /// Upper bound on concurrent uses of this source's underlying
+    /// connection pool. The validation pipeline (and any other
+    /// shared-pool caller) builds a `tokio::sync::Semaphore` per
+    /// component sized to this value and gates every probe / call
+    /// through it, so a config with thousands of flows referencing the
+    /// same source does not stampede the server's accept queue.
+    ///
+    /// Default is unbounded (`u32::MAX`). Connectors that own a
+    /// connection pool MUST override this to mirror their pool's
+    /// `max-connections` so the semaphore matches the pool's actual
+    /// permit budget.
+    fn max_connections(&self) -> u32 {
+        u32::MAX
     }
 }
 
@@ -135,6 +168,17 @@ pub trait Sink: Send + Sync {
     fn supports_deletes(&self) -> bool {
         true
     }
+
+    /// Upper bound on concurrent uses of this sink's underlying
+    /// connection pool. See [`Source::max_connections`] for the full
+    /// rationale — the validation pipeline gates probes through a
+    /// per-sink `tokio::sync::Semaphore` sized to this value.
+    ///
+    /// Default is unbounded (`u32::MAX`). Connectors that own a
+    /// connection pool MUST override.
+    fn max_connections(&self) -> u32 {
+        u32::MAX
+    }
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -142,7 +186,18 @@ pub trait Sink: Send + Sync {
 pub trait Storage: Send + Sync {
     async fn validate_access(&self) -> RuntimeResult<()>;
     async fn migrate(&self) -> RuntimeResult<()>;
-    async fn load_cursor(&self, flow: &str) -> RuntimeResult<Option<CursorState>>;
+    /// Load the persisted cursor for `flow`. `cursor_types` is the
+    /// list of expected canonical [`DataType`]s for each cursor field,
+    /// in the same order as `ReadSpec.cursor_fields` — resolved by the
+    /// caller from the source schema. Storage impls dispatch the JSON
+    /// payload through [`DataType::decode_cursor_json`] per field so
+    /// `Value::Custom` cursor values (e.g. `MongoObjectIdValue`) can
+    /// be reconstructed without a global registry.
+    async fn load_cursor(
+        &self,
+        flow: &str,
+        cursor_types: &[DataType],
+    ) -> RuntimeResult<Option<CursorState>>;
     async fn save_cursor(
         &self,
         flow: &str,
@@ -172,5 +227,16 @@ pub trait Storage: Send + Sync {
              persistence — switch to a backend that does (postgres / mysql / mongodb)"
                 .into(),
         ))
+    }
+
+    /// Upper bound on concurrent uses of this storage's underlying
+    /// connection pool. See [`Source::max_connections`] for the full
+    /// rationale — the validation pipeline gates probes through a
+    /// per-storage `tokio::sync::Semaphore` sized to this value.
+    ///
+    /// Default is unbounded (`u32::MAX`). Storage backends that own a
+    /// connection pool MUST override.
+    fn max_connections(&self) -> u32 {
+        u32::MAX
     }
 }

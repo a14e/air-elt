@@ -402,6 +402,23 @@ fn validate_post_merge(root: &RootConfig) -> Result<(), ConfigError> {
                 reason: format!("flow {flow_name:?} has zero cursor interval"),
             });
         }
+        // `jitter` is operator-facing — validate the upper bound (≤
+        // interval) only when explicitly set. The auto-default
+        // (`min(interval, 5min)`) is by construction never above
+        // interval, so it never trips this check. Zero jitter ("0s") is
+        // intentionally permitted: it disables the first-tick offset
+        // entirely.
+        if let Some(jitter) = flow.cursor.jitter {
+            if jitter > flow.cursor.interval {
+                return Err(ConfigError::Invalid {
+                    reason: format!(
+                        "flow {flow_name:?} cursor.jitter must be ≤ interval (got jitter={}, interval={})",
+                        crate::config::interval::to_iso(&jitter),
+                        crate::config::interval::to_iso(&flow.cursor.interval),
+                    ),
+                });
+            }
+        }
         if let Some(t) = flow.query_timeout {
             if t.is_zero() {
                 return Err(ConfigError::Invalid {
@@ -736,6 +753,129 @@ id = "id"
             err.to_string().contains("zero"),
             "expected zero-duration error, got: {err}"
         );
+    }
+
+    /// `cursor.jitter` must be `<= interval`. A config with `jitter =
+    /// "11s"` and `interval = "10s"` is rejected with a
+    /// `ConfigError::Invalid` naming both durations so the operator
+    /// can fix the offending pair. The equal-to-interval case is
+    /// accepted — see `cursor_jitter_equal_to_interval_accepted`.
+    #[test]
+    fn cursor_jitter_exceeding_interval_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "config.toml",
+            r#"
+[[sources]]
+name = "pg"
+type = "postgres"
+config = {}
+[[sinks]]
+name = "pg"
+type = "postgres"
+config = {}
+[[storages]]
+name = "pg"
+type = "postgres"
+config = {}
+[flow.f]
+source = "pg"
+sink = "pg"
+storage = "pg"
+from = "t"
+to = "t"
+cursor = { fields = ["id"], interval = "10s", jitter = "11s" }
+[flow.f.mapping]
+id = "id"
+"#,
+        );
+        let err = load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("jitter") && msg.contains("≤ interval"),
+            "expected jitter-cap error, got: {msg}"
+        );
+    }
+
+    /// `cursor.jitter == interval` is the boundary case and must be
+    /// accepted — the runner's offset lies in `[0, jitter)` so even at
+    /// equality the first-tick wait stays strictly below `interval`.
+    #[test]
+    fn cursor_jitter_equal_to_interval_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "config.toml",
+            r#"
+[[sources]]
+name = "pg"
+type = "postgres"
+config = {}
+[[sinks]]
+name = "pg"
+type = "postgres"
+config = {}
+[[storages]]
+name = "pg"
+type = "postgres"
+config = {}
+[flow.f]
+source = "pg"
+sink = "pg"
+storage = "pg"
+from = "t"
+to = "t"
+cursor = { fields = ["id"], interval = "10s", jitter = "10s" }
+[flow.f.mapping]
+id = "id"
+"#,
+        );
+        let root = load(&path).expect("jitter == interval must load");
+        let flow = root.flow.get("f").expect("flow f present");
+        assert_eq!(flow.cursor.jitter, Some(std::time::Duration::from_secs(10)));
+        assert_eq!(
+            flow.cursor.effective_jitter(),
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    /// `cursor.jitter = "0s"` is explicitly accepted — operators use it
+    /// to disable startup jitter for e2e / deterministic test runs.
+    #[test]
+    fn cursor_jitter_zero_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "config.toml",
+            r#"
+[[sources]]
+name = "pg"
+type = "postgres"
+config = {}
+[[sinks]]
+name = "pg"
+type = "postgres"
+config = {}
+[[storages]]
+name = "pg"
+type = "postgres"
+config = {}
+[flow.f]
+source = "pg"
+sink = "pg"
+storage = "pg"
+from = "t"
+to = "t"
+cursor = { fields = ["id"], interval = "1s", jitter = "0s" }
+[flow.f.mapping]
+id = "id"
+"#,
+        );
+        let root = load(&path).expect("zero jitter must load");
+        let flow = root.flow.get("f").expect("flow f present");
+        assert_eq!(flow.cursor.jitter, Some(std::time::Duration::ZERO));
+        assert_eq!(flow.cursor.effective_jitter(), std::time::Duration::ZERO);
     }
 
     #[test]

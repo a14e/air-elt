@@ -69,7 +69,7 @@ Mongo has no SQL surface, so `commons-mongodb` ships its own helper set:
 
 ClickHouse is sink-only today; `commons-clickhouse` carries the helpers shared with any future CH source. Reuse these — do not roll up ad-hoc HTTP / type-parsing per call site.
 
-- **`commons-clickhouse::client`** — `reqwest::Client` wrapper plus `ChClientConfig` (URL, database, user, password, `PoolSettings`). `ping()`, `query_text()`, `insert_row_binary()`. We use `reqwest` directly rather than the `clickhouse` 0.13 crate because that crate's typed `Client::insert::<T: Row>` API doesn't fit dynamic `Vec<Value>` batches.
+- **`commons-clickhouse::client`** — `reqwest::Client` wrapper plus `ChClientConfig` (URL, database, `user`, `password`, `PoolSettings`). `user` and `password` are required strings — use `""` for the authless variant on CH instances with `<networks>` open for the `default` user. Both auth headers (`X-ClickHouse-User` / `X-ClickHouse-Key`) are always emitted regardless of value; no "skip header when empty" branching. `ping()`, `query_text()`, `insert_row_binary()`. We use `reqwest` directly rather than the `clickhouse` 0.13 crate because that crate's typed `Client::insert::<T: Row>` API doesn't fit dynamic `Vec<Value>` batches.
 - **`commons-clickhouse::identifier`** — backtick quoting (CH shares MySQL's backtick syntax). `quote_ident`, `quote_qualified`, `quote_columns`, `split_qualified`.
 - **`commons-clickhouse::ch_type_parser`** — recursive parser for `system.columns.type` strings. Returns `ParsedType { data_type, nullable }`. `Nullable(T)` strips onto the `nullable` flag; `LowCardinality(T)` strips transparently. Composite shapes (`Array`, `Tuple`, `Map`, `Nested`, geo) map onto `DataType::Json`.
 - **`commons-clickhouse::schema`** — `fetch_schema(client, table)` runs `SELECT name, type FROM system.columns … FORMAT JSON` and folds the result into a canonical `Schema`.
@@ -99,7 +99,7 @@ Future no-delete sinks (e.g. an append-only event-store backend) MUST repeat the
 Canonical types are the only pivot — connectors do NOT introduce parallel enums. Each connector maps `native → DataType` on read and `DataType → native` on write.
 
 - **`core::types::{DataType, Value}`** — the type enums. `Text`/`Bytes` carry `size: Option<u32>` (None = unbounded). `BigInt { width }` covers integer-only `numeric(p, 0)` (carrying `num_bigint::BigInt`); `Decimal { precision, scale }` covers fractional `numeric(p, s>0)` (carrying `bigdecimal::BigDecimal`). `Int8` is the canonical signed 8-bit pivot (from MySQL tinyint and ClickHouse Int8). Unsigned variants exist solely for MySQL/MariaDB UNSIGNED columns — pg never produces them.
-- **`core::types::matrix`** — validation-time width check. `is_compatible` is the lossless matrix; `is_compatible_with_truncate` widens to admit narrowing arms when a mapping has `truncate=true`. Reverse paths (`BigInt/Decimal → Int*`, `Float ↔ BigInt/Decimal`) are deliberately rejected by the lossless matrix.
+- **`core::types::matrix`** — validation-time width check. `is_compatible` is the lossless matrix; `is_compatible_with_truncate` widens to admit narrowing arms when a mapping has `truncate=true`. Reverse paths `BigInt/Decimal → Int*` and `Float → BigInt/Decimal` stay rejected at lossless level. `Decimal → Float64`/`Float32` is admitted losslessly only when precision and scale are both known and `precision ≤ 15` (Float64) / `≤ 7` (Float32); wider / unbounded Decimal lands in the truncate-tolerant matrix and the runtime dispatcher (overflow saturates to ±INFINITY).
 - **`core::types::convert`** — runtime per-cell dispatcher (`convert(value, src, dst, &ctx)`). Identity / pure-widening pairs return the value unchanged. Connectors must NOT implement these conversions themselves; the Transform layer wraps a `ColumnConversionPlan` in `TransformOp::Convert` and dispatches via `convert` at apply time.
 - **`core::types::default_value::parse`** — parses a TOML default literal against the sink `DataType`. Bytes columns require a typed prefix (`hex:` / `base64:` / `utf8:` / `bin:`).
 - The compiled `Transform` program is owned by `DerivedPlans` and rebuilt whenever the schema is re-introspected.
@@ -116,6 +116,17 @@ Backend-specific types that don't reduce to canonical pivots live behind `DataTy
 - **`DynType::is_object() -> bool`** (default `false`). Set to `true` for types that wrap a whole-document object, signalling that they may legally feed a body slot for schemaless raw passthrough. `BsonObjectType` overrides to `true`. Mirrored at the canonical level by `DataType::is_object()` (`true` for `Json`, delegates for `Custom(t)`).
 - `Custom` forbidden as cursor field; `Value::Custom` / `DataType::Custom` Deserialize errors out (cursor-storage JSON never carries one).
 - **Existing custom kinds**: `mongodb.object_id`, `mongodb.javascript`, `mongodb.bson_object` (whole-document raw passthrough — `commons-mongodb::types::bson_object`), `postgresql.hll`.
+
+## Sampled schema is a validation-time artifact only
+
+For schemaless sources or sinks (Mongo today; future doc-stores / queues), the actual cell types only become known at row time — `core::types::convert` already dispatches on the actual `Value` variant when needed. The static `ColumnConversionPlan` baked into `TransformOp::Convert` is meant as a *fast path* for typed sides where `information_schema` (or equivalent) is the contract; it MUST NOT be load-bearing when the source side is schemaless. For sources whose schema is sampled (`commons-mongodb::infer` / `sampling`), the inferred types are a hypothesis: int32 in 99 docs + int64 in one, a field nullable in the sample but never null in production, a rare variant the sample missed. Today the compiled plan treats the sampled type as fact, so those legitimate edge cases blow up as runtime type mismatches.
+
+The rule:
+
+- Sampled schema is consumed by the validation pipeline only — mapping reference resolution and (for direct mappings against typed sinks) sink-side compatibility checks. The matrix narrowing check and nullability check are skipped when `Source::schemaless() == true`; the sampled `nullable` flag is non-authoritative (a sample can never prove NOT NULL). The user can still opt back in to those checks by leaving `[flow.<name>.validation] fields = true` explicitly — operators get the (admittedly-hypothetical) matrix check against the sample.
+- `Source::schemaless()` (mirroring the existing `Sink::schemaless()`) is the flag a schemaless connector sets. For schemaless sources the Transform compiler emits a dynamic-source `TransformOp::Convert` — the same variant as the typed path, but with `ColumnConversionPlan.source = None`. `plan.sink` is the sink's authoritative `DataType`; at apply time the runtime resolves the source `DataType` per cell via `Value::data_type()` and dispatches through the standard `core::types::convert` matrix. The sampled "source type" never enters per-row decisions — for switch-table compile and debug logs we still look at the resolved sink type or the sample, but `plan.source = None` is the on-disk signal that the source is schemaless.
+- For typed sources (pg, mysql, …) the static `Convert` plan path stays as-is — `information_schema` is the contract, and a row with a different type from what it declared is a database integrity violation, correctly surfaced at the Convert layer.
+- When *both* sides are schemaless, the type matrix degenerates to identity — Transform is the existing raw-passthrough fast path (single `Body` op writing the `_root` target).
 
 ## Schema on context
 
@@ -157,7 +168,19 @@ Body construction for relational sources goes through **`air_elt_core::transform
 
 ## Validation pipeline
 
-Two stages: `assemble` (no I/O) → `validate` (probes, schema introspection, matrix, sampling). The pipeline groups assembled flows by `Source::name()` and runs them through `futures::join_all` — one async worker per source, sequential within. The CLI prints `running validation in {N} workers` at start. Output is sorted back into config order so error reporting is deterministic.
+Two stages: `assemble` (no I/O) → `validate` (probes, schema introspection, matrix, sampling). All assembled flows are driven concurrently through `futures::stream::iter(...).for_each_concurrent(None, validate_flow)` — no per-source grouping. Backend contention is bounded purely by the per-component `tokio::sync::Semaphore`s built in `assemble`, sized to each backend's `max-connections`. The CLI prints `running validation for {N} flows; semaphores cap {source=K, sink=L, storage=M}` at start. Output is sorted back into config order so error reporting is deterministic.
+
+### Concurrency: per-component semaphores
+
+`assemble` builds one `tokio::sync::Semaphore` per declared `[[sources]]`/`[[sinks]]`/`[[storages]]` instance, with permit count = the component's `max-connections` (capped at `Semaphore::MAX_PERMITS`). Flows sharing a component share the same `Arc<Semaphore>`. Each flow gets a `FlowLockHandle` (`core::util::concurrency`) that exposes `acquire_source()` / `acquire_sink()` / `acquire_storage()` — one permit per component kind.
+
+**Locks must be strictly local — held only across the single I/O call that touches the component, then released. Never hold a permit across an unrelated `await` or across two backend calls; that's a parasitic block on sibling flows that share the pool.** The runner enforces this by scoping each `acquire_*` to a tight `{ let _g = ...acquire_X().await?; <single call> }` block: `ensure_built` takes source for source `build_context`, releases, takes sink for sink `build_context`, releases; cursor load/save take storage; `read_batch` / `sample` take source; `write_batch` takes sink. Transform runs without any permit (pure compute). The validation pipeline mirrors this — each probe / schema fetch scopes its own permit.
+
+Because no call site ever holds two permits at once, **deadlock between flows is structurally impossible** — there is no canonical lock order to maintain, no AB-BA hazard to defend against. A long PG read in one flow no longer blocks an unrelated CH write in another flow that happens to share the storage; the two only contend on permits they both actually use.
+
+Access probes inside validation are additionally wrapped in `retry_transient` (`core::util::retry`): three attempts (50 ms → 250 ms → 1.25 s), retrying only `RuntimeError::Backend`; every other error is authoritative and fails immediately. The runtime tick has its own exponential backoff (`1s → 4× → 1h cap`) on `Err`; the inter-tick idle sleep and the backoff sleep both happen AFTER the tick returns, so they never hold any permit. `dry_run` governs *what* the tick does (`sample` vs `read_batch`, no-op sink write, skip cursor save) — not *whether* it acquires.
+
+`max-connections = 0` is rejected at `build_*` time (`PoolSettingsError::ZeroMaxConnections`): a zero-permit semaphore would hang every flow forever. Operators see a config error before any I/O is attempted.
 
 The flow-level `[flow.<name>.validation]` block exposes four toggles: `access`, `fields`, `inserts`, `sampling`. The first three default `true` and gate the access probes / matrix / sink write probe respectively. `sampling` follows the per-backend `SourceFactory::sampling_default()` — Mongo enables it (size 100), SQL keeps it disabled.
 
@@ -177,9 +200,11 @@ Optional `[flow.<name>.conflict]` block. `core::config::conflict::{ConflictConfi
 
 ## Interval parsing, secrets, config
 
-- **`core::config::interval`** — parses `1s`, `1h30m`, `PT1H5S`, etc. into `Duration`. Used for `CursorConfig::interval` and `query-timeout`.
+- **`core::config::interval`** — parses `1s`, `1h30m`, `PT1H5S`, etc. into `Duration`. Used for `CursorConfig::interval` and `query-timeout`. `parse_allow_zero` / `deserialize_opt_allow_zero` are the zero-permitting variants used by config fields whose `"0s"` value carries explicit meaning (today: `cursor.jitter`).
 - **`core::config::env_expand`** — runs on raw TOML before parsing. Resolves `${VAR}` via env → `[secrets]` map → default → error. `std::env::var(...)` in connectors is forbidden.
-- **`core::config::loader::load`** — entry point. Enforces 16 MiB file cap, no absolute-path includes, symlink-loop dedupe, `${VAR}` expansion, and structural validation (`batch_limit ≥ 1`, `batch_limit × mapping_cols ≤ 60_000`, cursor fields ⊆ mapping, `conflict.key` ⊆ mapping).
+- **`core::config::loader::load`** — entry point. Enforces 16 MiB file cap, no absolute-path includes, symlink-loop dedupe, `${VAR}` expansion, and structural validation (`batch_limit ≥ 1`, `batch_limit × mapping_cols ≤ 60_000`, cursor fields ⊆ mapping, `conflict.key` ⊆ mapping, `cursor.jitter ≤ cursor.interval` when set).
+- **`CursorConfig::effective_jitter`** — resolves `cursor.jitter` to a concrete `Duration`. Defaults to `min(interval, 5min)` when the operator omits the field — the full interval, capped at five minutes. Explicit `"0s"` is honoured as "disable jitter". The runner sleeps a deterministic offset `ahash(flow.name) mod jitter` before the first tick (`FlowRunner::jitter_offset`, using `ahash::AHasher::default()` — the workspace's standard deterministic hasher), spreading concurrent flows across the cadence period. For typical scaffolds (1s interval, ≤5 max-connections per pool) this gives ≥0.5 ops/ms even at 500 flows fan-in to one sink. Set `cursor.jitter = "0s"` to disable.
+- **Tick scheduling is fixed-rate, anchored to `UNIX_EPOCH`** (see `FlowRunner::next_tick_instant`). The flow's tick grid is the set `{ t : (t - offset_ns) mod interval == 0 }` where `offset_ns = hash(flow_name) mod min(jitter, interval)`. After each tick that returns an empty batch, the runner sleeps to the **next future** grid point — missed grid points (slow tick, long backoff, busy semaphore) are NEVER caught up. This keeps the per-flow jitter spread stable across the lifetime of the process and across restarts, and prevents back-to-back catchup bursts that would re-cluster flows after any slow phase. The math is a pure function and unit-tested independently of the tokio runtime.
 
 ## Testing
 

@@ -423,6 +423,7 @@ name = "air-elt-storage-mysql"
 version = "0.1.0"
 dependencies = [
  "air-elt-commons",
+ "air-elt-commons-mongodb",
  "air-elt-commons-mysql",
  "air-elt-commons-testing",
  "air-elt-core",
@@ -443,6 +444,7 @@ name = "air-elt-storage-postgres"
 version = "0.1.0"
 dependencies = [
  "air-elt-commons",
+ "air-elt-commons-mongodb",
  "air-elt-commons-pg",
  "air-elt-commons-testing",
  "air-elt-core",

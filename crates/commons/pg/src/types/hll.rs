@@ -47,7 +47,7 @@ impl DynType for PgHllType {
         Self::KIND
     }
 
-    fn can_be_cursor(&self) -> bool {
+    fn cursor_compatible(&self) -> bool {
         false
     }
 
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn cannot_be_cursor() {
-        assert!(!PgHllType.can_be_cursor());
+        assert!(!PgHllType.cursor_compatible());
     }
 
     #[test]

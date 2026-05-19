@@ -23,7 +23,7 @@
 //!
 //! ## Cursor
 //!
-//! `can_be_cursor() = false`. Whole documents have no useful order.
+//! `cursor_compatible() = false`. Whole documents have no useful order.
 
 use std::any::Any;
 
@@ -62,7 +62,7 @@ impl DynType for BsonObjectType {
         Self::KIND
     }
 
-    fn can_be_cursor(&self) -> bool {
+    fn cursor_compatible(&self) -> bool {
         false
     }
 
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn cannot_be_cursor() {
-        assert!(!BsonObjectType.can_be_cursor());
+        assert!(!BsonObjectType.cursor_compatible());
     }
 
     #[test]

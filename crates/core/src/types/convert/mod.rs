@@ -14,6 +14,7 @@ pub mod bigint_narrow;
 pub mod bytes_narrow;
 pub mod context;
 pub mod decimal_narrow;
+pub mod decimal_to_float;
 pub mod dispatch;
 pub mod error;
 pub mod float_narrow;

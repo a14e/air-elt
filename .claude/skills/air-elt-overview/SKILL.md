@@ -144,3 +144,7 @@ Vault secret retrieval (only `$ENV_VAR` / literals work), privilege-excess check
 ## Testing
 
 Inverted pyramid: heavy e2e tests against real databases, focused unit tests for pure logic. No database mocks. See `project-conventions::Testing` for handles and rules.
+
+## Manual smoke test
+
+A Python+uv orchestrator at `manual-tests/mongo-to-pg-10k-rps/` (not bash, cross-platform) runs a continuous mongo→pg pipeline for at least 5 minutes and captures replication lag plus daemon CPU/RSS. Containers persist after `run.py` exits — invoke `cleanup.py` explicitly to tear them down. See the folder's `README.md` for usage.

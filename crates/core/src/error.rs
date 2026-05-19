@@ -429,4 +429,13 @@ impl RuntimeError {
     }
 }
 
+impl From<air_elt_commons::pool_settings::PoolSettingsError> for RuntimeError {
+    fn from(e: air_elt_commons::pool_settings::PoolSettingsError) -> Self {
+        // A connector-config invariant violation surfaces at
+        // `build_*` time; treat it as a plain operator-facing error
+        // rather than a backend/network failure.
+        RuntimeError::Other(e.to_string())
+    }
+}
+
 pub type RuntimeResult<T> = Result<T, RuntimeError>;

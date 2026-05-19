@@ -45,8 +45,14 @@ pub struct ChClientConfig {
     /// string). Example: `http://localhost:8123`.
     pub url: String,
     pub database: String,
-    pub user: Option<String>,
-    pub password: Option<String>,
+    /// CH user. Required — never `Option`. For authless CH instances
+    /// (default user, no password) set `user = "default"` and
+    /// `password = ""`; the empty `X-ClickHouse-Key` header still goes
+    /// over the wire and CH's auth accepts the empty match.
+    pub user: String,
+    /// CH password matching `user`. Required — never `Option`. Use
+    /// `""` for authless setups; see the comment on `user`.
+    pub password: String,
     pub pool: PoolSettings,
     /// INSERT body compression. Defaults to LZ4.
     pub compression: ChCompression,
@@ -79,12 +85,13 @@ pub struct ChClient {
 impl ChClient {
     pub fn connect(config: ChClientConfig) -> Result<Self, ChClientError> {
         let mut headers = HeaderMap::new();
-        if let Some(user) = &config.user {
-            insert_header(&mut headers, "X-ClickHouse-User", user)?;
-        }
-        if let Some(password) = &config.password {
-            insert_header(&mut headers, "X-ClickHouse-Key", password)?;
-        }
+        // Always emit both auth headers — empty strings are a valid
+        // wire shape for authless CH (CH's auth accepts the empty-
+        // password match). Branching on emptiness would silently
+        // re-introduce the bug where a missing user header caused
+        // CH 24.3+ to reject the connection with a cryptic 403.
+        insert_header(&mut headers, "X-ClickHouse-User", &config.user)?;
+        insert_header(&mut headers, "X-ClickHouse-Key", &config.password)?;
         insert_header(&mut headers, "X-ClickHouse-Database", &config.database)?;
         // CH HTTP has no separate per-statement timeout — the request
         // timeout doubles as the unified call cap.
@@ -262,8 +269,8 @@ mod tests {
         ChClient::connect(ChClientConfig {
             url,
             database: "default".into(),
-            user: None,
-            password: None,
+            user: "default".into(),
+            password: String::new(),
             pool: PoolSettings {
                 connect: Duration::from_secs(1),
                 statement: Duration::from_secs(2),

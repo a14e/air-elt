@@ -68,6 +68,7 @@ pub fn default_source_mock() -> MockSource {
     s.expect_schemaless().return_const(false);
     s.expect_body_data_type()
         .returning(|| crate::types::DataType::Json);
+    s.expect_max_connections().return_const(u32::MAX);
     s
 }
 
@@ -79,6 +80,7 @@ pub fn raw_passthrough_source_mock() -> MockSource {
     s.expect_schemaless().return_const(true);
     s.expect_body_data_type()
         .returning(|| crate::types::DataType::Json);
+    s.expect_max_connections().return_const(u32::MAX);
     s
 }
 
@@ -193,17 +195,28 @@ pub fn mock_sink_ok() -> MockSink {
 
 pub fn mock_storage_ok() -> MockStorage {
     let mut s = MockStorage::new();
-    s.expect_load_cursor().returning(|_| Ok(None));
+    s.expect_load_cursor().returning(|_, _| Ok(None));
     s.expect_save_cursor().returning(|_, _, _| Ok(()));
     s
 }
 
 pub fn mock_storage_save_fails() -> MockStorage {
     let mut s = MockStorage::new();
-    s.expect_load_cursor().returning(|_| Ok(None));
+    s.expect_load_cursor().returning(|_, _| Ok(None));
     s.expect_save_cursor()
         .returning(|_, _, _| Err(RuntimeError::Other("storage boom".into())));
     s
+}
+
+/// Build a `FlowLockHandle` backed by a fresh `ConcurrencyManager`
+/// with effectively-unbounded permits. Test default — tests that need
+/// to assert concurrency caps must build their own manager.
+fn unbounded_lock_handle(source: &str, sink: &str, storage: &str) -> crate::util::FlowLockHandle {
+    let mut m = crate::util::ConcurrencyManager::new();
+    m.register_source(source, u32::MAX);
+    m.register_sink(sink, u32::MAX);
+    m.register_storage(storage, u32::MAX);
+    m.handle(source, sink, storage)
 }
 
 pub fn test_flow_named(
@@ -239,12 +252,14 @@ pub fn test_flow_named(
             conflict: None,
         },
         interval: Duration::from_millis(10),
+        jitter: Duration::ZERO,
         query_timeout: Duration::from_secs(5),
         sampling: crate::config::validation::SamplingConfig::Disabled,
         access_check: true,
         fields_check: true,
         inserts_check: true,
         cursor_persistence: crate::model::CursorPersistence::ColumnCursor,
+        lock_handle: unbounded_lock_handle(name, "test-sink", "test-storage"),
     };
     let derived = DerivedPlans {
         transform: crate::transform::Transform::new(

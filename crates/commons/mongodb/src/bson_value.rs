@@ -492,7 +492,7 @@ mod tests {
             fn kind(&self) -> &str {
                 "test.unknown"
             }
-            fn can_be_cursor(&self) -> bool {
+            fn cursor_compatible(&self) -> bool {
                 false
             }
             fn can_convert_to(&self, _t: &DataType, _trunc: bool) -> bool {

@@ -28,6 +28,10 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 air-elt-commons-testing = { workspace = true }
+# Used solely by the cursor-Custom round-trip integration test —
+# `MongoObjectIdValue` is the only `DynValue` impl whose
+# `cursor_compatible() == true` ships today.
+air-elt-commons-mongodb = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 chrono = { workspace = true }
 uuid = { workspace = true }

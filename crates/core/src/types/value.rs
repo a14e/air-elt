@@ -12,6 +12,20 @@ use crate::types::dynamic::DynValue;
 /// Serialised with a `{ "type": "...", "value": ... }` internal tag so that
 /// round-tripping through JSONB (cursor storage) preserves the exact variant.
 /// Untagged serde would silently coerce e.g. `Int64(42)` → `Int16(42)`.
+///
+/// `Value::Custom` is admitted only when the underlying [`DynType`]
+/// declares [`cursor_compatible() == true`](crate::types::dynamic::DynType::cursor_compatible).
+/// In that case the wire shape is
+/// `{ "type": "custom", "kind": "<kind>", "value": <json> }`, with
+/// `<json>` produced by [`DynValue::to_json`]. The bare
+/// `Value::Deserialize` impl does NOT decode `custom` envelopes —
+/// recovering a `Box<dyn DynValue>` needs the expected descriptor
+/// up front. The typed entry point is
+/// [`crate::types::DataType::decode_cursor_json`], driven by the
+/// storage layer from the source-schema cursor types.
+/// Cursor-incompatible custom values error out on `Serialize` —
+/// validation rejects them up front, but the serializer keeps the
+/// safety net.
 #[derive(Debug)]
 pub enum Value {
     Null,
@@ -42,15 +56,62 @@ pub enum Value {
     Timestamp(DateTime<Utc>),
     Uuid(Uuid),
     Json(serde_json::Value),
-    /// Connector-specific opaque value. Cursor JSON storage MUST NOT see
-    /// this variant — Serialize/Deserialize error on it deliberately;
-    /// validation rejects flows that would persist a Custom cursor.
+    /// Connector-specific opaque value. Cursor JSON storage admits
+    /// this variant iff the underlying `DynType::cursor_compatible()`
+    /// returns `true` AND the matching descriptor overrides
+    /// `DynType::decode_cursor_value` (the typed reload entry, called
+    /// from [`crate::types::DataType::decode_cursor_json`]).
+    /// `Serialize` errors out for cursor-incompatible custom values;
+    /// the bare `Value::Deserialize` always errors on `custom`
+    /// envelopes regardless — typed decode via `DataType` is the only
+    /// supported reload path.
     Custom(Box<dyn DynValue>),
 }
 
 impl Value {
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
+    }
+
+    /// Map this `Value` variant onto its concrete [`crate::types::DataType`].
+    /// Returns `None` for `Value::Null` (carries no type information by
+    /// design — nullability is on `Field`, not `DataType`).
+    ///
+    /// Width-bearing variants (`Text`, `Bytes`, `BigInt`, `Decimal`)
+    /// report unbounded because the value carries no width metadata;
+    /// callers that need the post-conversion width must read it off the
+    /// **target** type. Used by the dynamic-source path of
+    /// `TransformOp::Convert` (when `ColumnConversionPlan.source = None`)
+    /// for schemaless sources, and by the `Union` source-side runtime
+    /// re-dispatch inside the convert dispatcher.
+    pub fn data_type(&self) -> Option<crate::types::DataType> {
+        use crate::types::DataType;
+        match self {
+            Value::Null => None,
+            Value::Bool(_) => Some(DataType::Bool),
+            Value::Int8(_) => Some(DataType::Int8),
+            Value::Int16(_) => Some(DataType::Int16),
+            Value::Int32(_) => Some(DataType::Int32),
+            Value::Int64(_) => Some(DataType::Int64),
+            Value::UInt8(_) => Some(DataType::UInt8),
+            Value::UInt16(_) => Some(DataType::UInt16),
+            Value::UInt32(_) => Some(DataType::UInt32),
+            Value::UInt64(_) => Some(DataType::UInt64),
+            Value::Float32(_) => Some(DataType::Float32),
+            Value::Float64(_) => Some(DataType::Float64),
+            Value::BigInt(_) => Some(DataType::BigInt { width: None }),
+            Value::Decimal(_) => Some(DataType::Decimal {
+                precision: None,
+                scale: None,
+            }),
+            Value::Text(_) => Some(DataType::Text { size: None }),
+            Value::Bytes(_) => Some(DataType::Bytes { size: None }),
+            Value::Date(_) => Some(DataType::Date),
+            Value::Timestamp(_) => Some(DataType::Timestamp),
+            Value::Uuid(_) => Some(DataType::Uuid),
+            Value::Json(_) => Some(DataType::Json),
+            Value::Custom(v) => Some(DataType::Custom(v.dyn_type())),
+        }
     }
 }
 
@@ -124,8 +185,14 @@ impl PartialEq for Value {
 // `BigInt` and `Decimal` use the canonical decimal-string form (see
 // the wrappers below).
 //
-// `Custom` errors on both Serialize and Deserialize. Validation guards
-// against cursor JSON ever seeing it.
+// `Custom` participates in the wire format when the underlying
+// `DynType::cursor_compatible()` is `true`. Wire shape:
+//   {"type":"custom","kind":"<kind>","value":<json from to_json()>}
+// The bare `Value::Deserialize` impl refuses `custom` envelopes —
+// typed reload lives on `DataType::decode_cursor_json`. Cursor-
+// incompatible kinds also error out on `Serialize` (validation
+// already rejects them up front, but the serializer keeps the
+// safety net).
 
 impl Serialize for Value {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -157,11 +224,28 @@ impl Serialize for Value {
             Value::Timestamp(t) => emit(serializer, "timestamp", t),
             Value::Uuid(u) => emit(serializer, "uuid", u),
             Value::Json(j) => emit(serializer, "json", j),
-            Value::Custom(_) => Err(serde::ser::Error::custom(
-                "Value::Custom cannot be serialized — \
-                 connector-specific values must not be persisted to cursor JSON; \
-                 validation::assemble guards against this",
-            )),
+            Value::Custom(inner) => {
+                let dt = inner.dyn_type();
+                if !dt.cursor_compatible() {
+                    return Err(serde::ser::Error::custom(format!(
+                        "Value::Custom (kind = {:?}) is not cursor_compatible; \
+                         validation::assemble rejects flows whose cursor would \
+                         carry this type",
+                        dt.kind()
+                    )));
+                }
+                let payload = inner.to_json().map_err(|e| {
+                    serde::ser::Error::custom(format!(
+                        "Value::Custom (kind = {:?}) to_json failed: {e}",
+                        dt.kind()
+                    ))
+                })?;
+                let mut m = serializer.serialize_map(Some(3))?;
+                m.serialize_entry("type", "custom")?;
+                m.serialize_entry("kind", dt.kind())?;
+                m.serialize_entry("value", &payload)?;
+                m.end()
+            }
         }
     }
 }
@@ -199,9 +283,11 @@ impl<'de> Visitor<'de> for ValueVisitor {
         // The original `#[serde(tag = "type", content = "value")]` shape
         // requires the `type` key first or anywhere; serde's own visitor
         // tolerates either order. We do the same: drain into a small
-        // buffer then dispatch.
+        // buffer then dispatch. The `kind` slot is only used by the
+        // `"custom"` variant (cursor-codec discriminator).
         let mut tag: Option<String> = None;
         let mut raw_value: Option<serde_json::Value> = None;
+        let mut kind: Option<String> = None;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "type" => {
@@ -216,7 +302,15 @@ impl<'de> Visitor<'de> for ValueVisitor {
                     }
                     raw_value = Some(map.next_value()?);
                 }
-                other => return Err(de::Error::unknown_field(other, &["type", "value"])),
+                "kind" => {
+                    if kind.is_some() {
+                        return Err(de::Error::duplicate_field("kind"));
+                    }
+                    kind = Some(map.next_value()?);
+                }
+                other => {
+                    return Err(de::Error::unknown_field(other, &["type", "value", "kind"]));
+                }
             }
         }
         let tag = tag.ok_or_else(|| de::Error::missing_field("type"))?;
@@ -255,10 +349,23 @@ impl<'de> Visitor<'de> for ValueVisitor {
             "timestamp" => decode(v).map(Value::Timestamp),
             "uuid" => decode(v).map(Value::Uuid),
             "json" => Ok(Value::Json(v)),
-            "custom" => Err(de::Error::custom(
-                "Value::Custom cannot be deserialized — \
-                 connector-specific values have no global registry",
-            )),
+            "custom" => {
+                // Custom values can't deserialize through the bare
+                // `Value` path: a `Box<dyn DynValue>` needs the
+                // descriptor's `decode_cursor_value` impl, which we
+                // can only reach when the caller supplies the
+                // expected `DataType::Custom(t)` ahead of time. Use
+                // [`crate::types::DataType::decode_cursor_json`]
+                // instead — the storage layer does so per cursor
+                // field, looking the expected type up on the source
+                // schema.
+                let _ = kind;
+                Err(de::Error::custom(
+                    "Value::Deserialize does not handle `custom` envelopes — \
+                     callers must dispatch through DataType::decode_cursor_json \
+                     with the expected source-schema type",
+                ))
+            }
             other => Err(de::Error::unknown_variant(
                 other,
                 &[
@@ -399,6 +506,45 @@ mod tests {
         }
     }
 
+    /// Test stand-in `DynType` paired with `StubValue` to exercise
+    /// the cursor-incompatible Serialize guard.
+    #[derive(Debug, Clone, Copy)]
+    struct StubType;
+
+    impl crate::types::dynamic::DynType for StubType {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn kind(&self) -> &str {
+            "test.stub"
+        }
+        fn can_convert_to(&self, _t: &crate::types::DataType, _trunc: bool) -> bool {
+            false
+        }
+        fn can_construct_from(&self, _t: &crate::types::DataType, _trunc: bool) -> bool {
+            false
+        }
+        fn convert(
+            &self,
+            _v: Value,
+            _t: &crate::types::DataType,
+            _ctx: &crate::types::convert::context::ConversionContext,
+        ) -> Result<Value, crate::types::convert::ConvertError> {
+            unimplemented!()
+        }
+        fn construct(
+            &self,
+            _v: Value,
+            _t: &crate::types::DataType,
+            _ctx: &crate::types::convert::context::ConversionContext,
+        ) -> Result<Value, crate::types::convert::ConvertError> {
+            unimplemented!()
+        }
+        fn clone_box(&self) -> Box<dyn crate::types::dynamic::DynType> {
+            Box::new(*self)
+        }
+    }
+
     /// Test stand-in `DynValue` so we can construct a `Value::Custom` and
     /// verify the serialize-error guard.
     #[derive(Debug)]
@@ -406,7 +552,7 @@ mod tests {
 
     impl DynValue for StubValue {
         fn dyn_type(&self) -> Box<dyn crate::types::dynamic::DynType> {
-            unimplemented!()
+            Box::new(StubType)
         }
         fn as_any(&self) -> &dyn Any {
             self
@@ -422,11 +568,88 @@ mod tests {
         }
     }
 
+    /// Cursor-compatible stub that participates in the round-trip
+    /// test. Pairs a `DynType` whose `cursor_compatible() == true`
+    /// with a `DynValue` whose `to_json` emits a plain number.
+    #[derive(Debug, Clone, Copy)]
+    struct CursorStubType;
+
+    impl crate::types::dynamic::DynType for CursorStubType {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn kind(&self) -> &str {
+            "test.cursor_stub"
+        }
+        fn cursor_compatible(&self) -> bool {
+            true
+        }
+        fn can_convert_to(&self, _t: &crate::types::DataType, _trunc: bool) -> bool {
+            false
+        }
+        fn can_construct_from(&self, _t: &crate::types::DataType, _trunc: bool) -> bool {
+            false
+        }
+        fn convert(
+            &self,
+            _v: Value,
+            _t: &crate::types::DataType,
+            _ctx: &crate::types::convert::context::ConversionContext,
+        ) -> Result<Value, crate::types::convert::ConvertError> {
+            unimplemented!()
+        }
+        fn construct(
+            &self,
+            _v: Value,
+            _t: &crate::types::DataType,
+            _ctx: &crate::types::convert::context::ConversionContext,
+        ) -> Result<Value, crate::types::convert::ConvertError> {
+            unimplemented!()
+        }
+        fn clone_box(&self) -> Box<dyn crate::types::dynamic::DynType> {
+            Box::new(*self)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CursorStubValue(u32);
+
+    impl DynValue for CursorStubValue {
+        fn dyn_type(&self) -> Box<dyn crate::types::dynamic::DynType> {
+            Box::new(CursorStubType)
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+            self
+        }
+        fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+            other
+                .as_any()
+                .downcast_ref::<CursorStubValue>()
+                .is_some_and(|o| o.0 == self.0)
+        }
+        fn clone_box(&self) -> Box<dyn DynValue> {
+            Box::new(self.clone())
+        }
+        fn to_json(&self) -> Result<serde_json::Value, crate::error::JsonEncodeError> {
+            Ok(serde_json::Value::from(self.0))
+        }
+    }
+
     #[test]
-    fn custom_serialize_errors() {
+    fn custom_serialize_errors_for_non_cursor_compatible() {
+        // `StubType::cursor_compatible()` defaults to false → the
+        // Serialize guard refuses with a clear message that traces
+        // the kind. (Validation rejects flows before they get here,
+        // but the serializer keeps the safety net.)
         let v = Value::Custom(Box::new(StubValue));
         let res = serde_json::to_value(&v);
-        assert!(res.is_err(), "Value::Custom must not serialise");
+        assert!(
+            res.is_err(),
+            "non-cursor-compatible Value::Custom must not serialise"
+        );
     }
 
     #[test]
@@ -437,5 +660,41 @@ mod tests {
         // intent here is to exercise the `Value::Clone` arm and
         // confirm `PartialEq` reaches `eq_dyn` on the boxed payload.
         assert_eq!(original, cloned);
+    }
+
+    /// Custom values serialise into the `{type,kind,value}` envelope
+    /// for cursor JSON storage, but the bare `Value` deserialize path
+    /// no longer attempts to recover them: a `Box<dyn DynValue>` needs
+    /// the expected descriptor up front. The typed entry point is
+    /// `DataType::decode_cursor_json` on the storage / runner side.
+    #[test]
+    fn cursor_compatible_custom_serialize_via_envelope() {
+        let v = Value::Custom(Box::new(CursorStubValue(42)));
+        let got = serde_json::to_value(v.clone()).expect("serialize");
+        assert_eq!(
+            got,
+            serde_json::json!({
+                "type": "custom",
+                "kind": "test.cursor_stub",
+                "value": 42,
+            })
+        );
+    }
+
+    #[test]
+    fn custom_deserialize_through_value_serde_errors() {
+        // The bare `Value` Deserialize path refuses `custom` envelopes
+        // — typed decode is the only supported entry. The storage
+        // layer dispatches via `DataType::decode_cursor_json` instead.
+        let raw = serde_json::json!({
+            "type": "custom",
+            "kind": "test.cursor_stub",
+            "value": 1,
+        });
+        let res: Result<Value, _> = serde_json::from_value(raw);
+        assert!(
+            res.is_err(),
+            "bare Value::Deserialize must refuse `custom` envelopes"
+        );
     }
 }

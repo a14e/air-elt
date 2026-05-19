@@ -3,6 +3,19 @@
 
 use std::time::Duration;
 
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum PoolSettingsError {
+    /// `max-connections = 0` would translate to a `Semaphore::new(0)`
+    /// in the runtime concurrency manager, and every flow referencing
+    /// that component would wait for a permit forever. Reject at
+    /// connector-build time so the operator sees a config error
+    /// rather than a hung process.
+    #[error("max-connections must be ≥ 1 (got 0)")]
+    ZeroMaxConnections,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PoolSettings {
     pub connect: Duration,
@@ -43,16 +56,20 @@ impl PoolSettings {
         statement: Option<Duration>,
         max_connections: Option<u32>,
         min_connections: Option<u32>,
-    ) -> Self {
+    ) -> Result<Self, PoolSettingsError> {
         let defaults = Self::defaults();
-        Self {
+        let max_connections = max_connections.unwrap_or(defaults.max_connections).min(100);
+        if max_connections == 0 {
+            return Err(PoolSettingsError::ZeroMaxConnections);
+        }
+        Ok(Self {
             connect: connect.unwrap_or(defaults.connect),
             acquire: acquire.unwrap_or(defaults.acquire),
             idle: idle.unwrap_or(defaults.idle),
             max_lifetime: max_lifetime.unwrap_or(defaults.max_lifetime),
             statement: statement.unwrap_or(defaults.statement),
-            max_connections: max_connections.unwrap_or(defaults.max_connections).min(100),
+            max_connections,
             min_connections: min_connections.unwrap_or(0),
-        }
+        })
     }
 }

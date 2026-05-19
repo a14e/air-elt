@@ -19,6 +19,15 @@
 //! the Mongo sink is schemaless so `validate_flow` rebuilds `dst_schema`
 //! with `nullable: true` regardless.
 //!
+//! `_id` is **not** an exception. Mongo guarantees the field is
+//! present on every document, but applications can store `null` as
+//! the unique `_id` value of one document — and the server-inserted
+//! default is an `ObjectId`, not a NOT NULL constraint. Treating
+//! `_id` as nullable is the only safe call; a sink-side `NOT NULL`
+//! that rejects a legal `_id: null` will surface at validate-time
+//! against the inferred schema instead of at runtime against a real
+//! row.
+//!
 //! Allocation profile: leaf paths and types are collected into a
 //! borrowed-key trie keyed by `&str` slices into the BSON documents.
 //! `String` is allocated once per *unique leaf path* during DFS emit,
@@ -135,8 +144,19 @@ pub fn infer_schema_from_sample(docs: &[Document]) -> Result<Schema, InferenceEr
             } else {
                 merge_types(node.types_seen.iter().cloned())
             };
+            // Every inferred field is treated as nullable — sampling
+            // is non-exhaustive (we look at ~100 docs out of millions)
+            // and `_id` in particular can legally be `null` once per
+            // collection because the application chose `null` as that
+            // collection's unique `_id` value. Forcing `nullable =
+            // false` on `_id` would let the validator accept it
+            // mapped onto a `NOT NULL` sink column, then fail at
+            // runtime on a valid Mongo document. The Mongo sink is
+            // schemaless so `validate_flow` rebuilds the dst schema
+            // with `nullable = true` anyway.
+            let name = p.to_string();
             out.push(Field {
-                name: p.to_string(),
+                name,
                 data_type: merged,
                 nullable: true,
             });
@@ -284,11 +304,51 @@ mod tests {
 
     #[test]
     fn missing_in_one_still_nullable() {
-        // Sampling is non-exhaustive — every field is nullable
-        // regardless of presence count.
+        // Sampling is non-exhaustive — every non-`_id` field is
+        // nullable regardless of presence count.
         let docs = vec![doc! { "id": 1_i32 }, doc! {}];
         let s = infer_schema_from_sample(&docs).unwrap();
         assert!(find(&s, "id").nullable);
+    }
+
+    #[test]
+    fn id_field_is_nullable_like_everything_else() {
+        // `_id` exists on every Mongo document but an application can
+        // legally store `null` as the unique `_id` value of one
+        // document. Treating it as non-nullable would let the
+        // validator accept it mapped onto a `NOT NULL` sink column,
+        // then fail at runtime on a valid Mongo document.
+        use bson::oid::ObjectId;
+        let docs = vec![
+            doc! { "_id": ObjectId::new(), "name": "alice" },
+            doc! { "_id": ObjectId::new(), "name": "bob" },
+        ];
+        let s = infer_schema_from_sample(&docs).unwrap();
+        assert!(find(&s, "_id").nullable, "_id must be nullable");
+        assert!(find(&s, "name").nullable);
+    }
+
+    #[test]
+    fn id_field_stays_nullable_with_varying_other_fields() {
+        use bson::oid::ObjectId;
+        let docs = vec![
+            doc! { "_id": ObjectId::new(), "a": 1_i32 },
+            doc! { "_id": ObjectId::new(), "b": "x" },
+            doc! { "_id": ObjectId::new() },
+        ];
+        let s = infer_schema_from_sample(&docs).unwrap();
+        assert!(find(&s, "_id").nullable);
+        assert!(find(&s, "a").nullable);
+        assert!(find(&s, "b").nullable);
+    }
+
+    #[test]
+    fn nested_id_inside_subdocument_is_nullable() {
+        // Same nullable-by-default rule for any nested `_id`.
+        let docs = vec![doc! { "addr": { "_id": "x" } }];
+        let s = infer_schema_from_sample(&docs).unwrap();
+        let f = find(&s, "addr._id");
+        assert!(f.nullable);
     }
 
     #[test]

@@ -9,8 +9,8 @@
 use super::ConvertError;
 use super::context::ConversionContext;
 use super::{
-    bigint_narrow, bytes_narrow, decimal_narrow, float_narrow, int_narrow, json_text, text_bool,
-    text_narrow, timestamp_date, uuid as uuid_conv, xml,
+    bigint_narrow, bytes_narrow, decimal_narrow, decimal_to_float, float_narrow, int_narrow,
+    json_text, text_bool, text_narrow, timestamp_date, uuid as uuid_conv, xml,
 };
 use crate::types::{DataType, Value};
 use bigdecimal::BigDecimal;
@@ -36,7 +36,8 @@ pub fn convert(
     // member of the union against the sink, so this is just runtime
     // routing.
     if matches!(src, DataType::Union(_)) {
-        let concrete = concrete_type_of(&value)
+        let concrete = value
+            .data_type()
             .ok_or_else(|| ConvertError::ValueShapeMismatch { src: src.clone() })?;
         return convert(value, &concrete, dst, ctx);
     }
@@ -420,6 +421,38 @@ pub fn convert(
             bigint_narrow::convert(value, src, dst)
         }
 
+        // ---- Decimal → Float64 / Float32 ------------------------------
+        //
+        // Conversion via `BigDecimal::to_f64()` then `as f32` for the
+        // 32-bit arm. Loss happens in two distinct shapes:
+        //
+        //   1. **Mantissa rounding** when the decimal value carries more
+        //      significant digits than the target float can represent
+        //      exactly (Float64: ~15 digits, Float32: ~7). The matrix
+        //      already classifies this kind of pair as narrowing — the
+        //      matrix admits the lossless flavour only when
+        //      `precision <= 15` (Float64) / `precision <= 7` (Float32)
+        //      and both precision/scale are known. Beyond that, the
+        //      validator gates on `truncate=true`, and *that* `truncate`
+        //      flag is what makes `ctx.truncate` true here. The
+        //      dispatcher itself does not re-check the precision rule —
+        //      `decimal_to_float` returns whatever `to_f64()` produces
+        //      and any mantissa loss is silently absorbed by the IEEE
+        //      cast, mirroring the existing Float→Float narrowing
+        //      semantics in `float_narrow`.
+        //
+        //   2. **Magnitude overflow** when the value exceeds the target
+        //      float's range (Float64: ~1.8e308, Float32: ~3.4e38). Here
+        //      `truncate=true` saturates to `±INFINITY` matching the
+        //      value's sign; `truncate=false` surfaces `Overflow` so
+        //      the operator sees the loss rather than a silent `inf`.
+        (DataType::Decimal { .. }, DataType::Float64) => {
+            decimal_to_float::convert_to_f64(value, src, ctx.truncate)
+        }
+        (DataType::Decimal { .. }, DataType::Float32) => {
+            decimal_to_float::convert_to_f32(value, src, ctx.truncate)
+        }
+
         // ---- Decimal narrowing → BigInt/Int*/UInt* --------------------
         (
             DataType::Decimal { .. },
@@ -496,73 +529,157 @@ fn identity_or_narrow_numeric(
     ctx: &ConversionContext,
 ) -> Result<Value, ConvertError> {
     use DataType::*;
-    let widens = match (src, dst) {
-        (BigInt { width: a }, BigInt { width: b }) => widens_or_equal(*a, *b),
-        (
-            Decimal {
-                precision: pa,
-                scale: sa,
-            },
-            Decimal {
-                precision: pb,
-                scale: sb,
-            },
-        ) => decimal_widens_or_equal(*pa, *sa, *pb, *sb),
-        _ => false,
+    // BigInt arm keeps the original static rule — widening unconditionally,
+    // narrowing only under `truncate=true`.
+    if let (BigInt { width: a }, BigInt { width: b }) = (src, dst) {
+        if widens_or_equal(*a, *b) {
+            return Ok(value);
+        }
+        if !ctx.truncate {
+            return Err(ConvertError::Unsupported {
+                src: src.clone(),
+                dst: dst.clone(),
+            });
+        }
+        return bigint_narrow::convert(value, src, dst);
+    }
+
+    // Decimal arm is value-aware: even when the *static* declared source
+    // type is wider than the target (e.g. unbounded `Decimal { None, None }`
+    // produced by Mongo's Decimal128 → canonical mapping), the actual
+    // `BigDecimal` payload may still fit the target's precision/scale
+    // exactly, in which case the conversion is lossless and we do not
+    // require the user to opt into `truncate=true`. Only when the value
+    // genuinely loses information (fractional digits dropped, integer-part
+    // overflow) do we gate behind `truncate`.
+    if matches!(src, Decimal { .. }) && matches!(dst, Decimal { .. }) {
+        return convert_decimal_to_decimal(value, src, dst, ctx);
+    }
+
+    Err(ConvertError::Unsupported {
+        src: src.clone(),
+        dst: dst.clone(),
+    })
+}
+
+/// Decimal → Decimal value-aware dispatch.
+///
+/// The static type matrix may have already approved this conversion under
+/// `truncate=true`, but at runtime the actual `BigDecimal` mantissa often
+/// fits a narrower target losslessly — in particular the mongo→pg path
+/// where every Decimal128 carries `DataType::Decimal { None, None }`
+/// regardless of the value's real magnitude. Routing decisions here:
+///
+/// * **No-op rescale into an unbounded target** (`pb = None, sb = None`):
+///   the BigDecimal payload is preserved as-is.
+/// * **Always-safe widening**: target scale ≥ source scale AND target
+///   integer-digit capacity ≥ source integer-digit count → return the
+///   value unchanged. The decision uses the actual value's mantissa width
+///   when the source type's bounds are absent.
+/// * **Narrowing without `truncate`**: return [`ConvertError::Unsupported`]
+///   — the user has not opted into a lossy cast.
+/// * **Narrowing with `truncate`**: delegate to [`decimal_narrow::convert`]
+///   which rescales via `BigDecimal::with_scale_round(target_scale,
+///   RoundingMode::Down)` (truncate toward zero, matching the existing
+///   Decimal-scale-narrowing convention shared with Postgres/ClickHouse)
+///   and saturates integer-digit overflow on the mantissa.
+fn convert_decimal_to_decimal(
+    value: Value,
+    src: &DataType,
+    dst: &DataType,
+    ctx: &ConversionContext,
+) -> Result<Value, ConvertError> {
+    // Caller has guaranteed both sides are `DataType::Decimal { .. }`. Pull
+    // the precision/scale tuples out so the rest of the body can reason in
+    // terms of plain options.
+    let (pa, sa) = match src {
+        DataType::Decimal { precision, scale } => (*precision, *scale),
+        _ => unreachable!("convert_decimal_to_decimal called with non-Decimal src"),
     };
-    if widens {
+    let (pb, sb) = match dst {
+        DataType::Decimal { precision, scale } => (*precision, *scale),
+        _ => unreachable!("convert_decimal_to_decimal called with non-Decimal dst"),
+    };
+
+    // Unbounded target soaks up any value losslessly.
+    if pb.is_none() && sb.is_none() {
         return Ok(value);
     }
+
+    // Static widening (both sides bounded enough to decide from types alone).
+    if decimal_widens_or_equal(pa, sa, pb, sb) {
+        return Ok(value);
+    }
+
+    // Extract the actual BigDecimal payload to make a value-level decision.
+    // Value-shape mismatch is the right error for "src claims Decimal but
+    // the variant isn't `Value::Decimal`".
+    let d = match &value {
+        Value::Decimal(d) => d,
+        _ => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+    };
+
+    // Per-value widening probe: compute the value's own scale and
+    // integer-digit count and see if both fit the target's bounds. When
+    // the source type is statically wider than the target this is the
+    // mongo→pg lossless path.
+    let value_scale = decimal_value_scale(d);
+    let value_int_digits = decimal_value_int_digits(d);
+    let target_scale = sb.unwrap_or(0);
+    let target_int_capacity = match (pb, sb) {
+        (None, _) => u32::MAX,
+        (Some(p), Some(s)) => p.saturating_sub(s),
+        (Some(p), None) => p,
+    };
+    let fits_scale = u64::from(target_scale) >= value_scale;
+    let fits_int = u64::from(target_int_capacity) >= value_int_digits;
+    if fits_scale && fits_int {
+        // Rescale only when the BigDecimal's stored scale differs from the
+        // target's declared scale. The value is unchanged numerically — we
+        // just align the on-the-wire scale so the sink-side bind path sees
+        // the expected precision/scale shape.
+        return Ok(Value::Decimal(d.with_scale_round(
+            i64::from(target_scale),
+            bigdecimal::RoundingMode::Down,
+        )));
+    }
+
     if !ctx.truncate {
+        // Lossy: either fractional digits would be dropped or the integer
+        // part overflows the target's int-digit capacity. Without consent
+        // we refuse — `Unsupported` keeps the error shape consistent with
+        // the static type-matrix rejection.
         return Err(ConvertError::Unsupported {
             src: src.clone(),
             dst: dst.clone(),
         });
     }
-    match (src, dst) {
-        (BigInt { .. }, BigInt { .. }) => bigint_narrow::convert(value, src, dst),
-        (Decimal { .. }, Decimal { .. }) => decimal_narrow::convert(value, src, dst),
-        _ => Err(ConvertError::Unsupported {
-            src: src.clone(),
-            dst: dst.clone(),
-        }),
-    }
+
+    decimal_narrow::convert(value, src, dst)
 }
 
-/// Map a runtime `Value` variant to its concrete `DataType`. Used when
-/// the source type is `DataType::Union(_)` — we inspect the actual value
-/// at hand and re-dispatch through the normal matrix arms. Width-bearing
-/// variants (`Text`, `Bytes`, `BigInt`, `Decimal`) report unbounded
-/// because the value carries no width information; the matrix has
-/// already approved every union member against the sink, so unbounded
-/// is the safe upper bound.
-fn concrete_type_of(value: &Value) -> Option<DataType> {
-    match value {
-        Value::Null => None,
-        Value::Bool(_) => Some(DataType::Bool),
-        Value::Int8(_) => Some(DataType::Int8),
-        Value::Int16(_) => Some(DataType::Int16),
-        Value::Int32(_) => Some(DataType::Int32),
-        Value::Int64(_) => Some(DataType::Int64),
-        Value::UInt8(_) => Some(DataType::UInt8),
-        Value::UInt16(_) => Some(DataType::UInt16),
-        Value::UInt32(_) => Some(DataType::UInt32),
-        Value::UInt64(_) => Some(DataType::UInt64),
-        Value::Float32(_) => Some(DataType::Float32),
-        Value::Float64(_) => Some(DataType::Float64),
-        Value::BigInt(_) => Some(DataType::BigInt { width: None }),
-        Value::Decimal(_) => Some(DataType::Decimal {
-            precision: None,
-            scale: None,
-        }),
-        Value::Text(_) => Some(DataType::Text { size: None }),
-        Value::Bytes(_) => Some(DataType::Bytes { size: None }),
-        Value::Date(_) => Some(DataType::Date),
-        Value::Timestamp(_) => Some(DataType::Timestamp),
-        Value::Uuid(_) => Some(DataType::Uuid),
-        Value::Json(_) => Some(DataType::Json),
-        Value::Custom(v) => Some(DataType::Custom(v.dyn_type())),
+/// Number of fractional digits the BigDecimal value carries, ignoring
+/// trailing zeros (e.g. "12.30" reports 1, "12.300" still 1). Matches the
+/// "significant scale" rule the default-value parser uses so the dispatcher
+/// agrees with validation on what counts as widening.
+fn decimal_value_scale(d: &BigDecimal) -> u64 {
+    let normalized = d.normalized();
+    let scale = normalized.fractional_digit_count();
+    if scale <= 0 { 0 } else { scale as u64 }
+}
+
+/// Number of integer digits in the value, ignoring sign. Zero reports 0.
+fn decimal_value_int_digits(d: &BigDecimal) -> u64 {
+    let int_part = d.with_scale_round(0, bigdecimal::RoundingMode::Down);
+    let (mantissa, _exp) = int_part.into_bigint_and_exponent();
+    if mantissa.sign() == num_bigint::Sign::NoSign {
+        return 0;
     }
+    // BigInt has no direct decimal-digit count; the string form's length
+    // (minus a possible leading `-`) is the conventional way and avoids
+    // re-implementing log10 on arbitrary-precision integers.
+    let s = mantissa.to_string();
+    s.trim_start_matches('-').len() as u64
 }
 
 fn widens_or_equal(a: Option<u32>, b: Option<u32>) -> bool {
@@ -933,6 +1050,222 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, Value::Int32(i32::MAX));
+    }
+
+    // §6.7b Decimal → Decimal value-aware dispatch
+    //
+    // Mongo Decimal128 maps to canonical `Decimal { None, None }`, which the
+    // static matrix can't compare against a bounded pg `numeric(12, 2)`.
+    // The dispatcher now inspects the actual `BigDecimal` payload: if it
+    // fits the target precision/scale, the cast is lossless and proceeds
+    // without `truncate=true`; otherwise it falls back to the truncate
+    // gate.
+    const DEC_UNB: DataType = DataType::Decimal {
+        precision: None,
+        scale: None,
+    };
+
+    #[test]
+    fn decimal_unbounded_to_bounded_fits_without_truncate() {
+        // The motivating case: mongo Decimal128 carrying 123.45 routed
+        // into pg `numeric(12, 2)` without the user setting truncate.
+        let d: BigDecimal = "123.45".parse().unwrap();
+        let out = convert(Value::Decimal(d), &DEC_UNB, &dt_dec(12, 2), &passthrough()).unwrap();
+        assert_eq!(out, Value::Decimal("123.45".parse().unwrap()));
+    }
+
+    #[test]
+    fn decimal_widening_with_more_precision_and_scale_is_noop() {
+        let d: BigDecimal = "12.34".parse().unwrap();
+        let out = convert(
+            Value::Decimal(d.clone()),
+            &dt_dec(6, 2),
+            &dt_dec(10, 4),
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Decimal(d));
+    }
+
+    #[test]
+    fn decimal_narrowing_scale_rejected_without_truncate() {
+        // 12.345 → Decimal(p, 2): scale shrinks from 3 to 2 → needs consent.
+        let d: BigDecimal = "12.345".parse().unwrap();
+        let res = convert(Value::Decimal(d), &DEC_UNB, &dt_dec(10, 2), &passthrough());
+        assert!(matches!(res, Err(ConvertError::Unsupported { .. })));
+    }
+
+    #[test]
+    fn decimal_narrowing_scale_with_truncate_truncates_toward_zero() {
+        // RoundingMode::Down (truncate toward zero), shared with the
+        // existing decimal_narrow path. 12.345 → 12.34 (not 12.35).
+        let d: BigDecimal = "12.345".parse().unwrap();
+        let out = convert(Value::Decimal(d), &DEC_UNB, &dt_dec(10, 2), &truncate_ctx()).unwrap();
+        assert_eq!(out, Value::Decimal("12.34".parse().unwrap()));
+    }
+
+    #[test]
+    fn decimal_integer_overflow_rejected_without_truncate() {
+        // 123456.78 → Decimal(4, 2): integer-digit capacity is p−s = 2,
+        // value has 6 integer digits. No consent → error.
+        let d: BigDecimal = "123456.78".parse().unwrap();
+        let res = convert(Value::Decimal(d), &DEC_UNB, &dt_dec(4, 2), &passthrough());
+        assert!(matches!(res, Err(ConvertError::Unsupported { .. })));
+    }
+
+    #[test]
+    fn decimal_unbounded_to_unbounded_is_identity() {
+        let d: BigDecimal = "9999999999999999.123456789".parse().unwrap();
+        let out = convert(
+            Value::Decimal(d.clone()),
+            &DEC_UNB,
+            &DEC_UNB,
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Decimal(d));
+    }
+
+    #[test]
+    fn decimal_unbounded_to_bounded_aligns_scale() {
+        // Value 1.5 (scale 1) lands in Decimal(12, 2) — output mantissa
+        // shape is normalised to scale 2 so sink bindings see the
+        // expected precision/scale on the wire. Numerically equivalent.
+        let d: BigDecimal = "1.5".parse().unwrap();
+        let out = convert(Value::Decimal(d), &DEC_UNB, &dt_dec(12, 2), &passthrough()).unwrap();
+        assert_eq!(out, Value::Decimal("1.50".parse().unwrap()));
+    }
+
+    #[test]
+    fn decimal_zero_into_bounded_fits() {
+        // Zero has 0 integer digits and 0 fractional digits — always fits.
+        let d: BigDecimal = "0".parse().unwrap();
+        let out = convert(Value::Decimal(d), &DEC_UNB, &dt_dec(4, 2), &passthrough()).unwrap();
+        assert_eq!(out, Value::Decimal("0.00".parse().unwrap()));
+    }
+
+    #[test]
+    fn decimal_negative_value_fits() {
+        // Sign must not count toward the integer-digit budget.
+        let d: BigDecimal = "-12.34".parse().unwrap();
+        let out = convert(Value::Decimal(d), &DEC_UNB, &dt_dec(4, 2), &passthrough()).unwrap();
+        assert_eq!(out, Value::Decimal("-12.34".parse().unwrap()));
+    }
+
+    #[test]
+    fn decimal_trailing_zeros_count_as_no_extra_scale() {
+        // 12.30 normalised has scale 1; target scale 1 fits without
+        // truncate even though the literal carried two fractional chars.
+        let d: BigDecimal = "12.30".parse().unwrap();
+        let out = convert(Value::Decimal(d), &DEC_UNB, &dt_dec(4, 1), &passthrough()).unwrap();
+        assert_eq!(out, Value::Decimal("12.3".parse().unwrap()));
+    }
+
+    // §6.7c Decimal → Float64 / Float32 (truncate-tolerant)
+    //
+    // Motivating scenario: pg `NUMERIC(12, 2)` → QuestDB `DOUBLE`
+    // (canonical `Decimal{12,2}` → `Float64`). `numeric(12, 2)` carries
+    // ≤15 significant digits so the round-trip is lossless and the
+    // dispatcher resolves without `truncate=true`. Oversize Decimals
+    // (e.g. > f64::MAX) require `truncate=true` to saturate to ±∞;
+    // otherwise the dispatcher surfaces `Overflow`.
+
+    #[test]
+    fn decimal_12_2_to_f64_happy_path() {
+        let d: BigDecimal = "12345.67".parse().unwrap();
+        let out = convert(
+            Value::Decimal(d),
+            &dt_dec(12, 2),
+            &DataType::Float64,
+            &passthrough(),
+        )
+        .unwrap();
+        match out {
+            Value::Float64(f) => assert!((f - 12345.67).abs() < 1e-9),
+            _ => panic!("expected Float64"),
+        }
+    }
+
+    #[test]
+    fn decimal_oversize_to_f64_rejects_without_truncate() {
+        let mut digits = String::from("1");
+        for _ in 0..350 {
+            digits.push('0');
+        }
+        let d: BigDecimal = digits.parse().unwrap();
+        let res = convert(
+            Value::Decimal(d),
+            &dt_dec(38, 0),
+            &DataType::Float64,
+            &passthrough(),
+        );
+        assert!(matches!(res, Err(ConvertError::Overflow { .. })));
+    }
+
+    #[test]
+    fn decimal_oversize_to_f64_saturates_under_truncate() {
+        let mut digits = String::from("1");
+        for _ in 0..350 {
+            digits.push('0');
+        }
+        let d: BigDecimal = digits.parse().unwrap();
+        let out = convert(
+            Value::Decimal(d),
+            &dt_dec(38, 0),
+            &DataType::Float64,
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Float64(f64::INFINITY));
+    }
+
+    #[test]
+    fn decimal_7_2_to_f32_happy_path() {
+        let d: BigDecimal = "1234.56".parse().unwrap();
+        let out = convert(
+            Value::Decimal(d),
+            &dt_dec(7, 2),
+            &DataType::Float32,
+            &passthrough(),
+        )
+        .unwrap();
+        match out {
+            Value::Float32(f) => assert!((f - 1234.56_f32).abs() < 1e-2),
+            _ => panic!("expected Float32"),
+        }
+    }
+
+    #[test]
+    fn decimal_oversize_to_f32_rejects_without_truncate() {
+        let mut digits = String::from("1");
+        for _ in 0..50 {
+            digits.push('0');
+        }
+        let d: BigDecimal = digits.parse().unwrap();
+        let res = convert(
+            Value::Decimal(d),
+            &dt_dec(38, 0),
+            &DataType::Float32,
+            &passthrough(),
+        );
+        assert!(matches!(res, Err(ConvertError::Overflow { .. })));
+    }
+
+    #[test]
+    fn decimal_oversize_to_f32_saturates_under_truncate() {
+        let mut digits = String::from("1");
+        for _ in 0..50 {
+            digits.push('0');
+        }
+        let d: BigDecimal = digits.parse().unwrap();
+        let out = convert(
+            Value::Decimal(d),
+            &dt_dec(38, 0),
+            &DataType::Float32,
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Float32(f32::INFINITY));
     }
 
     // §6.8 Json / Xml conversions
