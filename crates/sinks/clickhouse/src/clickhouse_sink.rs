@@ -148,7 +148,7 @@ impl Sink for ChSink {
         dry_run: bool,
     ) -> RuntimeResult<WriteReport> {
         if batch.rows.is_empty() {
-            return Ok(WriteReport { rows_written: 0 });
+            return Ok(WriteReport::default());
         }
         let ch_ctx = ctx.downcast_ref_to::<ChSinkCtx>()?;
         if dry_run {
@@ -159,7 +159,7 @@ impl Sink for ChSink {
                 .query_text(&explain_sql)
                 .await
                 .map_err(RuntimeError::backend)?;
-            return Ok(WriteReport { rows_written: 0 });
+            return Ok(WriteReport::default());
         }
         // Authoritative filter: sinks whose `supports_deletes() = false`
         // own the responsibility of dropping `Delete` rows themselves
@@ -169,10 +169,11 @@ impl Sink for ChSink {
         // would otherwise pre-allocate megabytes that the encode loop
         // never touches.
         let upsert_count = batch.rows.iter().filter(|r| r.op == RowOp::Upsert).count();
+        let skipped = (batch.rows.len() - upsert_count) as u64;
         let mut body: Vec<u8> = Vec::with_capacity(upsert_count * ch_ctx.columns.len() * 8);
-        let mut rows_written: u64 = 0;
+        let mut upserts: u64 = 0;
         for row in batch.rows.iter().filter(|r| r.op == RowOp::Upsert) {
-            rows_written += 1;
+            upserts += 1;
             for (i, field) in ch_ctx.columns.iter().enumerate() {
                 let v = row
                     .values
@@ -181,11 +182,15 @@ impl Sink for ChSink {
                 encode_value(&mut body, field, v).map_err(RuntimeError::backend)?;
             }
         }
-        if rows_written == 0 {
-            return Ok(WriteReport { rows_written: 0 });
+        if upserts == 0 {
+            return Ok(WriteReport {
+                upserts: 0,
+                deletes: 0,
+                skipped,
+            });
         }
         debug!(
-            rows = rows_written,
+            rows = upserts,
             bytes = body.len(),
             "clickhouse row-binary insert"
         );
@@ -193,6 +198,10 @@ impl Sink for ChSink {
             .insert_row_binary(&ch_ctx.insert_sql, body)
             .await
             .map_err(RuntimeError::backend)?;
-        Ok(WriteReport { rows_written })
+        Ok(WriteReport {
+            upserts,
+            deletes: 0,
+            skipped,
+        })
     }
 }

@@ -28,8 +28,11 @@ impl FlowEngine {
             let rx = self.shutdown.clone();
             let flow_name = flow.name.clone();
             let mode = self.mode;
+            // The recorder is pre-baked on the FlowState by assemble —
+            // FlowEngine itself no longer talks to MonitoringManager.
+            let recorder = flow.recorder.clone();
             handles.push(tokio::spawn(async move {
-                let runner = FlowRunner::new(flow, mode, rx);
+                let runner = FlowRunner::new(flow, mode, rx, recorder);
                 let result = runner.run().await;
                 (flow_name, result)
             }));

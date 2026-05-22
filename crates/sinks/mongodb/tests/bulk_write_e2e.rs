@@ -45,7 +45,7 @@ async fn round_trip_overwrite(sink: MongoSink, db: &str, client: &mongodb::Clien
         next_cursor: None,
     };
     let report_a = sink.write_batch(&spec, &ctx, batch_a, false).await.unwrap();
-    assert_eq!(report_a.rows_written, 3, "first batch: 3 upserts");
+    assert_eq!(report_a.rows_written(), 3, "first batch: 3 upserts");
 
     // Second batch — same _ids, new labels — exercises the matched/replace
     // half of the upsert path.
@@ -56,7 +56,7 @@ async fn round_trip_overwrite(sink: MongoSink, db: &str, client: &mongodb::Clien
         next_cursor: None,
     };
     let report_b = sink.write_batch(&spec, &ctx, batch_b, false).await.unwrap();
-    assert_eq!(report_b.rows_written, 3, "second batch: 3 replacements");
+    assert_eq!(report_b.rows_written(), 3, "second batch: 3 replacements");
 
     let coll = client.database(db).collection::<bson::Document>("items");
     let two = coll.find_one(doc! { "_id": 2_i64 }).await.unwrap().unwrap();
@@ -66,11 +66,14 @@ async fn round_trip_overwrite(sink: MongoSink, db: &str, client: &mongodb::Clien
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bulk_write_path_on_modern_server() {
     let handle = mongo_pool().await;
-    let sink = MongoSink::connect(MongoSinkConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let sink = MongoSink::connect(
+        MongoSinkConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect");
     let v = sink.server_version();
@@ -86,11 +89,14 @@ async fn bulk_write_path_on_modern_server() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fallback_path_compound_key_on_legacy_server() {
     let handle = mongo_pool_legacy().await;
-    let sink = MongoSink::connect(MongoSinkConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let sink = MongoSink::connect(
+        MongoSinkConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect");
     assert!(!sink.server_version().supports_bulk_write());
@@ -130,7 +136,7 @@ async fn round_trip_overwrite_compound_key(sink: MongoSink, db: &str, client: &m
         next_cursor: None,
     };
     let report_a = sink.write_batch(&spec, &ctx, batch_a, false).await.unwrap();
-    assert_eq!(report_a.rows_written, 2, "two upserts via compound key");
+    assert_eq!(report_a.rows_written(), 2, "two upserts via compound key");
 
     // Same compound keys, new label — must replace, not duplicate.
     let batch_b = Batch {
@@ -142,7 +148,7 @@ async fn round_trip_overwrite_compound_key(sink: MongoSink, db: &str, client: &m
         next_cursor: None,
     };
     let report_b = sink.write_batch(&spec, &ctx, batch_b, false).await.unwrap();
-    assert_eq!(report_b.rows_written, 1, "one matched replacement");
+    assert_eq!(report_b.rows_written(), 1, "one matched replacement");
 
     let coll = client
         .database(db)
@@ -165,11 +171,14 @@ async fn round_trip_overwrite_compound_key(sink: MongoSink, db: &str, client: &m
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bulk_write_object_id_lands_as_bson_object_id() {
     let handle = mongo_pool().await;
-    let sink = MongoSink::connect(MongoSinkConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let sink = MongoSink::connect(
+        MongoSinkConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect");
     assert!(sink.server_version().supports_bulk_write());
@@ -200,7 +209,7 @@ async fn bulk_write_object_id_lands_as_bson_object_id() {
         next_cursor: None,
     };
     let report = sink.write_batch(&spec, &ctx, batch, false).await.unwrap();
-    assert_eq!(report.rows_written, 3);
+    assert_eq!(report.rows_written(), 3);
 
     let coll = handle
         .client
@@ -222,11 +231,14 @@ async fn bulk_write_object_id_lands_as_bson_object_id() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fallback_path_on_legacy_server() {
     let handle = mongo_pool_legacy().await;
-    let sink = MongoSink::connect(MongoSinkConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let sink = MongoSink::connect(
+        MongoSinkConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect");
     let v = sink.server_version();

@@ -4,6 +4,12 @@
 //! `connect()`. Centralising the option builder means timeouts, the UTC
 //! session TZ, and the statement-level timeout stay in sync. Everything
 //! configurable is piped in via `PoolSettings`.
+//!
+//! Pool stats are NOT wired here. The driver-pool instant gauges are
+//! driven by a snapshot-at-scrape source registered with the monitoring
+//! collector — see `pool_stats_reader::PgPoolStatsReader`. The factory
+//! wraps the returned `PgPool`, registers the stats reader, and the
+//! collector polls it on every scrape.
 
 use sqlx::PgPool;
 use sqlx::pool::PoolOptions;

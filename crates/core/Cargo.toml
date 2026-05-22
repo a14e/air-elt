@@ -12,6 +12,7 @@ doctest = false
 
 [dependencies]
 air-elt-commons = { workspace = true }
+air-elt-monitoring = { workspace = true }
 air-elt-types = { workspace = true }
 ahash = { workspace = true }
 async-trait = { workspace = true }

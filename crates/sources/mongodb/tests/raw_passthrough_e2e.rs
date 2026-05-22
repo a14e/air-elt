@@ -33,6 +33,7 @@ async fn read_batch_raw_mode_emits_bson_object_rows() {
             database: Some(handle.database.clone()),
             ..Default::default()
         },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
     )
     .await
     .expect("connect");
@@ -109,6 +110,7 @@ async fn read_batch_attaches_body_when_needs_body_set() {
             database: Some(handle.database.clone()),
             ..Default::default()
         },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
     )
     .await
     .expect("connect");
@@ -173,6 +175,7 @@ async fn read_batch_skips_body_when_needs_body_unset() {
             database: Some(handle.database.clone()),
             ..Default::default()
         },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
     )
     .await
     .expect("connect");

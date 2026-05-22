@@ -98,11 +98,14 @@ async fn mongo_cdc_to_clickhouse_drops_deletes_and_advances_cursor() {
     // `migrate()` is a no-op so opening early doesn't change behaviour
     // — the same collection lookup happens whether we open here or
     // later in `app.run_once()`.
-    let seed_storage = MongoStorage::connect(MongoStorageConfig {
-        url: mongo.url.clone(),
-        database: Some(state_db.clone()),
-        ..Default::default()
-    })
+    let seed_storage = MongoStorage::connect(
+        MongoStorageConfig {
+            url: mongo.url.clone(),
+            database: Some(state_db.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("seed storage connect");
     seed_storage.migrate().await.expect("seed storage migrate");
@@ -273,11 +276,14 @@ interval = "100ms"
     // though the batch contained a Delete that the sink dropped, the
     // cursor still committed (proving the delete didn't abort the
     // commit path).
-    let state_storage = MongoStorage::connect(MongoStorageConfig {
-        url: mongo.url.clone(),
-        database: Some(state_db.clone()),
-        ..Default::default()
-    })
+    let state_storage = MongoStorage::connect(
+        MongoStorageConfig {
+            url: mongo.url.clone(),
+            database: Some(state_db.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("storage reopen");
     let saved = state_storage

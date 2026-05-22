@@ -42,10 +42,16 @@ pub(crate) struct FlowRunner {
     backoff: Duration,
     source_ctx: Option<Arc<dyn SourceCtx>>,
     sink_ctx: Option<Arc<dyn SinkCtx>>,
+    metrics: air_elt_monitoring::FlowRecorder,
 }
 
 impl FlowRunner {
-    pub fn new(flow: FlowState, mode: RunMode, shutdown: watch::Receiver<bool>) -> Self {
+    pub fn new(
+        flow: FlowState,
+        mode: RunMode,
+        shutdown: watch::Receiver<bool>,
+        metrics: air_elt_monitoring::FlowRecorder,
+    ) -> Self {
         Self {
             flow,
             mode,
@@ -54,6 +60,7 @@ impl FlowRunner {
             backoff: BACKOFF_INITIAL,
             source_ctx: None,
             sink_ctx: None,
+            metrics,
         }
     }
 
@@ -165,6 +172,11 @@ impl FlowRunner {
                         self.source_ctx = None;
                         self.sink_ctx = None;
                     }
+                    // Stage tagging happens at each I/O call site via
+                    // `.inspect_err(|e| metrics.inc_error(stage, e.kind()))?`
+                    // — by the time the outer loop sees the error, the
+                    // appropriate `errors_total{stage=...,kind=...}`
+                    // has already incremented exactly once.
                     error!(
                         flow = %self.flow.name,
                         error = %e,
@@ -195,7 +207,12 @@ impl FlowRunner {
         // and trigger an immediate `shutdown.changed()` inside `tick`,
         // defeating the dry-run probe.
         let (_keep_tx_alive, shutdown_rx) = watch::channel(false);
-        let mut runner = Self::new(flow, RunMode::Once, shutdown_rx);
+        let mut runner = Self::new(
+            flow,
+            RunMode::Once,
+            shutdown_rx,
+            air_elt_monitoring::FlowRecorder::disabled(),
+        );
         // Sampling-validation calls `tick(true)` directly. Startup
         // jitter lives in `run()` (Daemon-only now), not in `tick`,
         // so the probe never sleeps on it.
@@ -221,7 +238,11 @@ impl FlowRunner {
                 self.flow
                     .source
                     .build_context(&self.flow.derived().read_spec)
-                    .await?,
+                    .await
+                    .inspect_err(|e| {
+                        self.metrics
+                            .inc_error(air_elt_monitoring::ErrorStage::Fetch, e.kind())
+                    })?,
             );
         }
         if self.sink_ctx.is_none() {
@@ -231,7 +252,11 @@ impl FlowRunner {
                 self.flow
                     .sink
                     .build_context(&self.flow.derived().write_spec)
-                    .await?,
+                    .await
+                    .inspect_err(|e| {
+                        self.metrics
+                            .inc_error(air_elt_monitoring::ErrorStage::Sink, e.kind())
+                    })?,
             );
         }
         if rebuild_needed {
@@ -333,13 +358,22 @@ impl FlowRunner {
                         .flow
                         .storage
                         .load_cursor(&self.flow.name, &cursor_types);
-                    with_timeout(&self.flow, "load_cursor", fut, &mut self.shutdown).await?
+                    with_timeout(&self.flow, "load_cursor", fut, &mut self.shutdown)
+                        .await
+                        .inspect_err(|e| {
+                            self.metrics
+                                .inc_error(air_elt_monitoring::ErrorStage::Storage, e.kind())
+                        })?
                 }
                 CursorPersistence::ResumeToken => {
                     let fut = self.flow.storage.load_resume_token(&self.flow.name);
                     let token =
                         with_timeout(&self.flow, "load_resume_token", fut, &mut self.shutdown)
-                            .await?;
+                            .await
+                            .inspect_err(|e| {
+                                self.metrics
+                                    .inc_error(air_elt_monitoring::ErrorStage::Storage, e.kind())
+                            })?;
                     token.map(|json| {
                         CursorState::new(vec![CursorFieldValue {
                             name: RESUME_TOKEN_FIELD.into(),
@@ -365,11 +399,17 @@ impl FlowRunner {
         // flows that share only the sink/storage are unaffected.
         let raw = {
             let _g = self.flow.lock_handle.acquire_source().await?;
+            let _timer = self.metrics.start_recording_fetch();
             if dry_run {
                 let read_spec = &self.flow.derived().read_spec;
                 let n = read_spec.limit;
                 let fut = self.flow.source.sample(read_spec, src_ctx, n);
-                with_timeout(&self.flow, "sample", fut, &mut self.shutdown).await?
+                with_timeout(&self.flow, "sample", fut, &mut self.shutdown)
+                    .await
+                    .inspect_err(|e| {
+                        self.metrics
+                            .inc_error(air_elt_monitoring::ErrorStage::Fetch, e.kind())
+                    })?
             } else {
                 // Production read path: source emits `Batch`; Transform
                 // applies projection / body folding / per-column conversion
@@ -378,12 +418,40 @@ impl FlowRunner {
                 let read_spec = &self.flow.derived().read_spec;
                 let cursor = self.cursor.as_ref();
                 let fut = self.flow.source.read_batch(read_spec, src_ctx, cursor);
-                with_timeout(&self.flow, "read_batch", fut, &mut self.shutdown).await?
+                with_timeout(&self.flow, "read_batch", fut, &mut self.shutdown)
+                    .await
+                    .inspect_err(|e| {
+                        self.metrics
+                            .inc_error(air_elt_monitoring::ErrorStage::Fetch, e.kind())
+                    })?
             }
         };
 
+        // Count the source rows by op as soon as we have them — this is
+        // the only place where Delete vs Upsert breakdown of the *read*
+        // side is visible (post-Transform the runner sees Upsert/Delete
+        // mixed and the sink does its own split).
+        if !raw.rows.is_empty() {
+            let upserts = raw
+                .rows
+                .iter()
+                .filter(|r| matches!(r.op, crate::model::RowOp::Upsert))
+                .count() as u64;
+            let deletes = raw.rows.len() as u64 - upserts;
+            self.metrics
+                .inc_rows_read(upserts, air_elt_monitoring::RowOp::Upsert);
+            self.metrics
+                .inc_rows_read(deletes, air_elt_monitoring::RowOp::Delete);
+        }
+
         // Transform is pure compute, no I/O — runs without any permit.
-        let batch = self.flow.derived().transform.apply(raw)?;
+        let batch = {
+            let _timer = self.metrics.start_recording_transform();
+            self.flow.derived().transform.apply(raw).inspect_err(|e| {
+                self.metrics
+                    .inc_error(air_elt_monitoring::ErrorStage::Transform, e.kind())
+            })?
+        };
         self.finish_tick(batch, dry_run).await
     }
 
@@ -427,11 +495,17 @@ impl FlowRunner {
         // touch storage for the cursor save below.
         let report = {
             let _g = self.flow.lock_handle.acquire_sink().await?;
+            let _timer = self.metrics.start_recording_sink();
             let fut = self
                 .flow
                 .sink
                 .write_batch(write_spec, sink_ctx, batch, dry_run);
-            match with_timeout(&self.flow, "write_batch", fut, &mut self.shutdown).await {
+            match with_timeout(&self.flow, "write_batch", fut, &mut self.shutdown)
+                .await
+                .inspect_err(|e| {
+                    self.metrics
+                        .inc_error(air_elt_monitoring::ErrorStage::Sink, e.kind())
+                }) {
                 Ok(r) => r,
                 Err(e) => {
                     error!(flow = %self.flow.name, error = %e, "write_batch failed");
@@ -439,10 +513,22 @@ impl FlowRunner {
                 }
             }
         };
+        self.metrics
+            .inc_rows_written(report.upserts, air_elt_monitoring::RowOp::Upsert);
+        self.metrics
+            .inc_rows_written(report.deletes, air_elt_monitoring::RowOp::Delete);
+        // Append-only sinks (ClickHouse, QuestDB) drop Delete rows
+        // pre-write; surface that as `rows_skipped_total{op=delete}`.
+        if report.skipped > 0 {
+            self.metrics
+                .inc_rows_skipped(report.skipped, air_elt_monitoring::RowOp::Delete);
+        }
 
         debug!(
             flow = %self.flow.name,
-            rows = report.rows_written,
+            rows = report.rows_written(),
+            upserts = report.upserts,
+            deletes = report.deletes,
             "batch written"
         );
 
@@ -463,7 +549,12 @@ impl FlowRunner {
                         .flow
                         .storage
                         .save_cursor(&self.flow.name, &next, dry_run);
-                    with_timeout(&self.flow, "save_cursor", fut, &mut self.shutdown).await
+                    with_timeout(&self.flow, "save_cursor", fut, &mut self.shutdown)
+                        .await
+                        .inspect_err(|e| {
+                            self.metrics
+                                .inc_error(air_elt_monitoring::ErrorStage::Storage, e.kind())
+                        })
                 }
                 CursorPersistence::ResumeToken => {
                     let token_json = extract_resume_token(&next)?;
@@ -471,7 +562,12 @@ impl FlowRunner {
                         self.flow
                             .storage
                             .save_resume_token(&self.flow.name, &token_json, dry_run);
-                    with_timeout(&self.flow, "save_resume_token", fut, &mut self.shutdown).await
+                    with_timeout(&self.flow, "save_resume_token", fut, &mut self.shutdown)
+                        .await
+                        .inspect_err(|e| {
+                            self.metrics
+                                .inc_error(air_elt_monitoring::ErrorStage::Storage, e.kind())
+                        })
                 }
             };
             if let Err(e) = save_result {
@@ -541,13 +637,8 @@ impl FlowRunner {
 }
 
 /// Decide whether the runner should drop its cached source/sink ctx
-/// Arcs in response to `err`. Backend errors (`Backend`, `Timeout`,
-/// `Cancelled`) signal that the underlying connection / driver state
-/// may be wedged — refreshing the ctx is the cheapest reliable
-/// recovery. Per-row data errors (type / conversion / JSON encoding
-/// failures, identifier issues) leave the ctx valid and must NOT
-/// trigger a reset. The match is exhaustive so a new variant has to
-/// pick a side at compile time.
+/// Arcs in response to `err`. Backend errors signal a wedged
+/// driver state; per-row data errors leave the ctx valid.
 fn should_drop_ctx_on(err: &RuntimeError) -> bool {
     match err {
         // Backend / connection-level — the underlying driver state may
@@ -711,7 +802,7 @@ mod tests {
     type TimelineHandle = Arc<std::sync::Mutex<Vec<(String, &'static str, std::time::Instant)>>>;
 
     fn run(flow: FlowState, mode: RunMode, rx: watch::Receiver<bool>) -> FlowRunner {
-        FlowRunner::new(flow, mode, rx)
+        FlowRunner::new(flow, mode, rx, air_elt_monitoring::FlowRecorder::disabled())
     }
 
     #[tokio::test(start_paused = true)]
@@ -735,6 +826,98 @@ mod tests {
         let result = run(flow, RunMode::Once, rx).run().await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("source boom"));
+    }
+
+    /// `errors_total` carries the right `stage` label for each I/O
+    /// call site. Each scenario fires exactly one error at a known
+    /// stage; the test asserts the corresponding `stage` value is
+    /// emitted with `count == 1`. Guards against regressions where the
+    /// `.inspect_err(...)?` tagging at each site loses sync with the
+    /// `ErrorStage` enum.
+    #[tokio::test(start_paused = true)]
+    async fn errors_total_carries_stage_label() {
+        use air_elt_monitoring::{FlowLabels, MonitoringManager, PrometheusConfig};
+
+        fn enabled_recorder(
+            flow_name: &str,
+        ) -> (MonitoringManager, air_elt_monitoring::FlowRecorder) {
+            let mut m = MonitoringManager::new(PrometheusConfig {
+                enabled: true,
+                ..PrometheusConfig::default()
+            })
+            .expect("manager");
+            let recorder = m.flow_recorder(FlowLabels {
+                flow: flow_name.into(),
+                source_name: "test-source".into(),
+                source_kind: "mock".into(),
+                sink_name: "test-sink".into(),
+                sink_kind: "mock".into(),
+                storage_name: "test-storage".into(),
+                storage_kind: "mock".into(),
+            });
+            (m, recorder)
+        }
+
+        fn swap_recorder(
+            state: FlowState,
+            recorder: air_elt_monitoring::FlowRecorder,
+        ) -> FlowState {
+            let inner = crate::model::AssembledFlow {
+                recorder,
+                ..(*state).clone()
+            };
+            FlowState::new(inner, state.derived().clone())
+        }
+
+        fn stage_count(mgr: &MonitoringManager, stage_label: &str) -> u64 {
+            let families = mgr.gather();
+            let Some(errors) = families.iter().find(|f| f.name() == "air_elt_errors_total") else {
+                // No `record_error` has fired yet — the IntCounterVec
+                // hasn't materialised any children, so prometheus filters
+                // the empty family out of `gather()`.
+                return 0;
+            };
+            let mut total = 0u64;
+            for metric in errors.get_metric() {
+                let has_stage = metric
+                    .get_label()
+                    .iter()
+                    .any(|lp| lp.name() == "stage" && lp.value() == stage_label);
+                if has_stage {
+                    total += metric.get_counter().get_value() as u64;
+                }
+            }
+            total
+        }
+
+        // Stage: Fetch — source.read_batch returns an error on the
+        // first call.
+        {
+            let (mgr, recorder) = enabled_recorder("fetch-fail");
+            let state = test_flow(mock_source_failing(1), mock_sink_ok(), mock_storage_ok());
+            let state = swap_recorder(state, recorder.clone());
+            let (_tx, rx) = watch::channel(false);
+            let _ = FlowRunner::new(state, RunMode::Once, rx, recorder)
+                .run()
+                .await;
+            assert_eq!(stage_count(&mgr, "fetch"), 1, "fetch error counted once");
+            assert_eq!(stage_count(&mgr, "sink"), 0, "sink stage untouched");
+            assert_eq!(stage_count(&mgr, "storage"), 0, "storage stage untouched");
+        }
+
+        // Stage: Storage — save_cursor fails on a successful tick.
+        {
+            let (mgr, recorder) = enabled_recorder("storage-fail");
+            let state = test_flow(mock_source_ok(), mock_sink_ok(), mock_storage_save_fails());
+            let state = swap_recorder(state, recorder.clone());
+            let (_tx, rx) = watch::channel(false);
+            let _ = FlowRunner::new(state, RunMode::Once, rx, recorder)
+                .run()
+                .await;
+            assert_eq!(stage_count(&mgr, "storage"), 1, "storage error counted");
+            assert_eq!(stage_count(&mgr, "fetch"), 0, "fetch stage untouched");
+            assert_eq!(stage_count(&mgr, "sink"), 0, "sink stage untouched");
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -795,7 +978,9 @@ mod tests {
                     sd.store(true, Ordering::SeqCst);
                 }
                 Ok(crate::model::WriteReport {
-                    rows_written: batch.rows.len() as u64,
+                    upserts: batch.rows.len() as u64,
+                    deletes: 0,
+                    skipped: 0,
                 })
             });
 
@@ -807,7 +992,12 @@ mod tests {
 
         let flow = test_flow(source, sink, storage);
         let (_tx, rx) = watch::channel(false);
-        let mut runner = FlowRunner::new(flow, RunMode::Once, rx);
+        let mut runner = FlowRunner::new(
+            flow,
+            RunMode::Once,
+            rx,
+            air_elt_monitoring::FlowRecorder::disabled(),
+        );
         runner.tick(true).await.expect("dry-run tick");
 
         assert_eq!(sample_calls.load(Ordering::SeqCst), 1, "sample must fire");
@@ -839,8 +1029,16 @@ mod tests {
 
         let flow = test_flow(source, mock_sink_ok(), mock_storage_ok());
         let (tx, rx) = watch::channel(false);
-        let handle =
-            tokio::spawn(async move { FlowRunner::new(flow, RunMode::Daemon, rx).run().await });
+        let handle = tokio::spawn(async move {
+            FlowRunner::new(
+                flow,
+                RunMode::Daemon,
+                rx,
+                air_elt_monitoring::FlowRecorder::disabled(),
+            )
+            .run()
+            .await
+        });
         // 500 ms < BACKOFF_INITIAL (1 s): runner is sleeping in backoff when
         // shutdown fires, so the result must be Ok(()).
         tokio::time::advance(Duration::from_millis(500)).await;
@@ -911,8 +1109,16 @@ mod tests {
 
         let flow = test_flow(source, mock_sink_ok(), mock_storage_ok());
         let (tx, rx) = watch::channel(false);
-        let handle =
-            tokio::spawn(async move { FlowRunner::new(flow, RunMode::Daemon, rx).run().await });
+        let handle = tokio::spawn(async move {
+            FlowRunner::new(
+                flow,
+                RunMode::Daemon,
+                rx,
+                air_elt_monitoring::FlowRecorder::disabled(),
+            )
+            .run()
+            .await
+        });
 
         // Two backend failures → two backoff cycles. After 1s + 4s sleeps
         // the third tick succeeds; advance in steps so the paused-time
@@ -968,8 +1174,16 @@ mod tests {
 
         let flow = test_flow(source, mock_sink_ok(), mock_storage_ok());
         let (tx, rx) = watch::channel(false);
-        let handle =
-            tokio::spawn(async move { FlowRunner::new(flow, RunMode::Daemon, rx).run().await });
+        let handle = tokio::spawn(async move {
+            FlowRunner::new(
+                flow,
+                RunMode::Daemon,
+                rx,
+                air_elt_monitoring::FlowRecorder::disabled(),
+            )
+            .run()
+            .await
+        });
 
         // 500 ms: well inside the 1 s backoff. Drop must already have
         // happened by now (it runs before the sleep).
@@ -1014,8 +1228,16 @@ mod tests {
 
         let flow = test_flow(source, mock_sink_ok(), mock_storage_ok());
         let (tx, rx) = watch::channel(false);
-        let handle =
-            tokio::spawn(async move { FlowRunner::new(flow, RunMode::Daemon, rx).run().await });
+        let handle = tokio::spawn(async move {
+            FlowRunner::new(
+                flow,
+                RunMode::Daemon,
+                rx,
+                air_elt_monitoring::FlowRecorder::disabled(),
+            )
+            .run()
+            .await
+        });
 
         for _ in 0..20 {
             tokio::task::yield_now().await;
@@ -1070,8 +1292,16 @@ mod tests {
         // ctx Arcs; the next tick must call `build_context` again — that
         // call is what this test verifies.
         let (tx, rx) = watch::channel(false);
-        let handle =
-            tokio::spawn(async move { FlowRunner::new(flow, RunMode::Daemon, rx).run().await });
+        let handle = tokio::spawn(async move {
+            FlowRunner::new(
+                flow,
+                RunMode::Daemon,
+                rx,
+                air_elt_monitoring::FlowRecorder::disabled(),
+            )
+            .run()
+            .await
+        });
 
         for _ in 0..20 {
             tokio::task::yield_now().await;
@@ -1148,16 +1378,23 @@ mod tests {
                         op: r.op,
                     }));
                 Ok(crate::model::WriteReport {
-                    rows_written: batch.rows.len() as u64,
+                    upserts: batch.rows.len() as u64,
+                    deletes: 0,
+                    skipped: 0,
                 })
             });
 
         let flow = test_flow(source, sink, mock_storage_ok());
         let (_tx, rx) = watch::channel(false);
-        FlowRunner::new(flow, RunMode::Once, rx)
-            .run()
-            .await
-            .expect("flow runs");
+        FlowRunner::new(
+            flow,
+            RunMode::Once,
+            rx,
+            air_elt_monitoring::FlowRecorder::disabled(),
+        )
+        .run()
+        .await
+        .expect("flow runs");
 
         let rows = captured.lock().unwrap();
         assert_eq!(rows.len(), 1);
@@ -1233,16 +1470,23 @@ mod tests {
                         op: r.op,
                     }));
                 Ok(crate::model::WriteReport {
-                    rows_written: upserts,
+                    upserts,
+                    deletes: 0,
+                    skipped: 0,
                 })
             });
 
         let flow = test_flow(source, sink, mock_storage_ok());
         let (_tx, rx) = watch::channel(false);
-        FlowRunner::new(flow, RunMode::Once, rx)
-            .run()
-            .await
-            .expect("flow runs");
+        FlowRunner::new(
+            flow,
+            RunMode::Once,
+            rx,
+            air_elt_monitoring::FlowRecorder::disabled(),
+        )
+        .run()
+        .await
+        .expect("flow runs");
 
         let rows = captured.lock().unwrap();
         assert_eq!(
@@ -1304,7 +1548,7 @@ mod tests {
             .returning(move |_, _ctx, _batch, _dry| {
                 wc.fetch_add(1, Ordering::SeqCst);
                 // Sink self-filtered all deletes; nothing to report.
-                Ok(crate::model::WriteReport { rows_written: 0 })
+                Ok(crate::model::WriteReport::default())
             });
 
         let mut storage = crate::traits::MockStorage::new();
@@ -1319,10 +1563,15 @@ mod tests {
 
         let flow = test_flow(source, sink, storage);
         let (_tx, rx) = watch::channel(false);
-        FlowRunner::new(flow, RunMode::Once, rx)
-            .run()
-            .await
-            .expect("flow runs");
+        FlowRunner::new(
+            flow,
+            RunMode::Once,
+            rx,
+            air_elt_monitoring::FlowRecorder::disabled(),
+        )
+        .run()
+        .await
+        .expect("flow runs");
 
         assert_eq!(
             write_calls.load(Ordering::SeqCst),
@@ -1341,8 +1590,16 @@ mod tests {
     async fn daemon_retries_after_failure_then_succeeds() {
         let flow = test_flow(mock_source_failing(2), mock_sink_ok(), mock_storage_ok());
         let (tx, rx) = watch::channel(false);
-        let handle =
-            tokio::spawn(async move { FlowRunner::new(flow, RunMode::Daemon, rx).run().await });
+        let handle = tokio::spawn(async move {
+            FlowRunner::new(
+                flow,
+                RunMode::Daemon,
+                rx,
+                air_elt_monitoring::FlowRecorder::disabled(),
+            )
+            .run()
+            .await
+        });
         tokio::time::advance(Duration::from_secs(6)).await;
         tx.send(true).unwrap();
         assert!(handle.await.unwrap().is_ok());
@@ -1370,7 +1627,12 @@ mod tests {
             };
             flow = crate::model::FlowState::new(inner, flow.derived().clone());
             let (_tx, rx) = watch::channel(false);
-            FlowRunner::new(flow, RunMode::Once, rx)
+            FlowRunner::new(
+                flow,
+                RunMode::Once,
+                rx,
+                air_elt_monitoring::FlowRecorder::disabled(),
+            )
         }
         let a1 = build_runner("flow-a", Duration::from_secs(1)).jitter_offset();
         let a2 = build_runner("flow-a", Duration::from_secs(1)).jitter_offset();
@@ -1402,7 +1664,12 @@ mod tests {
         };
         flow = crate::model::FlowState::new(inner, flow.derived().clone());
         let (_tx, rx) = watch::channel(false);
-        let runner = FlowRunner::new(flow, RunMode::Once, rx);
+        let runner = FlowRunner::new(
+            flow,
+            RunMode::Once,
+            rx,
+            air_elt_monitoring::FlowRecorder::disabled(),
+        );
         assert_eq!(runner.jitter_offset(), Duration::ZERO);
     }
 
@@ -1444,11 +1711,21 @@ mod tests {
         flow = crate::model::FlowState::new(inner, flow.derived().clone());
 
         let (tx, rx) = watch::channel(false);
-        let probe_runner = FlowRunner::new(flow.clone(), RunMode::Daemon, watch::channel(false).1);
+        let probe_runner = FlowRunner::new(
+            flow.clone(),
+            RunMode::Daemon,
+            watch::channel(false).1,
+            air_elt_monitoring::FlowRecorder::disabled(),
+        );
         let expected_offset = probe_runner.jitter_offset();
         assert!(expected_offset < Duration::from_millis(100));
 
-        let runner = FlowRunner::new(flow, RunMode::Daemon, rx);
+        let runner = FlowRunner::new(
+            flow,
+            RunMode::Daemon,
+            rx,
+            air_elt_monitoring::FlowRecorder::disabled(),
+        );
         let handle = tokio::spawn(async move { runner.run().await });
 
         // Before the offset elapses the runner must still be sleeping —
@@ -1567,7 +1844,12 @@ mod tests {
             // time for two flows pointing at the same `[[sources]]`
             // entry.
             let inner = crate::model::AssembledFlow {
-                lock_handle: mgr.handle("shared-src", sink_name, storage_name),
+                lock_handle: mgr.handle(
+                    "shared-src",
+                    sink_name,
+                    storage_name,
+                    &mut air_elt_monitoring::MonitoringManager::disabled(),
+                ),
                 ..(*state).clone()
             };
             crate::model::FlowState::new(inner, state.derived().clone())
@@ -1578,8 +1860,26 @@ mod tests {
 
         let (_tx, rx1) = watch::channel(false);
         let (_tx2, rx2) = watch::channel(false);
-        let h1 = tokio::spawn(async move { FlowRunner::new(f1, RunMode::Once, rx1).run().await });
-        let h2 = tokio::spawn(async move { FlowRunner::new(f2, RunMode::Once, rx2).run().await });
+        let h1 = tokio::spawn(async move {
+            FlowRunner::new(
+                f1,
+                RunMode::Once,
+                rx1,
+                air_elt_monitoring::FlowRecorder::disabled(),
+            )
+            .run()
+            .await
+        });
+        let h2 = tokio::spawn(async move {
+            FlowRunner::new(
+                f2,
+                RunMode::Once,
+                rx2,
+                air_elt_monitoring::FlowRecorder::disabled(),
+            )
+            .run()
+            .await
+        });
 
         h1.await.unwrap().expect("flow-1 ok");
         h2.await.unwrap().expect("flow-2 ok");

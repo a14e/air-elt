@@ -79,7 +79,7 @@ async fn basic_round_trip() {
         )
         .await
         .expect("write_batch");
-    assert_eq!(report.rows_written, 5);
+    assert_eq!(report.rows_written(), 5);
 
     // QuestDB WAL-apply is asynchronous — poll for the expected count
     // up to 5s before giving up.

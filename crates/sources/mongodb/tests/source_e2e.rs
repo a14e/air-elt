@@ -38,6 +38,7 @@ async fn read_with_cursor_and_dot_notation() {
             database: Some(handle.database.clone()),
             ..Default::default()
         },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
     )
     .await
     .expect("connect");
@@ -95,6 +96,7 @@ async fn sample_returns_documents() {
             database: Some(handle.database.clone()),
             ..Default::default()
         },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
     )
     .await
     .expect("connect");
@@ -158,6 +160,7 @@ async fn compound_cursor_updated_at_id() {
             database: Some(handle.database.clone()),
             ..Default::default()
         },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
     )
     .await
     .expect("connect");
@@ -226,6 +229,7 @@ async fn read_object_id_emits_custom_value() {
             database: Some(handle.database.clone()),
             ..Default::default()
         },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
     )
     .await
     .expect("connect");

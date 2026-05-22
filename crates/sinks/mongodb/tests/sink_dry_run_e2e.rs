@@ -21,11 +21,14 @@ use std::any::Any;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_batch_dry_run_skips_writes_then_real_run_commits() {
     let handle = mongo_pool().await;
-    let sink = MongoSink::connect(MongoSinkConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let sink = MongoSink::connect(
+        MongoSinkConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect");
 
@@ -57,7 +60,7 @@ async fn write_batch_dry_run_skips_writes_then_real_run_commits() {
         .write_batch(&spec, &ctx, make_batch(), true)
         .await
         .expect("dry-run write");
-    assert_eq!(report_dry.rows_written, 0);
+    assert_eq!(report_dry.rows_written(), 0);
     let count_after_dry = coll.count_documents(doc! {}).await.unwrap();
     assert_eq!(
         count_after_dry, 0,
@@ -68,7 +71,7 @@ async fn write_batch_dry_run_skips_writes_then_real_run_commits() {
         .write_batch(&spec, &ctx, make_batch(), false)
         .await
         .expect("real write");
-    assert_eq!(report.rows_written, 2);
+    assert_eq!(report.rows_written(), 2);
     let count_after = coll.count_documents(doc! {}).await.unwrap();
     assert_eq!(count_after, 2);
 }
@@ -84,11 +87,14 @@ async fn raw_passthrough_dry_run_skips_writes() {
     use air_elt_core::model::RowOp;
 
     let handle = mongo_pool().await;
-    let sink = MongoSink::connect(MongoSinkConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let sink = MongoSink::connect(
+        MongoSinkConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect");
 
@@ -119,7 +125,7 @@ async fn raw_passthrough_dry_run_skips_writes() {
     };
 
     let report = sink.write_batch(&spec, &ctx, batch, true).await.unwrap();
-    assert_eq!(report.rows_written, 0);
+    assert_eq!(report.rows_written(), 0);
 
     let coll = handle
         .client
@@ -211,11 +217,14 @@ impl DynValue for StubValue {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dry_run_delete_validates_per_row_key_encoding() {
     let handle = mongo_pool().await;
-    let sink = MongoSink::connect(MongoSinkConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let sink = MongoSink::connect(
+        MongoSinkConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect");
 
@@ -260,7 +269,7 @@ async fn dry_run_delete_validates_per_row_key_encoding() {
         .write_batch(&spec, &ctx, dry_delete, true)
         .await
         .expect("dry-run delete");
-    assert_eq!(report.rows_written, 0);
+    assert_eq!(report.rows_written(), 0);
     assert_eq!(
         coll.count_documents(doc! {}).await.unwrap(),
         2,
@@ -301,6 +310,6 @@ async fn dry_run_delete_validates_per_row_key_encoding() {
         .write_batch(&spec, &ctx, real_delete, false)
         .await
         .expect("real delete");
-    assert_eq!(report.rows_written, 2);
+    assert_eq!(report.rows_written(), 2);
     assert_eq!(coll.count_documents(doc! {}).await.unwrap(), 0);
 }

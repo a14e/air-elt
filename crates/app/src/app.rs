@@ -11,7 +11,9 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
+use parking_lot::Mutex;
 use tokio::sync::{OnceCell, watch};
+use tracing::error;
 
 use air_elt_core::config::loader;
 use air_elt_core::config::model::RootConfig;
@@ -38,39 +40,66 @@ pub struct ListedKinds {
 pub struct App {
     config: RootConfig,
     registry: Registry,
+    /// Construction-time monitoring handle. Wrapped in a parking_lot
+    /// `Mutex<Option<…>>` to keep interior mutability under `&self`
+    /// while honouring the constraint that the manager itself has no
+    /// internal mutex. Lifecycle: built once at construction, taken
+    /// out by [`Self::spawn_metrics`] when the metrics server starts.
+    /// `MetricsScraper` (cloned post-take) is what the HTTP server task
+    /// uses; the assemble pipeline locks briefly to mint recorders.
+    monitoring: Mutex<Option<air_elt_monitoring::MonitoringManager>>,
     /// Tracks whether `Storage::migrate` has run **to completion** for
     /// this `App`. Flipped to `true` only after every storage's
     /// `migrate()` returned `Ok`; a partial failure (e.g. storage #2
     /// errors after #1 succeeded) leaves the flag at `false` so the
-    /// next caller retries the full pass. The `migrate_lock` mutex
-    /// below serialises concurrent attempts so we don't run the DDL
-    /// twice when two callers race.
+    /// next caller retries the full pass.
     migrated: AtomicBool,
-    /// Serialises concurrent calls to `migrate()` / `run_once()` so
-    /// only one task drives the DDL pass at a time. The atomic above
-    /// is the "done" signal; this mutex is the "in flight" gate. The
-    /// `Notify`-pattern alternative would be more elegant but the
-    /// mutex is dead-simple and migrate is a once-per-process event.
     migrate_lock: tokio::sync::Mutex<()>,
-    /// Lazily-populated cache of the assembled flows — the no-I/O stage
-    /// of the validation pipeline that resolves component names, builds
-    /// connector instances through the registry, and constructs the
-    /// per-flow `ReadSpec`/`WriteSpec` halves. Filled on first call to
-    /// `flows_assembled()` and reused by every subsequent operation on
-    /// this `App`. Caching here (rather than re-running `assemble` per
-    /// call) keeps the same `Arc<dyn Source/Sink/Storage>` — and
-    /// therefore the same sqlx/mongo pools — alive across successive
-    /// `migrate` / `validate` / `run_once` / `run_daemon` calls.
     assembled: OnceCell<Vec<AssembledFlow>>,
-    /// Lazily-populated cache of the validated flows — the I/O stage of
-    /// the validation pipeline (access probes, schema introspection,
-    /// type matrix, optional sampling). Filled on first call to
-    /// `flows_validated()`. Distinct from `assembled` because
-    /// `migrate()` must be able to drive `Storage::migrate` on the
-    /// assembled flows *before* any I/O probe runs — sampling-validation
-    /// reads `air_elt_cursors` through the runner, which would fail on a
-    /// fresh database whose storage tables don't exist yet.
     validated: OnceCell<Vec<FlowState>>,
+}
+
+/// RAII guard that borrows the `MonitoringManager` out of `App`'s
+/// `Mutex<Option<…>>` for the duration of an `assemble` call. On drop
+/// (normal or unwind) the manager is restored to the slot — preventing
+/// a panic / cancellation mid-assemble from silently disabling metrics
+/// for the rest of the process.
+struct MonitoringGuard<'a> {
+    slot: &'a Mutex<Option<air_elt_monitoring::MonitoringManager>>,
+    inner: Option<air_elt_monitoring::MonitoringManager>,
+}
+
+impl<'a> MonitoringGuard<'a> {
+    fn take(slot: &'a Mutex<Option<air_elt_monitoring::MonitoringManager>>) -> Self {
+        let inner = match slot.lock().take() {
+            Some(inner) => inner,
+            None => {
+                tracing::warn!(
+                    "monitoring guard taken twice — metrics disabled for the rest of the process \
+                     (concurrent assemble or post-spawn_metrics access; this is a wiring bug)"
+                );
+                air_elt_monitoring::MonitoringManager::disabled()
+            }
+        };
+        Self {
+            slot,
+            inner: Some(inner),
+        }
+    }
+
+    fn as_mut(&mut self) -> &mut air_elt_monitoring::MonitoringManager {
+        self.inner
+            .as_mut()
+            .expect("inner stays Some until Drop runs")
+    }
+}
+
+impl Drop for MonitoringGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            *self.slot.lock() = Some(inner);
+        }
+    }
 }
 
 impl App {
@@ -83,9 +112,29 @@ impl App {
     /// Wrap an already-loaded config (used by tests that build configs in
     /// memory). Wires the default registry.
     pub fn from_config(config: RootConfig) -> Self {
+        let mut monitoring = match config
+            .metrics
+            .prometheus
+            .clone()
+            .map(air_elt_monitoring::MonitoringManager::new)
+        {
+            Some(Ok(m)) => m,
+            Some(Err(e)) => {
+                error!(error = %e, "failed to build monitoring manager; metrics disabled");
+                air_elt_monitoring::MonitoringManager::disabled()
+            }
+            None => air_elt_monitoring::MonitoringManager::disabled(),
+        };
+        monitoring.set_counts(
+            config.flow.len() as u32,
+            config.sources.len() as u32,
+            config.sinks.len() as u32,
+            config.storages.len() as u32,
+        );
         Self {
             config,
             registry: build_registry(),
+            monitoring: Mutex::new(Some(monitoring)),
             migrated: AtomicBool::new(false),
             migrate_lock: tokio::sync::Mutex::new(()),
             assembled: OnceCell::new(),
@@ -93,16 +142,60 @@ impl App {
         }
     }
 
-    /// Lazily run (and cache) the no-I/O `assemble` stage. Used by
-    /// `migrate` (which must run `Storage::migrate` *before* any I/O
-    /// probe) and by `flows_validated` (which feeds the assembled flows
-    /// into the I/O stage). Caching means every subsequent operation on
-    /// this `App` reuses the same connector `Arc`s — and therefore the
-    /// same sqlx/mongo pools.
+    pub fn is_monitoring_enabled(&self) -> bool {
+        self.monitoring
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.is_enabled())
+    }
+
+    /// Spawn the metrics HTTP server task, returning the `JoinHandle`.
+    /// Consumes the `MonitoringManager` (the recorder cache is no
+    /// longer needed) and freezes it into a `MetricsScraper` shared
+    /// with the server task. Returns `None` when monitoring is
+    /// disabled or has already been spawned.
+    pub fn spawn_metrics(
+        &self,
+        shutdown: watch::Receiver<bool>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let manager = self.monitoring.lock().take()?;
+        if !manager.is_enabled() {
+            return None;
+        }
+        let scraper = manager.into_scraper();
+        Some(tokio::spawn(async move {
+            if let Err(e) = air_elt_monitoring::server::serve(scraper, shutdown).await {
+                error!(error = %e, "metrics server stopped with error");
+            }
+        }))
+    }
+
+    /// Consume the monitoring manager and return the scrape-time
+    /// handle. Used by integration tests that bind their own ephemeral
+    /// `TcpListener` and spawn `air_elt_monitoring::server::serve_on_listener`
+    /// directly — production code goes through [`Self::spawn_metrics`]
+    /// instead.
+    pub fn take_scraper(&self) -> air_elt_monitoring::MetricsScraper {
+        self.monitoring
+            .lock()
+            .take()
+            .map(air_elt_monitoring::MonitoringManager::into_scraper)
+            .unwrap_or_default()
+    }
+
+    /// Lazily run (and cache) the no-I/O `assemble` stage.
     async fn flows_assembled(&self) -> Result<&Vec<AssembledFlow>> {
         self.assembled
             .get_or_try_init(|| async {
-                let assembled = assemble(&self.config, &self.registry).await?;
+                // `MonitoringGuard` borrows the manager out of the
+                // `Mutex<Option<…>>`, hands `&mut` to assemble, and
+                // restores it on Drop — including on panic or future
+                // cancellation between the `.take()` and the manual
+                // put-back below. Without it a mid-assemble unwind
+                // would leave the manager `None` and silently disable
+                // `/metrics` for the rest of the process lifetime.
+                let mut guard = MonitoringGuard::take(&self.monitoring);
+                let assembled = assemble(&self.config, &self.registry, guard.as_mut()).await?;
                 Ok::<_, anyhow::Error>(assembled)
             })
             .await
@@ -126,7 +219,6 @@ impl App {
             .await
     }
 
-    /// Sorted lists of registered source / sink / storage kinds.
     pub fn list_kinds(&self) -> ListedKinds {
         ListedKinds {
             sources: self.registry.source_kinds(),
@@ -147,50 +239,37 @@ impl App {
         })
     }
 
-    /// Run `Storage::migrate` for every declared storage. Only the
-    /// no-I/O `assemble` stage runs first — the validation I/O probes
-    /// are deferred to the runner caller. This ordering is load-bearing:
-    /// sampling-validation reads from `air_elt_cursors` through the
-    /// runner, so running it before the storage tables exist would
-    /// surface as `relation "air_elt_cursors" does not exist`. After
-    /// this returns, the `migrated` flag is set so `run_once` won't
-    /// repeat the DDL.
+    /// Run only the no-I/O assemble stage and cache the result. Used by
+    /// the CLI to mint recorders into `AssembledFlow` BEFORE spawning
+    /// the metrics server, so a subsequent validate I/O failure has a
+    /// live `/metrics` endpoint to surface error counters through.
+    pub fn assemble(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            self.flows_assembled().await?;
+            Ok(())
+        })
+    }
+
     pub fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             let assembled = self.flows_assembled().await?;
-            // Fast path: already done. Avoids taking the mutex on
-            // steady-state callers (e.g. multiple `run_once()` in a
-            // row).
             if self.migrated.load(Ordering::Acquire) {
                 return Ok(());
             }
             let _guard = self.migrate_lock.lock().await;
-            // Re-check inside the lock — a racing caller may have
-            // completed the pass while we were waiting.
             if self.migrated.load(Ordering::Acquire) {
                 return Ok(());
             }
             for f in assembled {
                 f.storage.migrate().await?;
             }
-            // Flag flips ONLY after every migrate() returned Ok.
-            // A mid-pass failure leaves the flag at false, so the
-            // next caller retries the whole DDL pass against the
-            // remaining unmigrated storages.
             self.migrated.store(true, Ordering::Release);
             Ok(())
         })
     }
 
-    /// Run all flows once (drain + exit). Mirrors `air-elt run --once`.
-    /// Storage migrations are applied (if not already) before the I/O
-    /// validation pass so its cursor-table probes succeed; subsequent
-    /// calls (including an earlier explicit `migrate()`) skip the DDL.
     pub fn run_once(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            // Reuse the dedicated migrate() path so the success-only
-            // flag flip + mutex serialisation logic lives in exactly
-            // one place.
             self.migrate().await?;
             let flows = self.flows_validated().await?;
             let (_tx, rx) = watch::channel(false);
@@ -201,9 +280,6 @@ impl App {
         })
     }
 
-    /// Run all flows in daemon mode until `shutdown` flips to `true`.
-    /// Storage migrations are NOT run here — call `migrate()` first if the
-    /// storage tables may not yet exist.
     pub fn run_daemon(
         &self,
         shutdown: watch::Receiver<bool>,
@@ -225,13 +301,32 @@ mod tests {
     use std::path::PathBuf;
 
     fn workspace_root() -> PathBuf {
-        // CARGO_MANIFEST_DIR for this crate is `crates/app`.
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .parent()
             .unwrap()
             .to_path_buf()
+    }
+
+    /// `MonitoringGuard` must restore the manager on Drop even when
+    /// the caller never explicitly returns it. Simulates the failure
+    /// path: take the guard, drop it without using `as_mut`, and
+    /// confirm the slot's `Option` is still `Some`.
+    #[test]
+    fn monitoring_guard_restores_on_drop() {
+        let slot = Mutex::new(Some(air_elt_monitoring::MonitoringManager::disabled()));
+        {
+            let _guard = MonitoringGuard::take(&slot);
+            assert!(
+                slot.lock().is_none(),
+                "manager moved out of slot for the guard's lifetime"
+            );
+        }
+        assert!(
+            slot.lock().is_some(),
+            "manager restored on Drop — assemble panic / cancellation cannot silently disable metrics"
+        );
     }
 
     #[test]

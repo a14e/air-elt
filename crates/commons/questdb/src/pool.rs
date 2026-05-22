@@ -7,6 +7,13 @@
 //!
 //! There is no wrapper struct: callers hold the `PgPool` directly and
 //! call the free functions in this module.
+//!
+//! Pool stats are NOT wired here. The driver-pool instant gauges
+//! are driven by a snapshot-at-scrape source registered with the
+//! monitoring collector — see
+//! `pool_stats_reader::QuestDbPoolStatsReader`. The factory wraps the
+//! returned `PgPool`, registers the stats reader, and the collector
+//! polls it on every scrape.
 
 use std::str::FromStr;
 
@@ -25,7 +32,11 @@ use air_elt_core::error::{RuntimeError, RuntimeResult};
 /// full TCP / `tokio::time::timeout` window.
 pub async fn connect_pool(pg_url: &str, pool: PoolSettings) -> RuntimeResult<PgPool> {
     let opts = PgConnectOptions::from_str(pg_url).map_err(RuntimeError::backend)?;
-    let statement_timeout_ms = pool.statement.as_millis() as u64;
+    // Mirror `air_elt_commons_pg::pool` — saturate to `i64::MAX` on
+    // overflow rather than silently truncating with `as u64`. QuestDB's
+    // pg wire driver accepts either signed or unsigned in
+    // `SET statement_timeout`; pg's idiom carries over cleanly.
+    let statement_timeout_ms = i64::try_from(pool.statement.as_millis()).unwrap_or(i64::MAX);
     let pool_opts: PgPoolOptions = PgPoolOptions::new()
         .max_connections(pool.max_connections)
         .min_connections(pool.min_connections)

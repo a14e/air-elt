@@ -76,6 +76,12 @@ impl MySqlSink {
         })
     }
 
+    /// Clone-cheap accessor used by the factory to wrap the pool in a
+    /// `MySqlPoolStatsReader`. The `MySqlPool` is internally `Arc`-backed.
+    pub fn pool(&self) -> MySqlPool {
+        self.pool.clone()
+    }
+
     async fn ensure_connection_alive(&self) -> RuntimeResult<()> {
         sqlx::query(sql::PING)
             .execute(&self.pool)
@@ -224,7 +230,7 @@ impl Sink for MySqlSink {
         dry_run: bool,
     ) -> RuntimeResult<WriteReport> {
         if batch.rows.is_empty() {
-            return Ok(WriteReport { rows_written: 0 });
+            return Ok(WriteReport::default());
         }
         let my_ctx = ctx.downcast_ref_to::<MySqlSinkCtx>()?;
         if dry_run {
@@ -246,12 +252,14 @@ impl Sink for MySqlSink {
             upsert_result?;
             delete_result?;
             rollback_result?;
-            return Ok(WriteReport { rows_written: 0 });
+            return Ok(WriteReport::default());
         }
         let upserted = write_upsert_batch(&self.pool, my_ctx, &batch.rows).await?;
         let deleted = write_delete_batch(&self.pool, my_ctx, &batch.rows).await?;
         Ok(WriteReport {
-            rows_written: upserted + deleted,
+            upserts: upserted,
+            deletes: deleted,
+            skipped: 0,
         })
     }
 }

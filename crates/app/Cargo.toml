@@ -20,6 +20,7 @@ path = "src/main.rs"
 [dependencies]
 air-elt-core = { workspace = true }
 air-elt-commons = { workspace = true }
+air-elt-monitoring = { workspace = true }
 air-elt-commons-mongodb = { workspace = true }
 air-elt-source-postgres = { workspace = true }
 air-elt-source-mysql = { workspace = true }
@@ -40,6 +41,7 @@ tracing = { workspace = true }
 mimalloc = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 air-elt-commons-testing = { workspace = true }
@@ -51,6 +53,7 @@ bigdecimal = { workspace = true }
 mongodb = { workspace = true }
 bson = { workspace = true }
 futures = { workspace = true }
+reqwest = { workspace = true }
 
 [lints]
 workspace = true

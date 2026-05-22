@@ -23,10 +23,21 @@
 use std::sync::Arc;
 
 use ahash::AHashMap;
+use air_elt_monitoring::{ActiveGuard, ComponentKind, LockRecorder, MonitoringManager};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::info;
 
 use crate::error::RuntimeError;
+
+/// One registered component: the semaphore that fronts its pool. The
+/// declared `max-connections` value is consumed by `register_into` to
+/// size the semaphore and is not retained — `log_concurrency_budgets`
+/// reads the live permit count directly via `available_permits()`. The
+/// configuration gauge `air_elt_lock_max` is set independently by
+/// `assemble` via `MonitoringManager::set_lock_max`.
+struct Slot {
+    semaphore: Arc<Semaphore>,
+}
 
 /// Registry of one `Semaphore` per declared component instance, keyed
 /// by `(kind, name)`. Built and frozen at validation `assemble` time;
@@ -35,9 +46,9 @@ use crate::error::RuntimeError;
 /// assemble).
 #[derive(Default)]
 pub struct ConcurrencyManager {
-    sources: AHashMap<String, Arc<Semaphore>>,
-    sinks: AHashMap<String, Arc<Semaphore>>,
-    storages: AHashMap<String, Arc<Semaphore>>,
+    sources: AHashMap<String, Slot>,
+    sinks: AHashMap<String, Slot>,
+    storages: AHashMap<String, Slot>,
 }
 
 impl ConcurrencyManager {
@@ -50,54 +61,78 @@ impl ConcurrencyManager {
     /// declared component, but the contract is defensive so a future
     /// caller that registers the same name twice cannot accidentally
     /// replace the live `Arc<Semaphore>` (which would orphan any
-    /// handle already holding the original).
+    /// handle already holding the original). `or_insert_with` preserves
+    /// the Arc identity on the second call.
     pub fn register_source(&mut self, name: &str, max_connections: u32) {
-        register_into(&mut self.sources, name, max_connections);
+        let permits = (max_connections as usize).min(Semaphore::MAX_PERMITS);
+        self.sources
+            .entry(name.to_string())
+            .or_insert_with(|| Slot {
+                semaphore: Arc::new(Semaphore::new(permits)),
+            });
     }
 
     pub fn register_sink(&mut self, name: &str, max_connections: u32) {
-        register_into(&mut self.sinks, name, max_connections);
+        let permits = (max_connections as usize).min(Semaphore::MAX_PERMITS);
+        self.sinks.entry(name.to_string()).or_insert_with(|| Slot {
+            semaphore: Arc::new(Semaphore::new(permits)),
+        });
     }
 
     pub fn register_storage(&mut self, name: &str, max_connections: u32) {
-        register_into(&mut self.storages, name, max_connections);
+        let permits = (max_connections as usize).min(Semaphore::MAX_PERMITS);
+        self.storages
+            .entry(name.to_string())
+            .or_insert_with(|| Slot {
+                semaphore: Arc::new(Semaphore::new(permits)),
+            });
     }
 
     /// Build a per-flow handle. Resolves the three components against
     /// the registry **once** here and caches the `Arc<Semaphore>`
     /// triple on the handle, so the hot `acquire_*` path is a single
-    /// `Semaphore::acquire` call — no hashmap lookup, no Arc clone.
+    /// `Semaphore::acquire` call — no hashmap lookup.
+    ///
+    /// Lock recorders are minted via the supplied `MonitoringManager`
+    /// and are idempotent on `(kind, name)`. When monitoring is
+    /// disabled, every `LockRecorder` collapses to a no-op.
     ///
     /// Panics if any of the three components has not been registered.
     /// That is a programming error in `assemble`, not a user-facing
     /// failure.
-    pub fn handle(&self, source: &str, sink: &str, storage: &str) -> FlowLockHandle {
+    pub fn handle(
+        &self,
+        source: &str,
+        sink: &str,
+        storage: &str,
+        monitoring: &mut MonitoringManager,
+    ) -> FlowLockHandle {
+        let source_slot = self
+            .sources
+            .get(source)
+            .unwrap_or_else(|| panic!("source {source:?} not registered"));
+        let sink_slot = self
+            .sinks
+            .get(sink)
+            .unwrap_or_else(|| panic!("sink {sink:?} not registered"));
+        let storage_slot = self
+            .storages
+            .get(storage)
+            .unwrap_or_else(|| panic!("storage {storage:?} not registered"));
+
+        let source_recorder = monitoring.lock_recorder(ComponentKind::Source, source);
+        let sink_recorder = monitoring.lock_recorder(ComponentKind::Sink, sink);
+        let storage_recorder = monitoring.lock_recorder(ComponentKind::Storage, storage);
+
         FlowLockHandle {
-            source: self
-                .sources
-                .get(source)
-                .unwrap_or_else(|| panic!("source {source:?} not registered"))
-                .clone(),
-            sink: self
-                .sinks
-                .get(sink)
-                .unwrap_or_else(|| panic!("sink {sink:?} not registered"))
-                .clone(),
-            storage: self
-                .storages
-                .get(storage)
-                .unwrap_or_else(|| panic!("storage {storage:?} not registered"))
-                .clone(),
+            source_semaphore: source_slot.semaphore.clone(),
+            sink_semaphore: sink_slot.semaphore.clone(),
+            storage_semaphore: storage_slot.semaphore.clone(),
+            source_recorder,
+            sink_recorder,
+            storage_recorder,
         }
     }
-}
-
-/// `or_insert_with` preserves Arc identity on second call so any
-/// handle already issued continues to reference the same Semaphore.
-fn register_into(map: &mut AHashMap<String, Arc<Semaphore>>, name: &str, max_connections: u32) {
-    let permits = (max_connections as usize).min(Semaphore::MAX_PERMITS);
-    map.entry(name.to_string())
-        .or_insert_with(|| Arc::new(Semaphore::new(permits)));
 }
 
 /// Emit one `info!` per registered component recording its permit
@@ -107,13 +142,13 @@ fn register_into(map: &mut AHashMap<String, Arc<Semaphore>>, name: &str, max_con
 pub fn log_concurrency_budgets(mgr: &ConcurrencyManager) {
     let mut rows: Vec<(&'static str, &str, usize)> = Vec::new();
     for (n, s) in &mgr.sources {
-        rows.push(("source", n.as_str(), s.available_permits()));
+        rows.push(("source", n.as_str(), s.semaphore.available_permits()));
     }
     for (n, s) in &mgr.sinks {
-        rows.push(("sink", n.as_str(), s.available_permits()));
+        rows.push(("sink", n.as_str(), s.semaphore.available_permits()));
     }
     for (n, s) in &mgr.storages {
-        rows.push(("storage", n.as_str(), s.available_permits()));
+        rows.push(("storage", n.as_str(), s.semaphore.available_permits()));
     }
     rows.sort();
     for (kind, name, permits) in rows {
@@ -134,22 +169,53 @@ pub fn log_concurrency_budgets(mgr: &ConcurrencyManager) {
 /// only on that pool, not on each other's unrelated reads/writes.
 #[derive(Clone)]
 pub struct FlowLockHandle {
-    source: Arc<Semaphore>,
-    sink: Arc<Semaphore>,
-    storage: Arc<Semaphore>,
+    source_semaphore: Arc<Semaphore>,
+    sink_semaphore: Arc<Semaphore>,
+    storage_semaphore: Arc<Semaphore>,
+    source_recorder: LockRecorder,
+    sink_recorder: LockRecorder,
+    storage_recorder: LockRecorder,
+}
+
+/// RAII guard bundling the held semaphore permit with the lock's
+/// `ActiveGuard`. On drop both are released — the permit returns to
+/// the semaphore, the `lock_active_seconds_integral` slot decrements.
+pub struct LockGuard<'a> {
+    _permit: SemaphorePermit<'a>,
+    _active: ActiveGuard<'a>,
 }
 
 impl FlowLockHandle {
-    pub async fn acquire_source(&self) -> Result<SemaphorePermit<'_>, RuntimeError> {
-        self.source.acquire().await.map_err(RuntimeError::backend)
+    pub async fn acquire_source(&self) -> Result<LockGuard<'_>, RuntimeError> {
+        self.acquire(ComponentKind::Source).await
     }
 
-    pub async fn acquire_sink(&self) -> Result<SemaphorePermit<'_>, RuntimeError> {
-        self.sink.acquire().await.map_err(RuntimeError::backend)
+    pub async fn acquire_sink(&self) -> Result<LockGuard<'_>, RuntimeError> {
+        self.acquire(ComponentKind::Sink).await
     }
 
-    pub async fn acquire_storage(&self) -> Result<SemaphorePermit<'_>, RuntimeError> {
-        self.storage.acquire().await.map_err(RuntimeError::backend)
+    pub async fn acquire_storage(&self) -> Result<LockGuard<'_>, RuntimeError> {
+        self.acquire(ComponentKind::Storage).await
+    }
+
+    /// Shared acquire path. Scopes the `lock_queue` integrating slot to
+    /// exactly the `acquire().await` span: increment on entry, drop the
+    /// guard once the permit is in hand, then attach the `lock_active`
+    /// guard to the returned `LockGuard` so it tracks the held permit's
+    /// lifetime.
+    async fn acquire(&self, kind: ComponentKind) -> Result<LockGuard<'_>, RuntimeError> {
+        let (semaphore, recorder) = match kind {
+            ComponentKind::Source => (&self.source_semaphore, &self.source_recorder),
+            ComponentKind::Sink => (&self.sink_semaphore, &self.sink_recorder),
+            ComponentKind::Storage => (&self.storage_semaphore, &self.storage_recorder),
+        };
+        let _queue = recorder.queue_guard();
+        let permit = semaphore.acquire().await.map_err(RuntimeError::backend)?;
+        drop(_queue);
+        Ok(LockGuard {
+            _permit: permit,
+            _active: recorder.active_guard(),
+        })
     }
 }
 
@@ -182,14 +248,19 @@ mod tests {
     #[tokio::test]
     async fn per_component_acquire_does_not_touch_siblings() {
         let m = manager_with(&[("s", 1)], &[("k", 1)], &[("st", 1)]);
-        let h = m.handle("s", "k", "st");
+        let h = m.handle(
+            "s",
+            "k",
+            "st",
+            &mut air_elt_monitoring::MonitoringManager::disabled(),
+        );
         {
             let _g = h.acquire_source().await.unwrap();
-            assert_eq!(m.sources["s"].available_permits(), 0);
-            assert_eq!(m.sinks["k"].available_permits(), 1);
-            assert_eq!(m.storages["st"].available_permits(), 1);
+            assert_eq!(m.sources["s"].semaphore.available_permits(), 0);
+            assert_eq!(m.sinks["k"].semaphore.available_permits(), 1);
+            assert_eq!(m.storages["st"].semaphore.available_permits(), 1);
         }
-        assert_eq!(m.sources["s"].available_permits(), 1);
+        assert_eq!(m.sources["s"].semaphore.available_permits(), 1);
     }
 
     /// Two flows sharing the same single-permit source must serialise
@@ -203,8 +274,18 @@ mod tests {
             &[("sink_a", 1), ("sink_b", 1)],
             &[("storage_a", 1), ("storage_b", 1)],
         );
-        let h1 = m.handle("shared", "sink_a", "storage_a");
-        let h2 = m.handle("shared", "sink_b", "storage_b");
+        let h1 = m.handle(
+            "shared",
+            "sink_a",
+            "storage_a",
+            &mut air_elt_monitoring::MonitoringManager::disabled(),
+        );
+        let h2 = m.handle(
+            "shared",
+            "sink_b",
+            "storage_b",
+            &mut air_elt_monitoring::MonitoringManager::disabled(),
+        );
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
         let tx1 = tx.clone();
@@ -240,13 +321,18 @@ mod tests {
     #[tokio::test]
     async fn sink_permit_independent_of_source_permit() {
         let m = manager_with(&[("s", 1)], &[("k", 1)], &[("st", 1)]);
-        let h = m.handle("s", "k", "st");
+        let h = m.handle(
+            "s",
+            "k",
+            "st",
+            &mut air_elt_monitoring::MonitoringManager::disabled(),
+        );
         let _src = h.acquire_source().await.unwrap();
         // Sink permit is unrelated to source — must acquire without
         // contention.
         let _snk = h.acquire_sink().await.unwrap();
-        assert_eq!(m.sources["s"].available_permits(), 0);
-        assert_eq!(m.sinks["k"].available_permits(), 0);
+        assert_eq!(m.sources["s"].semaphore.available_permits(), 0);
+        assert_eq!(m.sinks["k"].semaphore.available_permits(), 0);
     }
 
     /// Asking the manager for an unregistered handle is a programming
@@ -255,7 +341,12 @@ mod tests {
     #[should_panic(expected = "not registered")]
     fn unregistered_component_panics() {
         let m = manager_with(&[("s", 1)], &[("k", 1)], &[]);
-        let _ = m.handle("s", "k", "missing-storage");
+        let _ = m.handle(
+            "s",
+            "k",
+            "missing-storage",
+            &mut air_elt_monitoring::MonitoringManager::disabled(),
+        );
     }
 
     /// `register_*` is idempotent on name — registering the same
@@ -268,13 +359,18 @@ mod tests {
         m.register_sink("sink", 1);
         m.register_storage("storage", 1);
         let mgr = Arc::new(m);
-        let h1 = mgr.handle("shared_src", "sink", "storage");
+        let h1 = mgr.handle(
+            "shared_src",
+            "sink",
+            "storage",
+            &mut air_elt_monitoring::MonitoringManager::disabled(),
+        );
         // Re-register the same source — handle1's Arc must still
         // point at the same Semaphore the second handle gets.
         // (Unsafe to call from `&Arc<Self>`, so build a second
         // manager scenario via owned manager.)
-        let arc_via_handle = h1.source.clone();
-        let arc_via_inner = mgr.sources["shared_src"].clone();
+        let arc_via_handle = h1.source_semaphore.clone();
+        let arc_via_inner = mgr.sources["shared_src"].semaphore.clone();
         assert!(Arc::ptr_eq(&arc_via_handle, &arc_via_inner));
         assert_eq!(arc_via_handle.available_permits(), 5);
     }

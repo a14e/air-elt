@@ -2,6 +2,7 @@ mod app_migrate_ordering;
 mod cli_validate;
 mod cockroachdb_to_pg;
 mod mariadb_to_pg;
+mod metrics_e2e;
 mod mongo_cdc_to_clickhouse;
 mod mongo_to_mongo;
 mod mongo_to_mysql;

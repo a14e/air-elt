@@ -32,9 +32,13 @@ async fn cdc_source(handle: &MongoTestHandle) -> Arc<MongoCdcSource> {
         max_await_time: Some(Duration::from_millis(200)),
         ..Default::default()
     };
-    let s = MongoCdcSource::connect("mongo_cdc_oid".into(), cfg)
-        .await
-        .expect("connect mongo-cdc");
+    let s = MongoCdcSource::connect(
+        "mongo_cdc_oid".into(),
+        cfg,
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
+    .await
+    .expect("connect mongo-cdc");
     Arc::new(s)
 }
 

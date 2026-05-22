@@ -12,6 +12,7 @@ doctest = false
 
 [dependencies]
 air-elt-core = { workspace = true }
+air-elt-monitoring = { workspace = true }
 air-elt-commons = { workspace = true }
 air-elt-commons-mongodb = { workspace = true }
 mongodb = { workspace = true }

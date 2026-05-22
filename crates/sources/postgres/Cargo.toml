@@ -19,6 +19,7 @@ path = "tests/all.rs"
 air-elt-core = { workspace = true }
 air-elt-commons = { workspace = true }
 air-elt-commons-pg = { workspace = true }
+air-elt-monitoring = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

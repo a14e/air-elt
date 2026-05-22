@@ -14,6 +14,7 @@
 //!   (`Storage::{load,save}_resume_token`). Same JSON-as-string
 //!   approach for the same reason.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -22,6 +23,7 @@ use mongodb::Client;
 use mongodb::options::{FindOneOptions, ReplaceOptions};
 use tracing::info;
 
+use air_elt_commons_mongodb::MongoPoolStatsReader;
 use air_elt_commons_mongodb::client::{PoolSettings, connect, database_from_url};
 use air_elt_commons_mongodb::identifier;
 use air_elt_commons_mongodb::task::detached;
@@ -51,7 +53,11 @@ pub struct MongoStorage {
 }
 
 impl MongoStorage {
-    pub async fn connect(config: MongoStorageConfig) -> RuntimeResult<Self> {
+    /// See `MongoSource::connect` for the reader lifecycle contract.
+    pub async fn connect(
+        config: MongoStorageConfig,
+        reader: Arc<MongoPoolStatsReader>,
+    ) -> RuntimeResult<Self> {
         let database = config
             .database
             .clone()
@@ -79,7 +85,7 @@ impl MongoStorage {
         )?;
         let operation_timeout = settings.statement;
         let pool_max_connections = settings.max_connections;
-        let client = connect(&config.url, settings).await?;
+        let client = connect(&config.url, settings, reader).await?;
         Ok(Self {
             client,
             database,

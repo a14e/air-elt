@@ -13,11 +13,14 @@ use bson::oid::ObjectId;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn insert_and_upsert_with_dot_notation() {
     let handle = mongo_pool().await;
-    let sink = MongoSink::connect(MongoSinkConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let sink = MongoSink::connect(
+        MongoSinkConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect");
 
@@ -51,7 +54,7 @@ async fn insert_and_upsert_with_dot_notation() {
         next_cursor: None,
     };
     let report = sink.write_batch(&spec, &ctx, batch, false).await.unwrap();
-    assert_eq!(report.rows_written, 2);
+    assert_eq!(report.rows_written(), 2);
 
     // Re-write same id 1 with new city — upsert path replaces it.
     let batch2 = Batch {
@@ -83,11 +86,14 @@ async fn insert_and_upsert_with_dot_notation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_object_id_lands_as_bson_object_id() {
     let handle = mongo_pool().await;
-    let sink = MongoSink::connect(MongoSinkConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let sink = MongoSink::connect(
+        MongoSinkConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect");
 
@@ -131,11 +137,14 @@ async fn write_object_id_lands_as_bson_object_id() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_javascript_code_round_trip() {
     let handle = mongo_pool().await;
-    let sink = MongoSink::connect(MongoSinkConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let sink = MongoSink::connect(
+        MongoSinkConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect");
 

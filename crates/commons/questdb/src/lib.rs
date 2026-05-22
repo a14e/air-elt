@@ -22,9 +22,11 @@
 pub mod identifier;
 pub mod pg_bind;
 pub mod pool;
+pub mod pool_stats_reader;
 pub mod qd_type_parser;
 pub mod schema;
 pub mod types;
 
+pub use pool_stats_reader::QuestDbPoolStatsReader;
 pub use qd_type_parser::{ParseError, parse_type};
 pub use schema::{SchemaError, SchemaWithDesignated, fetch_schema};

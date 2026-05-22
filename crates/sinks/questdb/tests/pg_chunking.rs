@@ -71,7 +71,7 @@ async fn pg_wire_chunks_large_batch_at_bind_param_cap() {
         )
         .await
         .expect("write_batch");
-    assert_eq!(report.rows_written, 2_000);
+    assert_eq!(report.rows_written(), 2_000);
 
     // WAL-apply is asynchronous — poll for the expected count up to 10s.
     let mut row_count: i64 = 0;

@@ -78,13 +78,24 @@ Ctrl-C between iterations — containers stay up.
 
 ## Side channels
 
-Three tail-able logs:
+Four tail-able logs:
 
 - `logs/load.log` — insert simulator: rate, last seq.
 - `logs/validate.log` — count + lag every 5s.
+- `logs/metrics.log` — Prometheus `/metrics` health every 5s: asserts every required metric family is present and that `air_elt_rows_total` is monotonically non-decreasing across all `(stage, op)` label combinations. Three consecutive failures (404, missing family, regressing counter) exit non-zero.
 - `logs/stats.log` — CPU% + RSS for air-elt and both containers, TSV every 5s.
 
-All three written by sibling scripts (`load.py`, `validate.py`, `stats.py`); `run.py` starts them.
+All four written by sibling scripts (`load.py`, `validate.py`, `metrics.py`, `stats.py`); `run.py` starts them.
+
+## Metrics
+
+The smoke daemon enables `[metrics.prometheus]` on port `8090` (override in `air-elt-config/config.toml`). Browse with:
+
+```
+curl -s http://localhost:8090/metrics | grep ^air_elt_
+```
+
+`metrics.py` checks the same endpoint automatically — see `logs/metrics.log`.
 
 ## Cleanup
 

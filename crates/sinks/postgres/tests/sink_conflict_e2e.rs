@@ -91,7 +91,7 @@ async fn overwrite_replaces_existing_rows() {
         .write_batch(&s, &ctx, payload, false)
         .await
         .expect("write");
-    assert_eq!(report.rows_written, 3);
+    assert_eq!(report.rows_written(), 3);
 
     let rows = fetch_labels(&handle.pool).await;
     assert_eq!(rows.len(), 3);

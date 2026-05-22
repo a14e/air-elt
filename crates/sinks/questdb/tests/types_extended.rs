@@ -56,7 +56,7 @@ async fn binary_round_trip() {
         )
         .await
         .expect("write_batch");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     let mut count: i64 = 0;
     for _ in 0..50 {

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 
+use air_elt_monitoring::MonitoringManager;
 use async_trait::async_trait;
 
 use crate::config::model::ComponentConfig;
@@ -17,9 +18,23 @@ use crate::config::validation::SamplingConfig;
 use crate::error::{ConfigError, RuntimeError, RuntimeResult};
 use crate::traits::{Sink, Source, Storage};
 
+/// Each factory owns its connector's metric wiring end-to-end. The
+/// `monitoring` handle is passed in so the factory can call
+/// `monitoring.register_pool_stats(kind, name, max, min, reader)` once
+/// the driver pool is up — that single call publishes `max`/`min` and
+/// attaches the per-backend `PoolStatsReader` the collector polls on
+/// every scrape for live `(active, idle)` counts. Mongo builds the
+/// stats-reader strong-Arc before `Client::with_options(...)` because
+/// the CMAP closure captures it; SQL backends build it after `connect`
+/// from the live pool handle. Backends with no pool concept
+/// (ClickHouse) accept the handle and ignore it.
 #[async_trait]
 pub trait SourceFactory: Send + Sync {
-    async fn build(&self, cfg: &ComponentConfig) -> Result<Box<dyn Source>, ConfigError>;
+    async fn build(
+        &self,
+        cfg: &ComponentConfig,
+        monitoring: &mut MonitoringManager,
+    ) -> Result<Box<dyn Source>, ConfigError>;
 
     /// Per-backend default for the sampling-validation step.
     /// Off for SQL connectors (the schema is authoritative); on for
@@ -32,12 +47,20 @@ pub trait SourceFactory: Send + Sync {
 
 #[async_trait]
 pub trait SinkFactory: Send + Sync {
-    async fn build(&self, cfg: &ComponentConfig) -> Result<Box<dyn Sink>, ConfigError>;
+    async fn build(
+        &self,
+        cfg: &ComponentConfig,
+        monitoring: &mut MonitoringManager,
+    ) -> Result<Box<dyn Sink>, ConfigError>;
 }
 
 #[async_trait]
 pub trait StorageFactory: Send + Sync {
-    async fn build(&self, cfg: &ComponentConfig) -> Result<Box<dyn Storage>, ConfigError>;
+    async fn build(
+        &self,
+        cfg: &ComponentConfig,
+        monitoring: &mut MonitoringManager,
+    ) -> Result<Box<dyn Storage>, ConfigError>;
 }
 
 #[derive(Default, Clone)]
@@ -64,24 +87,32 @@ impl Registry {
         self.storages.insert(kind.to_string(), factory);
     }
 
-    pub async fn build_source(&self, cfg: &ComponentConfig) -> RuntimeResult<Box<dyn Source>> {
+    pub async fn build_source(
+        &self,
+        cfg: &ComponentConfig,
+        monitoring: &mut MonitoringManager,
+    ) -> RuntimeResult<Box<dyn Source>> {
         let f = self
             .sources
             .get(&cfg.kind)
             .ok_or_else(|| RuntimeError::NotRegistered {
                 component: format!("source:{}", cfg.kind),
             })?;
-        f.build(cfg).await.map_err(RuntimeError::Config)
+        f.build(cfg, monitoring).await.map_err(RuntimeError::Config)
     }
 
-    pub async fn build_sink(&self, cfg: &ComponentConfig) -> RuntimeResult<Box<dyn Sink>> {
+    pub async fn build_sink(
+        &self,
+        cfg: &ComponentConfig,
+        monitoring: &mut MonitoringManager,
+    ) -> RuntimeResult<Box<dyn Sink>> {
         let f = self
             .sinks
             .get(&cfg.kind)
             .ok_or_else(|| RuntimeError::NotRegistered {
                 component: format!("sink:{}", cfg.kind),
             })?;
-        f.build(cfg).await.map_err(RuntimeError::Config)
+        f.build(cfg, monitoring).await.map_err(RuntimeError::Config)
     }
 
     /// Look up the per-backend sampling-validation default, given a
@@ -117,13 +148,17 @@ impl Registry {
         keys
     }
 
-    pub async fn build_storage(&self, cfg: &ComponentConfig) -> RuntimeResult<Box<dyn Storage>> {
+    pub async fn build_storage(
+        &self,
+        cfg: &ComponentConfig,
+        monitoring: &mut MonitoringManager,
+    ) -> RuntimeResult<Box<dyn Storage>> {
         let f = self
             .storages
             .get(&cfg.kind)
             .ok_or_else(|| RuntimeError::NotRegistered {
                 component: format!("storage:{}", cfg.kind),
             })?;
-        f.build(cfg).await.map_err(RuntimeError::Config)
+        f.build(cfg, monitoring).await.map_err(RuntimeError::Config)
     }
 }

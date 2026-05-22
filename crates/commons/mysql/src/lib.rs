@@ -7,5 +7,8 @@ pub mod identifier;
 pub mod mysql_type;
 pub mod null_bind;
 pub mod pool;
+pub mod pool_stats_reader;
 pub mod schema;
 pub mod sink_bind;
+
+pub use pool_stats_reader::MySqlPoolStatsReader;

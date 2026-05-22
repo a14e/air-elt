@@ -106,7 +106,7 @@ async fn round_trip_all_custom_types() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     // SELECT each column back. Use TabSeparated for predictable output
     // and `toString` to coerce CH's native rendering into something we

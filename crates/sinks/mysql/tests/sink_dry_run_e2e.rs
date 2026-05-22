@@ -57,7 +57,7 @@ async fn write_batch_dry_run_skips_writes_then_real_run_commits() {
         .write_batch(&spec, &ctx, make_batch(), true)
         .await
         .expect("dry-run write");
-    assert_eq!(report_dry.rows_written, 0);
+    assert_eq!(report_dry.rows_written(), 0);
     let count_after_dry: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dry_run_t")
         .fetch_one(&handle.pool)
         .await
@@ -71,7 +71,7 @@ async fn write_batch_dry_run_skips_writes_then_real_run_commits() {
         .write_batch(&spec, &ctx, make_batch(), false)
         .await
         .expect("real write");
-    assert_eq!(report.rows_written, 2);
+    assert_eq!(report.rows_written(), 2);
     let count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dry_run_t")
         .fetch_one(&handle.pool)
         .await
@@ -209,7 +209,7 @@ async fn write_batch_dry_run_delete_preserves_then_real_run_deletes() {
         .write_batch(&spec, &ctx, make_delete(), true)
         .await
         .expect("dry-run delete");
-    assert_eq!(report_dry.rows_written, 0);
+    assert_eq!(report_dry.rows_written(), 0);
     let count_after_dry: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dry_run_del_seeded_t")
         .fetch_one(&handle.pool)
         .await
@@ -224,7 +224,7 @@ async fn write_batch_dry_run_delete_preserves_then_real_run_deletes() {
         .write_batch(&spec, &ctx, make_delete(), false)
         .await
         .expect("real delete");
-    assert_eq!(report_real.rows_written, 2);
+    assert_eq!(report_real.rows_written(), 2);
     let count_after_real: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dry_run_del_seeded_t")
         .fetch_one(&handle.pool)
         .await

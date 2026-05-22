@@ -20,11 +20,14 @@ use bson::doc;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_passthrough_writes_documents_verbatim() {
     let handle = mongo_pool().await;
-    let sink = MongoSink::connect(MongoSinkConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let sink = MongoSink::connect(
+        MongoSinkConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect");
 
@@ -57,7 +60,7 @@ async fn raw_passthrough_writes_documents_verbatim() {
         next_cursor: None,
     };
     let report = sink.write_batch(&spec, &ctx, batch, false).await.unwrap();
-    assert_eq!(report.rows_written, 2);
+    assert_eq!(report.rows_written(), 2);
 
     let coll = handle
         .client

@@ -77,7 +77,7 @@ async fn write_batch_and_validate_access() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write");
-    assert_eq!(report.rows_written, 2);
+    assert_eq!(report.rows_written(), 2);
 
     let rows: Vec<(i64, String, Option<serde_json::Value>)> =
         sqlx::query_as("SELECT id, label, payload FROM events ORDER BY id")
@@ -160,7 +160,7 @@ async fn all_nulls_across_data_types() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     // All NOT NULL arms decoded back as NULL. Separate query_as blocks keep
     // each tuple below clippy's type-complexity threshold.
@@ -288,7 +288,7 @@ async fn all_types_non_null_round_trip() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     let (c_bool, c_i16, c_i32, c_i64): (bool, i16, i32, i64) =
         sqlx::query_as("SELECT c_bool, c_i16, c_i32, c_i64 FROM all_vals WHERE id = 1")
@@ -359,7 +359,7 @@ async fn cockroach_smoke_insert_and_read_back() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write");
-    assert_eq!(report.rows_written, 5);
+    assert_eq!(report.rows_written(), 5);
 
     let back: Vec<(i64, String)> = sqlx::query_as("SELECT id, label FROM smoke ORDER BY id")
         .fetch_all(&handle.pool)
@@ -436,7 +436,7 @@ async fn ip_types_round_trip() {
         )
         .await
         .expect("write");
-    assert_eq!(report.rows_written, 3);
+    assert_eq!(report.rows_written(), 3);
 
     // Read back via `host()` / `text(inet)`.
     let back: Vec<(i64, String)> = sqlx::query_as("SELECT id, text(c_ip) FROM ip_vals ORDER BY id")

@@ -30,7 +30,11 @@ use crate::types::{ConversionContext, DataType};
 pub struct AssembledFlow {
     pub name: String,
     /// Shared via `Arc` so multiple flows referencing the same source by
-    /// name reuse a single instance (and its pool).
+    /// name reuse a single instance (and its pool). The connector
+    /// crates expose their config-given name + kind through the
+    /// `Source` / `Sink` / `Storage` traits; the assemble pipeline
+    /// uses those at recorder mint time and we don't cache the strings
+    /// on the flow itself.
     pub source: Arc<dyn Source>,
     pub sink: Arc<dyn Sink>,
     pub storage: Arc<dyn Storage>,
@@ -69,6 +73,10 @@ pub struct AssembledFlow {
     /// See the `project-conventions` skill ("Concurrency:
     /// per-component semaphores").
     pub lock_handle: crate::util::FlowLockHandle,
+    /// Per-flow metrics recorder. Minted idempotently by `assemble`
+    /// via `MonitoringManager::flow_recorder` — flow runners just
+    /// clone it. Disabled when monitoring is off.
+    pub recorder: air_elt_monitoring::FlowRecorder,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -589,8 +597,14 @@ mod tests {
                 m.register_source("test-source", u32::MAX);
                 m.register_sink("test-sink", u32::MAX);
                 m.register_storage("test-storage", u32::MAX);
-                m.handle("test-source", "test-sink", "test-storage")
+                m.handle(
+                    "test-source",
+                    "test-sink",
+                    "test-storage",
+                    &mut air_elt_monitoring::MonitoringManager::disabled(),
+                )
             },
+            recorder: air_elt_monitoring::FlowRecorder::disabled(),
         }
     }
 

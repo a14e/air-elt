@@ -51,7 +51,7 @@ async fn writes_native_uuid_column_to_mariadb() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     // Read back through the source decoder via raw bytes (MariaDB returns
     // UUID columns as 36-char canonical text, see source codec) and parse
