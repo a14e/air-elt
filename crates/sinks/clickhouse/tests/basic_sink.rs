@@ -69,7 +69,13 @@ async fn round_trip_simple_columns() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
-    assert_eq!(report.rows_written, 1, "delete must be filtered");
+    assert_eq!(report.rows_written(), 1, "delete must be filtered");
+    assert_eq!(
+        report.rows_skipped(),
+        1,
+        "the dropped Delete row must be surfaced via `skipped` so the runner \
+         can increment `air_elt_rows_total{{stage=skipped, op=delete}}`"
+    );
 
     let body = h
         .exec("SELECT count() FROM users FORMAT TabSeparated")

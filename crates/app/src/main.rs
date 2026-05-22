@@ -121,8 +121,25 @@ async fn run(config: &Path, once: bool) -> anyhow::Result<()> {
     let shutdown = tokio::spawn(async move {
         signal::wait_for_shutdown(&tx).await;
     });
+    // Assemble first (no I/O — just resolves config + mints recorders
+    // into AssembledFlow). spawn_metrics consumes the manager
+    // immediately after, so the `/metrics` endpoint is live BEFORE
+    // run_daemon kicks off the I/O validation pass. The daemon path is
+    // the only one that opens the metrics endpoint; `air-elt validate`
+    // is a one-shot CLI subcommand and never wires up an HTTP server,
+    // so validation-time errors there surface only through the
+    // process's exit code and stderr.
+    app.assemble().await?;
+    let metrics_task = app.spawn_metrics(rx.clone());
     let result = app.run_daemon(rx).await;
     shutdown.abort();
+    if let Some(handle) = metrics_task {
+        // Graceful: the signal handler already flipped the shutdown
+        // watch, so axum's `with_graceful_shutdown` is unwinding. Wait
+        // for it to release the listener instead of abort()ing
+        // mid-flight.
+        let _ = handle.await;
+    }
     match result {
         Ok(()) => Ok(()),
         Err(e) => {

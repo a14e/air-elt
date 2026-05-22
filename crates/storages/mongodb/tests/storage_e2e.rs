@@ -9,11 +9,14 @@ use air_elt_storage_mongodb::{MongoStorage, MongoStorageConfig};
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn save_and_load_cursor_roundtrip() {
     let handle = mongo_pool().await;
-    let storage = MongoStorage::connect(MongoStorageConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let storage = MongoStorage::connect(
+        MongoStorageConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect");
 
@@ -63,11 +66,14 @@ async fn save_and_load_cursor_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn save_cursor_and_resume_token_dry_run_skip_writes() {
     let handle = mongo_pool().await;
-    let storage = MongoStorage::connect(MongoStorageConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let storage = MongoStorage::connect(
+        MongoStorageConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect");
     storage.migrate().await.expect("migrate");
@@ -120,11 +126,14 @@ async fn save_cursor_and_resume_token_dry_run_skip_writes() {
 async fn resume_token_round_trip_and_reopen() {
     let handle = mongo_pool().await;
     let make = || async {
-        MongoStorage::connect(MongoStorageConfig {
-            url: handle.url.clone(),
-            database: Some(handle.database.clone()),
-            ..Default::default()
-        })
+        MongoStorage::connect(
+            MongoStorageConfig {
+                url: handle.url.clone(),
+                database: Some(handle.database.clone()),
+                ..Default::default()
+            },
+            std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+        )
         .await
         .expect("connect")
     };
@@ -176,11 +185,14 @@ async fn resume_token_round_trip_and_reopen() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn save_and_load_cursor_ip_round_trip() {
     let handle = mongo_pool().await;
-    let storage = MongoStorage::connect(MongoStorageConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let storage = MongoStorage::connect(
+        MongoStorageConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect");
     storage.migrate().await.expect("migrate");

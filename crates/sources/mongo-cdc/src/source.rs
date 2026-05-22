@@ -36,6 +36,7 @@ use mongodb::options::{ChangeStreamOptions, FindOptions, FullDocumentType};
 use mongodb::{Client, Collection};
 use tracing::{debug, info, warn};
 
+use air_elt_commons_mongodb::MongoPoolStatsReader;
 use air_elt_commons_mongodb::client::{PoolSettings, connect, database_from_url};
 use air_elt_commons_mongodb::key_bson::KeyBson;
 use air_elt_commons_mongodb::task::detached;
@@ -72,7 +73,12 @@ pub struct MongoCdcSource {
 }
 
 impl MongoCdcSource {
-    pub async fn connect(name: String, config: MongoCdcSourceConfig) -> RuntimeResult<Self> {
+    /// See [`MongoSource::connect`] for the reader lifecycle contract.
+    pub async fn connect(
+        name: String,
+        config: MongoCdcSourceConfig,
+        reader: Arc<MongoPoolStatsReader>,
+    ) -> RuntimeResult<Self> {
         let database = config
             .database
             .clone()
@@ -97,7 +103,7 @@ impl MongoCdcSource {
         )?;
         let operation_timeout = settings.statement;
         let pool_max_connections = settings.max_connections;
-        let client = connect(&config.url, settings).await?;
+        let client = connect(&config.url, settings, reader).await?;
         Ok(Self {
             client,
             database,

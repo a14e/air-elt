@@ -16,6 +16,7 @@ Validation prioritises **correctness**: every access probe, type check, and conf
 - **Static SQL.** Statements are composed during config-init, never per-row.
 - **Micro-batch + drain.** Sub-second batches with drain semantics (pull while full, sleep when empty). A nightly mode is available via a long interval.
 - **Structured logs** via `tracing` only — no `println!`.
+- **Processes must be observable.** Every long-running loop, retry, blocking acquire, user-visible failure, and latency-sensitive operation carries a Prometheus metric. Observability is a precondition for shipping a feature, not a follow-up. See `project-conventions::Metrics` for the recorder pattern and current inventory.
 - **Minimal resources.** Run centralised, or place instances next to each data plane.
 
 ## Tech stack
@@ -139,7 +140,7 @@ Cursor columns may be nullable. NULL is treated as the minimum element: `NULL < 
 
 ## Out of MVP
 
-Vault secret retrieval (only `$ENV_VAR` / literals work), privilege-excess check, Prometheus/OTel metrics, connectors beyond postgres + mysql + mongodb + cockroachdb.
+Vault secret retrieval (only `$ENV_VAR` / literals work), privilege-excess check, OTel metrics, connectors beyond postgres + mysql + mongodb + cockroachdb.
 
 ## Testing
 

@@ -42,6 +42,11 @@ impl PgStorage {
         })
     }
 
+    /// Clone-cheap accessor used by the factory.
+    pub fn pool(&self) -> PgPool {
+        self.pool.clone()
+    }
+
     async fn ensure_connection_alive(&self) -> RuntimeResult<()> {
         sqlx::query(sql::PING)
             .execute(&self.pool)

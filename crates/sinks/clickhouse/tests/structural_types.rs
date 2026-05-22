@@ -50,7 +50,7 @@ async fn round_trip_array_int32() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     let body = h
         .exec("SELECT toString(vals) FROM arr_t WHERE id = 1 FORMAT TabSeparated")
@@ -132,7 +132,7 @@ async fn round_trip_map_string_int32() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     let body = h
         .exec("SELECT toString(attrs) FROM map_t WHERE id = 1 FORMAT TabSeparated")
@@ -181,7 +181,7 @@ async fn round_trip_tuple_int32_string() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     let body = h
         .exec("SELECT toString(tup) FROM tuple_t WHERE id = 1 FORMAT TabSeparated")
@@ -237,7 +237,7 @@ async fn round_trip_nested_as_arrays() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     let body = h
         .exec(

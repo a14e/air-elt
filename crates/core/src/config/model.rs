@@ -31,6 +31,19 @@ pub struct RootConfig {
 
     #[serde(default)]
     pub flow: BTreeMap<String, FlowConfig>,
+
+    #[serde(default)]
+    pub metrics: MetricsSection,
+}
+
+/// Optional `[metrics]` section. Today only carries the Prometheus
+/// sub-config; future surfaces (OTLP, custom exporters) will land
+/// alongside.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsSection {
+    #[serde(default)]
+    pub prometheus: Option<air_elt_monitoring::PrometheusConfig>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]

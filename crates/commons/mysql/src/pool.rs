@@ -1,6 +1,12 @@
 //! Shared MySQL pool construction. Mirrors `air-elt-commons-pg::pool` —
 //! same `PoolSettings` (re-exported from `air-elt-commons`), different
 //! session-bootstrap SQL.
+//!
+//! Pool stats are NOT wired here. The driver-pool instant gauges
+//! are driven by a snapshot-at-scrape source registered with the
+//! monitoring collector — see `pool_stats_reader::MySqlPoolStatsReader`.
+//! The factory wraps the returned `MySqlPool`, registers the stats
+//! reader, and the collector polls it on every scrape.
 
 use sqlx::MySqlPool;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};

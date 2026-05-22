@@ -49,9 +49,13 @@ async fn cdc_source(handle: &MongoTestHandle) -> Arc<MongoCdcSource> {
         max_await_time: Some(Duration::from_millis(200)),
         ..Default::default()
     };
-    let s = MongoCdcSource::connect("mongo_cdc".into(), cfg)
-        .await
-        .expect("connect mongo-cdc");
+    let s = MongoCdcSource::connect(
+        "mongo_cdc".into(),
+        cfg,
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
+    .await
+    .expect("connect mongo-cdc");
     Arc::new(s)
 }
 
@@ -700,11 +704,14 @@ async fn cdc_to_mongo_sink_round_trip_with_inserts_and_deletes() {
     let read_spec = cdc_spec(coll_name, 3, "post-image");
     let src_ctx = source.build_context(&read_spec).await.expect("ctx");
 
-    let sink = MongoSink::connect(MongoSinkConfig {
-        url: sink_handle.url.clone(),
-        database: Some(sink_handle.database.clone()),
-        ..Default::default()
-    })
+    let sink = MongoSink::connect(
+        MongoSinkConfig {
+            url: sink_handle.url.clone(),
+            database: Some(sink_handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("sink");
     let write_spec = WriteSpec {

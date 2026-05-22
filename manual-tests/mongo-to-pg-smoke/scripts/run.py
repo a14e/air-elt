@@ -331,6 +331,18 @@ def main() -> int:
         ],
         LOG_DIR / "validate.log",
     )
+    metrics_proc = spawn_background(
+        "metrics",
+        [
+            "uv",
+            "run",
+            "--no-project",
+            str(HERE / "metrics.py"),
+            "--interval",
+            "5",
+        ],
+        LOG_DIR / "metrics.log",
+    )
 
     print(
         "\n"
@@ -338,6 +350,7 @@ def main() -> int:
         "  Tail the background workers in another terminal:\n"
         f"    tail -f {LOG_DIR / 'load.log'}\n"
         f"    tail -f {LOG_DIR / 'validate.log'}\n"
+        f"    tail -f {LOG_DIR / 'metrics.log'}\n"
         f"    tail -f {LOG_DIR / 'stats.log'}\n"
         "\n"
         "  After you are done, ALWAYS run `uv run --no-project scripts/cleanup.py`\n"
@@ -391,6 +404,7 @@ def main() -> int:
     finally:
         terminate(load_proc, "load")
         terminate(validate_proc, "validate")
+        terminate(metrics_proc, "metrics")
         terminate(stats_proc, "stats")
         for pidfile in STATE_DIR.glob("*.pid"):
             pidfile.unlink(missing_ok=True)

@@ -36,6 +36,7 @@ async fn javascript_round_trips_through_mongo_to_mongo() {
             database: Some(handle.database.clone()),
             ..Default::default()
         },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
     )
     .await
     .expect("connect source");
@@ -66,11 +67,14 @@ async fn javascript_round_trips_through_mongo_to_mongo() {
         other => panic!("expected Value::Custom(MongoJsValue), got {other:?}"),
     }
 
-    let sink = MongoSink::connect(MongoSinkConfig {
-        url: handle.url.clone(),
-        database: Some(handle.database.clone()),
-        ..Default::default()
-    })
+    let sink = MongoSink::connect(
+        MongoSinkConfig {
+            url: handle.url.clone(),
+            database: Some(handle.database.clone()),
+            ..Default::default()
+        },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
+    )
     .await
     .expect("connect sink");
     let write_spec = WriteSpec {

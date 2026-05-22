@@ -38,6 +38,7 @@ use mongodb::options::InsertManyOptions;
 use mongodb::{Client, Collection};
 use tracing::{debug, info, warn};
 
+use air_elt_commons_mongodb::MongoPoolStatsReader;
 use air_elt_commons_mongodb::client::{PoolSettings, connect, database_from_url};
 use air_elt_commons_mongodb::task::detached;
 use air_elt_commons_mongodb::types::BsonObjectType;
@@ -79,7 +80,11 @@ impl MongoSink {
         self.server_version
     }
 
-    pub async fn connect(config: MongoSinkConfig) -> RuntimeResult<Self> {
+    /// See [`MongoSource::connect`] for the reader lifecycle contract.
+    pub async fn connect(
+        config: MongoSinkConfig,
+        reader: Arc<MongoPoolStatsReader>,
+    ) -> RuntimeResult<Self> {
         let database = config
             .database
             .clone()
@@ -102,7 +107,7 @@ impl MongoSink {
         )?;
         let operation_timeout = settings.statement;
         let pool_max_connections = settings.max_connections;
-        let client = connect(&config.url, settings).await?;
+        let client = connect(&config.url, settings, reader).await?;
         let server_version = version::detect(&client).await?;
         info!(
             major = server_version.major,
@@ -341,7 +346,8 @@ impl Sink for MongoSink {
             // Order matters within a CDC batch: insert(_id=42) followed
             // by delete(_id=42) must apply upsert first; delete-first
             // would let the upsert recreate the row we just removed.
-            let mut total_written: u64 = 0;
+            let mut upserts_written: u64 = 0;
+            let mut deletes_written: u64 = 0;
             // Split the owned rows by op so each branch consumes its half
             // by value — `into_columns` and the raw-passthrough fast-path
             // can both move payloads without cloning.
@@ -354,7 +360,7 @@ impl Sink for MongoSink {
                 }
             }
             if !upsert_rows.is_empty() {
-                total_written += me
+                upserts_written += me
                     .write_upsert_rows(my_ctx, &coll, &table, upsert_rows)
                     .await?;
             }
@@ -371,11 +377,13 @@ impl Sink for MongoSink {
                         ));
                     }
                 };
-                total_written +=
+                deletes_written +=
                     write_delete_many(&coll, delete_rows, keys, my_ctx.id_fast_path).await?;
             }
             Ok(WriteReport {
-                rows_written: total_written,
+                upserts: upserts_written,
+                deletes: deletes_written,
+                skipped: 0,
             })
         })
         .await

@@ -66,7 +66,13 @@ async fn all_delete_batch_writes_zero_rows() {
         )
         .await
         .expect("write_batch");
-    assert_eq!(report.rows_written, 0);
+    assert_eq!(report.rows_written(), 0);
+    assert_eq!(
+        report.rows_skipped(),
+        2,
+        "both Delete rows must be surfaced via `skipped` so the runner can \
+         increment `air_elt_rows_total{{stage=skipped, op=delete}}`"
+    );
 
     h.drop_table("bench_all_delete").await;
     h.pool.close().await;
@@ -110,7 +116,7 @@ async fn empty_batch_writes_zero_rows() {
         )
         .await
         .expect("write_batch");
-    assert_eq!(report.rows_written, 0);
+    assert_eq!(report.rows_written(), 0);
 
     h.drop_table("bench_empty_batch").await;
     h.pool.close().await;
@@ -299,7 +305,7 @@ async fn pg_single_row_chunk() {
         )
         .await
         .expect("write");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     let mut count: i64 = 0;
     for _ in 0..50 {
@@ -375,7 +381,7 @@ async fn all_null_row_round_trip() {
         )
         .await
         .expect("write");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     let mut count: i64 = 0;
     for _ in 0..50 {

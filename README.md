@@ -123,7 +123,7 @@ env at load time, then from the `secrets` mapping.
 
 ## Roadmap
 
-- **Operational** — metrics (Prometheus / OpenTelemetry), Vault for secrets,
+- **Operational** — OpenTelemetry metrics, Vault for secrets,
   dead-letter queues, soft delete propagation.
 - **Targets** — Kafka, RabbitMQ, NATS, RocketMQ; S3 and Iceberg; Redis;
   vector databases (Qdrant and similar).

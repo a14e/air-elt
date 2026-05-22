@@ -66,7 +66,7 @@ async fn round_trip_decimal32() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     let body = h
         .exec("SELECT toString(v) FROM dec32_t WHERE id = 1 FORMAT TabSeparated")

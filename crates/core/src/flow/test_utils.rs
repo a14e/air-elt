@@ -187,7 +187,9 @@ pub fn mock_sink_ok() -> MockSink {
         .returning(|_| Ok(Arc::new(UnitSinkCtx)));
     s.expect_write_batch().returning(|_, _ctx, batch, _dry| {
         Ok(WriteReport {
-            rows_written: batch.rows.len() as u64,
+            upserts: batch.rows.len() as u64,
+            deletes: 0,
+            skipped: 0,
         })
     });
     s
@@ -216,7 +218,12 @@ fn unbounded_lock_handle(source: &str, sink: &str, storage: &str) -> crate::util
     m.register_source(source, u32::MAX);
     m.register_sink(sink, u32::MAX);
     m.register_storage(storage, u32::MAX);
-    m.handle(source, sink, storage)
+    m.handle(
+        source,
+        sink,
+        storage,
+        &mut air_elt_monitoring::MonitoringManager::disabled(),
+    )
 }
 
 pub fn test_flow_named(
@@ -260,6 +267,7 @@ pub fn test_flow_named(
         inserts_check: true,
         cursor_persistence: crate::model::CursorPersistence::ColumnCursor,
         lock_handle: unbounded_lock_handle(name, "test-sink", "test-storage"),
+        recorder: air_elt_monitoring::FlowRecorder::disabled(),
     };
     let derived = DerivedPlans {
         transform: crate::transform::Transform::new(

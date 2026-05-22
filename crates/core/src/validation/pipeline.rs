@@ -57,6 +57,7 @@ const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 pub async fn assemble(
     root: &RootConfig,
     registry: &Registry,
+    monitoring: &mut air_elt_monitoring::MonitoringManager,
 ) -> Result<Vec<AssembledFlow>, ValidationError> {
     // O(1) name → config indexes built once. Avoids the per-flow linear
     // scans that would make assemble O(F × (S + K + T)) on a config with
@@ -95,48 +96,58 @@ pub async fn assemble(
     // Phase 2: build each referenced component exactly once via O(1)
     // index lookup. Unreferenced components are skipped. Alongside the
     // build we register each component in the shared
-    // `ConcurrencyManager` with permits = `max_connections()` — see the
-    // project-conventions skill ("Concurrency: semaphores +
-    // canonical-order acquire").
+    // `ConcurrencyManager` with permits = `max_connections()`. The
+    // runner contract is "no permit held across two backend calls", so
+    // there is no canonical lock order to maintain — deadlock between
+    // flows is structurally impossible. See the project-conventions
+    // skill ("Concurrency: per-component semaphores").
     let mut concurrency = crate::util::ConcurrencyManager::new();
     let mut sources: AHashMap<&str, Arc<dyn Source>> = AHashMap::new();
     for &name in &source_names {
         let cfg = source_index[name];
-        let built: Arc<dyn Source> = Arc::from(registry.build_source(cfg).await.map_err(|e| {
-            ValidationError::AccessFailed {
-                component: "source",
-                name: cfg.name.clone(),
-                source: Box::new(e),
-            }
-        })?);
-        concurrency.register_source(name, built.max_connections());
+        let built: Arc<dyn Source> =
+            Arc::from(registry.build_source(cfg, monitoring).await.map_err(|e| {
+                ValidationError::AccessFailed {
+                    component: "source",
+                    name: cfg.name.clone(),
+                    source: Box::new(e),
+                }
+            })?);
+        let max = built.max_connections();
+        concurrency.register_source(name, max);
+        monitoring.set_lock_max(air_elt_monitoring::ComponentKind::Source, name, max);
         sources.insert(name, built);
     }
     let mut sinks: AHashMap<&str, Arc<dyn Sink>> = AHashMap::new();
     for &name in &sink_names {
         let cfg = sink_index[name];
-        let built: Arc<dyn Sink> = Arc::from(registry.build_sink(cfg).await.map_err(|e| {
-            ValidationError::AccessFailed {
-                component: "sink",
-                name: cfg.name.clone(),
-                source: Box::new(e),
-            }
-        })?);
-        concurrency.register_sink(name, built.max_connections());
+        let built: Arc<dyn Sink> =
+            Arc::from(registry.build_sink(cfg, monitoring).await.map_err(|e| {
+                ValidationError::AccessFailed {
+                    component: "sink",
+                    name: cfg.name.clone(),
+                    source: Box::new(e),
+                }
+            })?);
+        let max = built.max_connections();
+        concurrency.register_sink(name, max);
+        monitoring.set_lock_max(air_elt_monitoring::ComponentKind::Sink, name, max);
         sinks.insert(name, built);
     }
     let mut storages: AHashMap<&str, Arc<dyn Storage>> = AHashMap::new();
     for &name in &storage_names {
         let cfg = storage_index[name];
         let built: Arc<dyn Storage> =
-            Arc::from(registry.build_storage(cfg).await.map_err(|e| {
+            Arc::from(registry.build_storage(cfg, monitoring).await.map_err(|e| {
                 ValidationError::AccessFailed {
                     component: "storage",
                     name: cfg.name.clone(),
                     source: Box::new(e),
                 }
             })?);
-        concurrency.register_storage(name, built.max_connections());
+        let max = built.max_connections();
+        concurrency.register_storage(name, max);
+        monitoring.set_lock_max(air_elt_monitoring::ComponentKind::Storage, name, max);
         storages.insert(name, built);
     }
     // assemble is done populating the manager — log per-component
@@ -157,6 +168,8 @@ pub async fn assemble(
         let source = sources[source_name].clone();
         let sink = sinks[flow.sink.as_str()].clone();
         let storage = storages[flow.storage.as_str()].clone();
+        let sink_cfg = sink_index[flow.sink.as_str()];
+        let storage_cfg = storage_index[flow.storage.as_str()];
 
         // Per-source-kind cursor.fields shape. Pull-based connectors
         // (postgres/mysql/mongodb) require non-empty cursor.fields so
@@ -279,9 +292,25 @@ pub async fn assemble(
             },
             // Per-flow lock handle: pre-resolves the three (kind,
             // name) keys against the shared manager and caches the
-            // canonical-sorted slots. `acquire()` is a plain walk —
-            // no per-tick sort, no per-tick hashmap lookup.
-            lock_handle: concurrency.handle(source_name, flow.sink.as_str(), flow.storage.as_str()),
+            // resolved `Arc<Semaphore>` triple. Each `acquire_*` is a
+            // single semaphore acquire — no per-tick hashmap lookup.
+            // No call site ever holds two permits at once, so there is
+            // no canonical lock order to maintain.
+            lock_handle: concurrency.handle(
+                source_name,
+                flow.sink.as_str(),
+                flow.storage.as_str(),
+                monitoring,
+            ),
+            recorder: monitoring.flow_recorder(air_elt_monitoring::FlowLabels {
+                flow: flow_name.clone(),
+                source_name: source_name.to_string(),
+                source_kind: source_cfg.kind.clone(),
+                sink_name: flow.sink.clone(),
+                sink_kind: sink_cfg.kind.clone(),
+                storage_name: flow.storage.clone(),
+                storage_kind: storage_cfg.kind.clone(),
+            }),
         });
     }
 
@@ -998,8 +1027,14 @@ mod tests {
                 m.register_source("test-source", u32::MAX);
                 m.register_sink("test-sink", u32::MAX);
                 m.register_storage("test-storage", u32::MAX);
-                m.handle("test-source", "test-sink", "test-storage")
+                m.handle(
+                    "test-source",
+                    "test-sink",
+                    "test-storage",
+                    &mut air_elt_monitoring::MonitoringManager::disabled(),
+                )
             },
+            recorder: air_elt_monitoring::FlowRecorder::disabled(),
         }
     }
 

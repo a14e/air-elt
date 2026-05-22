@@ -39,6 +39,7 @@ async fn cursor_objectid_paginates() {
             database: Some(handle.database.clone()),
             ..Default::default()
         },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
     )
     .await
     .expect("connect");

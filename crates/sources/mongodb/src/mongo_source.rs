@@ -21,6 +21,7 @@ use futures::stream::TryStreamExt;
 use mongodb::{Client, Collection, options::FindOptions};
 use tracing::{debug, info, warn};
 
+use air_elt_commons_mongodb::MongoPoolStatsReader;
 use air_elt_commons_mongodb::client::{PoolSettings, connect, database_from_url};
 use air_elt_commons_mongodb::task::detached;
 use air_elt_commons_mongodb::types::BsonObjectValue;
@@ -62,7 +63,16 @@ pub struct MongoSource {
 }
 
 impl MongoSource {
-    pub async fn connect(name: String, config: MongoSourceConfig) -> RuntimeResult<Self> {
+    /// `reader` is owned by the factory. The mongo driver's CMAP
+    /// closure captures it (strong Arc) — when the connector drops,
+    /// the closure goes with it and the strong count hits 0. The
+    /// monitoring collector's `Weak<dyn PoolStatsReader>` then fails to
+    /// upgrade on the next scrape and the labelled rows are evicted.
+    pub async fn connect(
+        name: String,
+        config: MongoSourceConfig,
+        reader: Arc<MongoPoolStatsReader>,
+    ) -> RuntimeResult<Self> {
         let database = config
             .database
             .clone()
@@ -87,7 +97,7 @@ impl MongoSource {
         )?;
         let operation_timeout = settings.statement;
         let pool_max_connections = settings.max_connections;
-        let client = connect(&config.url, settings).await?;
+        let client = connect(&config.url, settings, reader).await?;
         Ok(Self {
             client,
             database,

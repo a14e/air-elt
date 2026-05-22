@@ -70,7 +70,7 @@ async fn nullable_columns_round_trip_null_and_value() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write_batch");
-    assert_eq!(report.rows_written, 2);
+    assert_eq!(report.rows_written(), 2);
 
     // SELECT both rows and assert NULL handling. CH renders NULL as
     // `\N` in TabSeparated.

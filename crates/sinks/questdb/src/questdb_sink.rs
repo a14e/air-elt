@@ -84,6 +84,12 @@ impl QuestDbSink {
         })
     }
 
+    /// Clone-cheap accessor used by the factory to wrap the pool in a
+    /// `QuestDbPoolStatsReader`. The `PgPool` is internally `Arc`-backed.
+    pub fn pool(&self) -> PgPool {
+        self.pool.clone()
+    }
+
     /// Step 1: explicit conflict-config rejection. QuestDB's only dedup
     /// hook is the DDL-level `DEDUP UPSERT KEYS(...)`, owned by the
     /// user's table — the sink cannot accept a config-level override.
@@ -250,15 +256,25 @@ impl Sink for QuestDbSink {
         dry_run: bool,
     ) -> RuntimeResult<WriteReport> {
         if batch.rows.is_empty() {
-            return Ok(WriteReport { rows_written: 0 });
+            return Ok(WriteReport::default());
         }
         let qctx = ctx.downcast_ref_to::<QuestDbSinkCtx>()?;
         if dry_run {
             qctx.writer.dry_run().await?;
-            return Ok(WriteReport { rows_written: 0 });
+            return Ok(WriteReport::default());
         }
-        let rows_written = qctx.writer.write(&batch).await?;
-        Ok(WriteReport { rows_written })
+        let total = batch.rows.len() as u64;
+        let upserts = qctx.writer.write(&batch).await?;
+        // QuestDB's `pg_writer::write` drops `Delete` rows and returns
+        // the count of upserts actually written. Surface the difference
+        // as `skipped` so the runner can increment
+        // `rows_skipped_total{op=delete}`.
+        let skipped = total.saturating_sub(upserts);
+        Ok(WriteReport {
+            upserts,
+            deletes: 0,
+            skipped,
+        })
     }
 }
 

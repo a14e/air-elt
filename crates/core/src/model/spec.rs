@@ -79,7 +79,27 @@ pub struct Batch {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WriteReport {
-    pub rows_written: u64,
+    pub upserts: u64,
+    pub deletes: u64,
+    /// Rows the sink dropped before persistence — e.g. ClickHouse /
+    /// QuestDB filtering `RowOp::Delete` because they declare
+    /// `supports_deletes() == false`. Counted by `op` separately from
+    /// `upserts` / `deletes` (which represent rows actually written).
+    /// Default 0 for sinks that don't drop anything.
+    #[serde(default)]
+    pub skipped: u64,
+}
+
+impl WriteReport {
+    /// Sum of rows actually persisted (`upserts` + `deletes`). Sinks
+    /// that drop rows pre-write report those via `skipped`.
+    pub fn rows_written(&self) -> u64 {
+        self.upserts + self.deletes
+    }
+
+    pub fn rows_skipped(&self) -> u64 {
+        self.skipped
+    }
 }
 
 #[derive(Debug, Clone)]

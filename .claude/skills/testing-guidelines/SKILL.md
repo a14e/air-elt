@@ -47,9 +47,10 @@ must extend the proptest suite, not just the spec-cases.
   strategy/`Arbitrary` arm so the existing properties extend to it
   automatically.
 - Run via `cargo nextest run -p air-elt-types`.
-- Commit `crates/types/proptest-regressions/` to git. Proptest writes
-  shrink seeds there when a property fails; checking it in lets the
-  same failing seed be replayed locally and in CI.
+- DO NOT commit `proptest-regressions/` — it's gitignored workspace-wide.
+  Proptest writes shrink seeds there when a property fails, but those
+  failing seeds are local-only artefacts; CI reproduces a regression by
+  re-running the property test, not by replaying a checked-in seed.
 
 ## When adding a new sink / source / storage
 

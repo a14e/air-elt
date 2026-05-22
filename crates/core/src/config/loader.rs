@@ -329,6 +329,16 @@ fn merge_extra_into(
         }
         root.storages.push(st);
     }
+    if let Some(prom) = extra.metrics.prometheus {
+        if root.metrics.prometheus.is_some() {
+            return Err(ConfigError::Invalid {
+                reason:
+                    "[metrics.prometheus] must be declared at most once across the include graph"
+                        .to_string(),
+            });
+        }
+        root.metrics.prometheus = Some(prom);
+    }
     // Secrets must be declared exactly once across the include graph.
     // Mirroring sources/sinks/storages/flow keeps the rule single-shape:
     // "one definition per name, anywhere". Silent first-wins behaviour was
@@ -494,6 +504,11 @@ fn validate_post_merge(root: &RootConfig) -> Result<(), ConfigError> {
                 }
             }
         }
+    }
+    if let Some(prom) = &root.metrics.prometheus {
+        prom.validate().map_err(|e| ConfigError::Invalid {
+            reason: format!("metrics.prometheus: {e}"),
+        })?;
     }
     Ok(())
 }

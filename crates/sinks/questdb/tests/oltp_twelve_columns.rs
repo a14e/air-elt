@@ -189,7 +189,7 @@ async fn oltp_row_round_trip() {
         )
         .await
         .expect("write_batch");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     assert_eq!(poll_count(&h.pool, table, 1).await, 1);
 

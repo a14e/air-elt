@@ -23,6 +23,7 @@ members = [
     "crates/storages/mysql",
     "crates/storages/mongodb",
     "crates/types",
+    "crates/monitoring",
 ]
 
 [workspace.package]
@@ -55,8 +56,14 @@ air-elt-commons-clickhouse = { path = "crates/commons/clickhouse", version = "0.
 air-elt-sink-clickhouse = { path = "crates/sinks/clickhouse", version = "0.1.0" }
 air-elt-commons-questdb = { path = "crates/commons/questdb", version = "0.1.0" }
 air-elt-sink-questdb = { path = "crates/sinks/questdb", version = "0.1.0" }
+air-elt-monitoring = { path = "crates/monitoring", version = "0.1.0" }
 
 ahash = "0.8.12"
+prometheus = { version = "0.14.0", default-features = false }
+sketches-ddsketch = "0.4.0"
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
+axum = { version = "0.8.6", default-features = false, features = ["http1", "tokio"] }
+parking_lot = "0.12.5"
 tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "test-util"] }
 async-trait = "0.1.89"
 serde = { version = "1.0.228", features = ["derive"] }

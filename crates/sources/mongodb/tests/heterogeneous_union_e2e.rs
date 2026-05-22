@@ -38,6 +38,7 @@ async fn heterogeneous_field_inferred_as_union_and_read_back() {
             database: Some(handle.database.clone()),
             ..Default::default()
         },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
     )
     .await
     .expect("connect");
@@ -107,6 +108,7 @@ async fn heterogeneous_field_with_object_id_emits_union_with_custom() {
             database: Some(handle.database.clone()),
             ..Default::default()
         },
+        std::sync::Arc::new(air_elt_commons_mongodb::MongoPoolStatsReader::new()),
     )
     .await
     .expect("connect");

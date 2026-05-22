@@ -83,6 +83,12 @@ impl PgSource {
         })
     }
 
+    /// Clone-cheap accessor used by the factory to wrap the pool in a
+    /// `PgPoolStatsReader`. The `PgPool` is internally `Arc`-backed.
+    pub fn pool(&self) -> PgPool {
+        self.pool.clone()
+    }
+
     async fn ensure_connection_alive(&self) -> RuntimeResult<()> {
         sqlx::query(sql::PING)
             .execute(&self.pool)

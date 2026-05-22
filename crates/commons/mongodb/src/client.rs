@@ -21,17 +21,35 @@
 //! runaway work. The flow runner is oblivious to cancel-safety — it
 //! only wraps adapter calls in `tokio::time::timeout` + a shutdown
 //! `select!`. See `task::detached`.
+//!
+//! CMAP wiring: the caller passes in a strong `Arc<MongoPoolStatsReader>`.
+//! We register a CMAP event handler on `ClientOptions` that maps each
+//! pool-lifecycle event to a `MongoPoolStatsReader::on_*` call (atomic
+//! adds — cheap on the driver's CMAP thread). Mongo's CMAP separates
+//! `ConnectionReady` (conn enters idle pool) from `CheckedOut` (conn
+//! handed to caller), so the active/idle atomics reflect the true pool
+//! state on every transition. The collector reads the stats reader once
+//! per scrape via `PoolStatsReader::read()`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use mongodb::Client;
+use mongodb::event::EventHandler;
+use mongodb::event::cmap::{CmapEvent, ConnectionClosedReason};
 use mongodb::options::ClientOptions;
 
 pub use air_elt_commons::pool_settings::PoolSettings;
 
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 
-pub async fn connect(url: &str, settings: PoolSettings) -> RuntimeResult<Client> {
+use crate::pool_stats_reader::MongoPoolStatsReader;
+
+pub async fn connect(
+    url: &str,
+    settings: PoolSettings,
+    reader: Arc<MongoPoolStatsReader>,
+) -> RuntimeResult<Client> {
     let mut options = ClientOptions::parse(url)
         .await
         .map_err(RuntimeError::backend)?;
@@ -42,11 +60,59 @@ pub async fn connect(url: &str, settings: PoolSettings) -> RuntimeResult<Client>
     options.max_idle_time = Some(settings.idle);
     options.app_name = Some("air-elt".to_string());
 
+    options.cmap_event_handler = Some(cmap_handler(reader));
+
     // `Client::with_options` is synchronous (no I/O); the driver
     // honours `connect_timeout` on the first real wire operation. No
     // outer `tokio::time::timeout` is needed here — it would be a
     // no-op around a synchronous function.
     Client::with_options(options).map_err(RuntimeError::backend)
+}
+
+/// Map mongo CMAP events onto stats-reader transitions. The driver
+/// invokes the callback synchronously on its CMAP thread, so the
+/// closure must be cheap and panic-free — each `reader.on_*` is a
+/// single atomic `fetch_add` / `fetch_update`.
+///
+/// Transition table:
+/// * `ConnectionReady` — fresh conn joined the idle pool.
+/// * `ConnectionCheckedOut` — idle conn handed to caller.
+/// * `ConnectionCheckedIn` — caller returned conn to idle pool.
+/// * `ConnectionClosed { reason }`:
+///   * `Idle` / `Stale` — closed from idle (lifecycle evictions;
+///     in-use conns aren't interrupted by `pool.clear` unless
+///     `interrupt_in_use_connections=true`, which we don't set).
+///   * `Error` / `Dropped` — closed from active (errored mid-op).
+///   * `PoolClosed` — `Pool::close()` is invoked at shutdown and
+///     sweeps **both** idle and active conns; mapping it to either
+///     bucket would drive one slot negative. We ignore it — the
+///     metric is academic at shutdown anyway (the scrape that
+///     captures shutdown is one of the last ones, and the registry
+///     is being torn down on the next breath).
+///
+/// Other CMAP variants (`PoolCreated`/`PoolReady`/`PoolCleared`/
+/// `PoolClosed`/`ConnectionCreated`/`ConnectionCheckoutStarted`/
+/// `ConnectionCheckoutFailed`) carry no state-transition signal we
+/// track and are ignored.
+fn cmap_handler(reader: Arc<MongoPoolStatsReader>) -> EventHandler<CmapEvent> {
+    EventHandler::callback(move |event| match event {
+        CmapEvent::ConnectionReady(_) => reader.on_pool_filled(),
+        CmapEvent::ConnectionCheckedOut(_) => reader.on_idle_acquired(),
+        CmapEvent::ConnectionCheckedIn(_) => reader.on_released_to_idle(),
+        CmapEvent::ConnectionClosed(ev) => match ev.reason {
+            ConnectionClosedReason::Idle | ConnectionClosedReason::Stale => {
+                reader.on_closed_from_idle()
+            }
+            ConnectionClosedReason::Error | ConnectionClosedReason::Dropped => {
+                reader.on_closed_from_active()
+            }
+            // `PoolClosed` sweeps both states at shutdown; routing to
+            // either would drive the counter negative. `Unset` only
+            // appears in driver test fixtures.
+            _ => {}
+        },
+        _ => {}
+    })
 }
 
 pub fn database_from_url(url: &str) -> Option<String> {

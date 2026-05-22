@@ -95,7 +95,7 @@ async fn hll_round_trip_through_sink_and_source() {
     };
     let ctx = sink.build_context(&spec).await.unwrap();
     let report = sink.write_batch(&spec, &ctx, batch, false).await.unwrap();
-    assert_eq!(report.rows_written, 2);
+    assert_eq!(report.rows_written(), 2);
 
     // ---- source path ---------------------------------------------------
     let source = PgSource::connect(

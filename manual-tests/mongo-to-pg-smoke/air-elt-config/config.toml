@@ -15,3 +15,10 @@ config = { url = "${PG_SINK_URL}" }
 name = "pg_state"
 type = "postgres"
 config = { url = "${PG_STATE_URL}" }
+
+# Manual smoke exercises the full /metrics surface — `scripts/metrics.py`
+# polls this endpoint and asserts the contract (expected names, monotonic
+# counters, non-zero process CPU sample).
+[metrics.prometheus]
+enabled = true
+port = 8090

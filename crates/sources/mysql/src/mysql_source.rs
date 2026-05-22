@@ -70,6 +70,12 @@ impl MySqlSource {
         })
     }
 
+    /// Clone-cheap accessor used by the factory to wrap the pool in a
+    /// `MySqlPoolStatsReader`. The `MySqlPool` is internally `Arc`-backed.
+    pub fn pool(&self) -> MySqlPool {
+        self.pool.clone()
+    }
+
     async fn ensure_connection_alive(&self) -> RuntimeResult<()> {
         sqlx::query(sql::PING)
             .execute(&self.pool)

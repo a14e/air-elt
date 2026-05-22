@@ -1,0 +1,42 @@
+[package]
+name = "air-elt-monitoring"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+autotests = false
+
+[lib]
+doctest = false
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+[dependencies]
+# Monitoring sits one layer above the foundational crates (commons,
+# types). It depends on `air-elt-commons` only — never on `air-elt-core`
+# or any connector. Direction stays: core/connectors → monitoring →
+# commons.
+air-elt-commons = { workspace = true }
+ahash = { workspace = true }
+parking_lot = { workspace = true }
+prometheus = { workspace = true }
+sketches-ddsketch = { workspace = true }
+sysinfo = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+toml = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

@@ -208,7 +208,7 @@ async fn round_trip_aggregate_states_through_sink() {
             .write_batch(&spec, &ctx, batch, false)
             .await
             .unwrap_or_else(|e| panic!("[{}] write_batch: {e}", sc.label));
-        assert_eq!(report.rows_written, 1, "[{}] rows_written", sc.label);
+        assert_eq!(report.rows_written(), 1, "[{}] rows_written", sc.label);
 
         // Merge on the sink side vs. direct aggregate on the source
         // population — both expressed as a single Float64 (CH coerces

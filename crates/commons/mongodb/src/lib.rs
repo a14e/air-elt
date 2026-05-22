@@ -15,11 +15,13 @@ pub mod identifier;
 pub mod infer;
 pub mod key_bson;
 pub mod path;
+pub mod pool_stats_reader;
 pub mod sampling;
 pub mod task;
 pub mod types;
 pub mod version;
 
+pub use pool_stats_reader::MongoPoolStatsReader;
 pub use types::{
     BsonObjectType, BsonObjectValue, MongoJsType, MongoJsValue, MongoObjectIdType,
     MongoObjectIdValue,

@@ -414,6 +414,32 @@ impl RuntimeError {
     {
         RuntimeError::Backend(Box::new(err))
     }
+
+    /// snake_case variant tag. Single source of truth for the
+    /// `errors_total{kind=...}` label and any other classification
+    /// surface. Keeping this on the error type itself avoids a parallel
+    /// classifier function in the runner.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            RuntimeError::Backend(_) => "backend",
+            RuntimeError::Type(_) => "type_error",
+            RuntimeError::Io(_) => "io",
+            RuntimeError::Serde(_) => "serde",
+            RuntimeError::FlowAborted { .. } => "flow_aborted",
+            RuntimeError::NotRegistered { .. } => "not_registered",
+            RuntimeError::Config(_) => "config",
+            RuntimeError::Timeout { .. } => "timeout",
+            RuntimeError::Cancelled { .. } => "cancelled",
+            RuntimeError::ContextMismatch { .. } => "context_mismatch",
+            RuntimeError::SchemaColumnMissing { .. } => "schema_column_missing",
+            RuntimeError::Conversion(_) => "conversion",
+            RuntimeError::Identifier(_) => "identifier",
+            RuntimeError::Validation(_) => "validation",
+            RuntimeError::JsonEncode(_) => "json_encode",
+            RuntimeError::DerivedPlanInvariant { .. } => "derived_plan_invariant",
+            RuntimeError::Other(_) => "other",
+        }
+    }
 }
 
 impl From<air_elt_commons::pool_settings::PoolSettingsError> for RuntimeError {

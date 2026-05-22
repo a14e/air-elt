@@ -9,10 +9,12 @@ pub mod identifier;
 pub mod null_bind;
 pub mod pg_type;
 pub mod pool;
+pub mod pool_stats_reader;
 pub mod retry;
 pub mod schema;
 pub mod sink_bind;
 pub mod types;
 
 pub use dialect::Dialect;
+pub use pool_stats_reader::PgPoolStatsReader;
 pub use types::{PgHllType, PgHllValue};

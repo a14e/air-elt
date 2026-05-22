@@ -77,7 +77,7 @@ async fn write_batch_and_validate_access() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write");
-    assert_eq!(report.rows_written, 2);
+    assert_eq!(report.rows_written(), 2);
 
     let rows: Vec<(i64, String, Option<serde_json::Value>)> =
         sqlx::query_as("SELECT id, label, payload FROM events ORDER BY id")
@@ -158,7 +158,7 @@ async fn all_nulls_across_data_types() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     #[allow(clippy::type_complexity)]
     type NumericProbe = (
@@ -280,7 +280,7 @@ async fn all_types_non_null_round_trip() {
         .write_batch(&spec, &ctx, batch, false)
         .await
         .expect("write");
-    assert_eq!(report.rows_written, 1);
+    assert_eq!(report.rows_written(), 1);
 
     let (c_bool, c_i16, c_i32, c_i64): (bool, i16, i32, i64) =
         sqlx::query_as("SELECT c_bool, c_i16, c_i32, c_i64 FROM all_vals WHERE id = 1")
