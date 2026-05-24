@@ -1,0 +1,51 @@
+# deny.toml — cargo-deny configuration for Air Elt
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+# ── Licenses ──────────────────────────────────────────────────────────
+[licenses]
+# The project is MIT OR Apache-2.0. Allow the union of licenses that
+# commonly appear in transitive Rust dependencies.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",
+    "OpenSSL",
+    "MPL-2.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+# ── Advisories ────────────────────────────────────────────────────────
+[advisories]
+unmaintained = "workspace"
+unsound = "workspace"
+yanked = "warn"
+ignore = [
+    # rsa crate Marvin Attack — no patch available upstream yet.
+    # Transitive dep via mongodb driver; not exploitable in our use case
+    # (we don't use RSA directly). Re-check periodically.
+    "RUSTSEC-2023-0071",
+]
+
+# ── Bans ──────────────────────────────────────────────────────────────
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+# ── Sources ───────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
