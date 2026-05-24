@@ -58,6 +58,10 @@ pub enum Value {
     Ipv4(std::net::Ipv4Addr),
     Ipv6(std::net::Ipv6Addr),
     Json(serde_json::Value),
+    /// Ordered key-value document. Keys are always strings, values are
+    /// heterogeneous (any `Value` variant). Order matters for
+    /// deterministic serialisation.
+    Object(Vec<(String, Value)>),
     /// Connector-specific opaque value. Cursor JSON storage admits
     /// this variant iff the underlying `DynType::cursor_compatible()`
     /// returns `true` AND the matching descriptor overrides
@@ -114,6 +118,7 @@ impl Value {
             Value::Ipv4(_) => Some(DataType::Ipv4),
             Value::Ipv6(_) => Some(DataType::Ipv6),
             Value::Json(_) => Some(DataType::Json),
+            Value::Object(_) => Some(DataType::Object),
             Value::Custom(v) => Some(DataType::Custom(v.dyn_type())),
         }
     }
@@ -144,6 +149,7 @@ impl Clone for Value {
             Value::Ipv4(a) => Value::Ipv4(*a),
             Value::Ipv6(a) => Value::Ipv6(*a),
             Value::Json(j) => Value::Json(j.clone()),
+            Value::Object(entries) => Value::Object(entries.clone()),
             Value::Custom(v) => Value::Custom((**v).clone_box()),
         }
     }
@@ -175,6 +181,7 @@ impl PartialEq for Value {
             (Ipv4(a), Ipv4(b)) => a == b,
             (Ipv6(a), Ipv6(b)) => a == b,
             (Json(a), Json(b)) => a == b,
+            (Object(a), Object(b)) => a == b,
             (Custom(a), Custom(b)) => (**a).eq_dyn(&**b),
             _ => false,
         }
@@ -234,6 +241,17 @@ impl Serialize for Value {
             Value::Ipv4(a) => emit(serializer, "ipv4", &a.to_string()),
             Value::Ipv6(a) => emit(serializer, "ipv6", &a.to_string()),
             Value::Json(j) => emit(serializer, "json", j),
+            Value::Object(entries) => {
+                let json_map: serde_json::Map<String, serde_json::Value> = entries
+                    .iter()
+                    .map(|(k, v)| {
+                        let json_v =
+                            crate::json_encode::value_to_json(v).unwrap_or(serde_json::Value::Null);
+                        (k.clone(), json_v)
+                    })
+                    .collect();
+                emit(serializer, "object", &serde_json::Value::Object(json_map))
+            }
             Value::Custom(inner) => {
                 let dt = inner.dyn_type();
                 if !dt.cursor_compatible() {
@@ -371,6 +389,16 @@ impl<'de> Visitor<'de> for ValueVisitor {
                     .map_err(de::Error::custom)
             }
             "json" => Ok(Value::Json(v)),
+            "object" => {
+                let map = v
+                    .as_object()
+                    .ok_or_else(|| de::Error::custom("object value must be a JSON object"))?;
+                let entries: Vec<(String, Value)> = map
+                    .iter()
+                    .map(|(k, val)| Ok((k.clone(), Value::Json(val.clone()))))
+                    .collect::<Result<_, A::Error>>()?;
+                Ok(Value::Object(entries))
+            }
             "custom" => {
                 // Custom values can't deserialize through the bare
                 // `Value` path: a `Box<dyn DynValue>` needs the
@@ -846,6 +874,7 @@ mod tests {
             Value::Ipv4(_) => prop_assert_eq!(got, Some(DataType::Ipv4)),
             Value::Ipv6(_) => prop_assert_eq!(got, Some(DataType::Ipv6)),
             Value::Json(_) => prop_assert_eq!(got, Some(DataType::Json)),
+            Value::Object(_) => unreachable!("strategy excludes Object"),
             Value::Custom(_) => unreachable!("strategy excludes Custom"),
         }
     }

@@ -49,6 +49,8 @@ pub fn bind_typed_null<'q>(
         // Union never reaches a MySQL sink: schemaful sinks declare
         // concrete column types, and validation rejects Union → MySQL
         // before any bind happens.
+        // Object is handled as Json in connectors
+        DataType::Object => query.bind::<Option<serde_json::Value>>(None),
         DataType::Union(_) => unreachable!("mysql sinks never carry Union types"),
         DataType::Custom(_) => unreachable!(
             "DataType::Custom must be handled by the connector before reaching null_bind"

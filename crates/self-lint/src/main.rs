@@ -53,6 +53,7 @@ fn main() -> ExitCode {
         Box::new(checks::mod_purity::ModPurityCheck),
         Box::new(checks::test_aggregator::TestAggregatorCheck),
         Box::new(checks::doctest::DoctestCheck),
+        Box::new(checks::worktree::WorktreeCheck),
     ];
 
     let mut diagnostics: Vec<Diagnostic> = all_checks

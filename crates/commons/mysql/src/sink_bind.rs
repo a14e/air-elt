@@ -98,6 +98,10 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
             DataType::Xml => {
                 sep.push_bind::<Option<String>>(None);
             }
+            // Object is handled as Json in connectors
+            DataType::Object => {
+                sep.push_bind::<Option<serde_json::Value>>(None);
+            }
             DataType::Union(_) => unreachable!("mysql sinks never carry Union types"),
             DataType::Custom(_) => unreachable!(
                 "DataType::Custom must be handled by the connector before reaching sink_bind"
@@ -169,6 +173,18 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
         }
         Value::UInt64(n) => {
             sep.push_bind(*n);
+        }
+        Value::Object(entries) => {
+            // Object is handled as Json in connectors
+            let map: serde_json::Map<String, serde_json::Value> = entries
+                .iter()
+                .map(|(k, v)| {
+                    let json_v =
+                        air_elt_core::types::value_to_json(v).unwrap_or(serde_json::Value::Null);
+                    (k.clone(), json_v)
+                })
+                .collect();
+            sep.push_bind(serde_json::Value::Object(map));
         }
         Value::Custom(_) => {
             unreachable!("Value::Custom must be handled by the connector before reaching sink_bind")

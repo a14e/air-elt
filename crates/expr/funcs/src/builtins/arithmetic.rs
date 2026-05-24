@@ -1,0 +1,915 @@
+use air_elt_expr_types::bounds::{ArithmeticOp, arithmetic_result_type, concat_result_type};
+use air_elt_expr_types::nullable::NullableExprType;
+use air_elt_types::{DataType, Value};
+use num_bigint::BigInt;
+
+use crate::error::FuncError;
+use crate::registry::FunctionRegistry;
+use crate::signature::{EvalContext, ExprFunction};
+
+static ADD: AddFunc = AddFunc;
+static SUBTRACT: SubtractFunc = SubtractFunc;
+static MULTIPLY: MultiplyFunc = MultiplyFunc;
+static DIVIDE: DivideFunc = DivideFunc;
+static MODULO: ModuloFunc = ModuloFunc;
+static NEGATE: NegateFunc = NegateFunc;
+static ABS: AbsFunc = AbsFunc;
+static CEIL: CeilFunc = CeilFunc;
+static FLOOR: FloorFunc = FloorFunc;
+static ROUND: RoundFunc = RoundFunc;
+static MIN: MinFunc = MinFunc;
+static MAX: MaxFunc = MaxFunc;
+static SIGN: SignFunc = SignFunc;
+static POWER: PowerFunc = PowerFunc;
+static SQRT: SqrtFunc = SqrtFunc;
+
+pub fn register(registry: &mut FunctionRegistry) {
+    registry.register(&ADD);
+    registry.register(&SUBTRACT);
+    registry.register(&MULTIPLY);
+    registry.register(&DIVIDE);
+    registry.register(&MODULO);
+    registry.register(&NEGATE);
+    registry.register(&ABS);
+    registry.register(&CEIL);
+    registry.register(&FLOOR);
+    registry.register(&ROUND);
+    registry.register(&MIN);
+    registry.register(&MAX);
+    registry.register(&SIGN);
+    registry.register(&POWER);
+    registry.register(&SQRT);
+}
+
+struct AddFunc;
+
+impl ExprFunction for AddFunc {
+    fn name(&self) -> &str {
+        "add"
+    }
+
+    fn min_args(&self) -> usize {
+        2
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        let nullable = args.iter().any(|a| a.nullable);
+        let both_text = matches!(
+            (&args[0].data_type, &args[1].data_type),
+            (DataType::Text { .. }, DataType::Text { .. })
+        );
+        if both_text {
+            let result_dt =
+                concat_result_type(&[&args[0].data_type, &args[1].data_type]).map_err(|e| {
+                    FuncError::TypeMismatch {
+                        function: "add".to_owned(),
+                        expected: "Text".to_owned(),
+                        actual: e.to_string(),
+                    }
+                })?;
+            Ok(NullableExprType::new(result_dt, nullable))
+        } else {
+            validate_numeric_args("add", &args[0].data_type, &args[1].data_type)?;
+            let result =
+                arithmetic_result_type(ArithmeticOp::Add, &args[0], &args[1]).map_err(|e| {
+                    FuncError::TypeMismatch {
+                        function: "add".to_owned(),
+                        expected: "numeric".to_owned(),
+                        actual: e.to_string(),
+                    }
+                })?;
+            Ok(NullableExprType { nullable, ..result })
+        }
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let b = args.remove(1);
+        let a = args.remove(0);
+        if a.is_null() || b.is_null() {
+            return Ok(Value::Null);
+        }
+        match (a, b) {
+            (Value::Text(mut s), Value::Text(t)) => {
+                s.push_str(&t);
+                Ok(Value::Text(s))
+            }
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_add(y) {
+                Some(result) => Ok(Value::Int64(result)),
+                None => Ok(Value::BigInt(BigInt::from(x) + BigInt::from(y))),
+            },
+            (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x + y)),
+            (a, b) => Err(FuncError::TypeMismatch {
+                function: "add".to_owned(),
+                expected: "matching numeric or text types".to_owned(),
+                actual: format!("{:?}, {:?}", a.data_type(), b.data_type()),
+            }),
+        }
+    }
+}
+
+struct SubtractFunc;
+
+impl ExprFunction for SubtractFunc {
+    fn name(&self) -> &str {
+        "subtract"
+    }
+
+    fn min_args(&self) -> usize {
+        2
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        let nullable = args.iter().any(|a| a.nullable);
+        validate_numeric_args("subtract", &args[0].data_type, &args[1].data_type)?;
+        let result =
+            arithmetic_result_type(ArithmeticOp::Subtract, &args[0], &args[1]).map_err(|e| {
+                FuncError::TypeMismatch {
+                    function: "subtract".to_owned(),
+                    expected: "numeric".to_owned(),
+                    actual: e.to_string(),
+                }
+            })?;
+        Ok(NullableExprType { nullable, ..result })
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let b = args.remove(1);
+        let a = args.remove(0);
+        if a.is_null() || b.is_null() {
+            return Ok(Value::Null);
+        }
+        match (a, b) {
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_sub(y) {
+                Some(result) => Ok(Value::Int64(result)),
+                None => Ok(Value::BigInt(BigInt::from(x) - BigInt::from(y))),
+            },
+            (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x - y)),
+            (a, b) => Err(FuncError::TypeMismatch {
+                function: "subtract".to_owned(),
+                expected: "matching numeric types".to_owned(),
+                actual: format!("{:?}, {:?}", a.data_type(), b.data_type()),
+            }),
+        }
+    }
+}
+
+struct MultiplyFunc;
+
+impl ExprFunction for MultiplyFunc {
+    fn name(&self) -> &str {
+        "multiply"
+    }
+
+    fn min_args(&self) -> usize {
+        2
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        let nullable = args.iter().any(|a| a.nullable);
+        validate_numeric_args("multiply", &args[0].data_type, &args[1].data_type)?;
+        let result =
+            arithmetic_result_type(ArithmeticOp::Multiply, &args[0], &args[1]).map_err(|e| {
+                FuncError::TypeMismatch {
+                    function: "multiply".to_owned(),
+                    expected: "numeric".to_owned(),
+                    actual: e.to_string(),
+                }
+            })?;
+        Ok(NullableExprType { nullable, ..result })
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let b = args.remove(1);
+        let a = args.remove(0);
+        if a.is_null() || b.is_null() {
+            return Ok(Value::Null);
+        }
+        match (a, b) {
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_mul(y) {
+                Some(result) => Ok(Value::Int64(result)),
+                None => Ok(Value::BigInt(BigInt::from(x) * BigInt::from(y))),
+            },
+            (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x * y)),
+            (a, b) => Err(FuncError::TypeMismatch {
+                function: "multiply".to_owned(),
+                expected: "matching numeric types".to_owned(),
+                actual: format!("{:?}, {:?}", a.data_type(), b.data_type()),
+            }),
+        }
+    }
+}
+
+struct DivideFunc;
+
+impl ExprFunction for DivideFunc {
+    fn name(&self) -> &str {
+        "divide"
+    }
+
+    fn min_args(&self) -> usize {
+        2
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        let nullable = args.iter().any(|a| a.nullable);
+        validate_numeric_args("divide", &args[0].data_type, &args[1].data_type)?;
+        let result =
+            arithmetic_result_type(ArithmeticOp::Divide, &args[0], &args[1]).map_err(|e| {
+                FuncError::TypeMismatch {
+                    function: "divide".to_owned(),
+                    expected: "numeric".to_owned(),
+                    actual: e.to_string(),
+                }
+            })?;
+        Ok(NullableExprType { nullable, ..result })
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let b = args.remove(1);
+        let a = args.remove(0);
+        if a.is_null() || b.is_null() {
+            return Ok(Value::Null);
+        }
+        match (a, b) {
+            (Value::Int64(_), Value::Int64(0)) => Err(FuncError::DivisionByZero),
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_div(y) {
+                Some(result) => Ok(Value::Int64(result)),
+                None => Ok(Value::BigInt(BigInt::from(x) / BigInt::from(y))),
+            },
+            (Value::Float64(x), Value::Float64(y)) => {
+                if y == 0.0 {
+                    return Err(FuncError::DivisionByZero);
+                }
+                Ok(Value::Float64(x / y))
+            }
+            (a, b) => Err(FuncError::TypeMismatch {
+                function: "divide".to_owned(),
+                expected: "matching numeric types".to_owned(),
+                actual: format!("{:?}, {:?}", a.data_type(), b.data_type()),
+            }),
+        }
+    }
+}
+
+struct ModuloFunc;
+
+impl ExprFunction for ModuloFunc {
+    fn name(&self) -> &str {
+        "modulo"
+    }
+
+    fn min_args(&self) -> usize {
+        2
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        let nullable = args.iter().any(|a| a.nullable);
+        validate_numeric_args("modulo", &args[0].data_type, &args[1].data_type)?;
+        let result =
+            arithmetic_result_type(ArithmeticOp::Modulo, &args[0], &args[1]).map_err(|e| {
+                FuncError::TypeMismatch {
+                    function: "modulo".to_owned(),
+                    expected: "numeric".to_owned(),
+                    actual: e.to_string(),
+                }
+            })?;
+        Ok(NullableExprType { nullable, ..result })
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let b = args.remove(1);
+        let a = args.remove(0);
+        if a.is_null() || b.is_null() {
+            return Ok(Value::Null);
+        }
+        match (a, b) {
+            (Value::Int64(_), Value::Int64(0)) => Err(FuncError::DivisionByZero),
+            (Value::Int64(x), Value::Int64(y)) => Ok(Value::Int64(x % y)),
+            (Value::Float64(x), Value::Float64(y)) => {
+                if y == 0.0 {
+                    return Err(FuncError::DivisionByZero);
+                }
+                Ok(Value::Float64(x % y))
+            }
+            (a, b) => Err(FuncError::TypeMismatch {
+                function: "modulo".to_owned(),
+                expected: "matching numeric types".to_owned(),
+                actual: format!("{:?}, {:?}", a.data_type(), b.data_type()),
+            }),
+        }
+    }
+}
+
+struct NegateFunc;
+
+impl ExprFunction for NegateFunc {
+    fn name(&self) -> &str {
+        "negate"
+    }
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        Ok(args[0].clone())
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let a = args.remove(0);
+        if a.is_null() {
+            return Ok(Value::Null);
+        }
+        match a {
+            Value::Int64(x) => match x.checked_neg() {
+                Some(result) => Ok(Value::Int64(result)),
+                None => Ok(Value::BigInt(-BigInt::from(x))),
+            },
+            Value::Float64(x) => Ok(Value::Float64(-x)),
+            other => Err(FuncError::TypeMismatch {
+                function: "negate".to_owned(),
+                expected: "numeric".to_owned(),
+                actual: format!("{:?}", other.data_type()),
+            }),
+        }
+    }
+}
+
+struct AbsFunc;
+
+impl ExprFunction for AbsFunc {
+    fn name(&self) -> &str {
+        "abs"
+    }
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        Ok(args[0].clone())
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let a = args.remove(0);
+        if a.is_null() {
+            return Ok(Value::Null);
+        }
+        match a {
+            Value::Int64(x) => match x.checked_abs() {
+                Some(result) => Ok(Value::Int64(result)),
+                None => Ok(Value::BigInt(BigInt::from(x).magnitude().clone().into())),
+            },
+            Value::Float64(x) => Ok(Value::Float64(x.abs())),
+            other => Err(FuncError::TypeMismatch {
+                function: "abs".to_owned(),
+                expected: "numeric".to_owned(),
+                actual: format!("{:?}", other.data_type()),
+            }),
+        }
+    }
+}
+
+struct CeilFunc;
+
+impl ExprFunction for CeilFunc {
+    fn name(&self) -> &str {
+        "ceil"
+    }
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let a = args.remove(0);
+        if a.is_null() {
+            return Ok(Value::Null);
+        }
+        match a {
+            Value::Int64(x) => Ok(Value::Int64(x)),
+            Value::Float64(x) => Ok(Value::Int64(x.ceil() as i64)),
+            other => Err(FuncError::TypeMismatch {
+                function: "ceil".to_owned(),
+                expected: "numeric".to_owned(),
+                actual: format!("{:?}", other.data_type()),
+            }),
+        }
+    }
+}
+
+struct FloorFunc;
+
+impl ExprFunction for FloorFunc {
+    fn name(&self) -> &str {
+        "floor"
+    }
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let a = args.remove(0);
+        if a.is_null() {
+            return Ok(Value::Null);
+        }
+        match a {
+            Value::Int64(x) => Ok(Value::Int64(x)),
+            Value::Float64(x) => Ok(Value::Int64(x.floor() as i64)),
+            other => Err(FuncError::TypeMismatch {
+                function: "floor".to_owned(),
+                expected: "numeric".to_owned(),
+                actual: format!("{:?}", other.data_type()),
+            }),
+        }
+    }
+}
+
+struct RoundFunc;
+
+impl ExprFunction for RoundFunc {
+    fn name(&self) -> &str {
+        "round"
+    }
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let a = args.remove(0);
+        if a.is_null() {
+            return Ok(Value::Null);
+        }
+        match a {
+            Value::Int64(x) => Ok(Value::Int64(x)),
+            Value::Float64(x) => Ok(Value::Int64(x.round() as i64)),
+            other => Err(FuncError::TypeMismatch {
+                function: "round".to_owned(),
+                expected: "numeric".to_owned(),
+                actual: format!("{:?}", other.data_type()),
+            }),
+        }
+    }
+}
+
+struct MinFunc;
+
+impl ExprFunction for MinFunc {
+    fn name(&self) -> &str {
+        "min"
+    }
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        None
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        Ok(NullableExprType::nullable(args[0].data_type.clone()))
+    }
+
+    fn evaluate(&self, args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let mut result: Option<Value> = None;
+        for val in args {
+            if val.is_null() {
+                continue;
+            }
+            result = Some(match result {
+                None => val,
+                Some(current) => match (&current, &val) {
+                    (Value::Int64(a), Value::Int64(b)) => {
+                        if b < a {
+                            val
+                        } else {
+                            current
+                        }
+                    }
+                    (Value::Float64(a), Value::Float64(b)) => {
+                        if b < a {
+                            val
+                        } else {
+                            current
+                        }
+                    }
+                    _ => current,
+                },
+            });
+        }
+        Ok(result.unwrap_or(Value::Null))
+    }
+}
+
+struct MaxFunc;
+
+impl ExprFunction for MaxFunc {
+    fn name(&self) -> &str {
+        "max"
+    }
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        None
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        Ok(NullableExprType::nullable(args[0].data_type.clone()))
+    }
+
+    fn evaluate(&self, args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let mut result: Option<Value> = None;
+        for val in args {
+            if val.is_null() {
+                continue;
+            }
+            result = Some(match result {
+                None => val,
+                Some(current) => match (&current, &val) {
+                    (Value::Int64(a), Value::Int64(b)) => {
+                        if b > a {
+                            val
+                        } else {
+                            current
+                        }
+                    }
+                    (Value::Float64(a), Value::Float64(b)) => {
+                        if b > a {
+                            val
+                        } else {
+                            current
+                        }
+                    }
+                    _ => current,
+                },
+            });
+        }
+        Ok(result.unwrap_or(Value::Null))
+    }
+}
+
+struct SignFunc;
+
+impl ExprFunction for SignFunc {
+    fn name(&self) -> &str {
+        "sign"
+    }
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let a = args.remove(0);
+        if a.is_null() {
+            return Ok(Value::Null);
+        }
+        match a {
+            Value::Int64(x) => Ok(Value::Int64(x.signum())),
+            Value::Float64(x) => {
+                if x > 0.0 {
+                    Ok(Value::Int64(1))
+                } else if x < 0.0 {
+                    Ok(Value::Int64(-1))
+                } else {
+                    Ok(Value::Int64(0))
+                }
+            }
+            other => Err(FuncError::TypeMismatch {
+                function: "sign".to_owned(),
+                expected: "numeric".to_owned(),
+                actual: format!("{:?}", other.data_type()),
+            }),
+        }
+    }
+}
+
+struct PowerFunc;
+
+impl ExprFunction for PowerFunc {
+    fn name(&self) -> &str {
+        "power"
+    }
+
+    fn min_args(&self) -> usize {
+        2
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        let nullable = args.iter().any(|a| a.nullable);
+        Ok(NullableExprType::new(DataType::Float64, nullable))
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let b = args.remove(1);
+        let a = args.remove(0);
+        if a.is_null() || b.is_null() {
+            return Ok(Value::Null);
+        }
+        let base = to_f64(&a, "power")?;
+        let exp = to_f64(&b, "power")?;
+        Ok(Value::Float64(base.powf(exp)))
+    }
+}
+
+struct SqrtFunc;
+
+impl ExprFunction for SqrtFunc {
+    fn name(&self) -> &str {
+        "sqrt"
+    }
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let a = args.remove(0);
+        if a.is_null() {
+            return Ok(Value::Null);
+        }
+        let x = to_f64(&a, "sqrt")?;
+        Ok(Value::Float64(x.sqrt()))
+    }
+}
+
+fn to_f64(val: &Value, func_name: &str) -> Result<f64, FuncError> {
+    match val {
+        Value::Int64(x) => Ok(*x as f64),
+        Value::Float64(x) => Ok(*x),
+        other => Err(FuncError::TypeMismatch {
+            function: func_name.to_owned(),
+            expected: "numeric".to_owned(),
+            actual: format!("{:?}", other.data_type()),
+        }),
+    }
+}
+
+fn is_numeric_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::BigInt { .. }
+            | DataType::Decimal { .. }
+    )
+}
+
+fn validate_numeric_args(
+    function: &str,
+    left: &DataType,
+    right: &DataType,
+) -> Result<(), FuncError> {
+    if !is_numeric_type(left) {
+        return Err(FuncError::TypeMismatch {
+            function: function.to_owned(),
+            expected: "numeric".to_owned(),
+            actual: format!("{left}"),
+        });
+    }
+    if !is_numeric_type(right) {
+        return Err(FuncError::TypeMismatch {
+            function: function.to_owned(),
+            expected: "numeric".to_owned(),
+            actual: format!("{right}"),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::signature::EvalContext;
+    use std::path::PathBuf;
+
+    fn ctx() -> EvalContext {
+        EvalContext {
+            env_resolver: Arc::new(crate::tests::EmptyEnv),
+            file_resolver: Arc::new(crate::tests::NoopFiles),
+            now: chrono::Utc::now(),
+            base_dir: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn add_int() {
+        let f = AddFunc;
+        let result = f
+            .evaluate(vec![Value::Int64(2), Value::Int64(3)], &ctx())
+            .unwrap();
+        assert_eq!(result, Value::Int64(5));
+    }
+
+    #[test]
+    fn add_int_overflow_promotes_to_bigint() {
+        let f = AddFunc;
+        let result = f
+            .evaluate(vec![Value::Int64(i64::MAX), Value::Int64(1)], &ctx())
+            .unwrap();
+        assert_eq!(
+            result,
+            Value::BigInt(BigInt::from(i64::MAX) + BigInt::from(1))
+        );
+    }
+
+    #[test]
+    fn add_text_concat() {
+        let f = AddFunc;
+        let result = f
+            .evaluate(
+                vec![Value::Text("hello".into()), Value::Text(" world".into())],
+                &ctx(),
+            )
+            .unwrap();
+        assert_eq!(result, Value::Text("hello world".into()));
+    }
+
+    #[test]
+    fn add_null_propagation() {
+        let f = AddFunc;
+        let result = f
+            .evaluate(vec![Value::Null, Value::Int64(3)], &ctx())
+            .unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn divide_by_zero() {
+        let f = DivideFunc;
+        let result = f.evaluate(vec![Value::Int64(5), Value::Int64(0)], &ctx());
+        assert!(matches!(result, Err(FuncError::DivisionByZero)));
+    }
+
+    #[test]
+    fn modulo_basic() {
+        let f = ModuloFunc;
+        let result = f
+            .evaluate(vec![Value::Int64(7), Value::Int64(3)], &ctx())
+            .unwrap();
+        assert_eq!(result, Value::Int64(1));
+    }
+
+    #[test]
+    fn negate_int() {
+        let f = NegateFunc;
+        let result = f.evaluate(vec![Value::Int64(5)], &ctx()).unwrap();
+        assert_eq!(result, Value::Int64(-5));
+    }
+
+    #[test]
+    fn abs_negative() {
+        let f = AbsFunc;
+        let result = f.evaluate(vec![Value::Int64(-7)], &ctx()).unwrap();
+        assert_eq!(result, Value::Int64(7));
+    }
+
+    #[test]
+    fn ceil_float() {
+        let f = CeilFunc;
+        let result = f.evaluate(vec![Value::Float64(2.3)], &ctx()).unwrap();
+        assert_eq!(result, Value::Int64(3));
+    }
+
+    #[test]
+    fn floor_float() {
+        let f = FloorFunc;
+        let result = f.evaluate(vec![Value::Float64(2.7)], &ctx()).unwrap();
+        assert_eq!(result, Value::Int64(2));
+    }
+
+    #[test]
+    fn round_float() {
+        let f = RoundFunc;
+        let result = f.evaluate(vec![Value::Float64(2.5)], &ctx()).unwrap();
+        assert_eq!(result, Value::Int64(3));
+    }
+
+    #[test]
+    fn min_ignores_null() {
+        let f = MinFunc;
+        let result = f
+            .evaluate(vec![Value::Int64(5), Value::Null, Value::Int64(2)], &ctx())
+            .unwrap();
+        assert_eq!(result, Value::Int64(2));
+    }
+
+    #[test]
+    fn max_all_null() {
+        let f = MaxFunc;
+        let result = f.evaluate(vec![Value::Null, Value::Null], &ctx()).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn sign_positive() {
+        let f = SignFunc;
+        let result = f.evaluate(vec![Value::Int64(42)], &ctx()).unwrap();
+        assert_eq!(result, Value::Int64(1));
+    }
+
+    #[test]
+    fn power_basic() {
+        let f = PowerFunc;
+        let result = f
+            .evaluate(vec![Value::Float64(2.0), Value::Float64(3.0)], &ctx())
+            .unwrap();
+        assert_eq!(result, Value::Float64(8.0));
+    }
+
+    #[test]
+    fn sqrt_basic() {
+        let f = SqrtFunc;
+        let result = f.evaluate(vec![Value::Float64(9.0)], &ctx()).unwrap();
+        assert_eq!(result, Value::Float64(3.0));
+    }
+}

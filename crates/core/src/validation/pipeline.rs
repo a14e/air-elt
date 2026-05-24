@@ -54,10 +54,16 @@ const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Sources / sinks / storages are shared by name across flows: building each
 /// instance only once means a single pool per declared component, regardless
 /// of how many flows reference it.
+///
+/// `config_dir` is used to build the expression evaluation context for
+/// resolving `default = "env('KEY', 'fallback')"` style expressions.
+/// Pass `None` when expressions should not be evaluated (e.g. in tests
+/// that build flows synthetically).
 pub async fn assemble(
     root: &RootConfig,
     registry: &Registry,
     monitoring: &mut air_elt_monitoring::MonitoringManager,
+    config_dir: Option<&std::path::Path>,
 ) -> Result<Vec<AssembledFlow>, ValidationError> {
     // O(1) name → config indexes built once. Avoids the per-flow linear
     // scans that would make assemble O(F × (S + K + T)) on a config with
@@ -156,6 +162,19 @@ pub async fn assemble(
     // this the manager is read-only; we only use it to issue
     // per-flow `FlowLockHandle`s below.
     crate::util::log_concurrency_budgets(&concurrency);
+
+    // Build the shared expression context once for all flows. When
+    // `config_dir` is `None` expression evaluation is skipped and
+    // `default = "env(...)"` style literals fall through to the plain
+    // `default_value::parse` path (which will likely error on them —
+    // the operator should always supply a config directory).
+    let expr_context: Option<Arc<crate::config::expression::ExpressionContext>> =
+        config_dir.map(|dir| {
+            Arc::new(crate::config::expression::ExpressionContext::new(
+                registry.expr_functions().clone(),
+                dir,
+            ))
+        });
 
     // Phase 3: assemble each flow by attaching shared Arcs via O(1)
     // map lookups.
@@ -311,6 +330,7 @@ pub async fn assemble(
                 storage_name: flow.storage.clone(),
                 storage_kind: storage_cfg.kind.clone(),
             }),
+            expr_context: expr_context.clone(),
         });
     }
 
@@ -1035,6 +1055,7 @@ mod tests {
                 )
             },
             recorder: air_elt_monitoring::FlowRecorder::disabled(),
+            expr_context: None,
         }
     }
 

@@ -190,6 +190,11 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
         (Ipv6, Bytes { size: b }) => b.is_none_or(|n| n >= 16),
         (Bytes { size: a }, Ipv6) => a.is_none_or(|n| n >= 16),
 
+        // Object → Json: lossless (Object can always be represented as JSON)
+        (Object, Json) => true,
+        // Object → Text (unbounded): serialize as JSON string
+        (Object, Text { size: None }) => true,
+
         // Narrowing from BigInt/Decimal back into fixed-width or integer
         // types is *not* supported — every reverse path is potentially
         // lossy. Users adding such pipelines must do an explicit transform.
@@ -302,6 +307,10 @@ pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool
         // runtime; the matrix admits the pair, dispatcher raises
         // `IpV6NotMappable` for non-mapped addresses.
         (Ipv6, Ipv4) => true,
+        // Json → Object with truncate: JSON doesn't guarantee typed values
+        (Json, Object) => true,
+        // Object → Text(n) with truncate: serialize as JSON, may exceed size
+        (Object, Text { size: Some(_) }) => true,
         _ => false,
     }
 }

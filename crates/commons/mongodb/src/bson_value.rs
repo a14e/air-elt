@@ -169,6 +169,13 @@ pub fn to_bson(v: &Value) -> RuntimeResult<Bson> {
         Value::Ipv4(a) => Bson::String(a.to_string()),
         Value::Ipv6(a) => Bson::String(a.to_string()),
         Value::Json(j) => bson::to_bson(j).map_err(RuntimeError::backend)?,
+        Value::Object(entries) => {
+            let mut doc = bson::Document::new();
+            for (key, val) in entries {
+                doc.insert(key.clone(), to_bson(val)?);
+            }
+            Bson::Document(doc)
+        }
         Value::Custom(inner) => {
             let any = inner.as_any();
             if let Some(oid) = any.downcast_ref::<MongoObjectIdValue>() {

@@ -40,6 +40,10 @@ pub struct ListedKinds {
 pub struct App {
     config: RootConfig,
     registry: Registry,
+    /// Directory containing the root config file. Used to build the
+    /// expression evaluation context (for resolving relative file
+    /// paths in expressions).
+    config_dir: std::path::PathBuf,
     /// Construction-time monitoring handle. Wrapped in a parking_lot
     /// `Mutex<Option<…>>` to keep interior mutability under `&self`
     /// while honouring the constraint that the manager itself has no
@@ -106,12 +110,22 @@ impl App {
     /// Load the config from disk and wire the default registry.
     pub fn from_path(path: &Path) -> Result<Self> {
         let config = loader::load(path)?;
-        Ok(Self::from_config(config))
+        let config_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Ok(Self::from_config_with_dir(config, config_dir))
     }
 
     /// Wrap an already-loaded config (used by tests that build configs in
-    /// memory). Wires the default registry.
+    /// memory). Wires the default registry. Uses cwd as config_dir.
     pub fn from_config(config: RootConfig) -> Self {
+        Self::from_config_with_dir(config, std::path::PathBuf::from("."))
+    }
+
+    /// Wrap an already-loaded config with an explicit config directory
+    /// for expression resolution.
+    fn from_config_with_dir(config: RootConfig, config_dir: std::path::PathBuf) -> Self {
         let mut monitoring = match config
             .metrics
             .prometheus
@@ -134,6 +148,7 @@ impl App {
         Self {
             config,
             registry: build_registry(),
+            config_dir,
             monitoring: Mutex::new(Some(monitoring)),
             migrated: AtomicBool::new(false),
             migrate_lock: tokio::sync::Mutex::new(()),
@@ -195,7 +210,13 @@ impl App {
                 // would leave the manager `None` and silently disable
                 // `/metrics` for the rest of the process lifetime.
                 let mut guard = MonitoringGuard::take(&self.monitoring);
-                let assembled = assemble(&self.config, &self.registry, guard.as_mut()).await?;
+                let assembled = assemble(
+                    &self.config,
+                    &self.registry,
+                    guard.as_mut(),
+                    Some(&self.config_dir),
+                )
+                .await?;
                 Ok::<_, anyhow::Error>(assembled)
             })
             .await

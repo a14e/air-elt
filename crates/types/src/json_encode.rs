@@ -85,6 +85,13 @@ fn encode_value_at_depth(v: &Value, depth: usize) -> Result<serde_json::Value, J
         Value::Ipv4(a) => serde_json::Value::String(a.to_string()),
         Value::Ipv6(a) => serde_json::Value::String(a.to_string()),
         Value::Json(inner) => encode_serde_json_at_depth(inner, depth + 1)?,
+        Value::Object(entries) => {
+            let mut map = serde_json::Map::with_capacity(entries.len());
+            for (key, val) in entries {
+                map.insert(key.clone(), encode_value_at_depth(val, depth + 1)?);
+            }
+            serde_json::Value::Object(map)
+        }
         Value::Custom(c) => c.to_json()?,
     };
     Ok(out)

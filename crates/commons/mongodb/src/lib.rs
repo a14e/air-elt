@@ -11,6 +11,7 @@
 
 pub mod bson_value;
 pub mod client;
+pub mod expr;
 pub mod identifier;
 pub mod infer;
 pub mod key_bson;

@@ -268,6 +268,7 @@ pub fn test_flow_named(
         cursor_persistence: crate::model::CursorPersistence::ColumnCursor,
         lock_handle: unbounded_lock_handle(name, "test-sink", "test-storage"),
         recorder: air_elt_monitoring::FlowRecorder::disabled(),
+        expr_context: None,
     };
     let derived = DerivedPlans {
         transform: crate::transform::Transform::new(

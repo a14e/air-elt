@@ -37,4 +37,7 @@ pub enum ConvertError {
 
     #[error("IPv6 address {addr} is not IPv4-mapped (::ffff:a.b.c.d) — cannot lower to Ipv4")]
     IpV6NotMappable { addr: String },
+
+    #[error("{message}")]
+    Custom { message: String },
 }

@@ -107,6 +107,10 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
                 unreachable!("postgres has no unsigned integer column types")
             }
+            // Object is handled as Json in connectors
+            DataType::Object => {
+                sep.push_bind::<Option<serde_json::Value>>(None);
+            }
             DataType::Union(_) => unreachable!("postgres sinks never carry Union types"),
             // HLL NULL: bind a typed NULL Vec<u8> and tack on `::hll` so
             // the placeholder lands as `$N::hll`. sqlx cannot infer a
@@ -198,6 +202,18 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
                  dispatcher rewrites every UInt → Int*/BigInt/Decimal mapping into \
                  the target variant before binding"
             )
+        }
+        Value::Object(entries) => {
+            // Object is handled as Json in connectors
+            let map: serde_json::Map<String, serde_json::Value> = entries
+                .iter()
+                .map(|(k, v)| {
+                    let json_v =
+                        air_elt_core::types::value_to_json(v).unwrap_or(serde_json::Value::Null);
+                    (k.clone(), json_v)
+                })
+                .collect();
+            sep.push_bind(serde_json::Value::Object(map));
         }
         Value::Custom(v) => {
             // HLL: bind raw bytes, then append `::hll` to cast the

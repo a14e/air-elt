@@ -6,6 +6,7 @@
 (Mandatory) When writing code or planning, also use `rust-guidelines` and `project-conventions`.
 (Mandatory) Before writing or modifying any test (unit, integration, e2e), load `testing-guidelines`.
 If you need to work with configs, use `config-format`.
+When extending the expression language (new functions, syntax changes, parser updates), load and update the `expression-language` skill.
 Save context using `context-saving` (load it before complex tasks and project research).
 Use the skill tools rather than reading skill files directly.
 

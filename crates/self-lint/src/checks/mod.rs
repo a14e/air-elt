@@ -9,3 +9,4 @@ pub mod registry;
 pub mod test_aggregator;
 pub mod traits;
 pub mod version;
+pub mod worktree;

@@ -728,6 +728,7 @@ fn value_variant(v: &Value) -> &'static str {
         Value::Ipv4(_) => "Ipv4",
         Value::Ipv6(_) => "Ipv6",
         Value::Json(_) => "Json",
+        Value::Object(_) => "Object",
         Value::Custom(_) => "Custom",
     }
 }

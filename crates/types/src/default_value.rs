@@ -49,6 +49,8 @@ pub enum DefaultParseError {
     InvalidXml { reason: String },
     #[error("default literal type does not match sink {dst}")]
     TypeMismatch { dst: DataType },
+    #[error("expression evaluation failed: {reason}")]
+    ExpressionFailed { reason: String },
 }
 
 pub fn parse(literal: &toml::Value, sink: &DataType) -> Result<Value, DefaultParseError> {
@@ -83,6 +85,7 @@ pub fn parse(literal: &toml::Value, sink: &DataType) -> Result<Value, DefaultPar
         DataType::Ipv4 => parse_ipv4(literal),
         DataType::Ipv6 => parse_ipv6(literal),
         DataType::Json => Ok(Value::Json(toml_to_json(literal))),
+        DataType::Object => parse_object(literal),
         DataType::Xml => parse_xml(literal),
         // Defaults are parsed against the sink's concrete type. Sinks
         // never carry Union (only sources can — see `DataType::Union`),
@@ -373,6 +376,17 @@ fn parse_xml(literal: &toml::Value) -> Result<Value, DefaultParseError> {
         .ok_or(DefaultParseError::TypeMismatch { dst: DataType::Xml })?;
     crate::convert::xml::validate(s).map_err(|reason| DefaultParseError::InvalidXml { reason })?;
     Ok(Value::Text(s.to_string()))
+}
+
+fn parse_object(literal: &toml::Value) -> Result<Value, DefaultParseError> {
+    let table = literal.as_table().ok_or(DefaultParseError::TypeMismatch {
+        dst: DataType::Object,
+    })?;
+    let entries: Vec<(String, Value)> = table
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::Json(toml_to_json(v))))
+        .collect();
+    Ok(Value::Object(entries))
 }
 
 fn toml_to_json(v: &toml::Value) -> serde_json::Value {

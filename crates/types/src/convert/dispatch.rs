@@ -621,6 +621,65 @@ pub fn convert(
             timestamp_date::convert(value, src)
         }
 
+        // ---- Object → Json -------------------------------------------
+        (DataType::Object, DataType::Json) => match value {
+            Value::Object(entries) => {
+                let mut map = serde_json::Map::with_capacity(entries.len());
+                for (key, val) in entries {
+                    let json_val = crate::json_encode::value_to_json(&val).map_err(|e| {
+                        ConvertError::Custom {
+                            message: format!("object to json: {e}"),
+                        }
+                    })?;
+                    map.insert(key, json_val);
+                }
+                Ok(Value::Json(serde_json::Value::Object(map)))
+            }
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+
+        // ---- Object → Text -------------------------------------------
+        (DataType::Object, DataType::Text { size }) => {
+            if size.is_some() {
+                require_truncate(ctx, src, dst)?;
+            }
+            match value {
+                Value::Object(entries) => {
+                    let mut map = serde_json::Map::with_capacity(entries.len());
+                    for (key, val) in entries {
+                        let json_val = crate::json_encode::value_to_json(&val).map_err(|e| {
+                            ConvertError::Custom {
+                                message: format!("object to text: {e}"),
+                            }
+                        })?;
+                        map.insert(key, json_val);
+                    }
+                    let serialized = serde_json::Value::Object(map).to_string();
+                    if let Some(max) = size {
+                        let chars: String = serialized.chars().take(*max as usize).collect();
+                        Ok(Value::Text(chars))
+                    } else {
+                        Ok(Value::Text(serialized))
+                    }
+                }
+                _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+            }
+        }
+
+        // ---- Json → Object (truncate-only) ---------------------------
+        (DataType::Json, DataType::Object) => {
+            require_truncate(ctx, src, dst)?;
+            match value {
+                Value::Json(serde_json::Value::Object(map)) => {
+                    let entries: Vec<(String, Value)> =
+                        map.into_iter().map(|(k, v)| (k, Value::Json(v))).collect();
+                    Ok(Value::Object(entries))
+                }
+                Value::Json(_) => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+                _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+            }
+        }
+
         _ => Err(ConvertError::Unsupported {
             src: src.clone(),
             dst: dst.clone(),
