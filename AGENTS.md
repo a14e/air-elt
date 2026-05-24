@@ -28,8 +28,9 @@ After a compaction, assume skills are not loaded — load them again before star
 * Agent tasks live in `agent_tasks/`. (Only human can write to this dir. You can write there only if user asks you)
 * If Docker is unavailable, check podman; prefer podman.
 * Delete every temporary file you create.
-* After every change, run `cargo fmt` and `cargo clippy --all-targets --workspace -- -D warnings`. and MANDATORY after
-  completing each task. that is, after local tests you must run full tests
+* After every change, run `just fmt` then `just lint` (or manually: `cargo fmt` and
+  `cargo clippy --all-targets --workspace -- -D warnings`). MANDATORY after completing each task —
+  after local workspace tests you must run full test suit.
 * You may skip plan steps only with the user's consent.
 * **(Mandatory)** After completing every task, run validator agents — this is non-negotiable, not opt-in. Skipping is allowed only with the user's explicit consent for the specific task.
 * **(Mandatory)** Pick as many validator agents as possible; exclude only those clearly untouched. If touched indirectly — invoke them. Run independent agents in parallel.
@@ -44,6 +45,16 @@ After a compaction, assume skills are not loaded — load them again before star
 * If you find a bug in the code via tests, fix it (even if it was outside the task scope). Tests exist precisely to catch and fix bugs.
 * perform reasoning in English
 * **No future-proofing config fields.** Do not introduce config keys, struct fields, or enum variants whose only purpose is "we might want this later". Add the field together with the feature that consumes it. Reserved-for-future fields rot, drift, and create misleading docs. If a feature is on the near horizon, file an `agent_tasks/` ticket — don't pre-wire the surface.
+
+## Development commands
+
+The `Justfile` is the primary interface for building, linting, and testing.
+
+* `just lint` — fmt check + clippy + cargo-deny
+* `just test` — auto-fmt + tests (nextest if available, otherwise cargo test)
+* `just build` — release build
+
+See the `Justfile` for the full recipe list.
 
 ## On `(Mandatory)`
 

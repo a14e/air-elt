@@ -17,34 +17,49 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
 jobs:
   lint:
-    name: fmt + clippy
+    name: fmt + clippy # don't change this name
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: "1.95.0"
-          components: rustfmt, clippy
+        run: rustup show
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: air-elt-lint
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Cache CI tools
+        id: cache-lint-tools
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/just /usr/local/bin/cargo-deny
+          key: ci-lint-tools-just-1.51.0-deny-0.19.7
+      - name: Install just
+        if: steps.cache-lint-tools.outputs.cache-hit != 'true'
+        run: curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin --tag 1.51.0
+      - name: Install cargo-deny
+        if: steps.cache-lint-tools.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -sSL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.7/cargo-deny-0.19.7-x86_64-unknown-linux-musl.tar.gz \
+            | tar xz -C /usr/local/bin --strip-components=1 cargo-deny-0.19.7-x86_64-unknown-linux-musl/cargo-deny
+      - name: just ci-lint
+        run: just ci-lint
 
   test:
     name: tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     services:
       postgres:
         # Citus image is wire-compatible with stock Postgres and ships
@@ -114,9 +129,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: "1.95.0"
+        run: rustup show
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -256,5 +269,17 @@ jobs:
           echo "questdb did not become ready in 60s"
           docker logs questdb || true
           exit 1
-      - name: cargo test
-        run: cargo test --workspace --all-targets
+      - name: Cache CI tools
+        id: cache-test-tools
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/just /usr/local/bin/cargo-nextest
+          key: ci-test-tools-just-1.51.0-nextest-0.9.133
+      - name: Install just
+        if: steps.cache-test-tools.outputs.cache-hit != 'true'
+        run: curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin --tag 1.51.0
+      - name: Install cargo-nextest
+        if: steps.cache-test-tools.outputs.cache-hit != 'true'
+        run: curl -LsSf https://get.nexte.st/0.9.133/linux | tar zxf - -C /usr/local/bin
+      - name: just test
+        run: just test

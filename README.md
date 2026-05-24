@@ -29,13 +29,8 @@ flow against the live targets before it starts.
 
 ## Running
 
-Local prerequisites: Rust 1.95 (pinned via `rust-toolchain.toml`) for
-the binary itself, and a container engine (Docker or Podman) for the
-testcontainers-backed integration tests. The manual benchmark scaffolds
-under `manual-tests/` additionally need `uv` to launch the PEP-723
-Python helpers.
-
 Build with `cargo build --release`.
+See [Development](#development) for toolchain setup.
 
 ```bash
 # Validate the config against live sources, sinks, and storages
@@ -217,6 +212,52 @@ Air Elt's `validate_access` dry-run probe fail with a cryptic
 "inconvertible types" error. The regression is covered by
 `crates/sinks/questdb/tests/oltp_twelve_columns.rs` against the
 12-column OLTP shape so a future image bump cannot silently regress.
+
+## Development
+
+### Pre-requirements
+
+- **Rust 1.95** — pinned via `rust-toolchain.toml`. Install manually:
+  [rustup.rs](https://rustup.rs).
+- **just** — command runner. `cargo install just` or `brew install just`
+  (macOS).
+- **clang + lld** — fast linker configured in `.cargo/config.toml`.
+  `just install-ci` handles installation automatically.
+  Manual: macOS `brew install lld`, Linux `apt install clang lld`,
+  Windows MinGW `pacman -S mingw-w64-x86_64-clang mingw-w64-x86_64-lld`
+  ([MSYS2](https://www.msys2.org) required),
+  Windows MSVC — no extra linker needed (bundled `link.exe`), install
+  [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
+  All Justfile recipes require bash (provided by MSYS2 or Git Bash).
+- **Container engine** — Docker or Podman for testcontainers integration
+  tests (local only; CI provisions its own services).
+
+Optional tools (installed by `just install-basic`):
+
+- `cargo-nextest` — faster parallel test runner, used automatically by
+  `just test`.
+- `cargo-deny` — license and advisory checks.
+
+For manual-test benchmarks, also install `uv` (Python package manager).
+`just install-local` sets up the full local environment.
+Run `just check-deps-local` to verify the complete set.
+
+### Commands
+
+The Justfile is the primary interface for linting and testing:
+
+```bash
+just build   # release build
+just lint            # fmt --check + clippy + cargo-deny
+just test            # auto-fmt + nextest (or cargo test fallback)
+just test-full       # fmt + lint + test (full pipeline)
+just install-basic   # cargo-deny + cargo-nextest
+just install-ci     # + clang/lld (CI-level)
+just install-local   # + uv + rtk (full local dev)
+just check-deps-basic     # verify Rust toolchain
+just check-deps-ci      # verify all development tools
+just --list          # show all recipes
+```
 
 ## Contributing
 
