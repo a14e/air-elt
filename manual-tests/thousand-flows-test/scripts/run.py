@@ -372,6 +372,16 @@ def main() -> int:
     parser.add_argument(
         "--skip-build", action="store_true", help="Skip `cargo build --release`."
     )
+    parser.add_argument(
+        "--setup-only",
+        action="store_true",
+        help="Run only the setup phase (gen, compose up, build, migrate) then exit.",
+    )
+    parser.add_argument(
+        "--run-only",
+        action="store_true",
+        help="Skip setup, run air-elt with background workers (assumes setup was done).",
+    )
     args = parser.parse_args()
 
     LOG_DIR.mkdir(exist_ok=True)
@@ -391,47 +401,56 @@ def main() -> int:
         _trim_podman_journal()
         _check_podman_memory_cap()
 
-    if not args.skip_gen:
-        print("[run.py] running gen.py")
-        subprocess.run(
-            ["uv", "run", "--no-project", str(HERE / "gen.py")],
-            cwd=TEST_ROOT,
-            check=True,
-        )
+    if not args.run_only:
+        if not args.skip_gen:
+            print("[run.py] running gen.py")
+            subprocess.run(
+                ["uv", "run", "--no-project", str(HERE / "gen.py")],
+                cwd=TEST_ROOT,
+                check=True,
+            )
+
     export_env_from_generated()
-
     top = load_topology()
-    services = services_from_topology(top)
 
-    print(f"[run.py] using compose CLI: {' '.join(COMPOSE)}")
-    print(f"[run.py] {' '.join(COMPOSE)} up -d ({len(services)} services)")
-    compose("up", "-d")
-    wait_all_healthy(services)
+    if not args.run_only:
+        services = services_from_topology(top)
 
-    if not args.skip_build:
-        print("[run.py] cargo build --release -p air-elt-app")
-        subprocess.run(
-            ["cargo", "build", "--release", "-p", "air-elt-app"],
-            cwd=REPO_ROOT,
-            check=True,
-        )
+        print(f"[run.py] using compose CLI: {' '.join(COMPOSE)}")
+        print(f"[run.py] {' '.join(COMPOSE)} up -d ({len(services)} services)")
+        compose("up", "-d")
+        wait_all_healthy(services)
 
-    warm_up_pg_pools(top)
-    apply_questdb_init(top)
+        if not args.skip_build:
+            print("[run.py] cargo build --release -p air-elt-app")
+            subprocess.run(
+                ["cargo", "build", "--release", "-p", "air-elt-app"],
+                cwd=REPO_ROOT,
+                check=True,
+            )
+
+        warm_up_pg_pools(top)
+        apply_questdb_init(top)
+
+        binary = air_elt_binary()
+        config_arg = "air-elt-config/config.toml"
+        migrate_log_path = LOG_DIR / "air-elt-migrate.log"
+        print(f"[run.py] {binary} migrate --config {config_arg} -> {migrate_log_path}")
+        with migrate_log_path.open("wb") as mlog:
+            subprocess.run(
+                [str(binary), "migrate", "--config", config_arg],
+                cwd=TEST_ROOT,
+                check=True,
+                stdout=mlog,
+                stderr=subprocess.STDOUT,
+            )
+
+        if args.setup_only:
+            print("[run.py] setup complete (--setup-only)")
+            return 0
 
     binary = air_elt_binary()
     config_arg = "air-elt-config/config.toml"
-    migrate_log_path = LOG_DIR / "air-elt-migrate.log"
-    print(f"[run.py] {binary} migrate --config {config_arg} -> {migrate_log_path}")
-    with migrate_log_path.open("wb") as mlog:
-        subprocess.run(
-            [str(binary), "migrate", "--config", config_arg],
-            cwd=TEST_ROOT,
-            check=True,
-            stdout=mlog,
-            stderr=subprocess.STDOUT,
-        )
-
     load = top.get("load", {})
     load_proc = spawn_background(
         "load",

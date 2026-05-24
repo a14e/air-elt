@@ -118,6 +118,7 @@ async fn mongo_legacy_infra() -> &'static MongoInfra {
             // tmpfs on /data/db: container is reaped at session end, so
             // on-disk state has no value.
             let container = MongoImage::default()
+                .with_name("mirror.gcr.io/library/mongo")
                 .with_tag("7.0")
                 .with_container_name(format!("air-elt-{kind_value}-{sv}"))
                 .with_label(sk, sv)
@@ -276,7 +277,7 @@ async fn mongo_rs_infra() -> &'static MongoInfra {
             // we need to override the entrypoint command with
             // `--replSet rs0 --bind_ip_all`. tmpfs on /data/db: container
             // is reaped at session end, so on-disk state has no value.
-            let image = GenericImage::new("mongo", "8")
+            let image = GenericImage::new("mirror.gcr.io/library/mongo", "8")
                 .with_exposed_port(ContainerPort::Tcp(27017))
                 .with_cmd(["--replSet", "rs0", "--bind_ip_all"])
                 .with_container_name(format!("air-elt-mongo-rs-{sv}"))

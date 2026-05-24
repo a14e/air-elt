@@ -52,11 +52,13 @@ After a compaction, assume skills are not loaded — load them again before star
 ## Development commands
 
 The `Justfile` is the primary interface for building, linting, and testing.
+Running `just` without arguments prints the full list of available recipes.
 
 * `just lint` — fmt check + clippy + cargo-deny + structural lint
 * `just test` — auto-fmt + tests (nextest if available, otherwise cargo test)
 * `just build` — release build
 
+Manual tests also use just: `just smoke-mongo-pg run`, `just smoke-10k-flows run`.
 See the `Justfile` for the full recipe list.
 
 ## On `(Mandatory)`

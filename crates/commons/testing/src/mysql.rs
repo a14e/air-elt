@@ -82,6 +82,7 @@ async fn mysql_base_url() -> &'static String {
             // container is reaped at session end, so on-disk state has no
             // value.
             let container = MySqlImage::default()
+                .with_name("mirror.gcr.io/library/mysql")
                 .with_tag("8.4")
                 .with_container_name(format!("air-elt-mysql-{sv}"))
                 .with_label(sk, sv)

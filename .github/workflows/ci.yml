@@ -83,7 +83,7 @@ jobs:
         # the postgresql-hll extension preinstalled. The local
         # testcontainers handle uses the same image; matching it here
         # keeps CI and dev parity. Pinned to 13.1.
-        image: citusdata/citus:13.1
+        image: mirror.gcr.io/citusdata/citus:13.1
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
@@ -100,7 +100,7 @@ jobs:
           --health-retries=10
           --tmpfs=/var/lib/postgresql/data:rw,size=512m
       mysql:
-        image: mysql:8.4
+        image: mirror.gcr.io/library/mysql:8.4
         env:
           MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
           MYSQL_DATABASE: airelt
@@ -116,7 +116,7 @@ jobs:
         # Pinned to 11.x: native UUID column (added in 10.7) is required by
         # the MariaDB e2e suite. Mapped to host port 3307 so it doesn't
         # collide with the mysql service.
-        image: mariadb:11.4
+        image: mirror.gcr.io/library/mariadb:11.4
         env:
           MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: "1"
           MARIADB_DATABASE: airelt
@@ -159,7 +159,7 @@ jobs:
         # over a CI run). Run as plain `docker run` instead.
         run: |
           set -euo pipefail
-          for spec in "mongo:8.0 27017 mongo-modern" "mongo:7.0 27018 mongo-legacy"; do
+          for spec in "mirror.gcr.io/library/mongo:8.0 27017 mongo-modern" "mirror.gcr.io/library/mongo:7.0 27018 mongo-legacy"; do
             read -r image port name <<<"$spec"
             docker run -d --name "$name" -p "$port:27017" \
               --tmpfs /data/db:rw,size=512m \
@@ -214,7 +214,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run -d --name cockroach -p 26257:26257 \
-            cockroachdb/cockroach:v25.1.0 start-single-node --insecure \
+            mirror.gcr.io/cockroachdb/cockroach:v25.1.0 start-single-node --insecure \
             --store=type=mem,size=1GiB
           for i in $(seq 1 30); do
             if docker exec cockroach \
@@ -239,7 +239,7 @@ jobs:
           docker run -d --name clickhouse -p 8123:8123 -p 9000:9000 \
             --tmpfs /var/lib/clickhouse:rw,size=512m \
             -e CLICKHOUSE_SKIP_USER_SETUP=1 \
-            clickhouse/clickhouse-server:24.8
+            mirror.gcr.io/clickhouse/clickhouse-server:24.8
           for i in $(seq 1 60); do
             if curl -fs http://localhost:8123/ping >/dev/null 2>&1; then
               echo "clickhouse ready after ${i}s"; exit 0
@@ -255,9 +255,9 @@ jobs:
         # fast on drift instead of waiting for a test to fail at runtime.
         run: |
           set -euo pipefail
-          grep -q 'questdb/questdb:8.2.3' \
+          grep -q 'mirror.gcr.io/questdb/questdb:8.2.3' \
             crates/commons/testing/src/questdb.rs
-          grep -q 'questdb/questdb:8.2.3' \
+          grep -q 'mirror.gcr.io/questdb/questdb:8.2.3' \
             .github/workflows/ci.yml
       - name: Install postgresql-client for the QuestDB readiness probe
         # ubuntu-latest does not ship `psql` by default. The QuestDB image
@@ -275,7 +275,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run -d --name questdb -p 8812:8812 \
-            questdb/questdb:8.2.3
+            mirror.gcr.io/questdb/questdb:8.2.3
           for i in $(seq 1 60); do
             if PGPASSWORD=quest psql -h localhost -p 8812 -U admin -d qdb \
                 -c 'SELECT 1' >/dev/null 2>&1; then

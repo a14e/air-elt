@@ -53,7 +53,7 @@ pub const SESSION_LABEL_KEY: &str = "air-elt.session";
 /// infrastructure don't share a ryuk.
 const SESSION_ID_ENV: &str = "AIR_ELT_TEST_SESSION_ID";
 
-const RYUK_IMAGE: &str = "testcontainers/ryuk";
+const RYUK_IMAGE: &str = "mirror.gcr.io/testcontainers/ryuk";
 const RYUK_TAG: &str = "0.11.0";
 const RYUK_PORT: u16 = 8080;
 

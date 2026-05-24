@@ -2,11 +2,16 @@
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+mod smoke-mongo-pg 'manual-tests/mongo-to-pg-smoke/Justfile'
+mod smoke-10k-flows 'manual-tests/thousand-flows-test/Justfile'
+
+
 # Show available recipes
 default:
     @just --list
 
 msrv := `grep '^channel' rust-toolchain.toml | cut -d'"' -f2 | cut -d. -f1-2`
+engine := if `which podman 2>/dev/null || true` != "" { "podman" } else { "docker" }
 
 # ── Build ─────────────────────────────────────────────────────────────
 
@@ -56,6 +61,21 @@ lint: lint-fmt lint-clippy lint-deny lint-structure
 
 # CI lint pipeline (same as lint)
 ci-lint: lint
+
+# ── Container images ──────────────────────────────────────────────────
+
+# Pull all test container images sequentially (avoids Docker Hub rate limits)
+pull-images:
+    {{ engine }} pull mirror.gcr.io/library/postgres:16
+    {{ engine }} pull mirror.gcr.io/citusdata/citus:13.1
+    {{ engine }} pull mirror.gcr.io/library/mysql:8.4
+    {{ engine }} pull mirror.gcr.io/library/mariadb:11.4
+    {{ engine }} pull mirror.gcr.io/library/mongo:8.0
+    {{ engine }} pull mirror.gcr.io/library/mongo:7.0
+    {{ engine }} pull mirror.gcr.io/cockroachdb/cockroach:v25.1.0
+    {{ engine }} pull mirror.gcr.io/clickhouse/clickhouse-server:24.8
+    {{ engine }} pull mirror.gcr.io/questdb/questdb:8.2.3
+    {{ engine }} pull mirror.gcr.io/testcontainers/ryuk:0.11.0
 
 # ── Test ──────────────────────────────────────────────────────────────
 
@@ -159,6 +179,16 @@ check-deps-local: check-deps-ci
         echo "  podman: $(podman --version 2>/dev/null | head -1)"
     else
         echo "  docker/podman: NOT FOUND — install Docker (https://docs.docker.com/get-docker/) or Podman (https://podman.io)"
+        fail=1
+    fi
+    if command -v docker-compose >/dev/null 2>&1; then
+        echo "  docker-compose: $(docker-compose --version 2>/dev/null | head -1)"
+    elif docker compose version >/dev/null 2>&1; then
+        echo "  docker compose: $(docker compose version 2>/dev/null | head -1)"
+    elif podman compose version >/dev/null 2>&1; then
+        echo "  podman compose: $(podman compose version 2>/dev/null)"
+    else
+        echo "  compose: NOT FOUND — needed for manual-tests. Install docker-compose or enable compose in Podman Desktop"
         fail=1
     fi
     if command -v uv >/dev/null 2>&1; then

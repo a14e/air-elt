@@ -37,7 +37,7 @@ use crate::ryuk;
 const URL_VAR: &str = "AIR_ELT_TEST_COCKROACHDB_URL";
 
 /// CockroachDB image tag we test against. Pinned for reproducibility.
-const COCKROACH_IMAGE: &str = "cockroachdb/cockroach";
+const COCKROACH_IMAGE: &str = "mirror.gcr.io/cockroachdb/cockroach";
 const COCKROACH_TAG: &str = "v25.1.0";
 const KIND_LABEL_KEY: &str = "air-elt.kind";
 const KIND_LABEL_VALUE: &str = "cockroach";
