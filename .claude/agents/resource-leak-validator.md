@@ -76,33 +76,33 @@ For each resource-acquiring site:
 Produce a structured report in Russian (matching project communication style) with these sections:
 
 ```
-# Отчёт по аудиту ресурсов
+# Resource Audit Report
 
-## Резюме
-- Проверено файлов: N
-- Критических проблем: N
-- Предупреждений: N
-- Замечаний: N
-- Общая оценка: [ЧИСТО | ТРЕБУЕТ ВНИМАНИЯ | КРИТИЧНО]
+## Summary
+- Files checked: N
+- Critical issues: N
+- Warnings: N
+- Notes: N
+- Overall: [CLEAN | NEEDS ATTENTION | CRITICAL]
 
-## Критические проблемы (гарантированные утечки)
-### [CRIT-1] <краткое название>
-- **Файл**: path/to/file.rs:LINE
-- **Ресурс**: <тип ресурса>
-- **Путь утечки**: <описание path'а, на котором release не выполняется>
-- **Воспроизведение**: <как это приведёт к утечке>
-- **Рекомендация**: <конкретный fix, например RAII-обёртка, scopeguard, Drop impl>
+## Critical issues (confirmed leaks)
+### [CRIT-1] <short title>
+- **File**: path/to/file.rs:LINE
+- **Resource**: <resource type>
+- **Leak path**: <description of the path where release is not performed>
+- **Reproduction**: <how this leads to a leak>
+- **Recommendation**: <concrete fix, e.g. RAII wrapper, scopeguard, Drop impl>
 
-## Предупреждения (возможные утечки / хрупкие места)
+## Warnings (possible leaks / fragile spots)
 ...
 
-## Замечания (стиль, best practices)
+## Notes (style, best practices)
 ...
 
-## Проверенные места без проблем
-- <перечисление ключевых мест, где cleanup сделан корректно>
+## Verified clean spots
+- <list of key places where cleanup is done correctly>
 
-## Рекомендации по архитектуре
+## Architecture recommendations
 ...
 ```
 

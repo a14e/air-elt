@@ -1,0 +1,22 @@
+[package]
+name = "air-elt-self-lint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "air-elt-self-lint"
+path = "src/main.rs"
+
+[dependencies]
+toml = { workspace = true }
+clap = { workspace = true }
+regex = { workspace = true }
+walkdir = { workspace = true }
+semver = { workspace = true }
+
+[lints]
+workspace = true

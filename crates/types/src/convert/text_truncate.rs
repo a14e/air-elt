@@ -3,9 +3,9 @@
 //! `Text { size: Some(N) }` represents a column whose declared length `N`
 //! is in **characters** (matches `information_schema.character_maximum_length`
 //! semantics in both PG and MySQL). Truncation therefore counts codepoints,
-//! not bytes — `"Привет"` (6 chars / 12 bytes) fits a `varchar(10)` and
-//! must not be cropped to 5 chars just because a 10-byte limit would
-//! demand it.
+//! not bytes — a 6-char multibyte string (6 chars / 12 bytes) fits a
+//! `varchar(10)` and must not be cropped to 5 chars just because a
+//! 10-byte limit would demand it.
 //!
 //! Returns a `&str` slice prefix with at most `max_chars` codepoints.
 

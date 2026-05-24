@@ -45,12 +45,15 @@ After a compaction, assume skills are not loaded — load them again before star
 * If you find a bug in the code via tests, fix it (even if it was outside the task scope). Tests exist precisely to catch and fix bugs.
 * perform reasoning in English
 * **No future-proofing config fields.** Do not introduce config keys, struct fields, or enum variants whose only purpose is "we might want this later". Add the field together with the feature that consumes it. Reserved-for-future fields rot, drift, and create misleading docs. If a feature is on the near horizon, file an `agent_tasks/` ticket — don't pre-wire the surface.
+* **Bump the workspace patch version after each task** via `just bump-patch`. Minor version — only for backward-incompatible changes. Major version — only by the user's decision.
+* **Adding a new workspace crate.** Source/sink/storage crates are auto-covered by the structural linter (dep-graph, registry, traits checks). For any other crate type, ask the user which self-lint rules should apply and update `crates/self-lint/src/checks/dep_graph.rs` with the new category and constraints.
+* **Non-English text.** If the structural linter flags non-Latin characters, translate the offending text to English before committing.
 
 ## Development commands
 
 The `Justfile` is the primary interface for building, linting, and testing.
 
-* `just lint` — fmt check + clippy + cargo-deny
+* `just lint` — fmt check + clippy + cargo-deny + structural lint
 * `just test` — auto-fmt + tests (nextest if available, otherwise cargo test)
 * `just build` — release build
 
