@@ -1,0 +1,42 @@
+# Justfile — mongo-to-pg-smoke manual test
+#
+# Usage:
+#   just              — show available recipes
+#   just run          — full orchestrator (setup + air-elt run)
+#   just setup        — compose up, build, migrate, seed (no air-elt run)
+#   just start        — run air-elt only (assumes setup was done)
+#   just validate     — run validate.py against already-running containers
+#   just cleanup      — tear down containers, volumes, and logs
+#
+# Args for run/setup/start:
+#   --duration N         seconds to run (0 = until Ctrl-C, default)
+#   --load-rate N        inserts/s for load.py (default 20)
+#   --load-duration N    how long load.py inserts (seconds, default 360)
+#   --load-batch-size N  docs per bulk_write (default 50)
+#   --load-update-pct N  % of ops that replay existing _id (default 20)
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+# Show available recipes
+default:
+    @just --list
+
+# Full orchestrator: setup + run air-elt with load/validate/metrics/stats
+run *args:
+    uv run --no-project scripts/run.py {{ args }}
+
+# Setup only: compose up, cargo build, migrate, seed — then exit
+setup *args:
+    uv run --no-project scripts/run.py --setup-only {{ args }}
+
+# Run air-elt only (assumes setup was already done)
+start *args:
+    uv run --no-project scripts/run.py --run-only {{ args }}
+
+# Run validate.py standalone against already-running containers
+validate *args:
+    uv run --no-project scripts/validate.py {{ args }}
+
+# Tear down containers, volumes, and logs
+cleanup:
+    uv run --no-project scripts/cleanup.py

@@ -1,0 +1,56 @@
+# Justfile — thousand-flows-test manual test
+#
+# Usage:
+#   just              — show available recipes
+#   just run          — full orchestrator (gen + setup + air-elt run)
+#   just setup        — gen, compose up, build, migrate (no air-elt run)
+#   just start        — run air-elt only (assumes setup was done)
+#   just gen          — regenerate compose/config/init from topology.yaml
+#   just validate     — run validate.py against already-running containers
+#   just cleanup      — tear down containers, volumes, and generated files
+#
+# Args for run/setup/start:
+#   --duration N    seconds to run (0 = until Ctrl-C, default)
+#   --skip-gen      skip gen.py (reuse existing compose/config)
+#   --skip-build    skip cargo build --release
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+# Show available recipes
+default:
+    @just --list
+
+# Full orchestrator: gen, compose up, build, migrate, run air-elt with load/validate/stats
+run *args:
+    uv run --no-project scripts/run.py {{ args }}
+
+# Setup only: gen, compose up, cargo build, migrate — then exit
+setup *args:
+    uv run --no-project scripts/run.py --setup-only {{ args }}
+
+# Run air-elt only (assumes setup was already done)
+start *args:
+    uv run --no-project scripts/run.py --run-only {{ args }}
+
+# Regenerate docker-compose.yml, config, init SQL, and flow files from topology.yaml
+gen *args:
+    uv run --no-project scripts/gen.py {{ args }}
+
+# Run validate.py standalone against already-running containers
+validate *args:
+    #!/bin/bash
+    set -euo pipefail
+    env_file=".env.generated"
+    if [ -f "$env_file" ]; then
+        set -a
+        source "$env_file"
+        set +a
+    else
+        echo "ERROR: .env.generated not found — run 'just gen' or 'just run' first"
+        exit 1
+    fi
+    uv run --no-project scripts/validate.py {{ args }}
+
+# Tear down containers, volumes, and generated files
+cleanup:
+    uv run --no-project scripts/cleanup.py

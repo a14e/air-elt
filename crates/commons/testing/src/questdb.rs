@@ -31,7 +31,7 @@ use crate::ryuk;
 /// Must match `.github/workflows/ci.yml`'s docker run for the questdb
 /// service. A CI step grep-asserts this exact string appears in the
 /// workflow file so drift between the two surfaces fails fast.
-pub const QUESTDB_IMAGE_TAG: &str = "questdb/questdb:8.2.3";
+pub const QUESTDB_IMAGE_TAG: &str = "mirror.gcr.io/questdb/questdb:8.2.3";
 
 const URL_VAR: &str = "AIR_ELT_TEST_QUESTDB_URL";
 
@@ -280,8 +280,14 @@ mod tests {
         assert_eq!(redact_url(raw), raw);
     }
 
+    // Pinned to 8.2.3: earlier versions (notably 8.1.1) mis-type extended-protocol
+    // bind parameters as STRING for every non-STRING/non-LONG column, causing
+    // validate_access dry-run probes to fail with "inconvertible types".
     #[test]
     fn image_tag_pinned() {
-        assert_eq!(QUESTDB_IMAGE_TAG, "questdb/questdb:8.2.3");
+        assert!(
+            QUESTDB_IMAGE_TAG.ends_with("questdb/questdb:8.2.3"),
+            "QuestDB image tag must end with questdb/questdb:8.2.3, got: {QUESTDB_IMAGE_TAG}"
+        );
     }
 }

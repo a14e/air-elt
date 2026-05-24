@@ -119,6 +119,7 @@ async fn clickhouse_base_url() -> &'static String {
             info!("ensuring shared clickhouse container (reuse=Always, ryuk-managed)");
             let start_lock = crate::filelock::acquire_lock("clickhouse");
             let container = ClickHouseImage::default()
+                .with_name("mirror.gcr.io/clickhouse/clickhouse-server")
                 .with_tag("24.8") // match CI — cf. ci.yml:210
                 .with_env_var("CLICKHOUSE_SKIP_USER_SETUP", "1")
                 .with_container_name(format!("air-elt-clickhouse-{sv}"))

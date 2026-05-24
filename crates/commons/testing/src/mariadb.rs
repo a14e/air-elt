@@ -73,14 +73,12 @@ async fn mariadb_base_url() -> &'static String {
             let (sk, sv) = ryuk::session_label();
             info!("ensuring shared mariadb container (reuse=Always, ryuk-managed)");
             let start_lock = crate::filelock::acquire_lock("mariadb");
-            // The module's default tag already targets a recent MariaDB
-            // (≥ 11.x) which ships native UUID (added in 10.7). Overriding
-            // with `.with_tag()` can race the readiness probe — leave it.
-            // tmpfs on the data dir + relaxed durability flags trade
-            // crash-safety for raw throughput. Acceptable in tests: the
-            // container is reaped at session end, so on-disk state has no
-            // value.
+            // Pin to 11.4 to match CI. tmpfs on the data dir + relaxed
+            // durability flags trade crash-safety for raw throughput.
+            // Acceptable in tests: the container is reaped at session end.
             let container = MariaDbImage::default()
+                .with_name("mirror.gcr.io/library/mariadb")
+                .with_tag("11.4")
                 .with_container_name(format!("air-elt-mariadb-{sv}"))
                 .with_label(sk, sv)
                 .with_label(KIND_LABEL_KEY, KIND_LABEL_VALUE)

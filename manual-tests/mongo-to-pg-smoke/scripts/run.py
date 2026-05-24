@@ -253,6 +253,16 @@ def main() -> int:
             "replace_one(upsert=True), exercising air-elt's conflict path."
         ),
     )
+    parser.add_argument(
+        "--setup-only",
+        action="store_true",
+        help="Run only the setup phase (compose up, build, migrate, seed) then exit.",
+    )
+    parser.add_argument(
+        "--run-only",
+        action="store_true",
+        help="Skip setup, run air-elt with background workers (assumes setup was done).",
+    )
     args = parser.parse_args()
 
     mongo_url = os.environ.setdefault("MONGO_URL", DEFAULT_MONGO_URL)
@@ -274,30 +284,36 @@ def main() -> int:
     if COMPOSE[0] == "podman" and sys.platform == "darwin":
         _trim_podman_journal()
 
-    print(f"[run.py] using compose CLI: {' '.join(COMPOSE)}")
-    print(f"[run.py] {' '.join(COMPOSE)} up -d")
-    compose("up", "-d")
-    wait_healthy("mongo")
-    wait_healthy("postgres")
-
-    print("[run.py] cargo build --release -p air-elt-app")
-    subprocess.run(
-        ["cargo", "build", "--release", "-p", "air-elt-app"],
-        cwd=REPO_ROOT,
-        check=True,
-    )
-
-    apply_migration(pg_sink_url)
-    seed_mongo(mongo_url)
-
     binary = air_elt_binary()
     config_arg = "air-elt-config/config.toml"
-    print(f"[run.py] {binary} migrate --config {config_arg}")
-    subprocess.run(
-        [str(binary), "migrate", "--config", config_arg],
-        cwd=TEST_ROOT,
-        check=True,
-    )
+
+    if not args.run_only:
+        print(f"[run.py] using compose CLI: {' '.join(COMPOSE)}")
+        print(f"[run.py] {' '.join(COMPOSE)} up -d")
+        compose("up", "-d")
+        wait_healthy("mongo")
+        wait_healthy("postgres")
+
+        print("[run.py] cargo build --release -p air-elt-app")
+        subprocess.run(
+            ["cargo", "build", "--release", "-p", "air-elt-app"],
+            cwd=REPO_ROOT,
+            check=True,
+        )
+
+        apply_migration(pg_sink_url)
+        seed_mongo(mongo_url)
+
+        print(f"[run.py] {binary} migrate --config {config_arg}")
+        subprocess.run(
+            [str(binary), "migrate", "--config", config_arg],
+            cwd=TEST_ROOT,
+            check=True,
+        )
+
+        if args.setup_only:
+            print("[run.py] setup complete (--setup-only)")
+            return 0
 
     load_proc = spawn_background(
         "load",
