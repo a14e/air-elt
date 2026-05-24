@@ -30,7 +30,7 @@ After a compaction, assume skills are not loaded — load them again before star
 * Delete every temporary file you create.
 * After every change, run `just fmt` then `just lint` (or manually: `cargo fmt` and
   `cargo clippy --all-targets --workspace -- -D warnings`). MANDATORY after completing each task —
-  after local tests you must run full linting.
+  after local workspace tests you must run full test suit.
 * You may skip plan steps only with the user's consent.
 * **(Mandatory)** After completing every task, run validator agents — this is non-negotiable, not opt-in. Skipping is allowed only with the user's explicit consent for the specific task.
 * **(Mandatory)** Pick as many validator agents as possible; exclude only those clearly untouched. If touched indirectly — invoke them. Run independent agents in parallel.
