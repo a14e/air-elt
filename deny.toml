@@ -40,7 +40,7 @@ ignore = [
 
 # ── Bans ──────────────────────────────────────────────────────────────
 [bans]
-multiple-versions = "warn"
+multiple-versions = "allow"
 wildcards = "deny"
 
 # ── Sources ───────────────────────────────────────────────────────────

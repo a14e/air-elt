@@ -34,7 +34,7 @@ lint-clippy:
 
 # Run cargo-deny license and advisory checks
 lint-deny:
-    cargo deny check
+    cargo deny check --hide-inclusion-graph
 
 # Check formatting + clippy + cargo-deny
 lint: lint-fmt lint-clippy lint-deny
