@@ -36,10 +36,25 @@ lint-clippy:
 lint-deny:
     cargo deny check --hide-inclusion-graph
 
-# Check formatting + clippy + cargo-deny
-lint: lint-fmt lint-clippy lint-deny
+# Build self-lint binary if missing or changed, then run it
+lint-structure:
+    #!/bin/sh
+    set -eu
+    need_build=false
+    if [ ! -f target/release/air-elt-self-lint ]; then
+        need_build=true
+    elif ! git diff --quiet origin/main -- crates/self-lint/ Cargo.lock 2>/dev/null; then
+        need_build=true
+    fi
+    if $need_build; then
+        cargo build --release -p air-elt-self-lint
+    fi
+    ./target/release/air-elt-self-lint
 
-# CI lint pipeline (alias for lint)
+# Check formatting + clippy + cargo-deny + structure
+lint: lint-fmt lint-clippy lint-deny lint-structure
+
+# CI lint pipeline (same as lint)
 ci-lint: lint
 
 # ── Test ──────────────────────────────────────────────────────────────
@@ -319,3 +334,19 @@ rust-update:
     cargo --version
     echo ""
     echo "Review changes: git diff"
+
+# Bump workspace patch version (0.1.0 → 0.1.1)
+bump-patch:
+    #!/bin/sh
+    set -eu
+    current="$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)"
+    major="$(echo "$current" | cut -d. -f1)"
+    minor="$(echo "$current" | cut -d. -f2)"
+    patch="$(echo "$current" | cut -d. -f3)"
+    new_patch=$((patch + 1))
+    new_version="${major}.${minor}.${new_patch}"
+    sed -i.bak \
+        -e "s/^version = \"$current\"/version = \"$new_version\"/" \
+        -e "/^air-elt/s/version = \"$current\"/version = \"$new_version\"/" \
+        Cargo.toml && rm Cargo.toml.bak
+    echo "$current → $new_version"

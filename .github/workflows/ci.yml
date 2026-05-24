@@ -53,6 +53,23 @@ jobs:
           set -euo pipefail
           curl -sSL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.7/cargo-deny-0.19.7-x86_64-unknown-linux-musl.tar.gz \
             | tar xz -C /usr/local/bin --strip-components=1 cargo-deny-0.19.7-x86_64-unknown-linux-musl/cargo-deny
+      - name: Check self-lint diff
+        id: self-lint-diff
+        run: |
+          if git diff --quiet origin/main -- crates/self-lint/ Cargo.lock 2>/dev/null; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Cache self-lint binary
+        id: cache-self-lint
+        uses: actions/cache@v4
+        with:
+          path: target/release/air-elt-self-lint
+          key: self-lint-${{ hashFiles('crates/self-lint/**', 'Cargo.lock') }}
+      - name: Build self-lint
+        if: steps.cache-self-lint.outputs.cache-hit != 'true' || steps.self-lint-diff.outputs.changed == 'true'
+        run: cargo build --release -p air-elt-self-lint
       - name: just ci-lint
         run: just ci-lint
 
