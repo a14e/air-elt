@@ -243,9 +243,11 @@ dependencies = [
  "air-elt-types",
  "chrono",
  "proptest",
+ "serde",
  "serde_json",
  "test-strategy",
  "thiserror",
+ "toml",
 ]
 
 [[package]]

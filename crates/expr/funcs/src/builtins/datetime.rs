@@ -845,8 +845,8 @@ mod tests {
 
     fn ctx() -> EvalContext {
         EvalContext {
-            env_resolver: Arc::new(crate::tests::EmptyEnv),
-            file_resolver: Arc::new(crate::tests::NoopFiles),
+            env_resolver: Arc::new(crate::test_support::EmptyEnv),
+            file_resolver: Arc::new(crate::test_support::NoopFiles),
             now: Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 45).unwrap(),
             base_dir: PathBuf::new(),
         }

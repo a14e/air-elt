@@ -1,92 +1,86 @@
-# Описание задачи
+# Task description
 
-Мы создаем язык выражений. Задача первая -- статический скриптовой язык
+We are creating an expression language. First task — a static scripting language.
 
-# Что делаем?
-1. делаем статический язык выражений
-2. упрощаем работу с float/int типами и заменяем на bounded типы
-3. внедряем в основные места
+# What are we building?
+1. A static expression language
+2. Simplifying work with float/int types by replacing them with bounded types
+3. Integrating into key places
 
-# Что делаем с папками?
-1. добавляем в crates папку expr-and-types
-2. кладем туда папку types
-3. рядом кладем expr -- основной язык выражения и funcs -- таблицы функций
-4. в expr кладем парсинг и движок исполнения. скорее всего expr зависит от types и funcs а funcs от types. и вероятно нулабилити надо будет
-докинуть в некоторый враппер над типом и много где переделать) сейчас это в полях, но в выражениях появляется сценарий что нет имени у поля но есть нулаблити
-и нужно будет делать рефакторинг. 
-5. а в funcs будет реджистри типов который будет собираться из нескольких реджистри которые обьявлены в монго и в funcs и где-то еще он будет собираться в app
+# Folder structure
+1. Add an `expr-and-types` folder under `crates`
+2. Place a `types` folder inside it
+3. Next to it place `expr` — the main expression language — and `funcs` — function tables
+4. In `expr` put parsing and the execution engine. Most likely `expr` depends on `types` and `funcs`, while `funcs` depends on `types`. Nullability will probably need to be added as a wrapper around the type and refactored in many places — currently it lives in fields, but in expressions there are scenarios where there is no field name but nullability is still needed
+5. In `funcs` there will be a type registry assembled from multiple registries declared in mongo, in funcs, and elsewhere — it will be composed in app
 
-# Особенности языка
-Язык представляет собой простой язык с минимальным набором ветвления и функциями clickhouse-like
-Без циклов, кастомных функций и тд.
-Для ветвлений используем функции
+# Language features
+The language is a simple language with minimal branching and ClickHouse-like functions.
+No loops, custom functions, etc.
+Branching uses functions:
 if(cond, then, else)
 multiIf(c1, t1, c2, t2, ..., else)
 ifNull(x, alt) / nullIf(x, y)
 isNull(...) / isNotNull
 max(...)
-min(....)
+min(...)
 
-обьявления переменных вида a := 1 это просто литерал, который инлайнится без мутабильности
+Variable declarations like `a := 1` are plain literals that are inlined without mutability.
 
-в языке есть перегрузка функций (например можно сделать env("KEY", "default") который возврашет not null или env("KEY") который возвращает nullable)
+The language supports function overloading (for example `env("KEY", "default")` returns not-null while `env("KEY")` returns nullable).
 
-также в языке должна работать валидная интерполяция строк. во всех строках должно работать "{1 + 1}"
+String interpolation must work in all strings: `"{1 + 1}"`.
 
-делаем общий реджистри для функций и возможность регистрировать функции. 
+We build a common function registry with the ability to register functions.
 
-Например, в монге есть ObjectId. и ObjectId("asv....") надо сделать для hex и основной интепретатор не должен о нем знать
-и seconds(objectId) для извлечения секунд из objectId.
+For example, MongoDB has ObjectId. `ObjectId("asv....")` must be implemented for hex, and the main interpreter should not know about it.
+`seconds(objectId)` extracts seconds from an objectId.
 
-все выражения возвращают явный тип причем eval(1 + 1) возвращает int(2) потому что 2 это верхняя граница известных типов литералов.
+All expressions return an explicit type; `eval(1 + 1)` returns `int(2)` because 2 is the upper bound of known literal types.
 
-сейчас делаем в виде отдельно парсинга в вдерево, а потом постановки выражения через отдельный engine) 
+Currently implemented as separate parsing into a tree, followed by expression evaluation through a separate engine.
 
-# Вывод типов и конвертации типов
-1. особенности типов, что строковые, целые и вещественные типы хранят в себе границы. например varchar(10) + varchar(10) = varchar(20)
-или int64 + int64 = int65. 
-2. типы int и float мы переделываем и теперь у нас инты будут 2 видов (int64 и BigInt и один переходит во второй при переполнении)
-а flot храним в виде float64 с указанием размерности
-3. если вывести тип на основе операции нельзя -- приравниваем к нижней границы
-4. все операторы (берем ток базовые) имеют аналоги в виде функций и автоматом приводятся к функциям
-5. все функции имеют известные параметры выхода и выхода. и для каждой функции мы реализуем трейт с 4 полями:
-   1. название
-   2. количество аргументов
-   3. типы аргументов (типы слайсом и могут быть опциональными, тут мы делаем свой враппер над пайтом)
-   4. вычисление результата на основе входа
-   5. функция вычисления итогового типа на основе входящих типов
-6. простые литералы сразу парсим с размером и границами. 
+# Type inference and type conversions
+1. String, integer, and floating-point types store bounds. For example `varchar(10) + varchar(10) = varchar(20)` or `int64 + int64 = int65`.
+2. We are redesigning int and float types: integers will come in 2 kinds (int64 and BigInt, one transitions to the other on overflow); floats are stored as float64 with specified precision.
+3. If a type cannot be inferred from an operation — default to the lower bound.
+4. All operators (only basic ones) have function equivalents and are automatically converted to functions.
+5. All functions have known input and output parameters. For each function we implement a trait with 5 fields:
+   1. Name
+   2. Argument count
+   3. Argument types (types as a slice; may be optional — we build our own wrapper around the type)
+   4. Result computation based on input
+   5. Function to compute the resulting type based on input types
+6. Simple literals are parsed with size and bounds immediately.
 
+# Where do we apply it?
+1. In all secrets, URLs, and database connections
+2. In default values
+3. In secrets
+4. In switch expression values
 
-# Где применяем?
-1. во всех секретах, урлах и коннекшенах к бд
-2. в default значениях
-3. в секретах
-4. в значения switch выражениях
-
-# А что с энв переменными?
-синтаксис ${ENV} остается препроцессингом
+# What about environment variables?
+The `${ENV}` syntax remains as preprocessing.
 
 # R&D
-1. При формирвоании плана проведи исследование возможных функций для реализации. делаем в 2 шага
-   2. сначала агент выбирает сферы в которых стоит искать возможные функции
-   3. потом в параллель запускаешь агентов исследователей которые бы сформировали списки типовых функций которые стоит внедрить 
-      (интересуют типовые функции работы с числами, строками, хешами, байтами, временем, кодирвоками, аналог switch, jspath, 
-   слайс и получение по индексу и приведение типов (в стиле гошки), для энкодинга, хешей и шифрования делаем как специальные так 
-   и общие функции куда можно передать параметр)
+1. During plan formulation, conduct research on possible functions to implement. Done in 2 steps:
+   2. First the agent selects domains in which to look for possible functions
+   3. Then launch researcher agents in parallel to compile lists of typical functions worth implementing
+      (interested in typical functions for numbers, strings, hashes, bytes, time, encodings, switch analog, jspath,
+      slice and index access, and type casting (Go-style); for encoding, hashes, and encryption we make both specialized
+      and generic functions where a parameter can be passed)
 
-# Какие сайд эффекты сейчас возможны?
+# What side effects are currently possible?
 1. env(...)
 2. file("path_to_file")
 3. now()
 
-# Парсинг обьектов
+# Object parsing
 
-в значении default и в switch допустимо испольщование обьектов. и выражение может парсить не строку а обьект специального вида.
-это фнутрений обьект который представляет собой вложенных тип особого вида.
+In `default` values and in `switch` it is allowed to use objects. An expression can parse not just a string but an object of a special kind.
+This is an internal object representing a nested type of a special form.
 
-то есть можно написать что-то такое
-
+For example, you can write something like:
 
 [flow.myflow.mapping]
 myfield = {
@@ -98,32 +92,27 @@ myfield = {
       "interpolated" = "hello, world {'!'}"
    }
 }
-и работает так что мы парсим строки значения и собираем обьект который можно создать. в текущий момент абсолютно статичный.
-Для него надо в типах создать Object который может конвертирвоаться в bson/json и расширить их допустимые поля. отличие Object что он может принимать значения произвольного вида
+It works by parsing the string values and assembling an object that can be created. Currently it is completely static.
+For this we need to create an Object type that can convert to bson/json and extend their allowed fields. The difference with Object is that it can accept values of arbitrary kinds.
 
-# Особенностьп парсинга строк
-так как в yml и toml не всегда понятно что такое строка, то логика такая:
-если выражение после trim начинается с myname(....) то это трактуется как функция
-если нет -- то это строка. также если хотим что-то посчитать то можно указать в корне функцию eval(...) чтобы не возиться со строками и вернуть число
-также строки в корне всегда допускают интерполяцию строк
+# String parsing specifics
+Since in yml and toml it is not always clear what is a string, the logic is:
+if the expression after trim starts with `myname(....)` then it is treated as a function;
+if not — it is a string. Also, if you want to compute something you can specify the `eval(...)` function at the root to avoid string complications and return a number.
+Strings at the root always allow string interpolation.
 
-
-# Требования
-1. в начале имплементации делаем перевод на английский язык этого задания
-2. кастомные типы стараемся поменьше трогать кроме часто используемых например
-3. в линтер добавляем правило что типы функции и выражения могут зависеть только от коммонсов и друг друга и не могут зависеть
-от бд-шных коммонсов
-4. также за компанию добавляем требование что core не может зависеть от бд-шных коммонсов
-5. для парсинга обсудим необходимый механизм во время планирования
-6. после реализации запусти агентов валидаторов
-7. реализация задачи должна быть строго обратно совместима с текущими конфигами
-8. не забудь прогнать валидаторы через just (видимо надо бампнуть версию через just bump-patch а то не соберется)
-9. сделай скил по обучению языку выражений. и давай добавим в agents.md что при расширении языка выражений 
-и связанных с ним вещей надо обновляеть скил (в 1 -2 строчки коротко в agents md) а в самом скиле опишем 
-что надо использовать референсы если какой-то из разделов слишком большой. например разделы со списком функций могут быть тяжелыми. В самом скиле напишем что читать его только когда работаем с выражениями
-а в скиле с конфигами опишем поля где работают выражения. 
-10. обнови e2e тесты этими выражениями 
-11. нужно много юнит тестов на разные сценарии
-12. запусти отдельного агента на валидацию корнер кейсов выражений
-13. текущий скрипт лимитированный только для compile time исполнения при сборке флоу. для рантайм скриптов будет отдельная задача. при исполнении сейчас вся сборка будет преобразована в понятные типы
-14. не делаем байткод, делаем обход дерева
+# Requirements
+1. At the start of implementation, translate this task to English
+2. Try to minimize changes to custom types except frequently used ones
+3. Add a linter rule that types, functions, and expressions can only depend on commons and each other, not on database commons
+4. Also add a requirement that core cannot depend on database commons
+5. Discuss the necessary parsing mechanism during planning
+6. After implementation, run validator agents
+7. The implementation must be strictly backward-compatible with current configs
+8. Do not forget to run validators via just (probably need to bump version via `just bump-patch` or it will not build)
+9. Create a skill for teaching the expression language. Add to agents.md (in 1-2 short lines) that when extending the expression language and related things, the skill should be updated. In the skill itself describe that references should be used if any section is too large. For example, sections listing functions may be heavy. In the skill itself write that it should be read only when working with expressions, and in the config skill describe the fields where expressions work.
+10. Update e2e tests with these expressions
+11. Need many unit tests for various scenarios
+12. Launch a separate agent to validate expression corner cases
+13. The current script is limited to compile-time execution only when assembling flows. A separate task will cover runtime scripts. During execution the entire assembly will be converted to understandable types.
+14. No bytecode — use tree walking

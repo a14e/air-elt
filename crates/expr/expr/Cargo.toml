@@ -15,8 +15,10 @@ air-elt-expr-funcs = { workspace = true }
 air-elt-types = { workspace = true }
 air-elt-commons = { workspace = true }
 ahash = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+toml = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]

@@ -692,8 +692,10 @@ fn extract_resume_token(state: &CursorState) -> RuntimeResult<serde_json::Value>
     }
     match &field.value {
         crate::types::Value::Json(j) => Ok(j.clone()),
+        crate::types::Value::Object(_) => crate::types::json_encode::value_to_json(&field.value)
+            .map_err(|e| RuntimeError::Other(format!("cdc resume token json encode failed: {e}"))),
         other => Err(RuntimeError::Other(format!(
-            "cdc resume token must be Value::Json, got {other:?}"
+            "cdc resume token must be Value::Json or Value::Object, got {other:?}"
         ))),
     }
 }

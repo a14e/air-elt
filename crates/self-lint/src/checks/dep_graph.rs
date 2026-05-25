@@ -34,8 +34,8 @@ impl Check for DepGraphCheck {
                     CrateCategory::Foundation => {
                         matches!(
                             target_category,
-                            CrateCategory::Core
-                                | CrateCategory::Expression
+                            CrateCategory::Expression
+                                | CrateCategory::Core
                                 | CrateCategory::Source
                                 | CrateCategory::Sink
                                 | CrateCategory::Storage
@@ -45,13 +45,13 @@ impl Check for DepGraphCheck {
                                 | CrateCategory::CommonsTesting
                         )
                     }
-                    CrateCategory::Monitoring => {
-                        !matches!(target_category, CrateCategory::Foundation)
-                    }
                     CrateCategory::Expression => !matches!(
                         target_category,
                         CrateCategory::Foundation | CrateCategory::Expression
                     ),
+                    CrateCategory::Monitoring => {
+                        !matches!(target_category, CrateCategory::Foundation)
+                    }
                     CrateCategory::Core => matches!(
                         target_category,
                         CrateCategory::Source

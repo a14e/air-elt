@@ -332,4 +332,153 @@ mod tests {
         // depending on whether the path can be canonicalized.
         assert!(result.is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // Integration tests: full expression evaluation pipeline
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_expression_env_with_default() {
+        let registry = test_registry();
+        let ctx = test_context();
+        let value = toml::Value::String("env('NONEXISTENT_VAR_XYZ', 'fallback')".to_owned());
+        let result = resolve_toml_value(&value, &registry, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, Value::Text("fallback".to_owned()));
+    }
+
+    #[test]
+    fn resolve_expression_concat() {
+        let registry = test_registry();
+        let ctx = test_context();
+        let value = toml::Value::String("concat('hello', ' ', 'world')".to_owned());
+        let result = resolve_toml_value(&value, &registry, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, Value::Text("hello world".to_owned()));
+    }
+
+    #[test]
+    fn resolve_expression_arithmetic() {
+        let registry = test_registry();
+        let ctx = test_context();
+        let value = toml::Value::String("power(2, 10)".to_owned());
+        let result = resolve_toml_value(&value, &registry, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, Value::Int64(1024));
+    }
+
+    #[test]
+    fn resolve_interpolation() {
+        let registry = test_registry();
+        let ctx = test_context();
+        let value = toml::Value::String("prefix_{1 + 1}_suffix".to_owned());
+        let result = resolve_toml_value(&value, &registry, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, Value::Text("prefix_2_suffix".to_owned()));
+    }
+
+    #[test]
+    fn resolve_plain_string_unchanged() {
+        let registry = test_registry();
+        let ctx = test_context();
+        let value = toml::Value::String("just a plain string".to_owned());
+        let result = resolve_toml_value(&value, &registry, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, Value::Text("just a plain string".to_owned()));
+    }
+
+    #[test]
+    fn resolve_integer_passthrough() {
+        let registry = test_registry();
+        let ctx = test_context();
+        let value = toml::Value::Integer(42);
+        let result = resolve_toml_value(&value, &registry, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, Value::Int64(42));
+    }
+
+    #[test]
+    fn resolve_table_as_object() {
+        let registry = test_registry();
+        let ctx = test_context();
+        let mut table = toml::map::Map::new();
+        table.insert(
+            "key".to_owned(),
+            toml::Value::String("concat('a', 'b')".to_owned()),
+        );
+        table.insert("num".to_owned(), toml::Value::Integer(42));
+        let value = toml::Value::Table(table);
+        let result = resolve_toml_value(&value, &registry, &ctx)
+            .unwrap()
+            .unwrap();
+        if let Value::Object(entries) = result {
+            assert!(
+                entries
+                    .iter()
+                    .any(|(k, v)| k == "key" && *v == Value::Text("ab".to_owned()))
+            );
+            assert!(
+                entries
+                    .iter()
+                    .any(|(k, v)| k == "num" && *v == Value::Int64(42))
+            );
+        } else {
+            panic!("expected Object");
+        }
+    }
+
+    #[test]
+    fn resolve_if_expression_lazy() {
+        let registry = test_registry();
+        let ctx = test_context();
+        let value = toml::Value::String("if(true, 'yes', 'no')".to_owned());
+        let result = resolve_toml_value(&value, &registry, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, Value::Text("yes".to_owned()));
+    }
+
+    #[test]
+    fn resolve_sha256() {
+        let registry = test_registry();
+        let ctx = test_context();
+        let value = toml::Value::String("sha256('test')".to_owned());
+        let result = resolve_toml_value(&value, &registry, &ctx)
+            .unwrap()
+            .unwrap();
+        if let Value::Text(hash) = result {
+            assert_eq!(hash.len(), 64); // sha256 hex = 64 chars
+        } else {
+            panic!("expected Text");
+        }
+    }
+
+    #[test]
+    fn resolve_now_returns_timestamp() {
+        let registry = test_registry();
+        let ctx = test_context();
+        let value = toml::Value::String("now()".to_owned());
+        let result = resolve_toml_value(&value, &registry, &ctx)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Value::Timestamp(_)));
+    }
+
+    #[test]
+    fn resolve_dollar_escape() {
+        // $$ should not be treated as expression — it's a plain string
+        let registry = test_registry();
+        let ctx = test_context();
+        let value = toml::Value::String("plain $$ value".to_owned());
+        let result = resolve_toml_value(&value, &registry, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, Value::Text("plain $$ value".to_owned()));
+    }
 }

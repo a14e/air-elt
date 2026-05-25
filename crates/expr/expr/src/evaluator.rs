@@ -4,7 +4,7 @@ use air_elt_expr_funcs::signature::EvalContext;
 use air_elt_expr_types::limits::MAX_EXPR_DEPTH;
 use air_elt_types::Value;
 
-use crate::ast::{Expr, InterpolationSegment, LiteralValue, Program, Statement};
+use crate::ast::{ConditionalExpr, Expr, InterpolationSegment, LiteralValue, Program, Statement};
 use crate::error::ExprError;
 
 /// Evaluate a parsed program with a function registry and evaluation context.
@@ -116,6 +116,7 @@ impl<'a> Evaluator<'a> {
             Expr::Literal(lit) => Ok(eval_literal(lit)),
             Expr::Variable(name) => self.eval_variable(name),
             Expr::FunctionCall { name, args } => self.eval_function_call(name, args),
+            Expr::Conditional(conditional) => self.eval_conditional(conditional),
             Expr::Interpolation(segments) => self.eval_interpolation(segments),
             Expr::Object(entries) => self.eval_object(entries),
         }
@@ -147,6 +148,142 @@ impl<'a> Evaluator<'a> {
         }
 
         let result = function.evaluate(evaluated_args, self.context)?;
+        self.depth -= 1;
+        Ok(result)
+    }
+
+    fn eval_conditional(&mut self, conditional: &ConditionalExpr) -> Result<Value, ExprError> {
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            self.depth -= 1;
+            return Err(ExprError::NestingTooDeep {
+                max: MAX_EXPR_DEPTH,
+            });
+        }
+
+        let result = match conditional {
+            ConditionalExpr::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let cond_value = self.eval_expr(condition)?;
+                match cond_value {
+                    Value::Bool(true) => self.eval_expr(then_branch)?,
+                    Value::Bool(false) | Value::Null => self.eval_expr(else_branch)?,
+                    other => {
+                        return Err(ExprError::Function(
+                            air_elt_expr_funcs::FuncError::TypeMismatch {
+                                function: "if".to_owned(),
+                                expected: "Bool".to_owned(),
+                                actual: format!("{:?}", other.data_type()),
+                            },
+                        ));
+                    }
+                }
+            }
+            ConditionalExpr::MultiIf { branches, default } => {
+                let mut found = None;
+                for (condition, value) in branches {
+                    let cond_value = self.eval_expr(condition)?;
+                    match cond_value {
+                        Value::Bool(true) => {
+                            found = Some(self.eval_expr(value)?);
+                            break;
+                        }
+                        Value::Bool(false) | Value::Null => continue,
+                        other => {
+                            return Err(ExprError::Function(
+                                air_elt_expr_funcs::FuncError::TypeMismatch {
+                                    function: "multiIf".to_owned(),
+                                    expected: "Bool".to_owned(),
+                                    actual: format!("{:?}", other.data_type()),
+                                },
+                            ));
+                        }
+                    }
+                }
+                found.map_or_else(|| self.eval_expr(default), Ok)?
+            }
+            ConditionalExpr::IfNull { value, alternative } => {
+                let val = self.eval_expr(value)?;
+                if val.is_null() {
+                    self.eval_expr(alternative)?
+                } else {
+                    val
+                }
+            }
+            ConditionalExpr::NullIf { value, sentinel } => {
+                let val = self.eval_expr(value)?;
+                let sent = self.eval_expr(sentinel)?;
+                if val == sent { Value::Null } else { val }
+            }
+            ConditionalExpr::And { left, right } => {
+                let left_val = self.eval_expr(left)?;
+                match left_val {
+                    Value::Null => Value::Null,
+                    Value::Bool(false) => Value::Bool(false),
+                    Value::Bool(true) => {
+                        let right_val = self.eval_expr(right)?;
+                        match right_val {
+                            Value::Null => Value::Null,
+                            Value::Bool(b) => Value::Bool(b),
+                            other => {
+                                return Err(ExprError::Function(
+                                    air_elt_expr_funcs::FuncError::TypeMismatch {
+                                        function: "and".to_owned(),
+                                        expected: "Bool".to_owned(),
+                                        actual: format!("{:?}", other.data_type()),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(ExprError::Function(
+                            air_elt_expr_funcs::FuncError::TypeMismatch {
+                                function: "and".to_owned(),
+                                expected: "Bool".to_owned(),
+                                actual: format!("{:?}", other.data_type()),
+                            },
+                        ));
+                    }
+                }
+            }
+            ConditionalExpr::Or { left, right } => {
+                let left_val = self.eval_expr(left)?;
+                match left_val {
+                    Value::Null => Value::Null,
+                    Value::Bool(true) => Value::Bool(true),
+                    Value::Bool(false) => {
+                        let right_val = self.eval_expr(right)?;
+                        match right_val {
+                            Value::Null => Value::Null,
+                            Value::Bool(b) => Value::Bool(b),
+                            other => {
+                                return Err(ExprError::Function(
+                                    air_elt_expr_funcs::FuncError::TypeMismatch {
+                                        function: "or".to_owned(),
+                                        expected: "Bool".to_owned(),
+                                        actual: format!("{:?}", other.data_type()),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(ExprError::Function(
+                            air_elt_expr_funcs::FuncError::TypeMismatch {
+                                function: "or".to_owned(),
+                                expected: "Bool".to_owned(),
+                                actual: format!("{:?}", other.data_type()),
+                            },
+                        ));
+                    }
+                }
+            }
+        };
+
         self.depth -= 1;
         Ok(result)
     }
@@ -580,5 +717,58 @@ mod tests {
     #[test]
     fn variable_shadowing_in_order() {
         assert_eq!(eval("x = 1; x = x + 1; x").unwrap(), Value::Int64(2));
+    }
+
+    // --- Lazy evaluation (short-circuit) proof tests ---
+
+    #[test]
+    fn if_true_skips_else_branch() {
+        // 1/0 would fail if evaluated — proves else is not evaluated
+        let result = eval("if(true, 42, 1/0)").unwrap();
+        assert_eq!(result, Value::Int64(42));
+    }
+
+    #[test]
+    fn if_false_skips_then_branch() {
+        let result = eval("if(false, 1/0, 42)").unwrap();
+        assert_eq!(result, Value::Int64(42));
+    }
+
+    #[test]
+    fn coalesce_stops_at_first_non_null() {
+        let result = eval("coalesce(null, 42, 1/0)").unwrap();
+        assert_eq!(result, Value::Int64(42));
+    }
+
+    #[test]
+    fn multi_if_skips_unreached_branches() {
+        let result = eval("multiIf(true, 42, 1/0 == 1, 1/0, 1/0)").unwrap();
+        assert_eq!(result, Value::Int64(42));
+    }
+
+    #[test]
+    fn and_false_skips_right() {
+        // false && (1/0 == 1) — right side not evaluated
+        let result = eval("false && (1/0 == 1)").unwrap();
+        assert_eq!(result, Value::Bool(false));
+    }
+
+    #[test]
+    fn or_true_skips_right() {
+        // true || (1/0 == 1) — right side not evaluated
+        let result = eval("true || (1/0 == 1)").unwrap();
+        assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
+    fn if_null_non_null_skips_alternative() {
+        let result = eval("ifNull(42, 1/0)").unwrap();
+        assert_eq!(result, Value::Int64(42));
+    }
+
+    #[test]
+    fn null_if_basic() {
+        assert_eq!(eval("nullIf(1, 1)").unwrap(), Value::Null);
+        assert_eq!(eval("nullIf(1, 2)").unwrap(), Value::Int64(1));
     }
 }

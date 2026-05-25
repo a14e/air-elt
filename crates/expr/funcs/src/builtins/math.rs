@@ -1025,8 +1025,8 @@ mod tests {
 
     fn ctx() -> EvalContext {
         EvalContext {
-            env_resolver: Arc::new(crate::tests::EmptyEnv),
-            file_resolver: Arc::new(crate::tests::NoopFiles),
+            env_resolver: Arc::new(crate::test_support::EmptyEnv),
+            file_resolver: Arc::new(crate::test_support::NoopFiles),
             now: chrono::Utc::now(),
             base_dir: PathBuf::new(),
         }
@@ -1615,5 +1615,4 @@ mod tests {
             .unwrap();
         assert_eq!(result, Value::Float64(3.0));
     }
-
 }

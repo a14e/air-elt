@@ -2,7 +2,7 @@ use air_elt_expr_types::limits::{
     MAX_AST_NODES, MAX_EXPR_DEPTH, MAX_EXPR_SOURCE_LEN, MAX_FUNCTION_ARGS, MAX_VARIABLES,
 };
 
-use crate::ast::{Expr, InterpolationSegment, LiteralValue, Program, Statement};
+use crate::ast::{ConditionalExpr, Expr, InterpolationSegment, LiteralValue, Program, Statement};
 use crate::error::ExprError;
 use crate::lexer::Lexer;
 use crate::token::{SpannedToken, StringPart, Token};
@@ -199,10 +199,10 @@ impl Parser {
             self.advance();
             let right = self.parse_and_expr()?;
             self.count_node()?;
-            left = Expr::FunctionCall {
-                name: "or".to_string(),
-                args: vec![left, right],
-            };
+            left = Expr::Conditional(ConditionalExpr::Or {
+                left: Box::new(left),
+                right: Box::new(right),
+            });
         }
 
         Ok(left)
@@ -215,10 +215,10 @@ impl Parser {
             self.advance();
             let right = self.parse_bit_or_expr()?;
             self.count_node()?;
-            left = Expr::FunctionCall {
-                name: "and".to_string(),
-                args: vec![left, right],
-            };
+            left = Expr::Conditional(ConditionalExpr::And {
+                left: Box::new(left),
+                right: Box::new(right),
+            });
         }
 
         Ok(left)
@@ -396,12 +396,18 @@ impl Parser {
     }
 
     fn parse_call_expr(&mut self) -> Result<Expr, ExprError> {
-        if let Token::Ident(_) = self.peek() {
+        if let Token::Ident(name) = self.peek().clone() {
             if *self.peek_ahead(1) == Token::LParen {
-                let name = match self.advance() {
-                    Token::Ident(name) => name,
-                    _ => unreachable!(),
-                };
+                match name.as_str() {
+                    "if" => return self.parse_if_conditional(),
+                    "multiIf" => return self.parse_multi_if_conditional(),
+                    "coalesce" => return self.parse_coalesce_conditional(),
+                    "ifNull" => return self.parse_if_null_conditional(),
+                    "nullIf" => return self.parse_null_if_conditional(),
+                    _ => {}
+                }
+
+                self.advance(); // consume ident
                 self.advance(); // consume '('
 
                 let args = self.parse_args()?;
@@ -424,6 +430,119 @@ impl Parser {
         }
 
         self.parse_primary()
+    }
+
+    fn parse_if_conditional(&mut self) -> Result<Expr, ExprError> {
+        self.advance(); // consume "if"
+        self.advance(); // consume "("
+        let condition = self.parse_expr()?;
+        self.expect(&Token::Comma)?;
+        let then_branch = self.parse_expr()?;
+        self.expect(&Token::Comma)?;
+        let else_branch = self.parse_expr()?;
+        self.expect(&Token::RParen)?;
+        self.count_node()?;
+        Ok(Expr::Conditional(ConditionalExpr::If {
+            condition: Box::new(condition),
+            then_branch: Box::new(then_branch),
+            else_branch: Box::new(else_branch),
+        }))
+    }
+
+    fn parse_multi_if_conditional(&mut self) -> Result<Expr, ExprError> {
+        self.advance(); // consume "multiIf"
+        self.advance(); // consume "("
+        let mut args = vec![self.parse_expr()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            if *self.peek() == Token::RParen {
+                break;
+            }
+            args.push(self.parse_expr()?);
+        }
+        self.expect(&Token::RParen)?;
+
+        if args.len() < 3 || args.len() % 2 == 0 {
+            return Err(ExprError::Parse {
+                position: self.pos,
+                message: "multiIf requires odd number of arguments (cond1, val1, ..., default)"
+                    .to_string(),
+            });
+        }
+
+        let default = args.pop().expect("checked length above");
+        let mut branches = Vec::with_capacity(args.len() / 2);
+        let mut iter = args.into_iter();
+        while let Some(condition) = iter.next() {
+            let value = iter.next().expect("checked odd length");
+            branches.push((condition, value));
+        }
+
+        self.count_node()?;
+        Ok(Expr::Conditional(ConditionalExpr::MultiIf {
+            branches,
+            default: Box::new(default),
+        }))
+    }
+
+    fn parse_coalesce_conditional(&mut self) -> Result<Expr, ExprError> {
+        self.advance(); // consume "coalesce"
+        self.advance(); // consume "("
+        let mut args = vec![self.parse_expr()?];
+        while *self.peek() == Token::Comma {
+            self.advance();
+            if *self.peek() == Token::RParen {
+                break;
+            }
+            args.push(self.parse_expr()?);
+        }
+        self.expect(&Token::RParen)?;
+
+        if args.is_empty() {
+            return Err(ExprError::Parse {
+                position: self.pos,
+                message: "coalesce requires at least one argument".to_string(),
+            });
+        }
+
+        // Desugar: coalesce(a, b, c) -> IfNull(a, IfNull(b, c))
+        let mut result = args.pop().expect("checked non-empty");
+        while let Some(arg) = args.pop() {
+            self.count_node()?;
+            result = Expr::Conditional(ConditionalExpr::IfNull {
+                value: Box::new(arg),
+                alternative: Box::new(result),
+            });
+        }
+        Ok(result)
+    }
+
+    fn parse_if_null_conditional(&mut self) -> Result<Expr, ExprError> {
+        self.advance(); // consume "ifNull"
+        self.advance(); // consume "("
+        let value = self.parse_expr()?;
+        self.expect(&Token::Comma)?;
+        let alternative = self.parse_expr()?;
+        self.expect(&Token::RParen)?;
+        self.count_node()?;
+        Ok(Expr::Conditional(ConditionalExpr::IfNull {
+            value: Box::new(value),
+            alternative: Box::new(alternative),
+        }))
+    }
+
+    fn parse_null_if_conditional(&mut self) -> Result<Expr, ExprError> {
+        self.advance(); // consume "nullIf"
+        self.advance(); // consume "("
+        let value = self.parse_expr()?;
+        self.expect(&Token::Comma)?;
+        let sentinel = self.parse_expr()?;
+        self.expect(&Token::RParen)?;
+        self.count_node()?;
+        Ok(Expr::Conditional(ConditionalExpr::NullIf {
+            value: Box::new(value),
+            sentinel: Box::new(sentinel),
+        }))
     }
 
     fn parse_args(&mut self) -> Result<Vec<Expr>, ExprError> {
@@ -690,18 +809,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_function_call_multiple_args() {
+    fn parse_if_conditional() {
         let program = parse("if(true, 1, 2)").unwrap();
         assert_eq!(
             program.result,
-            Expr::FunctionCall {
-                name: "if".to_string(),
-                args: vec![
-                    Expr::Literal(LiteralValue::Bool(true)),
-                    Expr::Literal(LiteralValue::Int(1)),
-                    Expr::Literal(LiteralValue::Int(2)),
-                ],
-            }
+            Expr::Conditional(ConditionalExpr::If {
+                condition: Box::new(Expr::Literal(LiteralValue::Bool(true))),
+                then_branch: Box::new(Expr::Literal(LiteralValue::Int(1))),
+                else_branch: Box::new(Expr::Literal(LiteralValue::Int(2))),
+            })
         );
     }
 
@@ -907,13 +1023,10 @@ mod tests {
         let program = parse("a && b").unwrap();
         assert_eq!(
             program.result,
-            Expr::FunctionCall {
-                name: "and".to_string(),
-                args: vec![
-                    Expr::Variable("a".to_string()),
-                    Expr::Variable("b".to_string()),
-                ],
-            }
+            Expr::Conditional(ConditionalExpr::And {
+                left: Box::new(Expr::Variable("a".to_string())),
+                right: Box::new(Expr::Variable("b".to_string())),
+            })
         );
     }
 
@@ -922,13 +1035,10 @@ mod tests {
         let program = parse("a || b").unwrap();
         assert_eq!(
             program.result,
-            Expr::FunctionCall {
-                name: "or".to_string(),
-                args: vec![
-                    Expr::Variable("a".to_string()),
-                    Expr::Variable("b".to_string()),
-                ],
-            }
+            Expr::Conditional(ConditionalExpr::Or {
+                left: Box::new(Expr::Variable("a".to_string())),
+                right: Box::new(Expr::Variable("b".to_string())),
+            })
         );
     }
 
@@ -950,19 +1060,13 @@ mod tests {
         let program = parse("a || b && c").unwrap();
         assert_eq!(
             program.result,
-            Expr::FunctionCall {
-                name: "or".to_string(),
-                args: vec![
-                    Expr::Variable("a".to_string()),
-                    Expr::FunctionCall {
-                        name: "and".to_string(),
-                        args: vec![
-                            Expr::Variable("b".to_string()),
-                            Expr::Variable("c".to_string()),
-                        ],
-                    },
-                ],
-            }
+            Expr::Conditional(ConditionalExpr::Or {
+                left: Box::new(Expr::Variable("a".to_string())),
+                right: Box::new(Expr::Conditional(ConditionalExpr::And {
+                    left: Box::new(Expr::Variable("b".to_string())),
+                    right: Box::new(Expr::Variable("c".to_string())),
+                })),
+            })
         );
     }
 
@@ -1243,20 +1347,17 @@ mod tests {
         assert_eq!(program.statements[0].name, "x");
         assert_eq!(
             program.result,
-            Expr::FunctionCall {
-                name: "if".to_string(),
-                args: vec![
-                    Expr::FunctionCall {
-                        name: "equals".to_string(),
-                        args: vec![
-                            Expr::Variable("x".to_string()),
-                            Expr::Literal(LiteralValue::String("prod".to_string())),
-                        ],
-                    },
-                    Expr::Literal(LiteralValue::Int(100)),
-                    Expr::Literal(LiteralValue::Int(10)),
-                ],
-            }
+            Expr::Conditional(ConditionalExpr::If {
+                condition: Box::new(Expr::FunctionCall {
+                    name: "equals".to_string(),
+                    args: vec![
+                        Expr::Variable("x".to_string()),
+                        Expr::Literal(LiteralValue::String("prod".to_string())),
+                    ],
+                }),
+                then_branch: Box::new(Expr::Literal(LiteralValue::Int(100))),
+                else_branch: Box::new(Expr::Literal(LiteralValue::Int(10))),
+            })
         );
     }
 

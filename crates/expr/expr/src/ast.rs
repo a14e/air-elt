@@ -26,11 +26,44 @@ pub enum Expr {
     /// Function call: name(arg1, arg2, ...)
     FunctionCall { name: String, args: Vec<Expr> },
 
+    /// Control-flow conditional — evaluated lazily (short-circuit).
+    Conditional(ConditionalExpr),
+
     /// String with interpolation segments.
     Interpolation(Vec<InterpolationSegment>),
 
     /// Object literal: { "key" = expr, ... }
     Object(Vec<(String, Expr)>),
+}
+
+/// Short-circuit conditional expressions evaluated lazily by the evaluator.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConditionalExpr {
+    /// `if(condition, then_branch, else_branch)`
+    If {
+        condition: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Box<Expr>,
+    },
+    /// `multiIf(cond1, val1, cond2, val2, ..., default)`
+    MultiIf {
+        branches: Vec<(Expr, Expr)>,
+        default: Box<Expr>,
+    },
+    /// `ifNull(value, alternative)` — returns value if non-null, else alternative.
+    IfNull {
+        value: Box<Expr>,
+        alternative: Box<Expr>,
+    },
+    /// `nullIf(value, sentinel)` — returns null if value equals sentinel, else value.
+    NullIf {
+        value: Box<Expr>,
+        sentinel: Box<Expr>,
+    },
+    /// `a && b` — short-circuit logical AND.
+    And { left: Box<Expr>, right: Box<Expr> },
+    /// `a || b` — short-circuit logical OR.
+    Or { left: Box<Expr>, right: Box<Expr> },
 }
 
 /// Literal values in the expression language.

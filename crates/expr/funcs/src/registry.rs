@@ -1,4 +1,5 @@
 use ahash::AHashMap;
+use air_elt_expr_types::limits::RESERVED_CONTROL_FLOW_NAMES;
 
 use crate::error::FuncError;
 use crate::signature::ExprFunction;
@@ -40,6 +41,10 @@ impl FunctionRegistry {
     /// Overloads for the same name must be registered consecutively.
     pub fn register(&mut self, function: &'static dyn ExprFunction) {
         let name = function.name().to_string();
+        assert!(
+            !RESERVED_CONTROL_FLOW_NAMES.contains(&name.as_str()),
+            "cannot register '{name}' as a function — reserved control flow keyword"
+        );
         if let Some(func_ref) = self.names.get_mut(&name) {
             assert_eq!(
                 func_ref.end as usize,
@@ -100,6 +105,13 @@ impl FunctionRegistry {
                 arg_types: format!("{arg_count} arguments"),
             }),
         }
+    }
+
+    /// Create a registry pre-loaded with all builtin functions.
+    pub fn with_builtins() -> Self {
+        let mut registry = Self::new();
+        crate::builtins::register_builtins(&mut registry);
+        registry
     }
 
     /// Number of registered function names.

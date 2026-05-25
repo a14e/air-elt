@@ -3,7 +3,7 @@ use air_elt_expr_funcs::FunctionRegistry;
 use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::DataType;
 
-use crate::ast::{Expr, LiteralValue, Program, Statement};
+use crate::ast::{ConditionalExpr, Expr, LiteralValue, Program, Statement};
 use crate::error::ExprError;
 
 /// Infer the output type of a program without evaluating it.
@@ -55,6 +55,7 @@ impl<'a> TypeChecker<'a> {
             Expr::Literal(literal) => Ok(self.check_literal(literal)),
             Expr::Variable(name) => self.check_variable(name),
             Expr::FunctionCall { name, args } => self.check_function_call(name, args),
+            Expr::Conditional(conditional) => self.check_conditional(conditional),
             Expr::Interpolation(_segments) => Ok(self.check_interpolation()),
             Expr::Object(_entries) => Ok(self.check_object()),
         }
@@ -101,6 +102,69 @@ impl<'a> TypeChecker<'a> {
         let function = self.registry.resolve(name, args.len())?;
         let result_type = function.resolve_type(&arg_types)?;
         Ok(result_type)
+    }
+
+    fn check_conditional(
+        &self,
+        conditional: &ConditionalExpr,
+    ) -> Result<NullableExprType, ExprError> {
+        match conditional {
+            ConditionalExpr::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let _cond_type = self.check_expr(condition)?;
+                let then_type = self.check_expr(then_branch)?;
+                let else_type = self.check_expr(else_branch)?;
+                let nullable = then_type.nullable || else_type.nullable;
+                Ok(NullableExprType::new(then_type.data_type, nullable))
+            }
+            ConditionalExpr::MultiIf { branches, default } => {
+                for (condition, _value) in branches {
+                    let _cond_type = self.check_expr(condition)?;
+                }
+                let mut nullable = false;
+                let mut data_type = None;
+                for (_condition, value) in branches {
+                    let val_type = self.check_expr(value)?;
+                    if data_type.is_none() {
+                        data_type = Some(val_type.data_type.clone());
+                    }
+                    nullable = nullable || val_type.nullable;
+                }
+                let default_type = self.check_expr(default)?;
+                nullable = nullable || default_type.nullable;
+                let result_data_type = data_type.unwrap_or(default_type.data_type);
+                Ok(NullableExprType::new(result_data_type, nullable))
+            }
+            ConditionalExpr::IfNull { value, alternative } => {
+                let value_type = self.check_expr(value)?;
+                let alt_type = self.check_expr(alternative)?;
+                Ok(NullableExprType::new(
+                    value_type.data_type,
+                    alt_type.nullable,
+                ))
+            }
+            ConditionalExpr::NullIf { value, sentinel } => {
+                let value_type = self.check_expr(value)?;
+                let _sentinel_type = self.check_expr(sentinel)?;
+                // Always nullable since it can return null.
+                Ok(NullableExprType::nullable(value_type.data_type))
+            }
+            ConditionalExpr::And { left, right } => {
+                let left_type = self.check_expr(left)?;
+                let right_type = self.check_expr(right)?;
+                let nullable = left_type.nullable || right_type.nullable;
+                Ok(NullableExprType::new(DataType::Bool, nullable))
+            }
+            ConditionalExpr::Or { left, right } => {
+                let left_type = self.check_expr(left)?;
+                let right_type = self.check_expr(right)?;
+                let nullable = left_type.nullable || right_type.nullable;
+                Ok(NullableExprType::new(DataType::Bool, nullable))
+            }
+        }
     }
 
     fn check_interpolation(&self) -> NullableExprType {
@@ -167,7 +231,7 @@ mod tests {
     #[test]
     fn function_return_type() {
         let result = infer_expression_type("if(true, 1, 2)", &registry()).unwrap();
-        // IfFunc uses NullableExprType::new() which does not propagate int_bound
+        // Conditional type checking uses NullableExprType::new() which does not propagate int_bound
         assert_eq!(result.data_type, DataType::Int64);
         assert!(!result.nullable);
         assert_eq!(result.int_bound, None);

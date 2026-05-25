@@ -26,6 +26,27 @@ Air Elt accepts both TOML (`.toml`) and YAML (`.yml`/`.yaml`). Format is detecte
 
 Flat `key = "value"` map. Used by `${VAR}` expansion (env → secrets → default → error). No recursion, no vault.
 
+## Expression support
+
+Config string values support expressions in these fields:
+- `default` in mapping entries
+- Switch table values (RHS of switch pairs)
+- `[secrets]` values
+- Component config string values (URLs, connection strings)
+
+Detection rules:
+- String starting with `name(...)` → evaluated as expression
+- String containing `{expr}` → string interpolation
+- `$$` in raw text escapes to literal `$`
+- `{{` inside interpolation escapes to literal `{`
+- Plain values (integers, booleans, non-expression strings) pass through unchanged
+
+Examples:
+- `default = "env('DB_HOST', 'localhost')"`
+- `default = "concat(env('PREFIX'), '_suffix')"`
+- `default = "if(isNull(env('OPT')), 'none', env('OPT'))"`
+- `default = { "key" = "env('X')", "ts" = "now()" }`
+
 ## `[[sources]]` / `[[sinks]]` / `[[storages]]`
 
 | Field | Type | Required | Description |

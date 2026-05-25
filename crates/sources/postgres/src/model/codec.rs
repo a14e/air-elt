@@ -102,9 +102,7 @@ pub fn decode_column(row: &PgRow, index: usize, data_type: DataType) -> RuntimeR
         // means the schema introspector itself emitted Union (impossible
         // for pg `information_schema`). Mirrors the pg sink's
         // `unreachable!` for the same invariant.
-        // Object is not produced by postgres sources — decode as JSON
-        DataType::Object => nullable::<serde_json::Value>(row, index)
-            .map(|o| o.map(Value::Json).unwrap_or(Value::Null)),
+        DataType::Object => unreachable!("postgres sources never produce Object types"),
         DataType::Union(_) => unreachable!("postgres sources never produce Union types"),
         // HLL: the wire shape is a binary blob — sqlx decodes it as
         // `Vec<u8>` (sqlx has no native registration for the HLL type
@@ -180,11 +178,13 @@ pub fn bind_cursor_value<'q>(
         Value::Json(j) => query.bind(j),
         Value::BigInt(b) => query.bind(BigDecimal::new(b.clone(), 0)),
         Value::Decimal(d) => query.bind(d.clone()),
+        Value::Object(_) => {
+            unreachable!(
+                "Value::Object cannot appear in cursor values — it is not cursor-compatible"
+            )
+        }
         Value::UInt8(_) | Value::UInt16(_) | Value::UInt32(_) | Value::UInt64(_) => {
             unreachable!("postgres has no unsigned int columns; cursor cannot carry unsigned")
-        }
-        Value::Object(_) => {
-            unreachable!("Object is not cursor-compatible; validation rejects it upstream")
         }
         Value::Custom(c) => {
             // PG `inet` is cursor-compatible — wrap the IpNetwork

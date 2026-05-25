@@ -13,15 +13,16 @@
 //!   millisecond-resolution, so chrono nanoseconds are dropped on the
 //!   way out. Identity round-trips of typical pipeline timestamps are
 //!   millisecond-faithful; sub-ms data will silently floor.
-//! - **Nested Document/Array → `Value::Json`**: implemented via
+//! - **Document → `Value::Object`**: BSON documents are recursively
+//!   converted into `Value::Object(Vec<(String, Value)>)`, preserving
+//!   field order and enabling lossless round-trips through the
+//!   canonical model without the `serde_json::Value` intermediate.
+//! - **Array → `Value::Json`**: BSON arrays are still converted via
 //!   `bson::from_bson` into a `serde_json::Value`. Nested ObjectIds,
-//!   Decimal128, Binary and DateTime values are serialised as the
-//!   driver's extended-JSON shapes inside the JSON tree. They are not
-//!   lost, but consumers reading `Value::Json` see a JSON
-//!   representation rather than the original BSON variants. If a
-//!   pipeline needs full fidelity for nested BSON it should map the
-//!   leaf paths (`addr.city`, `addr.geo.lat`) explicitly rather than
-//!   pulling the whole `addr` subdocument as JSON.
+//!   Decimal128, Binary and DateTime values inside arrays are
+//!   serialised as the driver's extended-JSON shapes. If a pipeline
+//!   needs full fidelity for nested BSON it should map the leaf paths
+//!   explicitly rather than pulling the whole subdocument as JSON.
 
 use bigdecimal::BigDecimal;
 use bson::{Bson, Decimal128};
@@ -63,7 +64,14 @@ pub fn from_bson(b: &Bson) -> RuntimeResult<Value> {
                 .map_err(|e| RuntimeError::Other(format!("decimal128 parse: {e}")))?;
             Value::Decimal(parsed)
         }
-        Bson::Document(_) | Bson::Array(_) => {
+        Bson::Document(doc) => {
+            let entries: Vec<(String, Value)> = doc
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), from_bson(v)?)))
+                .collect::<RuntimeResult<_>>()?;
+            Value::Object(entries)
+        }
+        Bson::Array(_) => {
             let json: Json = bson::from_bson(b.clone()).map_err(RuntimeError::backend)?;
             Value::Json(json)
         }
@@ -83,12 +91,20 @@ pub fn from_bson(b: &Bson) -> RuntimeResult<Value> {
 /// Owning counterpart of [`to_bson`]. Moves the inner payload out
 /// where the canonical `Value` can give it up — notably `Value::Json`
 /// (whose `serde_json::Value` is bson-encoded byte-for-byte without an
-/// extra clone) and `Value::Custom(BsonObjectValue)` (whose `Document`
+/// extra clone), `Value::Object` (recursively converted to a BSON
+/// `Document`), and `Value::Custom(BsonObjectValue)` (whose `Document`
 /// is moved out of the box). Other variants forward to [`to_bson`]
 /// against a borrowed view because they're already cheap to copy.
 pub fn to_bson_owned(v: Value) -> RuntimeResult<Bson> {
     match v {
         Value::Json(j) => bson::to_bson(&j).map_err(RuntimeError::backend),
+        Value::Object(entries) => {
+            let doc: bson::Document = entries
+                .into_iter()
+                .map(|(k, v)| Ok((k, to_bson_owned(v)?)))
+                .collect::<RuntimeResult<_>>()?;
+            Ok(Bson::Document(doc))
+        }
         Value::Custom(inner) => {
             let dt = inner.dyn_type();
             let kind = dt.kind();
@@ -474,16 +490,19 @@ mod tests {
     }
 
     #[test]
-    fn nested_document_becomes_json_value() {
+    fn nested_document_becomes_object_value() {
         use bson::doc as bdoc;
         let nested = Bson::Document(bdoc! { "city": "Berlin", "zip": "10115" });
         let v = from_bson(&nested).unwrap();
         match v {
-            Value::Json(j) => {
-                assert_eq!(j["city"].as_str(), Some("Berlin"));
-                assert_eq!(j["zip"].as_str(), Some("10115"));
+            Value::Object(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].0, "city");
+                assert_eq!(entries[0].1, Value::Text("Berlin".into()));
+                assert_eq!(entries[1].0, "zip");
+                assert_eq!(entries[1].1, Value::Text("10115".into()));
             }
-            other => panic!("expected Json, got {other:?}"),
+            other => panic!("expected Object, got {other:?}"),
         }
     }
 
@@ -569,5 +588,63 @@ mod tests {
             ),
             other => panic!("expected RuntimeError::Other, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn document_round_trips_through_object() {
+        use bson::doc as bdoc;
+        let doc = bdoc! { "name": "Alice", "age": 30_i32 };
+        let v = from_bson(&Bson::Document(doc.clone())).unwrap();
+        assert!(matches!(v, Value::Object(_)));
+        let back = to_bson_owned(v).unwrap();
+        assert_eq!(back, Bson::Document(doc));
+    }
+
+    #[test]
+    fn nested_document_round_trips_through_object() {
+        use bson::doc as bdoc;
+        let doc = bdoc! {
+            "user": { "name": "Bob", "score": 42_i32 },
+            "tags": ["a", "b"],
+        };
+        let v = from_bson(&Bson::Document(doc.clone())).unwrap();
+        // Top level is Value::Object; nested document is also Object.
+        match &v {
+            Value::Object(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert!(matches!(&entries[0].1, Value::Object(_)));
+                assert!(matches!(&entries[1].1, Value::Json(_))); // Array stays Json
+            }
+            other => panic!("expected Object, got {other:?}"),
+        }
+        // Round-trip back to BSON preserves the structure.
+        let back = to_bson_owned(v).unwrap();
+        assert_eq!(back, Bson::Document(doc));
+    }
+
+    #[test]
+    fn to_bson_borrowed_object() {
+        let obj = Value::Object(vec![
+            ("x".into(), Value::Int32(1)),
+            ("y".into(), Value::Text("hello".into())),
+        ]);
+        let bson = to_bson(&obj).unwrap();
+        match bson {
+            Bson::Document(d) => {
+                assert_eq!(d.get_i32("x").unwrap(), 1);
+                assert_eq!(d.get_str("y").unwrap(), "hello");
+            }
+            other => panic!("expected Document, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_stays_as_json_value() {
+        let arr = Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)]);
+        let v = from_bson(&arr).unwrap();
+        assert!(
+            matches!(v, Value::Json(_)),
+            "Array should remain Value::Json"
+        );
     }
 }

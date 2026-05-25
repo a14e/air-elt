@@ -135,7 +135,7 @@ mod tests {
     fn ctx_with_env() -> EvalContext {
         EvalContext {
             env_resolver: Arc::new(TestEnv),
-            file_resolver: Arc::new(crate::tests::NoopFiles),
+            file_resolver: Arc::new(crate::test_support::NoopFiles),
             now: chrono::Utc::now(),
             base_dir: PathBuf::new(),
         }

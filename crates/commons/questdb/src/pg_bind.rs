@@ -178,18 +178,11 @@ pub fn bind_value_separated_pg(
                 got_kind: "UInt*".to_string(),
             })
         }
-        Value::Object(entries) => {
-            // Object is handled as Json in connectors
-            let map: serde_json::Map<String, serde_json::Value> = entries
-                .iter()
-                .map(|(k, v)| {
-                    let json_v =
-                        air_elt_core::types::value_to_json(v).unwrap_or(serde_json::Value::Null);
-                    (k.clone(), json_v)
-                })
-                .collect();
-            let s = serde_json::Value::Object(map).to_string();
-            chain.push_bind(s);
+        Value::Object(_) => {
+            // Convert the structured document into JSON for binding.
+            let j = air_elt_core::types::json_encode::value_to_json(value)
+                .expect("Value::Object json encode must not fail after validation");
+            chain.push_bind(j);
             Ok(())
         }
         Value::Custom(b) => bind_custom(chain, column, dt, b.as_ref()),

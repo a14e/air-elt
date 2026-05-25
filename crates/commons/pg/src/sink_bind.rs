@@ -90,7 +90,7 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
                 // `inet` OID by routing through `IpNetwork` host bits.
                 sep.push_bind::<Option<sqlx::types::ipnetwork::IpNetwork>>(None);
             }
-            DataType::Json => {
+            DataType::Json | DataType::Object => {
                 sep.push_bind::<Option<serde_json::Value>>(None);
             }
             DataType::BigInt { .. } | DataType::Decimal { .. } => {
@@ -106,10 +106,6 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
             }
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
                 unreachable!("postgres has no unsigned integer column types")
-            }
-            // Object is handled as Json in connectors
-            DataType::Object => {
-                sep.push_bind::<Option<serde_json::Value>>(None);
             }
             DataType::Union(_) => unreachable!("postgres sinks never carry Union types"),
             // HLL NULL: bind a typed NULL Vec<u8> and tack on `::hll` so
@@ -195,6 +191,14 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
         Value::Decimal(d) => {
             sep.push_bind(d.clone());
         }
+        Value::Object(_) => {
+            // Convert the structured document into a serde_json::Value
+            // for JSON/JSONB binding. Validation guarantees only
+            // compatible types reach the sink, so encode should not fail.
+            let j = air_elt_core::types::json_encode::value_to_json(v)
+                .expect("Value::Object json encode must not fail after validation");
+            sep.push_bind(j);
+        }
         Value::UInt8(_) | Value::UInt16(_) | Value::UInt32(_) | Value::UInt64(_) => {
             unreachable!(
                 "unsigned values cannot reach a postgres sink: pg schemas never \
@@ -202,18 +206,6 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
                  dispatcher rewrites every UInt → Int*/BigInt/Decimal mapping into \
                  the target variant before binding"
             )
-        }
-        Value::Object(entries) => {
-            // Object is handled as Json in connectors
-            let map: serde_json::Map<String, serde_json::Value> = entries
-                .iter()
-                .map(|(k, v)| {
-                    let json_v =
-                        air_elt_core::types::value_to_json(v).unwrap_or(serde_json::Value::Null);
-                    (k.clone(), json_v)
-                })
-                .collect();
-            sep.push_bind(serde_json::Value::Object(map));
         }
         Value::Custom(v) => {
             // HLL: bind raw bytes, then append `::hll` to cast the

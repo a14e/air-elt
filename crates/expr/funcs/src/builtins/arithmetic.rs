@@ -1,7 +1,9 @@
 use air_elt_expr_types::bounds::{ArithmeticOp, arithmetic_result_type, concat_result_type};
 use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::{DataType, Value};
+use bigdecimal::BigDecimal;
 use num_bigint::BigInt;
+use num_traits::Zero;
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
@@ -101,6 +103,12 @@ impl ExprFunction for AddFunc {
                 Some(result) => Ok(Value::Int64(result)),
                 None => Ok(Value::BigInt(BigInt::from(x) + BigInt::from(y))),
             },
+            (Value::BigInt(x), Value::BigInt(y)) => Ok(Value::BigInt(x + y)),
+            (Value::BigInt(x), Value::Int64(y)) => Ok(Value::BigInt(x + BigInt::from(y))),
+            (Value::Int64(x), Value::BigInt(y)) => Ok(Value::BigInt(BigInt::from(x) + y)),
+            (Value::Decimal(x), Value::Decimal(y)) => Ok(Value::Decimal(x + y)),
+            (Value::Decimal(x), Value::Int64(y)) => Ok(Value::Decimal(x + BigDecimal::from(y))),
+            (Value::Int64(x), Value::Decimal(y)) => Ok(Value::Decimal(BigDecimal::from(x) + y)),
             (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x + y)),
             (a, b) => Err(FuncError::TypeMismatch {
                 function: "add".to_owned(),
@@ -151,6 +159,12 @@ impl ExprFunction for SubtractFunc {
                 Some(result) => Ok(Value::Int64(result)),
                 None => Ok(Value::BigInt(BigInt::from(x) - BigInt::from(y))),
             },
+            (Value::BigInt(x), Value::BigInt(y)) => Ok(Value::BigInt(x - y)),
+            (Value::BigInt(x), Value::Int64(y)) => Ok(Value::BigInt(x - BigInt::from(y))),
+            (Value::Int64(x), Value::BigInt(y)) => Ok(Value::BigInt(BigInt::from(x) - y)),
+            (Value::Decimal(x), Value::Decimal(y)) => Ok(Value::Decimal(x - y)),
+            (Value::Decimal(x), Value::Int64(y)) => Ok(Value::Decimal(x - BigDecimal::from(y))),
+            (Value::Int64(x), Value::Decimal(y)) => Ok(Value::Decimal(BigDecimal::from(x) - y)),
             (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x - y)),
             (a, b) => Err(FuncError::TypeMismatch {
                 function: "subtract".to_owned(),
@@ -201,6 +215,12 @@ impl ExprFunction for MultiplyFunc {
                 Some(result) => Ok(Value::Int64(result)),
                 None => Ok(Value::BigInt(BigInt::from(x) * BigInt::from(y))),
             },
+            (Value::BigInt(x), Value::BigInt(y)) => Ok(Value::BigInt(x * y)),
+            (Value::BigInt(x), Value::Int64(y)) => Ok(Value::BigInt(x * BigInt::from(y))),
+            (Value::Int64(x), Value::BigInt(y)) => Ok(Value::BigInt(BigInt::from(x) * y)),
+            (Value::Decimal(x), Value::Decimal(y)) => Ok(Value::Decimal(x * y)),
+            (Value::Decimal(x), Value::Int64(y)) => Ok(Value::Decimal(x * BigDecimal::from(y))),
+            (Value::Int64(x), Value::Decimal(y)) => Ok(Value::Decimal(BigDecimal::from(x) * y)),
             (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x * y)),
             (a, b) => Err(FuncError::TypeMismatch {
                 function: "multiply".to_owned(),
@@ -252,6 +272,26 @@ impl ExprFunction for DivideFunc {
                 Some(result) => Ok(Value::Int64(result)),
                 None => Ok(Value::BigInt(BigInt::from(x) / BigInt::from(y))),
             },
+            (Value::BigInt(_), Value::BigInt(ref y)) if y.is_zero() => {
+                Err(FuncError::DivisionByZero)
+            }
+            (Value::BigInt(x), Value::BigInt(y)) => Ok(Value::BigInt(x / y)),
+            (Value::BigInt(_), Value::Int64(0)) => Err(FuncError::DivisionByZero),
+            (Value::BigInt(x), Value::Int64(y)) => Ok(Value::BigInt(x / BigInt::from(y))),
+            (Value::Int64(_), Value::BigInt(ref y)) if y.is_zero() => {
+                Err(FuncError::DivisionByZero)
+            }
+            (Value::Int64(x), Value::BigInt(y)) => Ok(Value::BigInt(BigInt::from(x) / y)),
+            (Value::Decimal(_), Value::Decimal(ref y)) if y.is_zero() => {
+                Err(FuncError::DivisionByZero)
+            }
+            (Value::Decimal(x), Value::Decimal(y)) => Ok(Value::Decimal(x / y)),
+            (Value::Decimal(_), Value::Int64(0)) => Err(FuncError::DivisionByZero),
+            (Value::Decimal(x), Value::Int64(y)) => Ok(Value::Decimal(x / BigDecimal::from(y))),
+            (Value::Int64(_), Value::Decimal(ref y)) if y.is_zero() => {
+                Err(FuncError::DivisionByZero)
+            }
+            (Value::Int64(x), Value::Decimal(y)) => Ok(Value::Decimal(BigDecimal::from(x) / y)),
             (Value::Float64(x), Value::Float64(y)) => {
                 if y == 0.0 {
                     return Err(FuncError::DivisionByZero);
@@ -305,6 +345,26 @@ impl ExprFunction for ModuloFunc {
         match (a, b) {
             (Value::Int64(_), Value::Int64(0)) => Err(FuncError::DivisionByZero),
             (Value::Int64(x), Value::Int64(y)) => Ok(Value::Int64(x % y)),
+            (Value::BigInt(_), Value::BigInt(ref y)) if y.is_zero() => {
+                Err(FuncError::DivisionByZero)
+            }
+            (Value::BigInt(x), Value::BigInt(y)) => Ok(Value::BigInt(x % y)),
+            (Value::BigInt(_), Value::Int64(0)) => Err(FuncError::DivisionByZero),
+            (Value::BigInt(x), Value::Int64(y)) => Ok(Value::BigInt(x % BigInt::from(y))),
+            (Value::Int64(_), Value::BigInt(ref y)) if y.is_zero() => {
+                Err(FuncError::DivisionByZero)
+            }
+            (Value::Int64(x), Value::BigInt(y)) => Ok(Value::BigInt(BigInt::from(x) % y)),
+            (Value::Decimal(_), Value::Decimal(ref y)) if y.is_zero() => {
+                Err(FuncError::DivisionByZero)
+            }
+            (Value::Decimal(x), Value::Decimal(y)) => Ok(Value::Decimal(x % y)),
+            (Value::Decimal(_), Value::Int64(0)) => Err(FuncError::DivisionByZero),
+            (Value::Decimal(x), Value::Int64(y)) => Ok(Value::Decimal(x % BigDecimal::from(y))),
+            (Value::Int64(_), Value::Decimal(ref y)) if y.is_zero() => {
+                Err(FuncError::DivisionByZero)
+            }
+            (Value::Int64(x), Value::Decimal(y)) => Ok(Value::Decimal(BigDecimal::from(x) % y)),
             (Value::Float64(x), Value::Float64(y)) => {
                 if y == 0.0 {
                     return Err(FuncError::DivisionByZero);
@@ -349,6 +409,8 @@ impl ExprFunction for NegateFunc {
                 Some(result) => Ok(Value::Int64(result)),
                 None => Ok(Value::BigInt(-BigInt::from(x))),
             },
+            Value::BigInt(x) => Ok(Value::BigInt(-x)),
+            Value::Decimal(x) => Ok(Value::Decimal(-x)),
             Value::Float64(x) => Ok(Value::Float64(-x)),
             other => Err(FuncError::TypeMismatch {
                 function: "negate".to_owned(),
@@ -388,6 +450,14 @@ impl ExprFunction for AbsFunc {
                 Some(result) => Ok(Value::Int64(result)),
                 None => Ok(Value::BigInt(BigInt::from(x).magnitude().clone().into())),
             },
+            Value::BigInt(x) => {
+                if x < BigInt::zero() {
+                    Ok(Value::BigInt(-x))
+                } else {
+                    Ok(Value::BigInt(x))
+                }
+            }
+            Value::Decimal(x) => Ok(Value::Decimal(x.abs())),
             Value::Float64(x) => Ok(Value::Float64(x.abs())),
             other => Err(FuncError::TypeMismatch {
                 function: "abs".to_owned(),
@@ -541,6 +611,20 @@ impl ExprFunction for MinFunc {
                             current
                         }
                     }
+                    (Value::BigInt(a), Value::BigInt(b)) => {
+                        if b < a {
+                            val
+                        } else {
+                            current
+                        }
+                    }
+                    (Value::Decimal(a), Value::Decimal(b)) => {
+                        if b < a {
+                            val
+                        } else {
+                            current
+                        }
+                    }
                     (Value::Float64(a), Value::Float64(b)) => {
                         if b < a {
                             val
@@ -591,6 +675,20 @@ impl ExprFunction for MaxFunc {
                             current
                         }
                     }
+                    (Value::BigInt(a), Value::BigInt(b)) => {
+                        if b > a {
+                            val
+                        } else {
+                            current
+                        }
+                    }
+                    (Value::Decimal(a), Value::Decimal(b)) => {
+                        if b > a {
+                            val
+                        } else {
+                            current
+                        }
+                    }
                     (Value::Float64(a), Value::Float64(b)) => {
                         if b > a {
                             val
@@ -632,6 +730,26 @@ impl ExprFunction for SignFunc {
         }
         match a {
             Value::Int64(x) => Ok(Value::Int64(x.signum())),
+            Value::BigInt(ref x) => {
+                use num_bigint::Sign;
+                let s = match x.sign() {
+                    Sign::Plus => 1i64,
+                    Sign::Minus => -1i64,
+                    Sign::NoSign => 0i64,
+                };
+                Ok(Value::Int64(s))
+            }
+            Value::Decimal(ref x) => {
+                use num_traits::Signed;
+                let s = x.signum();
+                if s.is_zero() {
+                    Ok(Value::Int64(0))
+                } else if s.is_positive() {
+                    Ok(Value::Int64(1))
+                } else {
+                    Ok(Value::Int64(-1))
+                }
+            }
             Value::Float64(x) => {
                 if x > 0.0 {
                     Ok(Value::Int64(1))
@@ -675,6 +793,22 @@ impl ExprFunction for PowerFunc {
         let a = args.remove(0);
         if a.is_null() || b.is_null() {
             return Ok(Value::Null);
+        }
+        // Integer power: both Int64 -> compute as integer
+        if let (Value::Int64(base), Value::Int64(exp)) = (&a, &b) {
+            if *exp >= 0 {
+                let exp_u32 = (*exp).min(63) as u32;
+                match base.checked_pow(exp_u32) {
+                    Some(result) => return Ok(Value::Int64(result)),
+                    None => {
+                        return Ok(Value::BigInt(BigInt::from(*base).pow(exp_u32)));
+                    }
+                }
+            }
+            // Negative exponent for integers -> float
+            let base_f = *base as f64;
+            let exp_f = *exp as f64;
+            return Ok(Value::Float64(base_f.powf(exp_f)));
         }
         let base = to_f64(&a, "power")?;
         let exp = to_f64(&b, "power")?;
@@ -774,8 +908,8 @@ mod tests {
 
     fn ctx() -> EvalContext {
         EvalContext {
-            env_resolver: Arc::new(crate::tests::EmptyEnv),
-            file_resolver: Arc::new(crate::tests::NoopFiles),
+            env_resolver: Arc::new(crate::test_support::EmptyEnv),
+            file_resolver: Arc::new(crate::test_support::NoopFiles),
             now: chrono::Utc::now(),
             base_dir: PathBuf::new(),
         }
@@ -907,9 +1041,168 @@ mod tests {
     }
 
     #[test]
+    fn power_integer_both_int64() {
+        let f = PowerFunc;
+        let result = f
+            .evaluate(vec![Value::Int64(2), Value::Int64(10)], &ctx())
+            .unwrap();
+        assert_eq!(result, Value::Int64(1024));
+    }
+
+    #[test]
+    fn power_integer_overflow_to_bigint() {
+        let f = PowerFunc;
+        let result = f
+            .evaluate(vec![Value::Int64(2), Value::Int64(63)], &ctx())
+            .unwrap();
+        assert_eq!(result, Value::BigInt(BigInt::from(2).pow(63)));
+    }
+
+    #[test]
+    fn power_integer_negative_exponent() {
+        let f = PowerFunc;
+        let result = f
+            .evaluate(vec![Value::Int64(2), Value::Int64(-1)], &ctx())
+            .unwrap();
+        assert_eq!(result, Value::Float64(0.5));
+    }
+
+    #[test]
     fn sqrt_basic() {
         let f = SqrtFunc;
         let result = f.evaluate(vec![Value::Float64(9.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(3.0));
+    }
+
+    // --- BigInt and Decimal tests ---
+
+    #[test]
+    fn add_bigint() {
+        let f = AddFunc;
+        let a = Value::BigInt(BigInt::from(1_000_000_000_000i64));
+        let b = Value::BigInt(BigInt::from(2_000_000_000_000i64));
+        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        assert_eq!(result, Value::BigInt(BigInt::from(3_000_000_000_000i64)));
+    }
+
+    #[test]
+    fn add_bigint_and_int64() {
+        let f = AddFunc;
+        let a = Value::BigInt(BigInt::from(100));
+        let b = Value::Int64(50);
+        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        assert_eq!(result, Value::BigInt(BigInt::from(150)));
+    }
+
+    #[test]
+    fn add_decimal() {
+        let f = AddFunc;
+        let a = Value::Decimal("1.5".parse().unwrap());
+        let b = Value::Decimal("2.5".parse().unwrap());
+        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        assert_eq!(result, Value::Decimal("4.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn subtract_bigint() {
+        let f = SubtractFunc;
+        let a = Value::BigInt(BigInt::from(100));
+        let b = Value::BigInt(BigInt::from(30));
+        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        assert_eq!(result, Value::BigInt(BigInt::from(70)));
+    }
+
+    #[test]
+    fn multiply_bigint() {
+        let f = MultiplyFunc;
+        let a = Value::BigInt(BigInt::from(100));
+        let b = Value::BigInt(BigInt::from(200));
+        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        assert_eq!(result, Value::BigInt(BigInt::from(20_000)));
+    }
+
+    #[test]
+    fn divide_bigint() {
+        let f = DivideFunc;
+        let a = Value::BigInt(BigInt::from(100));
+        let b = Value::BigInt(BigInt::from(4));
+        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        assert_eq!(result, Value::BigInt(BigInt::from(25)));
+    }
+
+    #[test]
+    fn divide_bigint_by_zero() {
+        let f = DivideFunc;
+        let a = Value::BigInt(BigInt::from(100));
+        let b = Value::BigInt(BigInt::from(0));
+        let result = f.evaluate(vec![a, b], &ctx());
+        assert!(matches!(result, Err(FuncError::DivisionByZero)));
+    }
+
+    #[test]
+    fn modulo_bigint() {
+        let f = ModuloFunc;
+        let a = Value::BigInt(BigInt::from(17));
+        let b = Value::BigInt(BigInt::from(5));
+        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        assert_eq!(result, Value::BigInt(BigInt::from(2)));
+    }
+
+    #[test]
+    fn negate_bigint() {
+        let f = NegateFunc;
+        let a = Value::BigInt(BigInt::from(42));
+        let result = f.evaluate(vec![a], &ctx()).unwrap();
+        assert_eq!(result, Value::BigInt(BigInt::from(-42)));
+    }
+
+    #[test]
+    fn abs_bigint_negative() {
+        let f = AbsFunc;
+        let a = Value::BigInt(BigInt::from(-99));
+        let result = f.evaluate(vec![a], &ctx()).unwrap();
+        assert_eq!(result, Value::BigInt(BigInt::from(99)));
+    }
+
+    #[test]
+    fn abs_decimal_negative() {
+        let f = AbsFunc;
+        let a = Value::Decimal("-3.14".parse().unwrap());
+        let result = f.evaluate(vec![a], &ctx()).unwrap();
+        assert_eq!(result, Value::Decimal("3.14".parse().unwrap()));
+    }
+
+    #[test]
+    fn sign_bigint_negative() {
+        let f = SignFunc;
+        let a = Value::BigInt(BigInt::from(-42));
+        let result = f.evaluate(vec![a], &ctx()).unwrap();
+        assert_eq!(result, Value::Int64(-1));
+    }
+
+    #[test]
+    fn sign_decimal_positive() {
+        let f = SignFunc;
+        let a = Value::Decimal("7.5".parse().unwrap());
+        let result = f.evaluate(vec![a], &ctx()).unwrap();
+        assert_eq!(result, Value::Int64(1));
+    }
+
+    #[test]
+    fn min_bigint() {
+        let f = MinFunc;
+        let a = Value::BigInt(BigInt::from(100));
+        let b = Value::BigInt(BigInt::from(50));
+        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        assert_eq!(result, Value::BigInt(BigInt::from(50)));
+    }
+
+    #[test]
+    fn max_decimal() {
+        let f = MaxFunc;
+        let a = Value::Decimal("1.5".parse().unwrap());
+        let b = Value::Decimal("2.7".parse().unwrap());
+        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        assert_eq!(result, Value::Decimal("2.7".parse().unwrap()));
     }
 }

@@ -18,6 +18,9 @@ static SHA512: Sha512Func = Sha512Func;
 static XXHASH64: XxHash64Func = XxHash64Func;
 static XXHASH32: XxHash32Func = XxHash32Func;
 static HMAC: HmacFunc = HmacFunc;
+static CITY_HASH64: CityHash64Func = CityHash64Func;
+static SIP_HASH64: SipHash64Func = SipHash64Func;
+static FNV1A64: Fnv1a64Func = Fnv1a64Func;
 
 pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&MD5);
@@ -27,6 +30,9 @@ pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&XXHASH64);
     registry.register(&XXHASH32);
     registry.register(&HMAC);
+    registry.register(&CITY_HASH64);
+    registry.register(&SIP_HASH64);
+    registry.register(&FNV1A64);
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +356,132 @@ impl ExprFunction for HmacFunc {
 }
 
 // ---------------------------------------------------------------------------
+// cityHash64
+// ---------------------------------------------------------------------------
+
+struct CityHash64Func;
+
+impl ExprFunction for CityHash64Func {
+    fn name(&self) -> &str {
+        "cityHash64"
+    }
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let input = args.remove(0);
+        if input.is_null() {
+            return Ok(Value::Null);
+        }
+        let bytes = extract_bytes(input, "cityHash64")?;
+        let hash = city_hash_64(&bytes);
+        Ok(Value::Int64(hash as i64))
+    }
+}
+
+fn city_hash_64(data: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = ahash::AHasher::default();
+    hasher.write(data);
+    hasher.finish()
+}
+
+// ---------------------------------------------------------------------------
+// sipHash64
+// ---------------------------------------------------------------------------
+
+struct SipHash64Func;
+
+impl ExprFunction for SipHash64Func {
+    fn name(&self) -> &str {
+        "sipHash64"
+    }
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let input = args.remove(0);
+        if input.is_null() {
+            return Ok(Value::Null);
+        }
+        let bytes = extract_bytes(input, "sipHash64")?;
+        let hash = sip_hash_64(&bytes);
+        Ok(Value::Int64(hash as i64))
+    }
+}
+
+fn sip_hash_64(data: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    #[allow(deprecated)]
+    let mut hasher = std::hash::SipHasher::new();
+    hasher.write(data);
+    hasher.finish()
+}
+
+// ---------------------------------------------------------------------------
+// fnv1a64
+// ---------------------------------------------------------------------------
+
+struct Fnv1a64Func;
+
+impl ExprFunction for Fnv1a64Func {
+    fn name(&self) -> &str {
+        "fnv1a64"
+    }
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let input = args.remove(0);
+        if input.is_null() {
+            return Ok(Value::Null);
+        }
+        let bytes = extract_bytes(input, "fnv1a64")?;
+        let hash = fnv1a_64(&bytes);
+        Ok(Value::Int64(hash as i64))
+    }
+}
+
+fn fnv1a_64(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -364,8 +496,8 @@ mod tests {
 
     fn ctx() -> EvalContext {
         EvalContext {
-            env_resolver: Arc::new(crate::tests::EmptyEnv),
-            file_resolver: Arc::new(crate::tests::NoopFiles),
+            env_resolver: Arc::new(crate::test_support::EmptyEnv),
+            file_resolver: Arc::new(crate::test_support::NoopFiles),
             now: chrono::Utc::now(),
             base_dir: PathBuf::new(),
         }
@@ -563,5 +695,115 @@ mod tests {
     fn type_mismatch_on_non_bytes_input() {
         let result = Md5Func.evaluate(vec![Value::Int64(42)], &ctx());
         assert!(matches!(result, Err(FuncError::TypeMismatch { .. })));
+    }
+
+    // --- cityHash64 ---
+
+    #[test]
+    fn city_hash64_deterministic() {
+        let input = Value::Text("test data".to_owned());
+        let result_a = CityHash64Func
+            .evaluate(vec![input.clone()], &ctx())
+            .unwrap();
+        let result_b = CityHash64Func.evaluate(vec![input], &ctx()).unwrap();
+        assert_eq!(result_a, result_b);
+        assert!(matches!(result_a, Value::Int64(_)));
+    }
+
+    #[test]
+    fn city_hash64_null_propagation() {
+        let result = CityHash64Func.evaluate(vec![Value::Null], &ctx()).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn city_hash64_different_inputs_different_hashes() {
+        let result_a = CityHash64Func
+            .evaluate(vec![Value::Text("hello".to_owned())], &ctx())
+            .unwrap();
+        let result_b = CityHash64Func
+            .evaluate(vec![Value::Text("world".to_owned())], &ctx())
+            .unwrap();
+        assert_ne!(result_a, result_b);
+    }
+
+    // --- sipHash64 ---
+
+    #[test]
+    fn sip_hash64_deterministic() {
+        let input = Value::Text("test data".to_owned());
+        let result_a = SipHash64Func.evaluate(vec![input.clone()], &ctx()).unwrap();
+        let result_b = SipHash64Func.evaluate(vec![input], &ctx()).unwrap();
+        assert_eq!(result_a, result_b);
+        assert!(matches!(result_a, Value::Int64(_)));
+    }
+
+    #[test]
+    fn sip_hash64_null_propagation() {
+        let result = SipHash64Func.evaluate(vec![Value::Null], &ctx()).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn sip_hash64_different_inputs_different_hashes() {
+        let result_a = SipHash64Func
+            .evaluate(vec![Value::Text("hello".to_owned())], &ctx())
+            .unwrap();
+        let result_b = SipHash64Func
+            .evaluate(vec![Value::Text("world".to_owned())], &ctx())
+            .unwrap();
+        assert_ne!(result_a, result_b);
+    }
+
+    // --- fnv1a64 ---
+
+    #[test]
+    fn fnv1a64_deterministic() {
+        let input = Value::Text("test data".to_owned());
+        let result_a = Fnv1a64Func.evaluate(vec![input.clone()], &ctx()).unwrap();
+        let result_b = Fnv1a64Func.evaluate(vec![input], &ctx()).unwrap();
+        assert_eq!(result_a, result_b);
+        assert!(matches!(result_a, Value::Int64(_)));
+    }
+
+    #[test]
+    fn fnv1a64_null_propagation() {
+        let result = Fnv1a64Func.evaluate(vec![Value::Null], &ctx()).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn fnv1a64_known_value_empty() {
+        // FNV-1a offset basis for empty input is the offset basis itself
+        let result = Fnv1a64Func
+            .evaluate(vec![Value::Text(String::new())], &ctx())
+            .unwrap();
+        // FNV-1a 64-bit offset basis = 0xcbf29ce484222325
+        assert_eq!(result, Value::Int64(0xcbf2_9ce4_8422_2325_u64 as i64));
+    }
+
+    #[test]
+    fn fnv1a64_different_inputs_different_hashes() {
+        let result_a = Fnv1a64Func
+            .evaluate(vec![Value::Text("hello".to_owned())], &ctx())
+            .unwrap();
+        let result_b = Fnv1a64Func
+            .evaluate(vec![Value::Text("world".to_owned())], &ctx())
+            .unwrap();
+        assert_ne!(result_a, result_b);
+    }
+
+    #[test]
+    fn fnv1a64_bytes_input() {
+        let result = Fnv1a64Func
+            .evaluate(
+                vec![Value::Bytes(vec![0x68, 0x65, 0x6c, 0x6c, 0x6f])],
+                &ctx(),
+            )
+            .unwrap();
+        let expected = Fnv1a64Func
+            .evaluate(vec![Value::Text("hello".to_owned())], &ctx())
+            .unwrap();
+        assert_eq!(result, expected);
     }
 }

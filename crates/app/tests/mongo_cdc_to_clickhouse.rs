@@ -318,13 +318,10 @@ async fn capture_pbrt_doc(coll: &Collection<Document>) -> Document {
 /// Convert the captured BSON resume-token document to the
 /// `serde_json::Value` shape `Storage::save_resume_token` expects.
 /// Round-trips through `bson_value` to mirror the runner's own
-/// `extract_resume_token` path: BSON → `Value::Json` → serde_json.
+/// `extract_resume_token` path: BSON → `Value::Object` → serde_json.
 fn bson_doc_to_serde_json(doc: &Document) -> serde_json::Value {
     let v = bson_value::from_bson(&Bson::Document(doc.clone())).expect("decode token");
-    match v {
-        air_elt_core::types::Value::Json(j) => j,
-        other => panic!("token decode must yield Value::Json, got {other:?}"),
-    }
+    air_elt_core::types::json_encode::value_to_json(&v).expect("json encode")
 }
 
 async fn enable_pre_post_images(client: &mongodb::Client, db: &str, coll: &str) {

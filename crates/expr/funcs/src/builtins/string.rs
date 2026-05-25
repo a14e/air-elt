@@ -1029,8 +1029,8 @@ mod tests {
 
     fn ctx() -> EvalContext {
         EvalContext {
-            env_resolver: Arc::new(crate::tests::EmptyEnv),
-            file_resolver: Arc::new(crate::tests::NoopFiles),
+            env_resolver: Arc::new(crate::test_support::EmptyEnv),
+            file_resolver: Arc::new(crate::test_support::NoopFiles),
             now: chrono::Utc::now(),
             base_dir: PathBuf::new(),
         }
@@ -1382,5 +1382,116 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, Value::Text("aaxxcc".into()));
+    }
+
+    // --- Allocation optimization tests ---
+
+    #[test]
+    fn to_string_passthrough_no_clone() {
+        // toString on a Text value should return the same allocation (no clone)
+        let input = Value::Text("already a string".to_owned());
+        let ptr_before = match &input {
+            Value::Text(s) => s.as_ptr(),
+            _ => unreachable!(),
+        };
+        let result = TO_STRING.evaluate(vec![input], &ctx()).unwrap();
+        let ptr_after = match &result {
+            Value::Text(s) => s.as_ptr(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            ptr_before, ptr_after,
+            "toString should pass through Text without cloning"
+        );
+    }
+
+    #[test]
+    fn substring_from_start_no_new_allocation() {
+        // substring(s, 0, n) should reuse the buffer (truncate in place)
+        let input = Value::Text("hello world".to_owned());
+        let ptr_before = match &input {
+            Value::Text(s) => s.as_ptr(),
+            _ => unreachable!(),
+        };
+        let result = SUBSTRING
+            .evaluate(vec![input, Value::Int64(0), Value::Int64(5)], &ctx())
+            .unwrap();
+        let ptr_after = match &result {
+            Value::Text(s) => s.as_ptr(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            ptr_before, ptr_after,
+            "substring from 0 should reuse buffer"
+        );
+        assert_eq!(result, Value::Text("hello".to_owned()));
+    }
+
+    #[test]
+    fn trim_no_whitespace_reuses_buffer() {
+        // trim on a string without whitespace should return same allocation
+        let input = Value::Text("no_spaces".to_owned());
+        let ptr_before = match &input {
+            Value::Text(s) => s.as_ptr(),
+            _ => unreachable!(),
+        };
+        let result = TRIM.evaluate(vec![input], &ctx()).unwrap();
+        let ptr_after = match &result {
+            Value::Text(s) => s.as_ptr(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            ptr_before, ptr_after,
+            "trim should reuse buffer when no whitespace"
+        );
+    }
+
+    #[test]
+    fn replace_no_match_reuses_buffer() {
+        // replace when pattern not found should return same allocation
+        let input = Value::Text("hello world".to_owned());
+        let ptr_before = match &input {
+            Value::Text(s) => s.as_ptr(),
+            _ => unreachable!(),
+        };
+        let result = REPLACE
+            .evaluate(
+                vec![
+                    input,
+                    Value::Text("xyz".to_owned()),
+                    Value::Text("abc".to_owned()),
+                ],
+                &ctx(),
+            )
+            .unwrap();
+        let ptr_after = match &result {
+            Value::Text(s) => s.as_ptr(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            ptr_before, ptr_after,
+            "replace should reuse buffer when pattern not found"
+        );
+    }
+
+    #[test]
+    fn concat_reuses_first_arg_buffer() {
+        // concat should push onto the first arg's buffer
+        let input = Value::Text(String::with_capacity(100));
+        let ptr_before = match &input {
+            Value::Text(s) => s.as_ptr(),
+            _ => unreachable!(),
+        };
+        let result = CONCAT
+            .evaluate(vec![input, Value::Text("hello".to_owned())], &ctx())
+            .unwrap();
+        let ptr_after = match &result {
+            Value::Text(s) => s.as_ptr(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            ptr_before, ptr_after,
+            "concat should reuse first arg buffer"
+        );
     }
 }

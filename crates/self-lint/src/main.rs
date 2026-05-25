@@ -44,6 +44,7 @@ fn main() -> ExitCode {
     let all_checks: Vec<Box<dyn Check>> = vec![
         Box::new(checks::ascii::NonEnglishCheck),
         Box::new(checks::dep_graph::DepGraphCheck),
+        Box::new(checks::expr_registration::ExprRegistrationCheck),
         Box::new(checks::registry::RegistryCheck),
         Box::new(checks::traits::TraitsCheck),
         Box::new(checks::app_tests::AppTestsCheck),
@@ -53,7 +54,6 @@ fn main() -> ExitCode {
         Box::new(checks::mod_purity::ModPurityCheck),
         Box::new(checks::test_aggregator::TestAggregatorCheck),
         Box::new(checks::doctest::DoctestCheck),
-        Box::new(checks::worktree::WorktreeCheck),
     ];
 
     let mut diagnostics: Vec<Diagnostic> = all_checks

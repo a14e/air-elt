@@ -68,7 +68,12 @@ impl<'a> Lexer<'a> {
             }
             b'*' => {
                 self.pos += 1;
-                Ok(Token::Star)
+                if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'*' {
+                    self.pos += 1;
+                    Ok(Token::Power)
+                } else {
+                    Ok(Token::Star)
+                }
             }
             b'/' => {
                 self.pos += 1;
@@ -624,6 +629,29 @@ mod tests {
                 Token::Ident("d".to_string()),
                 Token::Pipe,
                 Token::Ident("e".to_string()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_power_operator() {
+        assert_eq!(
+            tokens("2 ** 3"),
+            vec![Token::IntLit(2), Token::Power, Token::IntLit(3), Token::Eof,]
+        );
+    }
+
+    #[test]
+    fn tokenize_star_vs_power() {
+        assert_eq!(
+            tokens("a * b ** c"),
+            vec![
+                Token::Ident("a".to_string()),
+                Token::Star,
+                Token::Ident("b".to_string()),
+                Token::Power,
+                Token::Ident("c".to_string()),
                 Token::Eof,
             ]
         );

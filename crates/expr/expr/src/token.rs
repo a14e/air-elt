@@ -28,6 +28,9 @@ pub enum Token {
     Or,
     Not,
 
+    // Power operator
+    Power, // **
+
     // Bitwise operators
     Ampersand,  // & (bitwise AND)
     Pipe,       // | (bitwise OR)

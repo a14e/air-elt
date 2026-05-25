@@ -535,7 +535,6 @@ fn build_conversions(
                     &src_dt,
                     &sink_dt,
                     dst_schemaless,
-                    flow.expr_context.as_ref().map(AsRef::as_ref),
                 )?)
             }
             None => None,

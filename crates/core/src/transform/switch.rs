@@ -267,7 +267,6 @@ pub fn compile_switch(
     source_dt: &DataType,
     sink_dt: &DataType,
     schemaless_sink: bool,
-    expr_context: Option<&crate::config::expression::ExpressionContext>,
 ) -> Result<SwitchTable, ValidationError> {
     if !is_switchable_source(source_dt) {
         return Err(ValidationError::SwitchUnsupportedSource {
@@ -312,15 +311,15 @@ pub fn compile_switch(
         let (out_value, out_type) = if schemaless_sink {
             parse_value_untyped(&case.value)
         } else {
-            let v = resolve_switch_value(&case.value, sink_dt, truncate, expr_context).map_err(
-                |err| ValidationError::SwitchValueTypeMismatch {
+            let v = parse_typed_with_truncate(&case.value, sink_dt, truncate).map_err(|err| {
+                ValidationError::SwitchValueTypeMismatch {
                     flow: flow.into(),
                     column: column.into(),
                     key: case.key.clone(),
                     sink_type: sink_dt.clone(),
                     detail: err.to_string(),
-                },
-            )?;
+                }
+            })?;
             (v, sink_dt.clone())
         };
         observed_value_types.push(out_type);
@@ -335,7 +334,7 @@ pub fn compile_switch(
             observed_value_types.push(t);
             Some(v)
         } else {
-            let v = resolve_switch_value(lit, sink_dt, truncate, expr_context).map_err(|err| {
+            let v = parse_typed_with_truncate(lit, sink_dt, truncate).map_err(|err| {
                 ValidationError::SwitchValueTypeMismatch {
                     flow: flow.into(),
                     column: column.into(),
@@ -361,50 +360,6 @@ pub fn compile_switch(
         default,
         output_type,
     })
-}
-
-/// Try expression evaluation on a switch value, falling through to
-/// `parse_typed_with_truncate` for non-expression literals.
-fn resolve_switch_value(
-    literal: &toml::Value,
-    sink_dt: &DataType,
-    truncate: bool,
-    expr_context: Option<&crate::config::expression::ExpressionContext>,
-) -> Result<Value, DefaultParseError> {
-    if let Some(ctx) = expr_context {
-        if let toml::Value::String(s) = literal {
-            if air_elt_expr::is_expression(s) {
-                let resolved = crate::config::expression::resolve_toml_value(
-                    literal,
-                    &ctx.registry,
-                    &ctx.eval_context,
-                )
-                .map_err(|e| DefaultParseError::ExpressionFailed {
-                    reason: e.to_string(),
-                })?;
-                if let Some(value) = resolved {
-                    return Ok(value);
-                }
-            } else if air_elt_expr::has_interpolation(s) {
-                let resolved = crate::config::expression::resolve_toml_value(
-                    literal,
-                    &ctx.registry,
-                    &ctx.eval_context,
-                )
-                .map_err(|e| DefaultParseError::ExpressionFailed {
-                    reason: e.to_string(),
-                })?;
-                if let Some(Value::Text(text)) = resolved {
-                    return parse_typed_with_truncate(
-                        &toml::Value::String(text),
-                        sink_dt,
-                        truncate,
-                    );
-                }
-            }
-        }
-    }
-    parse_typed_with_truncate(literal, sink_dt, truncate)
 }
 
 /// Parse a typed RHS literal against `sink_dt`, applying truncation for
@@ -618,8 +573,8 @@ fn parse_key_text(key: &str, source: &DataType) -> Result<Value, DefaultParseErr
                 reason: e.to_string(),
             }),
         DataType::Json
-        | DataType::Object
         | DataType::Xml
+        | DataType::Object
         | DataType::Union(_)
         | DataType::Custom(_) => Err(DefaultParseError::TypeMismatch {
             dst: source.clone(),
@@ -860,7 +815,6 @@ mod tests {
             &DataType::Text { size: None },
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         assert_eq!(res.cases.len(), 2);
@@ -889,7 +843,6 @@ mod tests {
             &DataType::Int32,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         // Lookup must match an Int8/Int16/Int32/Int64 source carrying
@@ -927,7 +880,6 @@ mod tests {
             &DataType::Bool,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         assert_eq!(
@@ -952,7 +904,6 @@ mod tests {
             &DataType::Int8,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap_err();
         assert!(matches!(err, ValidationError::SwitchKeyTypeMismatch { .. }));
@@ -973,7 +924,6 @@ mod tests {
             &DataType::Int32,
             &DataType::Int32,
             false,
-            None,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1004,7 +954,6 @@ mod tests {
             // schemaless sink type is unused on this path.
             &DataType::Json,
             true,
-            None,
         )
         .unwrap();
         // Int8 + Int32 should collapse to Int32 by widening.
@@ -1042,7 +991,6 @@ mod tests {
             &DataType::Float64,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         // `-0.0` and `+0.0` collapse to the same SwitchKey.
@@ -1065,7 +1013,6 @@ mod tests {
             &DataType::Date,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         let probe = SwitchKey::from_value(&Value::Date(NaiveDate::from_str("2024-01-15").unwrap()))
@@ -1088,7 +1035,6 @@ mod tests {
             &DataType::Uuid,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
@@ -1113,7 +1059,6 @@ mod tests {
             &DataType::BigInt { width: Some(20) },
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         let probe = SwitchKey::from_value(&Value::BigInt(
@@ -1144,7 +1089,6 @@ mod tests {
             },
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         // 1.5 == 1.50 == 1.500 — all normalise to the same key.
@@ -1177,7 +1121,6 @@ mod tests {
             &DataType::Int32,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap_err();
         assert!(matches!(err, ValidationError::SwitchDuplicateKey { .. }));
@@ -1210,7 +1153,6 @@ mod tests {
             &DataType::Int32,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap_err();
         assert!(matches!(err, ValidationError::SwitchDuplicateKey { .. }));
@@ -1237,7 +1179,6 @@ mod tests {
             &DataType::Int32,
             &DataType::Json,
             true,
-            None,
         )
         .unwrap();
         // Union shape alone is not enough — assert both leaves are
@@ -1274,7 +1215,6 @@ mod tests {
             &DataType::Int32,
             &DataType::Json,
             true,
-            None,
         )
         .unwrap();
         // Default must participate in the collapse: with case=Int8,
@@ -1358,7 +1298,6 @@ mod tests {
                 &src,
                 &DataType::Text { size: None },
                 false,
-                None,
             )
             .unwrap_err();
             assert!(
@@ -1387,7 +1326,6 @@ mod tests {
             &DataType::UInt32,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         let probe = SwitchKey::from_value(&Value::UInt32(u32::MAX)).unwrap();
@@ -1411,7 +1349,6 @@ mod tests {
             &DataType::UInt8,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         let probe = SwitchKey::from_value(&Value::UInt8(u8::MAX)).unwrap();
@@ -1430,7 +1367,6 @@ mod tests {
             &DataType::UInt8,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .expect_err("256 must overflow u8");
     }
@@ -1452,7 +1388,6 @@ mod tests {
             &DataType::UInt16,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         let probe = SwitchKey::from_value(&Value::UInt16(u16::MAX)).unwrap();
@@ -1477,7 +1412,6 @@ mod tests {
             &DataType::UInt64,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         let probe = SwitchKey::from_value(&Value::UInt64(u64::MAX)).unwrap();
@@ -1501,7 +1435,6 @@ mod tests {
             &DataType::Float32,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         let probe = SwitchKey::from_value(&Value::Float32(1.5_f32)).unwrap();
@@ -1526,7 +1459,6 @@ mod tests {
             &DataType::Timestamp,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         let dt = chrono::DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z")
@@ -1557,7 +1489,6 @@ mod tests {
             &DataType::Bytes { size: None },
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         let probe = SwitchKey::from_value(&Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef])).unwrap();
@@ -1579,7 +1510,6 @@ mod tests {
             &DataType::Text { size: Some(4) },
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap_err();
         assert!(matches!(err, ValidationError::SwitchKeyTypeMismatch { .. }));
@@ -1606,7 +1536,6 @@ mod tests {
             &DataType::Int32,
             &sink,
             false,
-            None,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1624,7 +1553,6 @@ mod tests {
             &DataType::Int32,
             &sink,
             false,
-            None,
         )
         .unwrap();
         let key = SwitchKey::from_value(&Value::Int32(1)).unwrap();
@@ -1652,7 +1580,6 @@ mod tests {
             &DataType::Int32,
             &sink,
             false,
-            None,
         )
         .unwrap_err();
         assert!(matches!(
@@ -1669,7 +1596,6 @@ mod tests {
             &DataType::Int32,
             &sink,
             false,
-            None,
         )
         .unwrap();
         let key = SwitchKey::from_value(&Value::Int32(1)).unwrap();
@@ -1698,7 +1624,6 @@ mod tests {
             &DataType::Ipv4,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         let lookup = |s: &str| {
@@ -1736,7 +1661,6 @@ mod tests {
             &DataType::Ipv6,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         let lookup = |s: &str| {
@@ -1767,7 +1691,6 @@ mod tests {
             &DataType::Ipv6,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap();
         // Uncompressed source canonicalises to the same Ipv6Addr value
@@ -1792,7 +1715,6 @@ mod tests {
             &DataType::Ipv4,
             &DataType::Text { size: None },
             false,
-            None,
         )
         .unwrap_err();
         assert!(

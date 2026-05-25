@@ -1,9 +1,9 @@
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use num_bigint::BigInt;
-use uuid::Uuid;
 
 use air_elt_expr_types::nullable::NullableExprType;
+use air_elt_types::convert::{ConversionContext, ConvertError};
 use air_elt_types::{DataType, Value};
 
 use crate::error::FuncError;
@@ -46,6 +46,26 @@ pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&CAST_TO_UUID);
     registry.register(&CAST_TO_BIGINT);
     registry.register(&CAST_TO_DECIMAL);
+}
+
+// ---------------------------------------------------------------------------
+// Shared conversion context for all cast functions.
+// Cast is an explicit user request, so truncation is always allowed.
+// ---------------------------------------------------------------------------
+
+fn cast_context() -> ConversionContext {
+    ConversionContext {
+        truncate: true,
+        default: None,
+    }
+}
+
+/// Map a `ConvertError` into `FuncError::EvalFailed` with the cast function name.
+fn convert_error_to_func_error(function: &str, error: ConvertError) -> FuncError {
+    FuncError::EvalFailed {
+        function: function.to_owned(),
+        reason: error.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +134,7 @@ impl ExprFunction for CastToInt8Func {
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let n = to_i64("toInt8", &a)?;
+        let n = to_i64_via_convert("toInt8", a)?;
         let narrow = i8::try_from(n).map_err(|_| FuncError::EvalFailed {
             function: "toInt8".to_owned(),
             reason: format!("value {n} out of Int8 range (-128..127)"),
@@ -151,7 +171,7 @@ impl ExprFunction for CastToInt16Func {
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let n = to_i64("toInt16", &a)?;
+        let n = to_i64_via_convert("toInt16", a)?;
         let narrow = i16::try_from(n).map_err(|_| FuncError::EvalFailed {
             function: "toInt16".to_owned(),
             reason: format!("value {n} out of Int16 range (-32768..32767)"),
@@ -188,7 +208,7 @@ impl ExprFunction for CastToInt32Func {
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let n = to_i64("toInt32", &a)?;
+        let n = to_i64_via_convert("toInt32", a)?;
         let narrow = i32::try_from(n).map_err(|_| FuncError::EvalFailed {
             function: "toInt32".to_owned(),
             reason: format!("value {n} out of Int32 range"),
@@ -225,23 +245,8 @@ impl ExprFunction for CastToInt64Func {
         if a.is_null() {
             return Ok(Value::Null);
         }
-        match a {
-            Value::Int64(n) => Ok(Value::Int64(n)),
-            Value::Float64(n) => Ok(Value::Int64(n as i64)),
-            Value::Bool(b) => Ok(Value::Int64(if b { 1 } else { 0 })),
-            Value::Text(s) => {
-                let n: i64 = s.trim().parse().map_err(|_| FuncError::EvalFailed {
-                    function: "toInt64".to_owned(),
-                    reason: format!("cannot parse {s:?} as Int64"),
-                })?;
-                Ok(Value::Int64(n))
-            }
-            other => Err(FuncError::TypeMismatch {
-                function: "toInt64".to_owned(),
-                expected: "Text, Float64, Bool, or Int64".to_owned(),
-                actual: format!("{:?}", other.data_type()),
-            }),
-        }
+        let n = to_i64_via_convert("toInt64", a)?;
+        Ok(Value::Int64(n))
     }
 }
 
@@ -273,7 +278,7 @@ impl ExprFunction for CastToUInt8Func {
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let n = to_i64("toUInt8", &a)?;
+        let n = to_i64_via_convert("toUInt8", a)?;
         if n < 0 {
             return Err(FuncError::EvalFailed {
                 function: "toUInt8".to_owned(),
@@ -316,7 +321,7 @@ impl ExprFunction for CastToUInt16Func {
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let n = to_i64("toUInt16", &a)?;
+        let n = to_i64_via_convert("toUInt16", a)?;
         if n < 0 {
             return Err(FuncError::EvalFailed {
                 function: "toUInt16".to_owned(),
@@ -359,7 +364,7 @@ impl ExprFunction for CastToUInt32Func {
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let n = to_i64("toUInt32", &a)?;
+        let n = to_i64_via_convert("toUInt32", a)?;
         if n < 0 {
             return Err(FuncError::EvalFailed {
                 function: "toUInt32".to_owned(),
@@ -420,9 +425,25 @@ impl ExprFunction for CastToUInt64Func {
                         reason: format!("negative value {n} cannot be converted to UInt64"),
                     });
                 }
-                Ok(Value::UInt64(n as u64))
+                // Delegate Float64->UInt64 to the type conversion system (truncates toward zero).
+                air_elt_types::convert::convert(
+                    Value::Float64(n),
+                    &DataType::Float64,
+                    &DataType::UInt64,
+                    &cast_context(),
+                )
+                .map_err(|e| convert_error_to_func_error("toUInt64", e))
             }
-            Value::Bool(b) => Ok(Value::UInt64(if b { 1 } else { 0 })),
+            Value::Bool(b) => {
+                // Delegate Bool->UInt64 to the type conversion system.
+                air_elt_types::convert::convert(
+                    Value::Bool(b),
+                    &DataType::Bool,
+                    &DataType::UInt64,
+                    &cast_context(),
+                )
+                .map_err(|e| convert_error_to_func_error("toUInt64", e))
+            }
             Value::Text(s) => {
                 let n: u64 = s.trim().parse().map_err(|_| FuncError::EvalFailed {
                     function: "toUInt64".to_owned(),
@@ -469,7 +490,16 @@ impl ExprFunction for CastToFloat32Func {
         }
         match a {
             Value::Float32(n) => Ok(Value::Float32(n)),
-            Value::Float64(n) => Ok(Value::Float32(n as f32)),
+            Value::Float64(n) => {
+                let src_type = DataType::Float64;
+                air_elt_types::convert::convert(
+                    Value::Float64(n),
+                    &src_type,
+                    &DataType::Float32,
+                    &cast_context(),
+                )
+                .map_err(|e| convert_error_to_func_error("toFloat32", e))
+            }
             Value::Int64(n) => Ok(Value::Float32(n as f32)),
             Value::Text(s) => {
                 let n: f32 = s.trim().parse().map_err(|_| FuncError::EvalFailed {
@@ -612,7 +642,16 @@ impl ExprFunction for CastToDateFunc {
         }
         match a {
             Value::Date(d) => Ok(Value::Date(d)),
-            Value::Timestamp(ts) => Ok(Value::Date(ts.date_naive())),
+            Value::Timestamp(ts) => {
+                // Delegate Timestamp->Date to the type conversion system.
+                air_elt_types::convert::convert(
+                    Value::Timestamp(ts),
+                    &DataType::Timestamp,
+                    &DataType::Date,
+                    &cast_context(),
+                )
+                .map_err(|e| convert_error_to_func_error("toDate", e))
+            }
             Value::Text(s) => {
                 let date = NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").map_err(|e| {
                     FuncError::EvalFailed {
@@ -727,21 +766,17 @@ impl ExprFunction for CastToUuidFunc {
         if a.is_null() {
             return Ok(Value::Null);
         }
-        match a {
-            Value::Uuid(u) => Ok(Value::Uuid(u)),
-            Value::Text(s) => {
-                let id = Uuid::parse_str(s.trim()).map_err(|e| FuncError::EvalFailed {
+        let src_type = a.data_type().unwrap_or(DataType::Text { size: None });
+        air_elt_types::convert::convert(a, &src_type, &DataType::Uuid, &cast_context()).map_err(
+            |e| match e {
+                ConvertError::Unsupported { .. } => FuncError::TypeMismatch {
                     function: "toUuid".to_owned(),
-                    reason: format!("cannot parse {s:?} as UUID: {e}"),
-                })?;
-                Ok(Value::Uuid(id))
-            }
-            other => Err(FuncError::TypeMismatch {
-                function: "toUuid".to_owned(),
-                expected: "Text or Uuid".to_owned(),
-                actual: format!("{:?}", other.data_type()),
-            }),
-        }
+                    expected: "Text or Uuid".to_owned(),
+                    actual: format!("{src_type:?}"),
+                },
+                other => convert_error_to_func_error("toUuid", other),
+            },
+        )
     }
 }
 
@@ -777,8 +812,6 @@ impl ExprFunction for CastToBigIntFunc {
             return Ok(Value::Null);
         }
         match a {
-            Value::BigInt(n) => Ok(Value::BigInt(n)),
-            Value::Int64(n) => Ok(Value::BigInt(BigInt::from(n))),
             Value::Text(s) => {
                 let n: BigInt = s.trim().parse().map_err(|_| FuncError::EvalFailed {
                     function: "toBigInt".to_owned(),
@@ -786,11 +819,21 @@ impl ExprFunction for CastToBigIntFunc {
                 })?;
                 Ok(Value::BigInt(n))
             }
-            other => Err(FuncError::TypeMismatch {
-                function: "toBigInt".to_owned(),
-                expected: "Text, Int64, or BigInt".to_owned(),
-                actual: format!("{:?}", other.data_type()),
-            }),
+            other => {
+                let src_type = other.data_type().unwrap_or(DataType::Text { size: None });
+                let target = DataType::BigInt { width: None };
+                let result =
+                    air_elt_types::convert::convert(other, &src_type, &target, &cast_context());
+                match result {
+                    Ok(v) => Ok(v),
+                    Err(ConvertError::Unsupported { .. }) => Err(FuncError::TypeMismatch {
+                        function: "toBigInt".to_owned(),
+                        expected: "Text, Int64, or BigInt".to_owned(),
+                        actual: format!("{src_type:?}"),
+                    }),
+                    Err(e) => Err(convert_error_to_func_error("toBigInt", e)),
+                }
+            }
         }
     }
 }
@@ -899,22 +942,16 @@ impl ExprFunction for CastToDecimalFunc {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a value to i64 for the narrowing integer casts.
-fn to_i64(function: &str, value: &Value) -> Result<i64, FuncError> {
+/// Convert a value to i64 using the type conversion system where possible,
+/// falling back to text parsing for string inputs.
+///
+/// This delegates to `air_elt_types::convert::convert` for numeric and boolean
+/// inputs (Float→Int64 with truncation, Bool→Int64, identity, etc.), and
+/// handles Text→i64 parsing directly since the conversion system does not
+/// support that path.
+fn to_i64_via_convert(function: &str, value: Value) -> Result<i64, FuncError> {
     match value {
-        Value::Int8(n) => Ok(i64::from(*n)),
-        Value::Int16(n) => Ok(i64::from(*n)),
-        Value::Int32(n) => Ok(i64::from(*n)),
-        Value::Int64(n) => Ok(*n),
-        Value::UInt8(n) => Ok(i64::from(*n)),
-        Value::UInt16(n) => Ok(i64::from(*n)),
-        Value::UInt32(n) => Ok(i64::from(*n)),
-        Value::UInt64(n) => i64::try_from(*n).map_err(|_| FuncError::EvalFailed {
-            function: function.to_owned(),
-            reason: format!("UInt64 value {n} exceeds Int64 range"),
-        }),
-        Value::Float64(n) => Ok(*n as i64),
-        Value::Bool(b) => Ok(if *b { 1 } else { 0 }),
+        Value::Int64(n) => Ok(n),
         Value::Text(s) => {
             let n: i64 = s.trim().parse().map_err(|_| FuncError::EvalFailed {
                 function: function.to_owned(),
@@ -922,11 +959,28 @@ fn to_i64(function: &str, value: &Value) -> Result<i64, FuncError> {
             })?;
             Ok(n)
         }
-        other => Err(FuncError::TypeMismatch {
-            function: function.to_owned(),
-            expected: "numeric, Bool, or Text".to_owned(),
-            actual: format!("{:?}", other.data_type()),
-        }),
+        other => {
+            let src_type = other.data_type().unwrap_or(DataType::Text { size: None });
+            let result = air_elt_types::convert::convert(
+                other,
+                &src_type,
+                &DataType::Int64,
+                &cast_context(),
+            );
+            match result {
+                Ok(Value::Int64(n)) => Ok(n),
+                Ok(_) => Err(FuncError::EvalFailed {
+                    function: function.to_owned(),
+                    reason: "unexpected conversion result".to_owned(),
+                }),
+                Err(ConvertError::Unsupported { .. }) => Err(FuncError::TypeMismatch {
+                    function: function.to_owned(),
+                    expected: "numeric, Bool, or Text".to_owned(),
+                    actual: format!("{src_type:?}"),
+                }),
+                Err(e) => Err(convert_error_to_func_error(function, e)),
+            }
+        }
     }
 }
 
@@ -1004,8 +1058,8 @@ mod tests {
 
     fn ctx() -> EvalContext {
         EvalContext {
-            env_resolver: Arc::new(crate::tests::EmptyEnv),
-            file_resolver: Arc::new(crate::tests::NoopFiles),
+            env_resolver: Arc::new(crate::test_support::EmptyEnv),
+            file_resolver: Arc::new(crate::test_support::NoopFiles),
             now: chrono::Utc::now(),
             base_dir: PathBuf::new(),
         }
@@ -1436,4 +1490,21 @@ mod tests {
     }
 
     use chrono::Datelike;
+
+    // --- Allocation optimization tests ---
+
+    #[test]
+    fn to_string_cast_passthrough() {
+        let input = Value::Text("passthrough".to_owned());
+        let ptr_before = match &input {
+            Value::Text(s) => s.as_ptr(),
+            _ => unreachable!(),
+        };
+        let result = CAST_TO_STRING.evaluate(vec![input], &ctx()).unwrap();
+        let ptr_after = match &result {
+            Value::Text(s) => s.as_ptr(),
+            _ => unreachable!(),
+        };
+        assert_eq!(ptr_before, ptr_after);
+    }
 }
