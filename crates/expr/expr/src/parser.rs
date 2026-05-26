@@ -340,7 +340,7 @@ impl Parser {
     }
 
     fn parse_mul_expr(&mut self) -> Result<Expr, ExprError> {
-        let mut left = self.parse_unary_expr()?;
+        let mut left = self.parse_power_expr()?;
 
         loop {
             let operator_name = match self.peek() {
@@ -351,7 +351,7 @@ impl Parser {
             };
 
             self.advance();
-            let right = self.parse_unary_expr()?;
+            let right = self.parse_power_expr()?;
             self.count_node()?;
             left = Expr::FunctionCall {
                 name: operator_name.to_string(),
@@ -360,6 +360,22 @@ impl Parser {
         }
 
         Ok(left)
+    }
+
+    fn parse_power_expr(&mut self) -> Result<Expr, ExprError> {
+        let base = self.parse_unary_expr()?;
+
+        if *self.peek() == Token::Power {
+            self.advance();
+            let exponent = self.parse_power_expr()?;
+            self.count_node()?;
+            return Ok(Expr::FunctionCall {
+                name: "power".to_string(),
+                args: vec![base, exponent],
+            });
+        }
+
+        Ok(base)
     }
 
     fn parse_unary_expr(&mut self) -> Result<Expr, ExprError> {

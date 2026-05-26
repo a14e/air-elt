@@ -121,7 +121,7 @@ impl DynValue for ChInt256Value {
         self
     }
 
-    fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+    fn is_equal(&self, other: &dyn DynValue) -> bool {
         other
             .as_any()
             .downcast_ref::<ChInt256Value>()
@@ -265,7 +265,7 @@ impl DynValue for ChUInt256Value {
         self
     }
 
-    fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+    fn is_equal(&self, other: &dyn DynValue) -> bool {
         other
             .as_any()
             .downcast_ref::<ChUInt256Value>()

@@ -605,7 +605,6 @@ mod tests {
     use super::*;
     use crate::convert::ConvertError;
     use crate::convert::context::ConversionContext;
-    use crate::default_value::DefaultParseError;
     use crate::value::Value;
 
     /// Test-only Custom type with `cursor_compatible = true` so `cursor_compatible`
@@ -646,7 +645,7 @@ mod tests {
         ) -> Result<Value, ConvertError> {
             unimplemented!()
         }
-        fn parse_default(&self, _lit: &toml::Value) -> Result<Option<Value>, DefaultParseError> {
+        fn parse_default(&self, _lit: &toml::Value) -> Result<Option<Value>, String> {
             Ok(None)
         }
         fn clone_box(&self) -> Box<dyn DynType> {
@@ -876,7 +875,7 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn Any> {
             self
         }
-        fn eq_dyn(&self, other: &dyn crate::dynamic::DynValue) -> bool {
+        fn is_equal(&self, other: &dyn crate::dynamic::DynValue) -> bool {
             other
                 .as_any()
                 .downcast_ref::<DecodableValue>()

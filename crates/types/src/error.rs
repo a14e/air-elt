@@ -1,4 +1,24 @@
+use std::fmt;
+
 use thiserror::Error;
+
+/// Error constructing a [`Key`](crate::Key) from a [`Value`](crate::Value).
+#[derive(Debug, Clone)]
+pub enum KeyError {
+    UnsupportedType(&'static str),
+    EmptyComposite,
+}
+
+impl fmt::Display for KeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KeyError::UnsupportedType(kind) => write!(f, "unsupported key type: {kind}"),
+            KeyError::EmptyComposite => f.write_str("composite key must have at least one element"),
+        }
+    }
+}
+
+impl std::error::Error for KeyError {}
 
 /// Errors produced by `value_to_json` and the source-side body-fill
 /// path.

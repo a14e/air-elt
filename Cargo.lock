@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-app"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-commons-mongodb",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-commons"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "iso8601-duration",
  "serde",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-commons-clickhouse"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ahash",
  "air-elt-commons",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-commons-mongodb"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ahash",
  "air-elt-commons",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-commons-mysql"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-core",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-commons-pg"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-core",
@@ -163,7 +163,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-commons-questdb"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-core",
@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-commons-testing"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-commons-questdb",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ahash",
  "air-elt-commons",
@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-expr"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ahash",
  "air-elt-commons",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-expr-funcs"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ahash",
  "air-elt-commons",
@@ -260,6 +260,7 @@ dependencies = [
  "air-elt-types",
  "base64 0.22.1",
  "bigdecimal",
+ "ch_cityhash102",
  "chrono",
  "encoding_rs",
  "hex",
@@ -285,10 +286,9 @@ dependencies = [
 
 [[package]]
 name = "air-elt-expr-types"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ahash",
- "air-elt-commons",
  "air-elt-types",
  "proptest",
  "serde",
@@ -298,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-monitoring"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ahash",
  "air-elt-commons",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-self-lint"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "regex",
@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-sink-clickhouse"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-commons-clickhouse",
@@ -351,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-sink-mongodb"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-commons-mongodb",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-sink-mysql"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-commons-mysql",
@@ -388,7 +388,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-sink-postgres"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-commons-pg",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-sink-questdb"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-commons-questdb",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-source-mongo-cdc"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ahash",
  "air-elt-commons",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-source-mongodb"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ahash",
  "air-elt-commons",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-source-mysql"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-commons-mysql",
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-source-postgres"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-commons-pg",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-storage-mongodb"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-commons-mongodb",
@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-storage-mysql"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-commons-mongodb",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-storage-postgres"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "air-elt-commons",
  "air-elt-commons-mongodb",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "air-elt-types"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ahash",
  "base64 0.22.1",
@@ -598,6 +598,7 @@ dependencies = [
  "quick-xml",
  "serde",
  "serde_json",
+ "smallvec",
  "test-strategy",
  "thiserror",
  "toml",
@@ -1043,6 +1044,12 @@ name = "cfg_aliases"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+
+[[package]]
+name = "ch_cityhash102"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1eb857418fd28c9e70581e1ec52450a3ad6564e1d83f1806450a5128dadbf927"
 
 [[package]]
 name = "chacha20"

@@ -15,7 +15,6 @@ use air_elt_core::error::JsonEncodeError;
 use air_elt_core::types::convert::ConvertError;
 use air_elt_core::types::convert::context::ConversionContext;
 use air_elt_core::types::data_type::DataType;
-use air_elt_core::types::default_value::DefaultParseError;
 use air_elt_core::types::dynamic::{DynType, DynValue};
 use air_elt_core::types::value::Value;
 
@@ -98,12 +97,10 @@ impl DynType for ChInt128Type {
         }
     }
 
-    fn parse_default(&self, literal: &toml::Value) -> Result<Option<Value>, DefaultParseError> {
+    fn parse_default(&self, literal: &toml::Value) -> Result<Option<Value>, String> {
         let n = literal
             .as_integer()
-            .ok_or(DefaultParseError::TypeMismatch {
-                dst: DataType::Custom(Box::new(*self)),
-            })?;
+            .ok_or_else(|| "expected integer literal for Int128 default".to_owned())?;
         Ok(Some(Value::Custom(Box::new(ChInt128Value(i128::from(n))))))
     }
 
@@ -128,7 +125,7 @@ impl DynValue for ChInt128Value {
         self
     }
 
-    fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+    fn is_equal(&self, other: &dyn DynValue) -> bool {
         other
             .as_any()
             .downcast_ref::<ChInt128Value>()
@@ -253,15 +250,12 @@ impl DynType for ChUInt128Type {
         }
     }
 
-    fn parse_default(&self, literal: &toml::Value) -> Result<Option<Value>, DefaultParseError> {
+    fn parse_default(&self, literal: &toml::Value) -> Result<Option<Value>, String> {
         let n = literal
             .as_integer()
-            .ok_or(DefaultParseError::TypeMismatch {
-                dst: DataType::Custom(Box::new(*self)),
-            })?;
-        let v = u128::try_from(n).map_err(|_| DefaultParseError::TypeMismatch {
-            dst: DataType::Custom(Box::new(*self)),
-        })?;
+            .ok_or_else(|| "expected integer literal for UInt128 default".to_owned())?;
+        let v = u128::try_from(n)
+            .map_err(|_| format!("value {n} is negative or out of range for UInt128"))?;
         Ok(Some(Value::Custom(Box::new(ChUInt128Value(v)))))
     }
 
@@ -286,7 +280,7 @@ impl DynValue for ChUInt128Value {
         self
     }
 
-    fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+    fn is_equal(&self, other: &dyn DynValue) -> bool {
         other
             .as_any()
             .downcast_ref::<ChUInt128Value>()

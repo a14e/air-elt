@@ -286,7 +286,7 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
             self
         }
-        fn eq_dyn(&self, _: &dyn DynValue) -> bool {
+        fn is_equal(&self, _: &dyn DynValue) -> bool {
             true
         }
         fn clone_box(&self) -> Box<dyn DynValue> {
@@ -318,7 +318,7 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
             self
         }
-        fn eq_dyn(&self, _: &dyn DynValue) -> bool {
+        fn is_equal(&self, _: &dyn DynValue) -> bool {
             true
         }
         fn clone_box(&self) -> Box<dyn DynValue> {

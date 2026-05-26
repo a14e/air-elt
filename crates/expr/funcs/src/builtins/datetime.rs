@@ -3,6 +3,7 @@ use chrono::{DateTime, Datelike, Duration, Months, Timelike, Utc};
 use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::{DataType, Value};
 
+use super::arg_extract::extract_int64;
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
 use crate::signature::{EvalContext, ExprFunction};
@@ -108,17 +109,6 @@ fn extract_timestamp(val: Value, func: &str) -> Result<DateTime<Utc>, FuncError>
         _ => Err(FuncError::TypeMismatch {
             function: func.to_owned(),
             expected: "Timestamp or Date".to_owned(),
-            actual: format!("{:?}", val.data_type()),
-        }),
-    }
-}
-
-fn extract_int(val: Value, func: &str) -> Result<i64, FuncError> {
-    match val {
-        Value::Int64(n) => Ok(n),
-        _ => Err(FuncError::TypeMismatch {
-            function: func.to_owned(),
-            expected: "Int64".to_owned(),
             actual: format!("{:?}", val.data_type()),
         }),
     }
@@ -353,7 +343,7 @@ impl ExprFunction for FromSecondsFunc {
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let secs = extract_int(a, "fromSeconds")?;
+        let secs = extract_int64(a, "fromSeconds")?;
         let dt = DateTime::from_timestamp(secs, 0).ok_or_else(|| FuncError::EvalFailed {
             function: "fromSeconds".to_owned(),
             reason: format!("timestamp {secs}s is out of range"),
@@ -386,7 +376,7 @@ impl ExprFunction for FromMillisFunc {
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let millis = extract_int(a, "fromMillis")?;
+        let millis = extract_int64(a, "fromMillis")?;
         let dt = DateTime::from_timestamp_millis(millis).ok_or_else(|| FuncError::EvalFailed {
             function: "fromMillis".to_owned(),
             reason: format!("timestamp {millis}ms is out of range"),
@@ -436,7 +426,7 @@ macro_rules! duration_arithmetic_func {
                     return Ok(Value::Null);
                 }
                 let dt = extract_timestamp(a, $func_name)?;
-                let n = extract_int(b, $func_name)?;
+                let n = extract_int64(b, $func_name)?;
                 let make_duration: fn(i64) -> Option<Duration> = $duration_fn;
                 let dur = make_duration(n).ok_or_else(|| FuncError::EvalFailed {
                     function: $func_name.to_owned(),
@@ -491,7 +481,7 @@ macro_rules! duration_subtract_func {
                     return Ok(Value::Null);
                 }
                 let dt = extract_timestamp(a, $func_name)?;
-                let n = extract_int(b, $func_name)?;
+                let n = extract_int64(b, $func_name)?;
                 let make_duration: fn(i64) -> Option<Duration> = $duration_fn;
                 let dur = make_duration(n).ok_or_else(|| FuncError::EvalFailed {
                     function: $func_name.to_owned(),
@@ -564,7 +554,7 @@ impl ExprFunction for AddMonthsFunc {
             return Ok(Value::Null);
         }
         let dt = extract_timestamp(a, "addMonths")?;
-        let n = extract_int(b, "addMonths")?;
+        let n = extract_int64(b, "addMonths")?;
         add_months_to_dt(dt, n, "addMonths")
     }
 }
@@ -597,7 +587,7 @@ impl ExprFunction for SubtractMonthsFunc {
             return Ok(Value::Null);
         }
         let dt = extract_timestamp(a, "subtractMonths")?;
-        let n = extract_int(b, "subtractMonths")?;
+        let n = extract_int64(b, "subtractMonths")?;
         subtract_months_from_dt(dt, n, "subtractMonths")
     }
 }
@@ -630,7 +620,7 @@ impl ExprFunction for AddYearsFunc {
             return Ok(Value::Null);
         }
         let dt = extract_timestamp(a, "addYears")?;
-        let n = extract_int(b, "addYears")?;
+        let n = extract_int64(b, "addYears")?;
         let months = n.checked_mul(12).ok_or_else(|| FuncError::EvalFailed {
             function: "addYears".to_owned(),
             reason: format!("year value {n} overflows when converted to months"),
@@ -667,7 +657,7 @@ impl ExprFunction for SubtractYearsFunc {
             return Ok(Value::Null);
         }
         let dt = extract_timestamp(a, "subtractYears")?;
-        let n = extract_int(b, "subtractYears")?;
+        let n = extract_int64(b, "subtractYears")?;
         let months = n.checked_mul(12).ok_or_else(|| FuncError::EvalFailed {
             function: "subtractYears".to_owned(),
             reason: format!("year value {n} overflows when converted to months"),

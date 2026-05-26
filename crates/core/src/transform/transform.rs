@@ -15,7 +15,9 @@
 use crate::error::{RuntimeError, RuntimeResult, ValidationError};
 use crate::model::ColumnConversionPlan;
 use crate::model::{Batch, Row, Schema};
-use crate::transform::switch::{SwitchKey, SwitchTable};
+use air_elt_types::Key;
+
+use crate::transform::switch::SwitchTable;
 use crate::types::Value;
 use crate::types::convert::convert;
 use crate::types::data_type::DataType;
@@ -58,7 +60,7 @@ pub enum TransformOp {
         truncate: bool,
     },
     /// Value-to-value lookup. Evaluates `input` to a source value,
-    /// hashes it through [`SwitchKey::from_value`], and either returns
+    /// hashes it through [`Key::from_value`], and either returns
     /// the matched value or `table.default` on miss / NULL input. The
     /// `truncate` flag is opaque to the runtime — it travels with the
     /// op so the same compatibility opt-in is visible alongside the
@@ -340,7 +342,7 @@ impl Transform {
                 if matches!(v, Value::Null) {
                     return Ok(table.default.as_ref().cloned().unwrap_or(Value::Null));
                 }
-                let Some(key) = SwitchKey::from_value(&v) else {
+                let Some(key) = Key::from_value(&v) else {
                     return Err(RuntimeError::DerivedPlanInvariant {
                         detail: format!(
                             "Transform::Switch: source value {v:?} cannot produce a canonical \
@@ -770,7 +772,7 @@ mod tests {
 
     fn switch_table_with<I>(cases: I, default: Option<Value>) -> SwitchTable
     where
-        I: IntoIterator<Item = (SwitchKey, Value)>,
+        I: IntoIterator<Item = (Key, Value)>,
     {
         let mut m = ahash::AHashMap::new();
         for (k, v) in cases {
@@ -792,11 +794,11 @@ mod tests {
         let table = switch_table_with(
             [
                 (
-                    SwitchKey::Text("ACTIVE".into()),
+                    Key::single(Value::Text("ACTIVE".into())).unwrap(),
                     Value::Text("active".into()),
                 ),
                 (
-                    SwitchKey::Text("FINISHED".into()),
+                    Key::single(Value::Text("FINISHED".into())).unwrap(),
                     Value::Text("finished".into()),
                 ),
             ],
@@ -819,7 +821,7 @@ mod tests {
     fn switch_miss_returns_default() {
         let table = switch_table_with(
             [(
-                SwitchKey::Text("ACTIVE".into()),
+                Key::single(Value::Text("ACTIVE".into())).unwrap(),
                 Value::Text("active".into()),
             )],
             Some(Value::Text("unknown".into())),
@@ -841,7 +843,7 @@ mod tests {
     fn switch_miss_without_default_returns_null() {
         let table = switch_table_with(
             [(
-                SwitchKey::Text("ACTIVE".into()),
+                Key::single(Value::Text("ACTIVE".into())).unwrap(),
                 Value::Text("active".into()),
             )],
             None,
@@ -863,7 +865,7 @@ mod tests {
     fn switch_null_source_returns_default() {
         let table = switch_table_with(
             [(
-                SwitchKey::Text("ACTIVE".into()),
+                Key::single(Value::Text("ACTIVE".into())).unwrap(),
                 Value::Text("active".into()),
             )],
             Some(Value::Text("unknown".into())),
@@ -885,7 +887,7 @@ mod tests {
     fn switch_null_source_without_default_returns_null() {
         let table = switch_table_with(
             [(
-                SwitchKey::Text("ACTIVE".into()),
+                Key::single(Value::Text("ACTIVE".into())).unwrap(),
                 Value::Text("active".into()),
             )],
             None,
@@ -909,7 +911,10 @@ mod tests {
     #[test]
     fn last_take_absorb_through_switch() {
         let table = switch_table_with(
-            [(SwitchKey::Int(1), Value::Text("one".into()))],
+            [(
+                Key::single(Value::Int64(1)).unwrap(),
+                Value::Text("one".into()),
+            )],
             Some(Value::Text("unknown".into())),
         );
         let t = Transform::new(
@@ -942,11 +947,17 @@ mod tests {
     }
 
     /// Integer-subtype canonicalisation must hold at runtime too: an
-    /// operator-written `1` (compiled as `SwitchKey::Int(1)`) must match
+    /// operator-written `1` (compiled as `Key::single(Value::Int64(1))`) must match
     /// a `Value::Int64(1)` source.
     #[test]
     fn switch_cross_int_subtype_hit() {
-        let table = switch_table_with([(SwitchKey::Int(1), Value::Text("one".into()))], None);
+        let table = switch_table_with(
+            [(
+                Key::single(Value::Int64(1)).unwrap(),
+                Value::Text("one".into()),
+            )],
+            None,
+        );
         let t = Transform::new(
             vec![TransformOp::Switch {
                 input: Box::new(TransformOp::Take { source_index: 0 }),
@@ -1023,10 +1034,10 @@ mod tests {
     /// source DataType the dispatcher cannot canonicalise (Json).
     #[test]
     fn output_type_switch_rejects_unswitchable_source() {
-        use crate::transform::{SwitchKey, SwitchTable};
+        use crate::transform::SwitchTable;
         let table = SwitchTable {
             cases: ahash::AHashMap::from_iter([(
-                SwitchKey::Text("x".into()),
+                Key::single(Value::Text("x".into())).unwrap(),
                 Value::Text("y".into()),
             )]),
             default: None,

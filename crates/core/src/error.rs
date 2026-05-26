@@ -200,12 +200,11 @@ pub enum ValidationError {
     )]
     SwitchMissingDefaultForNotNullSink { flow: String, column: String },
 
-    #[error("field {column:?}: failed to parse default literal: {source}")]
-    DefaultParse {
+    #[error("flow {flow:?} field {column:?}: default value error: {reason}")]
+    DefaultEval {
         flow: String,
         column: String,
-        #[source]
-        source: crate::types::default_value::DefaultParseError,
+        reason: String,
     },
 
     #[error(

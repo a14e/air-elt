@@ -38,12 +38,18 @@ pub fn eval_interpolated(
     let mut result = String::new();
     let bytes = input.as_bytes();
     let mut i = 0;
+    let mut literal_start = 0;
 
     while i < bytes.len() {
         if bytes[i] == b'{' {
+            if literal_start < i {
+                result.push_str(&input[literal_start..i]);
+            }
+
             if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
                 result.push('{');
                 i += 2;
+                literal_start = i;
                 continue;
             }
 
@@ -68,14 +74,30 @@ pub fn eval_interpolated(
             let expr_source = &input[start..j];
             let value = eval_expression(expr_source, registry, context)?;
             result.push_str(&value_to_string(&value));
+            if result.len() > air_elt_expr_types::limits::MAX_EXPR_STRING_BYTES {
+                return Err(ExprError::Function(
+                    air_elt_expr_funcs::FuncError::StringTooLarge {
+                        len: result.len(),
+                        max: air_elt_expr_types::limits::MAX_EXPR_STRING_BYTES,
+                    },
+                ));
+            }
             i = j + 1;
+            literal_start = i;
         } else if bytes[i] == b'}' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
+            if literal_start < i {
+                result.push_str(&input[literal_start..i]);
+            }
             result.push('}');
             i += 2;
+            literal_start = i;
         } else {
-            result.push(bytes[i] as char);
             i += 1;
         }
+    }
+
+    if literal_start < bytes.len() {
+        result.push_str(&input[literal_start..]);
     }
 
     Ok(result)
@@ -221,13 +243,29 @@ impl<'a> Evaluator<'a> {
             ConditionalExpr::And { left, right } => {
                 let left_val = self.eval_expr(left)?;
                 match left_val {
-                    Value::Null => Value::Null,
                     Value::Bool(false) => Value::Bool(false),
                     Value::Bool(true) => {
                         let right_val = self.eval_expr(right)?;
                         match right_val {
                             Value::Null => Value::Null,
                             Value::Bool(b) => Value::Bool(b),
+                            other => {
+                                return Err(ExprError::Function(
+                                    air_elt_expr_funcs::FuncError::TypeMismatch {
+                                        function: "and".to_owned(),
+                                        expected: "Bool".to_owned(),
+                                        actual: format!("{:?}", other.data_type()),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    Value::Null => {
+                        // SQL three-valued: NULL AND FALSE = FALSE, NULL AND TRUE/NULL = NULL
+                        let right_val = self.eval_expr(right)?;
+                        match right_val {
+                            Value::Bool(false) => Value::Bool(false),
+                            Value::Bool(true) | Value::Null => Value::Null,
                             other => {
                                 return Err(ExprError::Function(
                                     air_elt_expr_funcs::FuncError::TypeMismatch {
@@ -253,13 +291,29 @@ impl<'a> Evaluator<'a> {
             ConditionalExpr::Or { left, right } => {
                 let left_val = self.eval_expr(left)?;
                 match left_val {
-                    Value::Null => Value::Null,
                     Value::Bool(true) => Value::Bool(true),
                     Value::Bool(false) => {
                         let right_val = self.eval_expr(right)?;
                         match right_val {
                             Value::Null => Value::Null,
                             Value::Bool(b) => Value::Bool(b),
+                            other => {
+                                return Err(ExprError::Function(
+                                    air_elt_expr_funcs::FuncError::TypeMismatch {
+                                        function: "or".to_owned(),
+                                        expected: "Bool".to_owned(),
+                                        actual: format!("{:?}", other.data_type()),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    Value::Null => {
+                        // SQL three-valued: NULL OR TRUE = TRUE, NULL OR FALSE/NULL = NULL
+                        let right_val = self.eval_expr(right)?;
+                        match right_val {
+                            Value::Bool(true) => Value::Bool(true),
+                            Value::Bool(false) | Value::Null => Value::Null,
                             other => {
                                 return Err(ExprError::Function(
                                     air_elt_expr_funcs::FuncError::TypeMismatch {
@@ -301,6 +355,14 @@ impl<'a> Evaluator<'a> {
                     result.push_str(&value_to_string(&value));
                 }
             }
+            if result.len() > air_elt_expr_types::limits::MAX_EXPR_STRING_BYTES {
+                return Err(ExprError::Function(
+                    air_elt_expr_funcs::FuncError::StringTooLarge {
+                        len: result.len(),
+                        max: air_elt_expr_types::limits::MAX_EXPR_STRING_BYTES,
+                    },
+                ));
+            }
         }
         Ok(Value::Text(result))
     }
@@ -309,7 +371,8 @@ impl<'a> Evaluator<'a> {
         let mut map = serde_json::Map::with_capacity(entries.len());
         for (key, value_expr) in entries {
             let value = self.eval_expr(value_expr)?;
-            map.insert(key.clone(), value_to_json(&value));
+            let json_val = air_elt_types::value_to_json(&value).unwrap_or(serde_json::Value::Null);
+            map.insert(key.clone(), json_val);
         }
         Ok(Value::Json(serde_json::Value::Object(map)))
     }
@@ -352,50 +415,16 @@ fn value_to_string(value: &Value) -> String {
         Value::Object(entries) => {
             let map: serde_json::Map<String, serde_json::Value> = entries
                 .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(value_to_string(v))))
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        air_elt_types::value_to_json(v).unwrap_or(serde_json::Value::Null),
+                    )
+                })
                 .collect();
             serde_json::Value::Object(map).to_string()
         }
         Value::Custom(v) => format!("{v:?}"),
-    }
-}
-
-fn value_to_json(value: &Value) -> serde_json::Value {
-    match value {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Int8(v) => serde_json::Value::Number((*v as i64).into()),
-        Value::Int16(v) => serde_json::Value::Number((*v as i64).into()),
-        Value::Int32(v) => serde_json::Value::Number((*v as i64).into()),
-        Value::Int64(v) => serde_json::Value::Number((*v).into()),
-        Value::UInt8(v) => serde_json::Value::Number((*v as u64).into()),
-        Value::UInt16(v) => serde_json::Value::Number((*v as u64).into()),
-        Value::UInt32(v) => serde_json::Value::Number((*v as u64).into()),
-        Value::UInt64(v) => serde_json::Value::Number((*v).into()),
-        Value::Float32(v) => serde_json::Number::from_f64(*v as f64)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        Value::Float64(v) => serde_json::Number::from_f64(*v)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        Value::Text(s) => serde_json::Value::String(s.clone()),
-        Value::BigInt(v) => serde_json::Value::String(v.to_string()),
-        Value::Decimal(v) => serde_json::Value::String(v.to_string()),
-        Value::Uuid(v) => serde_json::Value::String(v.to_string()),
-        Value::Date(d) => serde_json::Value::String(d.to_string()),
-        Value::Timestamp(t) => serde_json::Value::String(t.to_rfc3339()),
-        Value::Bytes(b) => serde_json::Value::String(format!("{b:?}")),
-        Value::Ipv4(v) => serde_json::Value::String(v.to_string()),
-        Value::Ipv6(v) => serde_json::Value::String(v.to_string()),
-        Value::Json(v) => v.clone(),
-        Value::Object(entries) => {
-            let map: serde_json::Map<String, serde_json::Value> = entries
-                .iter()
-                .map(|(k, v)| (k.clone(), value_to_json(v)))
-                .collect();
-            serde_json::Value::Object(map)
-        }
-        Value::Custom(v) => serde_json::Value::String(format!("{v:?}")),
     }
 }
 
@@ -770,5 +799,89 @@ mod tests {
     fn null_if_basic() {
         assert_eq!(eval("nullIf(1, 1)").unwrap(), Value::Null);
         assert_eq!(eval("nullIf(1, 2)").unwrap(), Value::Int64(1));
+    }
+
+    #[test]
+    fn interpolation_non_ascii() {
+        let registry = FunctionRegistry::with_builtins();
+        let ctx = test_context();
+        let result = eval_interpolated("Привет {1 + 1} мир", &registry, &ctx).unwrap();
+        assert_eq!(result, "Привет 2 мир");
+    }
+
+    #[test]
+    fn interpolation_emoji() {
+        let registry = FunctionRegistry::with_builtins();
+        let ctx = test_context();
+        let result = eval_interpolated("🎉{42}🎊", &registry, &ctx).unwrap();
+        assert_eq!(result, "🎉42🎊");
+    }
+
+    #[test]
+    fn or_null_true_is_true() {
+        // SQL three-valued logic: NULL OR TRUE = TRUE
+        let result = eval("null || true").unwrap();
+        assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
+    fn or_null_false_is_null() {
+        // SQL three-valued logic: NULL OR FALSE = NULL
+        let result = eval("null || false").unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn or_null_null_is_null() {
+        let result = eval("null || null").unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn and_null_false_is_false() {
+        // SQL three-valued logic: NULL AND FALSE = FALSE
+        let result = eval("null && false").unwrap();
+        assert_eq!(result, Value::Bool(false));
+    }
+
+    #[test]
+    fn and_null_true_is_null() {
+        // SQL three-valued logic: NULL AND TRUE = NULL
+        let result = eval("null && true").unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn power_operator_basic() {
+        let result = eval("2 ** 3").unwrap();
+        assert_eq!(result, Value::Int64(8));
+    }
+
+    #[test]
+    fn power_operator_right_associative() {
+        // 2 ** 3 ** 2 = 2 ** (3 ** 2) = 2 ** 9 = 512
+        let result = eval("2 ** 3 ** 2").unwrap();
+        assert_eq!(result, Value::Int64(512));
+    }
+
+    #[test]
+    fn replace_all_occurrences() {
+        let result = eval("replace('aaa', 'a', 'b')").unwrap();
+        assert_eq!(result, Value::Text("bbb".to_owned()));
+    }
+
+    #[test]
+    fn interpolation_size_cap_rejects_oversized_result() {
+        let input = "{repeat('x', 600000)}{repeat('y', 600000)}";
+        let registry = air_elt_expr_funcs::FunctionRegistry::with_builtins();
+        let ctx = test_context();
+        let err = eval_interpolated(input, &registry, &ctx).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ExprError::Function(air_elt_expr_funcs::FuncError::StringTooLarge { .. })
+            ),
+            "expected StringTooLarge, got {err:?}"
+        );
     }
 }

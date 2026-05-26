@@ -52,7 +52,7 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
         // Two distinct custom types — only `eq_dyn` knows whether
         // they actually represent the same descriptor (parametric
         // types may differ structurally).
-        return a.eq_dyn(&**b);
+        return a.is_equal(&**b);
     }
     if let Custom(a) = &source_t {
         return a.can_convert_to(&sink_t, false);
@@ -233,7 +233,7 @@ pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool
     // (custom types decide their own narrowing rules through
     // `can_convert_to` / `can_construct_from`).
     if let (Custom(a), Custom(b)) = (&source_t, &sink_t) {
-        return a.eq_dyn(&**b);
+        return a.is_equal(&**b);
     }
     if let Custom(a) = &source_t {
         return a.can_convert_to(&sink_t, true);

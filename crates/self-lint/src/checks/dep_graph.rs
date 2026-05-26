@@ -58,6 +58,7 @@ impl Check for DepGraphCheck {
                             | CrateCategory::Sink
                             | CrateCategory::Storage
                             | CrateCategory::App
+                            | CrateCategory::CommonsDb
                     ),
                     CrateCategory::CommonsDb | CrateCategory::CommonsTesting => matches!(
                         target_category,

@@ -24,7 +24,7 @@ After a compaction, assume skills are not loaded — load them again before star
 * Every change (except tests and metrics) must come with tests.
 * Always run tests after the work is done.
 * All library versions must be pinned explicitly.
-* Avoid git operations on update.
+* Avoid git operations on update. After completing the task, stage changes but do not commit.
 * Human-facing instructions live in `README.md`.
 * Agent tasks live in `agent_tasks/`. (Only human can write to this dir. You can write there only if user asks you)
 * If Docker is unavailable, check podman; prefer podman.
@@ -49,6 +49,7 @@ After a compaction, assume skills are not loaded — load them again before star
 * **Bump the workspace patch version after each task** via `just bump-patch`. Minor version — only for backward-incompatible changes. Major version — only by the user's decision.
 * **Adding a new workspace crate.** Source/sink/storage crates are auto-covered by the structural linter (dep-graph, registry, traits checks). For any other crate type, ask the user which self-lint rules should apply and update `crates/self-lint/src/checks/dep_graph.rs` with the new category and constraints.
 * **Non-English text.** If the structural linter flags non-Latin characters, translate the offending text to English before committing.
+
 
 ## Development commands
 

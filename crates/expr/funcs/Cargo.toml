@@ -15,6 +15,7 @@ air-elt-types = { workspace = true }
 air-elt-commons = { workspace = true }
 ahash = { workspace = true }
 base64 = { workspace = true }
+ch_cityhash102 = { workspace = true }
 bigdecimal = { workspace = true }
 chrono = { workspace = true }
 encoding_rs = { workspace = true }

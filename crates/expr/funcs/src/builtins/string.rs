@@ -13,7 +13,6 @@ static UPPER: UpperFunc = UpperFunc;
 static LOWER: LowerFunc = LowerFunc;
 static TRIM: TrimFunc = TrimFunc;
 static REPLACE: ReplaceFunc = ReplaceFunc;
-static REPLACE_ALL: ReplaceAllFunc = ReplaceAllFunc;
 static STARTS_WITH: StartsWithFunc = StartsWithFunc;
 static ENDS_WITH: EndsWithFunc = EndsWithFunc;
 static CONTAINS: ContainsFunc = ContainsFunc;
@@ -34,7 +33,6 @@ pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&LOWER);
     registry.register(&TRIM);
     registry.register(&REPLACE);
-    registry.register(&REPLACE_ALL);
     registry.register(&STARTS_WITH);
     registry.register(&ENDS_WITH);
     registry.register(&CONTAINS);
@@ -679,46 +677,6 @@ impl ExprFunction for ToStringFunc {
     }
 }
 
-struct ReplaceAllFunc;
-
-impl ExprFunction for ReplaceAllFunc {
-    fn name(&self) -> &str {
-        "replaceAll"
-    }
-
-    fn min_args(&self) -> usize {
-        3
-    }
-
-    fn max_args(&self) -> Option<usize> {
-        Some(3)
-    }
-
-    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        let nullable = args.iter().any(|a| a.nullable);
-        Ok(NullableExprType::new(
-            DataType::Text { size: None },
-            nullable,
-        ))
-    }
-
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let replacement = args.remove(2);
-        let pattern = args.remove(1);
-        let source = args.remove(0);
-        if source.is_null() || pattern.is_null() || replacement.is_null() {
-            return Ok(Value::Null);
-        }
-        let s = extract_text(source, "replaceAll")?;
-        let pat = extract_text(pattern, "replaceAll")?;
-        let rep = extract_text(replacement, "replaceAll")?;
-        if !s.contains(pat.as_str()) {
-            return Ok(Value::Text(s));
-        }
-        Ok(Value::Text(s.replace(&pat, &rep)))
-    }
-}
-
 struct ReverseFunc;
 
 impl ExprFunction for ReverseFunc {
@@ -1021,20 +979,8 @@ fn format_value(val: &Value) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::signature::EvalContext;
-    use std::path::PathBuf;
-
-    fn ctx() -> EvalContext {
-        EvalContext {
-            env_resolver: Arc::new(crate::test_support::EmptyEnv),
-            file_resolver: Arc::new(crate::test_support::NoopFiles),
-            now: chrono::Utc::now(),
-            base_dir: PathBuf::new(),
-        }
-    }
+    use crate::test_support::ctx;
 
     #[test]
     fn concat_basic() {
@@ -1366,22 +1312,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, Value::Text("hi...".into()));
-    }
-
-    #[test]
-    fn replace_all_basic() {
-        let f = ReplaceAllFunc;
-        let result = f
-            .evaluate(
-                vec![
-                    Value::Text("aabbcc".into()),
-                    Value::Text("b".into()),
-                    Value::Text("x".into()),
-                ],
-                &ctx(),
-            )
-            .unwrap();
-        assert_eq!(result, Value::Text("aaxxcc".into()));
     }
 
     // --- Allocation optimization tests ---

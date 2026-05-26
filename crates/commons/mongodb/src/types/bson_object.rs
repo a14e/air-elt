@@ -166,7 +166,7 @@ impl DynValue for BsonObjectValue {
         self
     }
 
-    fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+    fn is_equal(&self, other: &dyn DynValue) -> bool {
         other
             .as_any()
             .downcast_ref::<BsonObjectValue>()
@@ -303,15 +303,15 @@ mod tests {
         let a: Box<dyn DynValue> = Box::new(BsonObjectValue(doc! { "a": 1 }));
         let b: Box<dyn DynValue> = Box::new(BsonObjectValue(doc! { "a": 1 }));
         let c: Box<dyn DynValue> = Box::new(BsonObjectValue(doc! { "a": 2 }));
-        assert!(a.eq_dyn(&*b));
-        assert!(!a.eq_dyn(&*c));
+        assert!(a.is_equal(&*b));
+        assert!(!a.is_equal(&*c));
     }
 
     #[test]
     fn dyn_value_clone_box_preserves_payload() {
         let v: Box<dyn DynValue> = Box::new(BsonObjectValue(doc! { "x": 1 }));
         let c = v.clone_box();
-        assert!(v.eq_dyn(&*c));
+        assert!(v.is_equal(&*c));
     }
 
     #[test]

@@ -361,20 +361,8 @@ fn extract_length(function: &str, value: &Value, max: i64) -> Result<i64, FuncEr
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
     use super::*;
-    use crate::signature::EvalContext;
-
-    fn ctx() -> EvalContext {
-        EvalContext {
-            env_resolver: Arc::new(crate::test_support::EmptyEnv),
-            file_resolver: Arc::new(crate::test_support::NoopFiles),
-            now: chrono::Utc::now(),
-            base_dir: PathBuf::new(),
-        }
-    }
+    use crate::test_support::ctx;
 
     #[test]
     fn random_uuid_produces_valid_v4() {

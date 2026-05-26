@@ -66,7 +66,7 @@ impl NullableExprType {
             Some(bits) if bits <= 32 => DataType::Int32,
             Some(bits) if bits <= 64 => DataType::Int64,
             Some(bits) => DataType::BigInt {
-                width: Some(((bits as f64) * 0.301).ceil() as u32 + 1),
+                width: Some(((bits as f64) * std::f64::consts::LOG10_2).ceil() as u32 + 1),
             },
             None => self.data_type.clone(),
         }

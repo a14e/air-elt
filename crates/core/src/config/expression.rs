@@ -1,12 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use air_elt_expr::{eval_expression, eval_interpolated, has_interpolation, is_expression};
 use air_elt_expr_funcs::signature::{EnvResolver, EvalContext, FileResolver};
 use air_elt_expr_funcs::{FuncError, FunctionRegistry};
-use air_elt_types::Value;
-
-use crate::error::ConfigError;
 
 /// Bundles a [`FunctionRegistry`] and [`EvalContext`] for expression
 /// evaluation during flow plan construction. Stored on `AssembledFlow`
@@ -27,85 +23,6 @@ impl ExpressionContext {
     }
 }
 
-/// Resolve a TOML value that may contain expressions.
-///
-/// For String values: detects expression pattern (`name(...)`) or
-/// interpolation (`{expr}`).
-/// For Table values: recursively resolves each leaf value.
-/// For other values (Int, Float, Bool): passes through unchanged.
-pub fn resolve_toml_value(
-    value: &toml::Value,
-    registry: &FunctionRegistry,
-    context: &EvalContext,
-) -> Result<Option<Value>, ConfigError> {
-    match value {
-        toml::Value::String(s) => resolve_string(s, registry, context),
-        toml::Value::Integer(i) => Ok(Some(Value::Int64(*i))),
-        toml::Value::Float(f) => Ok(Some(Value::Float64(*f))),
-        toml::Value::Boolean(b) => Ok(Some(Value::Bool(*b))),
-        toml::Value::Table(table) => resolve_table(table, registry, context),
-        toml::Value::Array(arr) => resolve_array(arr, registry, context),
-        // Datetime etc. — not supported as expression
-        _ => Ok(None),
-    }
-}
-
-fn resolve_string(
-    s: &str,
-    registry: &FunctionRegistry,
-    context: &EvalContext,
-) -> Result<Option<Value>, ConfigError> {
-    if is_expression(s) {
-        let value = eval_expression(s, registry, context).map_err(|e| ConfigError::Invalid {
-            reason: format!("expression error: {e}"),
-        })?;
-        Ok(Some(value))
-    } else if has_interpolation(s) {
-        let result = eval_interpolated(s, registry, context).map_err(|e| ConfigError::Invalid {
-            reason: format!("interpolation error: {e}"),
-        })?;
-        Ok(Some(Value::Text(result)))
-    } else {
-        Ok(Some(Value::Text(s.to_string())))
-    }
-}
-
-fn resolve_table(
-    table: &toml::map::Map<String, toml::Value>,
-    registry: &FunctionRegistry,
-    context: &EvalContext,
-) -> Result<Option<Value>, ConfigError> {
-    let mut entries: Vec<(String, Value)> = Vec::with_capacity(table.len());
-    for (key, val) in table {
-        if let Some(resolved) = resolve_toml_value(val, registry, context)? {
-            entries.push((key.clone(), resolved));
-        }
-    }
-    Ok(Some(Value::Object(entries)))
-}
-
-fn resolve_array(
-    arr: &[toml::Value],
-    registry: &FunctionRegistry,
-    context: &EvalContext,
-) -> Result<Option<Value>, ConfigError> {
-    let mut values = Vec::with_capacity(arr.len());
-    for val in arr {
-        if let Some(resolved) = resolve_toml_value(val, registry, context)? {
-            values.push(resolved);
-        }
-    }
-    let json_arr: Vec<serde_json::Value> = values
-        .iter()
-        .map(|v| air_elt_types::value_to_json(v).unwrap_or(serde_json::Value::Null))
-        .collect();
-    Ok(Some(Value::Json(serde_json::Value::Array(json_arr))))
-}
-
-/// Build an [`EvalContext`] for expression evaluation during config loading.
-///
-/// Uses the real system environment and filesystem, scoped to `config_dir`
-/// for relative file reads.
 pub fn build_eval_context(config_dir: &Path) -> EvalContext {
     EvalContext {
         env_resolver: Arc::new(SystemEnvResolver),
@@ -113,6 +30,176 @@ pub fn build_eval_context(config_dir: &Path) -> EvalContext {
         now: chrono::Utc::now(),
         base_dir: config_dir.to_path_buf(),
     }
+}
+
+/// Walk a TOML table recursively and evaluate expression strings in place.
+/// Non-string values and plain string literals are left untouched; only
+/// strings detected as expressions or interpolations by `ExprValue::from_toml`
+/// are evaluated. The result is always coerced back to a TOML string (since
+/// component config values like `url` are strings anyway).
+pub fn resolve_config_expressions(
+    table: &toml::Table,
+    context: &ExpressionContext,
+) -> Result<toml::Table, air_elt_expr::ExprError> {
+    let mut resolved = toml::Table::new();
+    for (key, value) in table {
+        resolved.insert(key.clone(), resolve_toml_value(value, context)?);
+    }
+    Ok(resolved)
+}
+
+fn resolve_toml_value(
+    value: &toml::Value,
+    context: &ExpressionContext,
+) -> Result<toml::Value, air_elt_expr::ExprError> {
+    match value {
+        toml::Value::String(s) => {
+            let expr_val = air_elt_expr::ExprValue::parse(s);
+            if !expr_val.needs_eval() {
+                return Ok(value.clone());
+            }
+            let result = expr_val.eval(&context.registry, &context.eval_context)?;
+            Ok(value_to_toml(&result))
+        }
+        toml::Value::Table(t) => {
+            let mut out = toml::Table::new();
+            for (k, v) in t {
+                out.insert(k.clone(), resolve_toml_value(v, context)?);
+            }
+            Ok(toml::Value::Table(out))
+        }
+        toml::Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                out.push(resolve_toml_value(v, context)?);
+            }
+            Ok(toml::Value::Array(out))
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+/// Convert a runtime `Value` into a `toml::Value`. Used for config resolution
+/// (expression results back to TOML) and default-literal coercion.
+/// Types that don't map to a native TOML scalar fall back to their string
+/// representation.
+pub(crate) fn value_to_toml(value: &air_elt_types::Value) -> toml::Value {
+    use air_elt_types::Value;
+    match value {
+        Value::Text(s) => toml::Value::String(s.clone()),
+        Value::Int64(n) => toml::Value::Integer(*n),
+        Value::Float64(f) => toml::Value::Float(*f),
+        Value::Bool(b) => toml::Value::Boolean(*b),
+        Value::Int8(n) => toml::Value::Integer(*n as i64),
+        Value::Int16(n) => toml::Value::Integer(*n as i64),
+        Value::Int32(n) => toml::Value::Integer(*n as i64),
+        Value::UInt8(n) => toml::Value::Integer(*n as i64),
+        Value::UInt16(n) => toml::Value::Integer(*n as i64),
+        Value::UInt32(n) => toml::Value::Integer(*n as i64),
+        Value::UInt64(n) => i64::try_from(*n)
+            .map(toml::Value::Integer)
+            .unwrap_or_else(|_| toml::Value::String(n.to_string())),
+        Value::Float32(f) => toml::Value::Float(*f as f64),
+        Value::BigInt(b) => toml::Value::String(b.to_string()),
+        Value::Decimal(d) => toml::Value::String(d.to_string()),
+        Value::Date(d) => toml::Value::String(d.to_string()),
+        Value::Timestamp(ts) => toml::Value::String(ts.to_rfc3339()),
+        Value::Uuid(u) => toml::Value::String(u.to_string()),
+        Value::Ipv4(ip) => toml::Value::String(ip.to_string()),
+        Value::Ipv6(ip) => toml::Value::String(ip.to_string()),
+        _ => toml::Value::String(format!("{value:?}")),
+    }
+}
+
+/// Verify the evaluated Value matches the sink DataType; if not, attempt
+/// value-aware narrowing (int/float fit check) or lossless widening via
+/// `air_elt_types::convert`. Errors when the value cannot be represented
+/// in the target type.
+pub(crate) fn ensure_sink_compatible(
+    value: air_elt_types::Value,
+    sink_dt: &air_elt_types::DataType,
+) -> Result<air_elt_types::Value, String> {
+    use air_elt_types::{DataType, Value};
+
+    if let Some(ref value_dt) = value.data_type() {
+        if value_dt == sink_dt {
+            return Ok(value);
+        }
+        // Text/Bytes: check actual length against the sink's declared size.
+        match (&value, sink_dt) {
+            (Value::Text(s), DataType::Text { size: Some(max) }) => {
+                let chars = s.chars().count();
+                if chars > *max as usize {
+                    return Err(format!("text length {chars} exceeds sink size {max}"));
+                }
+                return Ok(value);
+            }
+            (Value::Bytes(b), DataType::Bytes { size: Some(max) }) => {
+                if b.len() > *max as usize {
+                    return Err(format!("bytes length {} exceeds sink size {max}", b.len()));
+                }
+                return Ok(value);
+            }
+            _ => {}
+        }
+        // Numeric narrowing: TOML gives us Int64/Float64, but the sink may
+        // be a narrower type. Check the actual value fits, then cast.
+        if let Some(narrowed) = try_narrow_numeric(&value, sink_dt) {
+            return narrowed;
+        }
+        let ctx = air_elt_types::ConversionContext::passthrough();
+        return air_elt_types::convert(value, value_dt, sink_dt, &ctx)
+            .map_err(|e| format!("cannot convert {value_dt} to {sink_dt}: {e}"));
+    }
+    Ok(value)
+}
+
+/// Try to narrow a numeric Value to the target DataType by checking the
+/// actual value fits. Returns `None` if this is not a numeric narrowing
+/// case — the caller should fall through to `convert()`.
+fn try_narrow_numeric(
+    value: &air_elt_types::Value,
+    target: &air_elt_types::DataType,
+) -> Option<Result<air_elt_types::Value, String>> {
+    use air_elt_types::{DataType, Value};
+
+    let n = match value {
+        Value::Int64(n) => *n,
+        Value::Float64(f) => {
+            return match target {
+                DataType::Float32 => Some(Ok(Value::Float32(*f as f32))),
+                _ => None,
+            };
+        }
+        _ => return None,
+    };
+
+    let result = match target {
+        DataType::Int8 if (i8::MIN as i64..=i8::MAX as i64).contains(&n) => Value::Int8(n as i8),
+        DataType::Int16 if (i16::MIN as i64..=i16::MAX as i64).contains(&n) => {
+            Value::Int16(n as i16)
+        }
+        DataType::Int32 if (i32::MIN as i64..=i32::MAX as i64).contains(&n) => {
+            Value::Int32(n as i32)
+        }
+        DataType::UInt8 if (0..=u8::MAX as i64).contains(&n) => Value::UInt8(n as u8),
+        DataType::UInt16 if (0..=u16::MAX as i64).contains(&n) => Value::UInt16(n as u16),
+        DataType::UInt32 if (0..=u32::MAX as i64).contains(&n) => Value::UInt32(n as u32),
+        DataType::UInt64 if n >= 0 => Value::UInt64(n as u64),
+        DataType::Float32 => Value::Float32(n as f32),
+        DataType::Float64 => Value::Float64(n as f64),
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => {
+            return Some(Err(format!("value {n} out of range for {target}")));
+        }
+        _ => return None,
+    };
+    Some(Ok(result))
 }
 
 struct SystemEnvResolver;
@@ -183,127 +270,6 @@ impl FileResolver for SystemFileResolver {
 mod tests {
     use super::*;
 
-    fn test_registry() -> FunctionRegistry {
-        FunctionRegistry::with_builtins()
-    }
-
-    fn test_context() -> EvalContext {
-        EvalContext {
-            env_resolver: Arc::new(SystemEnvResolver),
-            file_resolver: Arc::new(SystemFileResolver),
-            now: chrono::Utc::now(),
-            base_dir: std::path::PathBuf::from("/tmp"),
-        }
-    }
-
-    #[test]
-    fn plain_string_passes_through() {
-        let value = toml::Value::String("hello".to_string());
-        let result = resolve_toml_value(&value, &test_registry(), &test_context()).unwrap();
-        assert_eq!(result, Some(Value::Text("hello".to_string())));
-    }
-
-    #[test]
-    fn integer_passes_through() {
-        let value = toml::Value::Integer(42);
-        let result = resolve_toml_value(&value, &test_registry(), &test_context()).unwrap();
-        assert_eq!(result, Some(Value::Int64(42)));
-    }
-
-    #[test]
-    fn float_passes_through() {
-        let value = toml::Value::Float(2.71);
-        let result = resolve_toml_value(&value, &test_registry(), &test_context()).unwrap();
-        assert_eq!(result, Some(Value::Float64(2.71)));
-    }
-
-    #[test]
-    fn boolean_passes_through() {
-        let value = toml::Value::Boolean(true);
-        let result = resolve_toml_value(&value, &test_registry(), &test_context()).unwrap();
-        assert_eq!(result, Some(Value::Bool(true)));
-    }
-
-    #[test]
-    fn expression_is_evaluated() {
-        let value = toml::Value::String("concat('hello', ' ', 'world')".to_string());
-        let result = resolve_toml_value(&value, &test_registry(), &test_context()).unwrap();
-        assert_eq!(result, Some(Value::Text("hello world".to_string())));
-    }
-
-    #[test]
-    fn interpolation_is_evaluated() {
-        let value = toml::Value::String("prefix_{1 + 2}_suffix".to_string());
-        let result = resolve_toml_value(&value, &test_registry(), &test_context()).unwrap();
-        assert_eq!(result, Some(Value::Text("prefix_3_suffix".to_string())));
-    }
-
-    #[test]
-    fn table_resolves_recursively() {
-        let mut table = toml::map::Map::new();
-        table.insert("key".to_string(), toml::Value::String("plain".to_string()));
-        table.insert("num".to_string(), toml::Value::Integer(7));
-        let value = toml::Value::Table(table);
-        let result = resolve_toml_value(&value, &test_registry(), &test_context()).unwrap();
-        match result {
-            Some(Value::Object(entries)) => {
-                assert_eq!(entries.len(), 2);
-                assert!(
-                    entries
-                        .iter()
-                        .any(|(k, v)| k == "key" && *v == Value::Text("plain".to_string()))
-                );
-                assert!(
-                    entries
-                        .iter()
-                        .any(|(k, v)| k == "num" && *v == Value::Int64(7))
-                );
-            }
-            other => panic!("expected Object, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn invalid_expression_returns_error() {
-        let value = toml::Value::String("nonexistent_func(1)".to_string());
-        let result = resolve_toml_value(&value, &test_registry(), &test_context());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn datetime_returns_none() {
-        let dt = toml::Value::Datetime(toml::value::Datetime {
-            date: Some(toml::value::Date {
-                year: 2024,
-                month: 1,
-                day: 1,
-            }),
-            time: None,
-            offset: None,
-        });
-        let result = resolve_toml_value(&dt, &test_registry(), &test_context()).unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn array_resolves_elements() {
-        let arr = toml::Value::Array(vec![
-            toml::Value::Integer(1),
-            toml::Value::String("hello".to_string()),
-            toml::Value::Boolean(true),
-        ]);
-        let result = resolve_toml_value(&arr, &test_registry(), &test_context()).unwrap();
-        match result {
-            Some(Value::Json(serde_json::Value::Array(items))) => {
-                assert_eq!(items.len(), 3);
-                assert_eq!(items[0], serde_json::json!(1));
-                assert_eq!(items[1], serde_json::json!("hello"));
-                assert_eq!(items[2], serde_json::json!(true));
-            }
-            other => panic!("expected Json(Array), got {other:?}"),
-        }
-    }
-
     #[test]
     fn build_eval_context_uses_provided_dir() {
         let ctx = build_eval_context(Path::new("/some/dir"));
@@ -328,157 +294,124 @@ mod tests {
     fn file_resolver_rejects_path_traversal() {
         let resolver = SystemFileResolver;
         let result = resolver.read("../../etc/passwd", Path::new("/tmp/subdir"));
-        // This will either fail with "path traversal" or "No such file"
-        // depending on whether the path can be canonicalized.
         assert!(result.is_err());
     }
 
-    // -----------------------------------------------------------------------
-    // Integration tests: full expression evaluation pipeline
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn resolve_expression_env_with_default() {
-        let registry = test_registry();
-        let ctx = test_context();
-        let value = toml::Value::String("env('NONEXISTENT_VAR_XYZ', 'fallback')".to_owned());
-        let result = resolve_toml_value(&value, &registry, &ctx)
-            .unwrap()
-            .unwrap();
-        assert_eq!(result, Value::Text("fallback".to_owned()));
+    fn test_expr_context() -> ExpressionContext {
+        ExpressionContext::new(
+            Arc::new(FunctionRegistry::with_builtins()),
+            Path::new("/tmp"),
+        )
     }
 
     #[test]
-    fn resolve_expression_concat() {
-        let registry = test_registry();
-        let ctx = test_context();
-        let value = toml::Value::String("concat('hello', ' ', 'world')".to_owned());
-        let result = resolve_toml_value(&value, &registry, &ctx)
-            .unwrap()
-            .unwrap();
-        assert_eq!(result, Value::Text("hello world".to_owned()));
-    }
-
-    #[test]
-    fn resolve_expression_arithmetic() {
-        let registry = test_registry();
-        let ctx = test_context();
-        let value = toml::Value::String("power(2, 10)".to_owned());
-        let result = resolve_toml_value(&value, &registry, &ctx)
-            .unwrap()
-            .unwrap();
-        assert_eq!(result, Value::Int64(1024));
-    }
-
-    #[test]
-    fn resolve_interpolation() {
-        let registry = test_registry();
-        let ctx = test_context();
-        let value = toml::Value::String("prefix_{1 + 1}_suffix".to_owned());
-        let result = resolve_toml_value(&value, &registry, &ctx)
-            .unwrap()
-            .unwrap();
-        assert_eq!(result, Value::Text("prefix_2_suffix".to_owned()));
-    }
-
-    #[test]
-    fn resolve_plain_string_unchanged() {
-        let registry = test_registry();
-        let ctx = test_context();
-        let value = toml::Value::String("just a plain string".to_owned());
-        let result = resolve_toml_value(&value, &registry, &ctx)
-            .unwrap()
-            .unwrap();
-        assert_eq!(result, Value::Text("just a plain string".to_owned()));
-    }
-
-    #[test]
-    fn resolve_integer_passthrough() {
-        let registry = test_registry();
-        let ctx = test_context();
-        let value = toml::Value::Integer(42);
-        let result = resolve_toml_value(&value, &registry, &ctx)
-            .unwrap()
-            .unwrap();
-        assert_eq!(result, Value::Int64(42));
-    }
-
-    #[test]
-    fn resolve_table_as_object() {
-        let registry = test_registry();
-        let ctx = test_context();
-        let mut table = toml::map::Map::new();
+    fn resolve_config_expressions_evaluates_env_call() {
+        #[allow(unsafe_code)]
+        // Why: setting env var needed to test env() expression resolution
+        unsafe {
+            std::env::set_var("AIR_ELT_TEST_CFG_URL", "postgres://localhost/test");
+        }
+        let mut table = toml::Table::new();
         table.insert(
-            "key".to_owned(),
-            toml::Value::String("concat('a', 'b')".to_owned()),
+            "url".into(),
+            toml::Value::String("env('AIR_ELT_TEST_CFG_URL')".into()),
         );
-        table.insert("num".to_owned(), toml::Value::Integer(42));
-        let value = toml::Value::Table(table);
-        let result = resolve_toml_value(&value, &registry, &ctx)
-            .unwrap()
-            .unwrap();
-        if let Value::Object(entries) = result {
-            assert!(
-                entries
-                    .iter()
-                    .any(|(k, v)| k == "key" && *v == Value::Text("ab".to_owned()))
-            );
-            assert!(
-                entries
-                    .iter()
-                    .any(|(k, v)| k == "num" && *v == Value::Int64(42))
-            );
-        } else {
-            panic!("expected Object");
+
+        let ctx = test_expr_context();
+        let resolved = resolve_config_expressions(&table, &ctx).unwrap();
+        assert_eq!(
+            resolved.get("url").unwrap().as_str().unwrap(),
+            "postgres://localhost/test"
+        );
+
+        #[allow(unsafe_code)]
+        // Why: cleanup
+        unsafe {
+            std::env::remove_var("AIR_ELT_TEST_CFG_URL");
         }
     }
 
     #[test]
-    fn resolve_if_expression_lazy() {
-        let registry = test_registry();
-        let ctx = test_context();
-        let value = toml::Value::String("if(true, 'yes', 'no')".to_owned());
-        let result = resolve_toml_value(&value, &registry, &ctx)
-            .unwrap()
-            .unwrap();
-        assert_eq!(result, Value::Text("yes".to_owned()));
+    fn resolve_config_expressions_leaves_plain_strings_intact() {
+        let mut table = toml::Table::new();
+        table.insert(
+            "url".into(),
+            toml::Value::String("postgres://localhost/db".into()),
+        );
+        table.insert("port".into(), toml::Value::Integer(5432));
+
+        let ctx = test_expr_context();
+        let resolved = resolve_config_expressions(&table, &ctx).unwrap();
+        assert_eq!(
+            resolved.get("url").unwrap().as_str().unwrap(),
+            "postgres://localhost/db"
+        );
+        assert_eq!(resolved.get("port").unwrap().as_integer().unwrap(), 5432);
     }
 
     #[test]
-    fn resolve_sha256() {
-        let registry = test_registry();
-        let ctx = test_context();
-        let value = toml::Value::String("sha256('test')".to_owned());
-        let result = resolve_toml_value(&value, &registry, &ctx)
-            .unwrap()
-            .unwrap();
-        if let Value::Text(hash) = result {
-            assert_eq!(hash.len(), 64); // sha256 hex = 64 chars
-        } else {
-            panic!("expected Text");
-        }
+    fn resolve_config_expressions_handles_nested_tables() {
+        let mut inner = toml::Table::new();
+        inner.insert(
+            "value".into(),
+            toml::Value::String("concat('hello', ' world')".into()),
+        );
+        let mut table = toml::Table::new();
+        table.insert("nested".into(), toml::Value::Table(inner));
+
+        let ctx = test_expr_context();
+        let resolved = resolve_config_expressions(&table, &ctx).unwrap();
+        let nested = resolved.get("nested").unwrap().as_table().unwrap();
+        assert_eq!(
+            nested.get("value").unwrap().as_str().unwrap(),
+            "hello world"
+        );
     }
 
     #[test]
-    fn resolve_now_returns_timestamp() {
-        let registry = test_registry();
-        let ctx = test_context();
-        let value = toml::Value::String("now()".to_owned());
-        let result = resolve_toml_value(&value, &registry, &ctx)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(result, Value::Timestamp(_)));
+    fn resolve_config_expressions_interpolation() {
+        let mut table = toml::Table::new();
+        table.insert(
+            "url".into(),
+            toml::Value::String("prefix_{1 + 2}_suffix".into()),
+        );
+
+        let ctx = test_expr_context();
+        let resolved = resolve_config_expressions(&table, &ctx).unwrap();
+        assert_eq!(
+            resolved.get("url").unwrap().as_str().unwrap(),
+            "prefix_3_suffix"
+        );
     }
 
     #[test]
-    fn resolve_dollar_escape() {
-        // $$ should not be treated as expression — it's a plain string
-        let registry = test_registry();
-        let ctx = test_context();
-        let value = toml::Value::String("plain $$ value".to_owned());
-        let result = resolve_toml_value(&value, &registry, &ctx)
-            .unwrap()
-            .unwrap();
-        assert_eq!(result, Value::Text("plain $$ value".to_owned()));
+    fn resolve_config_expressions_handles_arrays() {
+        let mut table = toml::Table::new();
+        table.insert(
+            "tags".into(),
+            toml::Value::Array(vec![
+                toml::Value::String("concat('a', 'b')".into()),
+                toml::Value::String("plain".into()),
+            ]),
+        );
+
+        let ctx = test_expr_context();
+        let resolved = resolve_config_expressions(&table, &ctx).unwrap();
+        let arr = resolved.get("tags").unwrap().as_array().unwrap();
+        assert_eq!(arr[0].as_str().unwrap(), "ab");
+        assert_eq!(arr[1].as_str().unwrap(), "plain");
+    }
+
+    #[test]
+    fn resolve_config_expressions_invalid_expression_propagates_error() {
+        let mut table = toml::Table::new();
+        table.insert(
+            "url".into(),
+            toml::Value::String("nonexistent_func()".into()),
+        );
+
+        let ctx = test_expr_context();
+        let result = resolve_config_expressions(&table, &ctx);
+        assert!(result.is_err());
     }
 }

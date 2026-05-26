@@ -248,7 +248,7 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
             self
         }
-        fn eq_dyn(&self, _other: &dyn DynValue) -> bool {
+        fn is_equal(&self, _other: &dyn DynValue) -> bool {
             false
         }
         fn clone_box(&self) -> Box<dyn DynValue> {

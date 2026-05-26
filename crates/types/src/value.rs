@@ -155,36 +155,23 @@ impl Clone for Value {
     }
 }
 
+/// Cross-numeric equality: `Int8(5) == Int64(5)` is `true`.
+/// Delegates to [`crate::compare::values_equal`] which promotes
+/// small ints to i64, floats to f64, etc. before comparing.
+/// NaN == NaN is `false` (IEEE 754). For total equality (NaN == NaN,
+/// hashable), use [`crate::Key`].
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
-        use Value::*;
-        match (self, other) {
-            (Null, Null) => true,
-            (Bool(a), Bool(b)) => a == b,
-            (Int8(a), Int8(b)) => a == b,
-            (Int16(a), Int16(b)) => a == b,
-            (Int32(a), Int32(b)) => a == b,
-            (Int64(a), Int64(b)) => a == b,
-            (UInt8(a), UInt8(b)) => a == b,
-            (UInt16(a), UInt16(b)) => a == b,
-            (UInt32(a), UInt32(b)) => a == b,
-            (UInt64(a), UInt64(b)) => a == b,
-            (Float32(a), Float32(b)) => a == b,
-            (Float64(a), Float64(b)) => a == b,
-            (BigInt(a), BigInt(b)) => a == b,
-            (Decimal(a), Decimal(b)) => a == b,
-            (Text(a), Text(b)) => a == b,
-            (Bytes(a), Bytes(b)) => a == b,
-            (Date(a), Date(b)) => a == b,
-            (Timestamp(a), Timestamp(b)) => a == b,
-            (Uuid(a), Uuid(b)) => a == b,
-            (Ipv4(a), Ipv4(b)) => a == b,
-            (Ipv6(a), Ipv6(b)) => a == b,
-            (Json(a), Json(b)) => a == b,
-            (Object(a), Object(b)) => a == b,
-            (Custom(a), Custom(b)) => (**a).eq_dyn(&**b),
-            _ => false,
-        }
+        crate::compare::values_equal(self, other)
+    }
+}
+
+/// Cross-numeric ordering: `Int8(5) < Int64(10)` is `Some(Less)`.
+/// Delegates to [`crate::compare::compare_values`].
+/// Incompatible types (e.g. Text vs Int64) return `None`.
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        crate::compare::compare_values(self, other)
     }
 }
 
@@ -620,7 +607,7 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
             self
         }
-        fn eq_dyn(&self, _other: &dyn DynValue) -> bool {
+        fn is_equal(&self, _other: &dyn DynValue) -> bool {
             true
         }
         fn clone_box(&self) -> Box<dyn DynValue> {
@@ -684,7 +671,7 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
             self
         }
-        fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+        fn is_equal(&self, other: &dyn DynValue) -> bool {
             other
                 .as_any()
                 .downcast_ref::<CursorStubValue>()

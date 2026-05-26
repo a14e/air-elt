@@ -79,6 +79,7 @@ bigdecimal = { version = "0.4.10", features = ["serde"] }
 bollard = { version = "0.20.0", default-features = false }
 bson = "2.15.0"
 cbc = "0.1.2"
+ch_cityhash102 = "0.1.0"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 data-encoding = "2.9.0"
@@ -105,6 +106,7 @@ rand = "0.10.1"
 regex = "1.12.3"
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
 semver = "1.0.28"
+smallvec = "1.15.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 serde_yaml = "=0.9.33"

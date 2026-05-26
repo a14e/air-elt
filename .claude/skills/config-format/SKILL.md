@@ -29,10 +29,10 @@ Flat `key = "value"` map. Used by `${VAR}` expansion (env → secrets → defaul
 ## Expression support
 
 Config string values support expressions in these fields:
-- `default` in mapping entries
-- Switch table values (RHS of switch pairs)
+- `default` in mapping entries — all defaults go through `ExprValue.eval()`
+- Switch table values (RHS of switch pairs) — all values go through `ExprValue.eval()`
 - `[secrets]` values
-- Component config string values (URLs, connection strings)
+- Component config string values (URLs, connection strings) — via `resolve_config_expressions`
 
 Detection rules:
 - String starting with `name(...)` → evaluated as expression
@@ -46,6 +46,20 @@ Examples:
 - `default = "concat(env('PREFIX'), '_suffix')"`
 - `default = "if(isNull(env('OPT')), 'none', env('OPT'))"`
 - `default = { "key" = "env('X')", "ts" = "now()" }`
+
+### Component config expressions
+
+String values inside source/sink/storage `config = { ... }` tables are evaluated as expressions before factory deserialization via `resolve_config_expressions`. The function walks the TOML table recursively: string values detected as expressions or interpolations are evaluated; non-string values and plain string literals pass through unchanged. The result is coerced back to a TOML string (since component config values like `url` are strings anyway).
+
+```toml
+[[sinks]]
+name = "pg"
+type = "postgres"
+config = { url = "env('PG_URL')", connect-timeout = "5s" }
+
+# Interpolation works too:
+# url = "postgres://{env('PG_HOST')}:5432/db"
+```
 
 ## `[[sources]]` / `[[sinks]]` / `[[storages]]`
 
@@ -239,7 +253,7 @@ display = "user_name"
 # Long-form table. The sink column name is the key — there is NO `to`
 # field inside the inline table.
 summary = { from = "long_text", truncate = true }
-blob_out = { from = "blob_in",  default = "hex:00" }
+blob_out = { from = "blob_in",  default = 0 }
 
 # Body-pack: route the row body into a single sink column. RHS `"*"`
 # triggers it when the key is a regular column name.
@@ -258,7 +272,7 @@ status_label = { from = "status", switch = { ACTIVE = "active", FINISHED = "fini
 |-------|------|---------|-------------|
 | `from` | string | required | Source column name |
 | `truncate` | bool | `false` | Opt the column into narrowing conversions: text/bytes shrink (UTF-safe for text), integer/float saturate to target's max/min, decimal scale drop, decimal → float magnitude overflow saturates to `±INFINITY`, json/xml → `text(n)` serialize. `Decimal → Float64`/`Float32` is lossless without `truncate` when the declared precision fits the target's mantissa (≤ 15 / ≤ 7 respectively); wider or unbounded Decimal requires `truncate = true`. Forbidden combinations (`Json → Json`, `Xml → Xml`, UUID truncations, `Date → Timestamp`, `Float → Decimal/BigInt`) remain rejected. |
-| `default` | scalar / table | none | Fallback value substituted when the source value is `Null` and when `switch` produces no match. Permits mapping a nullable source into a `NOT NULL` sink. On the Direct path validation rejects `default` if the source column is `NOT NULL`. The literal is parsed against the resolved sink `DataType` (see grammar below). |
+| `default` | scalar / table | none | Fallback value substituted when the source value is `Null` and when `switch` produces no match. Permits mapping a nullable source into a `NOT NULL` sink. On the Direct path validation rejects `default` if the source column is `NOT NULL`. The value is expression-evaluated via `ExprValue.eval()` and checked against the resolved sink `DataType` (see `default` value evaluation below). |
 | `switch` | inline table | none | Value-to-value lookup. Keys (inline-table keys — always strings in TOML) are parsed against the source column's `DataType`; values are parsed against the sink column's `DataType` (or contribute to union-collapse for schemaless sinks). Output: the matched value, or `default` on miss / NULL input, or `Value::Null` if no `default`. See **Switch** below. |
 
 `#[serde(deny_unknown_fields)]` rejects any additional keys at parse time on the long form — including a stray `to` field (the map key already carries it).
@@ -310,11 +324,13 @@ Behaviour:
 - Miss → `default` (if set) or `Value::Null`.
 - NULL source → `default` (if set) or `Value::Null`. The switch is NOT consulted on NULL.
 
-Key matching is type-canonical, NOT string-canonical: `Int8(1)`, `Int32(1)`, `BigInt(1)` all collapse onto the same `SwitchKey::Int(1)`. Float keys use `f64::to_bits` with NaN-bit-pattern normalisation (all NaNs collapse, `-0.0` collapses with `+0.0`). Sources whose declared `DataType` is `Json`/`Xml`/`Union`/`Custom` cannot host a switch — surfaces `SwitchUnsupportedSource`.
+**Value evaluation:** All switch values (RHS of each case and `default`) go through `ExprValue.eval()` — not just expression-detected ones. `ExprValue::from_toml` classifies each TOML value as Expression, Interpolated, or Literal, then `eval()` handles all three uniformly. Plain string literals like `"open"` are classified as Literal and evaluated to `Value::Text("open")`. TOML integers produce `Value::Int64`; after evaluation, typed sinks run `ensure_sink_compatible` for auto-narrowing.
+
+**Key canonicalization:** Switch keys are canonicalized through `Key::from_value` so that integer subtypes are unified: `Int8(1)`, `Int32(1)`, `BigInt(1)` all collapse onto the same `SwitchKey::Int(1)`. Float keys use `f64::to_bits` with NaN-bit-pattern normalisation (all NaNs collapse, `-0.0` collapses with `+0.0`). Sources whose declared `DataType` is `Json`/`Xml`/`Union`/`Custom` cannot host a switch — surfaces `SwitchUnsupportedSource`.
 
 Sink type derivation:
-- **Typed sink** (postgres/mysql/clickhouse/questdb): each RHS literal is parsed against the sink column's declared `DataType` via the same parser used by `default`. Mismatch → `SwitchValueTypeMismatch`.
-- **Schemaless sink** (mongo): RHS literals are parsed untyped → each produces a `(Value, DataType)` pair. The set of observed `DataType`s collapses via `core::types::collapse_union` into a single widened type when widening rules apply (Int8 ∪ Int32 → Int32; Text(5) ∪ Text(9) → Text(9)); otherwise the column type becomes `DataType::Union(...)`.
+- **Typed sink** (postgres/mysql/clickhouse/questdb): each evaluated RHS value is checked against the sink column's declared `DataType` via `ensure_sink_compatible`. Mismatch → `SwitchValueTypeMismatch`.
+- **Schemaless sink** (mongo): each evaluated RHS value derives its own `DataType`. The set of observed types collapses via `core::types::collapse_union` into a single widened type when widening rules apply (Int8 ∪ Int32 → Int32; Text(5) ∪ Text(9) → Text(9)); otherwise the column type becomes `DataType::Union(...)`.
 
 Validation rejects empty `switch = {}` and duplicate canonical keys (`SwitchDuplicateKey`). The match table is built once at validate time; runtime lookup is one `AHashMap` probe per row.
 
@@ -344,23 +360,35 @@ Nesting depth limit: **64** (enforced inside `value_to_json`).
 
 Custom values delegate to `DynValue::to_json()`. New custom types must implement that method.
 
-#### `default` value grammar
+#### `default` value evaluation
 
-| Sink type | Literal | Example |
-|-----------|---------|---------|
-| `Bytes` | `"hex:<even-hex>"`, `"base64:<b64>"`, `"utf8:<utf8>"`, `"bin:<bits>"` (length must be byte-aligned, no whitespace) | `default = "hex:deadbeef"` |
-| `Text` | TOML string; UTF-char count ≤ declared `size` | `default = "n/a"` |
-| `Bool` | TOML bool only | `default = false` |
-| `Int*` / `UInt*` | TOML integer; range-checked | `default = 0` |
-| `Float*` | TOML float / int | `default = 0.0` |
-| `BigInt(width)` / `Decimal(p, s)` | TOML string for big numbers (recommended) or numeric literal | `default = "12.34"` |
-| `Date` | ISO 8601 date string | `default = "1970-01-01"` |
-| `Timestamp` | RFC 3339 string | `default = "1970-01-01T00:00:00Z"` |
-| `Uuid` | canonical UUID string | `default = "00000000-0000-0000-0000-000000000000"` |
-| `Json` | any TOML value | `default = { a = 1 }` |
-| `Xml` | well-formed XML string (validated via `quick-xml`) | `default = "<root/>"` |
+All default values are expression-evaluated via `ExprValue.eval()`. The TOML literal is classified as an expression, interpolation, or plain literal at parse time, then evaluated uniformly through the expression engine. After evaluation, the result is checked against the sink `DataType` via `ensure_sink_compatible`.
 
-`Bytes` columns require one of the four prefixes; bare strings are rejected. Other types use the plain literal — there is no prefix grammar.
+**Auto-narrowing:** TOML integer literals produce `Int64`; when the sink type is narrower (e.g. `Int8`), `try_narrow_numeric` checks the actual value fits and casts automatically. TOML float literals (`Float64`) auto-narrow to `Float32` the same way. For non-matching types, use an explicit cast expression: `default = "toInt8(42)"`.
+
+**Examples:**
+
+```toml
+# Plain literals — auto-narrowed to sink type
+default = 0              # Int64 → auto-narrows to Int8/Int16/etc. if value fits
+default = 3.14           # Float64 → auto-narrows to Float32 if sink is Float32
+default = false          # Bool
+default = "n/a"          # Text (plain string, no expression detected)
+
+# Expression defaults — evaluated via ExprValue
+default = "env('DB_HOST', 'localhost')"
+default = "toDate('2024-01-15')"
+default = "toInt8(42)"                    # explicit cast for non-matching types
+default = "if(isNull(env('OPT')), 'none', env('OPT'))"
+
+# Interpolation defaults
+default = "prefix_{env('SUFFIX')}"
+
+# Structured defaults (JSON sink columns)
+default = { a = 1 }
+```
+
+**Sink type constraints** — the evaluated value must be compatible with the sink column's `DataType`. Text values are length-checked against `size`, integers are range-checked, and so on. Incompatible values surface at validation time.
 
 ### `cursor`
 

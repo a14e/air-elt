@@ -99,6 +99,16 @@ pub async fn assemble(
         storage_names.insert(flow.storage.as_str());
     }
 
+    // Build the shared expression context before component factories so
+    // expressions in config tables (e.g. `url = "env('PG_URL')"`) are
+    // resolved before the factory deserialises the TOML into its typed
+    // config struct.
+    let expr_context: Arc<crate::config::expression::ExpressionContext> =
+        Arc::new(crate::config::expression::ExpressionContext::new(
+            registry.expr_functions().clone(),
+            config_dir.unwrap_or(std::path::Path::new(".")),
+        ));
+
     // Phase 2: build each referenced component exactly once via O(1)
     // index lookup. Unreferenced components are skipped. Alongside the
     // build we register each component in the shared
@@ -111,14 +121,17 @@ pub async fn assemble(
     let mut sources: AHashMap<&str, Arc<dyn Source>> = AHashMap::new();
     for &name in &source_names {
         let cfg = source_index[name];
-        let built: Arc<dyn Source> =
-            Arc::from(registry.build_source(cfg, monitoring).await.map_err(|e| {
-                ValidationError::AccessFailed {
+        let resolved_cfg = resolve_component_config(cfg, &expr_context)?;
+        let built: Arc<dyn Source> = Arc::from(
+            registry
+                .build_source(&resolved_cfg, monitoring)
+                .await
+                .map_err(|e| ValidationError::AccessFailed {
                     component: "source",
                     name: cfg.name.clone(),
                     source: Box::new(e),
-                }
-            })?);
+                })?,
+        );
         let max = built.max_connections();
         concurrency.register_source(name, max);
         monitoring.set_lock_max(air_elt_monitoring::ComponentKind::Source, name, max);
@@ -127,14 +140,17 @@ pub async fn assemble(
     let mut sinks: AHashMap<&str, Arc<dyn Sink>> = AHashMap::new();
     for &name in &sink_names {
         let cfg = sink_index[name];
-        let built: Arc<dyn Sink> =
-            Arc::from(registry.build_sink(cfg, monitoring).await.map_err(|e| {
-                ValidationError::AccessFailed {
+        let resolved_cfg = resolve_component_config(cfg, &expr_context)?;
+        let built: Arc<dyn Sink> = Arc::from(
+            registry
+                .build_sink(&resolved_cfg, monitoring)
+                .await
+                .map_err(|e| ValidationError::AccessFailed {
                     component: "sink",
                     name: cfg.name.clone(),
                     source: Box::new(e),
-                }
-            })?);
+                })?,
+        );
         let max = built.max_connections();
         concurrency.register_sink(name, max);
         monitoring.set_lock_max(air_elt_monitoring::ComponentKind::Sink, name, max);
@@ -143,14 +159,17 @@ pub async fn assemble(
     let mut storages: AHashMap<&str, Arc<dyn Storage>> = AHashMap::new();
     for &name in &storage_names {
         let cfg = storage_index[name];
-        let built: Arc<dyn Storage> =
-            Arc::from(registry.build_storage(cfg, monitoring).await.map_err(|e| {
-                ValidationError::AccessFailed {
+        let resolved_cfg = resolve_component_config(cfg, &expr_context)?;
+        let built: Arc<dyn Storage> = Arc::from(
+            registry
+                .build_storage(&resolved_cfg, monitoring)
+                .await
+                .map_err(|e| ValidationError::AccessFailed {
                     component: "storage",
                     name: cfg.name.clone(),
                     source: Box::new(e),
-                }
-            })?);
+                })?,
+        );
         let max = built.max_connections();
         concurrency.register_storage(name, max);
         monitoring.set_lock_max(air_elt_monitoring::ComponentKind::Storage, name, max);
@@ -162,19 +181,6 @@ pub async fn assemble(
     // this the manager is read-only; we only use it to issue
     // per-flow `FlowLockHandle`s below.
     crate::util::log_concurrency_budgets(&concurrency);
-
-    // Build the shared expression context once for all flows. When
-    // `config_dir` is `None` expression evaluation is skipped and
-    // `default = "env(...)"` style literals fall through to the plain
-    // `default_value::parse` path (which will likely error on them —
-    // the operator should always supply a config directory).
-    let expr_context: Option<Arc<crate::config::expression::ExpressionContext>> =
-        config_dir.map(|dir| {
-            Arc::new(crate::config::expression::ExpressionContext::new(
-                registry.expr_functions().clone(),
-                dir,
-            ))
-        });
 
     // Phase 3: assemble each flow by attaching shared Arcs via O(1)
     // map lookups.
@@ -992,6 +998,28 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
     Ok(FlowState::new(flow, derived))
 }
 
+fn resolve_component_config(
+    cfg: &ComponentConfig,
+    expr_context: &crate::config::expression::ExpressionContext,
+) -> Result<ComponentConfig, ValidationError> {
+    let resolved_table =
+        crate::config::expression::resolve_config_expressions(&cfg.config, expr_context).map_err(
+            |e| ValidationError::AccessFailed {
+                component: "config",
+                name: cfg.name.clone(),
+                source: Box::new(crate::error::RuntimeError::Other(format!(
+                    "expression resolution in config for {}: {e}",
+                    cfg.name,
+                ))),
+            },
+        )?;
+    Ok(ComponentConfig {
+        name: cfg.name.clone(),
+        kind: cfg.kind.clone(),
+        config: resolved_table,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1055,7 +1083,10 @@ mod tests {
                 )
             },
             recorder: air_elt_monitoring::FlowRecorder::disabled(),
-            expr_context: None,
+            expr_context: Arc::new(crate::config::expression::ExpressionContext::new(
+                Arc::new(air_elt_expr_funcs::FunctionRegistry::with_builtins()),
+                std::path::Path::new("/tmp"),
+            )),
         }
     }
 

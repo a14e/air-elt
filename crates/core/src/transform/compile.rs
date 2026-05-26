@@ -323,12 +323,20 @@ mod tests {
     /// into a bare `Take` or a `Convert` wrap.
     #[test]
     fn switch_plan_lowers_to_switch_op() {
-        use crate::transform::switch::{SwitchKey, SwitchTable};
+        use air_elt_types::Key;
+
+        use crate::transform::switch::SwitchTable;
         use crate::types::Value;
 
         let mut cases = ahash::AHashMap::new();
-        cases.insert(SwitchKey::Bool(true), Value::Text("yes".into()));
-        cases.insert(SwitchKey::Bool(false), Value::Text("no".into()));
+        cases.insert(
+            Key::single(Value::Bool(true)).unwrap(),
+            Value::Text("yes".into()),
+        );
+        cases.insert(
+            Key::single(Value::Bool(false)).unwrap(),
+            Value::Text("no".into()),
+        );
         let table = SwitchTable {
             cases,
             default: None,

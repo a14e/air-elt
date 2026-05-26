@@ -1,5 +1,3 @@
-use crate::token::StringPart;
-
 /// A complete expression program: zero or more variable bindings followed by a result expression.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
@@ -83,27 +81,4 @@ pub enum InterpolationSegment {
     Text(String),
     /// An embedded expression.
     Expression(Expr),
-}
-
-impl From<Vec<StringPart>> for Expr {
-    fn from(parts: Vec<StringPart>) -> Self {
-        if parts.len() == 1 {
-            if let StringPart::Literal(s) = &parts[0] {
-                return Expr::Literal(LiteralValue::String(s.clone()));
-            }
-        }
-
-        let segments = parts
-            .into_iter()
-            .map(|part| match part {
-                StringPart::Literal(s) => InterpolationSegment::Text(s),
-                StringPart::Expr(_source) => {
-                    // Interpolation expressions are parsed in a second pass
-                    InterpolationSegment::Text(String::new())
-                }
-            })
-            .collect();
-
-        Expr::Interpolation(segments)
-    }
 }

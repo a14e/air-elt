@@ -24,7 +24,8 @@ pub fn arithmetic_result_type(
         };
 
         if result_bits > 64 {
-            let decimal_digits = ((result_bits as f64) * 0.301).ceil() as u32 + 1;
+            let decimal_digits =
+                ((result_bits as f64) * std::f64::consts::LOG10_2).ceil() as u32 + 1;
             if decimal_digits > MAX_BIGINT_WIDTH {
                 return Err(ExprTypeError::IntegerOverflow {
                     max: MAX_BIGINT_WIDTH,
@@ -214,7 +215,7 @@ fn integer_bits(dt: &DataType) -> u32 {
 
 /// Convert bit width to approximate decimal digit count.
 fn bits_to_decimal_digits(bits: u32) -> u32 {
-    (bits as f64 * 0.301).ceil() as u32 + 1
+    (bits as f64 * std::f64::consts::LOG10_2).ceil() as u32 + 1
 }
 
 fn bits_to_int_type(bits: u32) -> Result<DataType, ExprTypeError> {

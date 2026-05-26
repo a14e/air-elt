@@ -1,16 +1,19 @@
 use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::{DataType, Value};
 
+use super::arg_extract::validate_text_arg;
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
 use crate::signature::{EvalContext, ExprFunction};
 
 static ENV_ONE_ARG: EnvOneArgFunc = EnvOneArgFunc;
 static ENV_TWO_ARG: EnvTwoArgFunc = EnvTwoArgFunc;
+static FILE: FileFunc = FileFunc;
 
 pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&ENV_ONE_ARG);
     registry.register(&ENV_TWO_ARG);
+    registry.register(&FILE);
 }
 
 /// `env("KEY")` - returns Null if not found
@@ -101,15 +104,45 @@ impl ExprFunction for EnvTwoArgFunc {
     }
 }
 
-fn validate_text_arg(function: &str, dt: &DataType) -> Result<(), FuncError> {
-    if !matches!(dt, DataType::Text { .. }) {
-        return Err(FuncError::TypeMismatch {
-            function: function.to_owned(),
-            expected: "Text".to_owned(),
-            actual: format!("{dt}"),
-        });
+/// `file("path")` - reads file contents relative to config base directory
+struct FileFunc;
+
+impl ExprFunction for FileFunc {
+    fn name(&self) -> &str {
+        "file"
     }
-    Ok(())
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn max_args(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        validate_text_arg("file", &args[0].data_type)?;
+        Ok(NullableExprType::non_null(DataType::Text { size: None }))
+    }
+
+    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
+        let path_val = args.remove(0);
+        if path_val.is_null() {
+            return Ok(Value::Null);
+        }
+        let path = match path_val {
+            Value::Text(s) => s,
+            other => {
+                return Err(FuncError::TypeMismatch {
+                    function: "file".to_owned(),
+                    expected: "Text".to_owned(),
+                    actual: format!("{:?}", other.data_type()),
+                });
+            }
+        };
+        let content = context.file_resolver.read(&path, &context.base_dir)?;
+        Ok(Value::Text(content))
+    }
 }
 
 #[cfg(test)]
@@ -191,5 +224,21 @@ mod tests {
         let f = EnvOneArgFunc;
         let result = f.evaluate(vec![Value::Null], &ctx_with_env()).unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn file_null_returns_null() {
+        let f = FileFunc;
+        let result = f.evaluate(vec![Value::Null], &ctx_with_env()).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn file_calls_resolver() {
+        let f = FileFunc;
+        let result = f.evaluate(vec![Value::Text("test.txt".into())], &ctx_with_env());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("test.txt"));
     }
 }

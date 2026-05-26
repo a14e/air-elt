@@ -47,7 +47,7 @@ pub fn convert(
     // dispatcher delegates without inspecting the value variant. Both-
     // sides Custom is identity iff the descriptors match.
     if let (DataType::Custom(a), DataType::Custom(b)) = (src, dst) {
-        if a.eq_dyn(&**b) {
+        if a.is_equal(&**b) {
             return Ok(value);
         }
         return Err(ConvertError::Unsupported {
@@ -2088,7 +2088,7 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
             self
         }
-        fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+        fn is_equal(&self, other: &dyn DynValue) -> bool {
             other
                 .as_any()
                 .downcast_ref::<DispatchTestValue>()

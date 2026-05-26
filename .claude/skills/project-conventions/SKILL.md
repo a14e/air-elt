@@ -13,7 +13,9 @@ Before editing Rust code, check this list. If a utility exists for your need, us
 Two foundational crates carry the no-internal-dep rule:
 
 - `air-elt-commons` (`crates/commons/lib`) — utility helpers (`tracing_init`, `identifier`, `pool_timeouts`, `pool_settings`, `bool_flag`, `interval`).
-- `air-elt-types` (`crates/types`) — canonical type model (`DataType`, `Value`, conversion matrix, default-literal parser, JSON encoder, `DynType` / `DynValue` traits, `JsonEncodeError`).
+- `air-elt-types` (`crates/types`) — canonical type model (`DataType`, `Value`, `Key`, conversion matrix, value comparison (`compare_values`, `values_equal`), JSON encoder, `DynType` / `DynValue` traits, `JsonEncodeError`).
+
+**All type casts and value comparisons belong in `air-elt-types`**, not in expression or connector code. Expression functions and connectors call `air_elt_types::compare_values` / `air_elt_types::convert` instead of hand-rolling match arms. Connector-local custom types implement `DynValue::partial_cmp_dyn` and `DynValue::eq_dyn` for ordering/equality of opaque values.
 
 Both **MUST NOT depend on any other `air-elt-*` crate**. Direction of dependency is the inverse: `core` (and connectors) depend on both; never the other way around. If a type wants to bridge a foundational crate and `core` (e.g. `impl From<IdentifierError> for RuntimeError`), the impl belongs in `core` — `core` is allowed to know about commons and types. The `commons-pg` / `commons-mysql` / `commons-mongodb` / `commons-clickhouse` / `commons-questdb` crates legitimately depend on both `core` and the two foundational crates; `commons-lib` and `air-elt-types` do not.
 
@@ -102,6 +104,10 @@ Future no-delete sinks (e.g. an append-only event-store backend) MUST repeat the
 ## Type model and the N+N matrix
 
 Canonical types are the only pivot — connectors map `native → DataType` on read and `DataType → native` on write. Compatibility is checked at validation time (`core::types::matrix::is_compatible` lossless, `is_compatible_with_truncate` for narrowing arms); per-cell conversion runs at row time inside the Transform layer (`core::types::convert`). Backend-specific types live behind `DataType::Custom(Box<dyn DynType>)` in `commons-{backend}/src/types/`, never in `core`. Sampled schemas (Mongo today) are a validation-time artifact only — the static `ColumnConversionPlan` MUST NOT be load-bearing for schemaless sources; `Source::schemaless() == true` switches the compiled Transform onto a dynamic-source `Convert` op that resolves the source `DataType` per cell. Full reference (every type, matrix arms, custom-kind requirements, sampled-schema escape hatches): [references/type-model.md](references/type-model.md).
+
+## Key newtype (`air_elt_types::Key`)
+
+Hashable, totally-ordered projection of `Value` for switch dispatch, batch dedup, and cursor comparison. `Value` has cross-numeric `PartialEq`/`PartialOrd` but does NOT implement `Hash` or `Eq` — for `HashMap`/`HashSet` usage, project through `Key`. Rejects Null/Json/Object; accepts cursor-compatible Custom. Canonicalises small ints → Int64, Float32 → Float64 on construction so cross-width values hash identically. `KeyBson` stays separate for BSON-layer dedup (raw `bson::Bson`, always `_id`).
 
 ## Schema on context
 

@@ -81,7 +81,7 @@ impl DynType for QuestDbGeohashType {
 
     /// Bit width participates in identity — two `GEOHASH(7b)` and
     /// `GEOHASH(12b)` columns are structurally different.
-    fn eq_dyn(&self, other: &dyn DynType) -> bool {
+    fn is_equal(&self, other: &dyn DynType) -> bool {
         other
             .as_any()
             .downcast_ref::<QuestDbGeohashType>()
@@ -139,7 +139,7 @@ impl DynValue for QuestDbGeohashValue {
         self
     }
 
-    fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+    fn is_equal(&self, other: &dyn DynValue) -> bool {
         other
             .as_any()
             .downcast_ref::<QuestDbGeohashValue>()
