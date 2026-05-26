@@ -39,6 +39,8 @@ The config loader determines what is an expression vs a plain string:
 - `{{` escapes to a literal `{` in interpolation.
 - `$$` escapes `$` in `env_expand` (secret resolution layer, runs before expressions).
 
+Config format matters for expression quoting: in YAML, expressions need no outer quotes (YAML handles strings natively). In TOML, outer quotes are required because bare values are typed.
+
 ## Type system
 
 `NullableExprType { data_type: DataType, nullable: bool, int_bound: Option<u8> }`
@@ -49,6 +51,10 @@ The config loader determines what is an expression vs a plain string:
 - Non-integer types carry `int_bound = None`.
 - Materialization picks the smallest `DataType` that fits the bound (Int8/16/32/64 or BigInt).
 
+`Value` implements cross-numeric `PartialEq` and `PartialOrd` via `compare::values_equal` and `compare::compare_values` -- `Int8(5) == Int64(5)` is true, `Int64(3) < BigInt(10)` works. Null==Null returns true for equality. Json/Object use structural equality. Ipv4 and Ipv6 support cross-comparison (v4 maps to v6). NaN comparisons follow IEEE 754 (NaN != NaN).
+
+`Key` newtype (in `crates/types/src/key.rs`) wraps `SmallVec<[Value; 2]>` for switch dispatch, batch dedup, and cursor comparison. Unlike `Value`, `Key` has total ordering (`Ord`) and total equality (`Eq`) -- NaN == NaN by design so keys are deterministic. Construction rejects Null/Json/Object and canonicalises representation (small ints promote to Int64, Float32 widens to Float64).
+
 ## Function categories
 
 All functions are registered as static items implementing `ExprFunction`. Brief category summary (full list in [references/functions.md](references/functions.md)):
@@ -56,7 +62,7 @@ All functions are registered as static items implementing `ExprFunction`. Brief 
 | Category | Functions |
 |---|---|
 | Conditional | `if`, `multiIf`, `ifNull`, `nullIf`, `coalesce`, `isNull`, `isNotNull` |
-| String | `concat`, `length`, `substring`, `charAt`, `upper`, `lower`, `trim`, `replace`, `replaceAll`, `startsWith`, `endsWith`, `contains`, `indexOf`, `format`, `toString`, `reverse`, `repeat`, `leftPad`, `rightPad` |
+| String | `concat`, `length`, `substring`, `charAt`, `upper`, `lower`, `trim`, `replace`, `startsWith`, `endsWith`, `contains`, `indexOf`, `format`, `toString`, `reverse`, `repeat`, `leftPad`, `rightPad` |
 | Arithmetic | `add`, `subtract`, `multiply`, `divide`, `modulo`, `negate`, `abs`, `ceil`, `floor`, `round`, `min`, `max`, `sign`, `power`, `sqrt` |
 | Math | trig, hyperbolic, logarithmic, constants, special (`erf`, `gamma`, `lambertW`, `beta`) |
 | Comparison | `equals`, `notEquals`, `greater`, `less`, `greaterOrEquals`, `lessOrEquals` |
@@ -65,7 +71,7 @@ All functions are registered as static items implementing `ExprFunction`. Brief 
 | Datetime | `now`, `today`, extraction (`second`..`year`, `dayOfWeek`, `dayOfYear`), conversion (`toSeconds`, `toMillis`, `fromSeconds`, `fromMillis`), arithmetic (`addDays`..`addYears`, `subtractDays`..`subtractYears`), `dateDiff`, `formatDateTime` |
 | Bytes | `byteLength`, `byteAt`, `byteSlice`, `bytesFromHex`, `bytesFromBase64`, `bytesFromUtf8`, `hex`, `base64`, `base64Url`, `bytesEqual`, `urlEncode`, `urlDecode` |
 | Encoding | `encode`, `decode`, `encodeText`, `decodeText` |
-| Crypto | `md5`, `sha1`, `sha256`, `sha512`, `xxHash64`, `xxHash32`, `hmac` |
+| Crypto | `md5`, `sha1`, `sha256`, `sha512`, `xxHash64`, `xxHash32`, `cityHash64`, `hmac` |
 | JSON | `parseJson`, `toJson`, `jsPath`, `jsPathString`, `jsPathInt`, `jsPathFloat`, `jsPathBool`, `jsonLength` |
 | Object | `objectLength`, `objectKeys`, `objectValues`, `objectHasKey`, `objectGet` |
 | Random | `randomUuid`, `randomInt`, `randomFloat`, `randomAlphanumeric`, `randomHex`, `randomBytes`, `randomChoice` |
@@ -92,6 +98,8 @@ crates/expr/
 - `ExpressionContext` on `AssembledFlow` holds the compiled program.
 - Evaluation happens during **assemble** (no I/O), not validate.
 - `EvalContext` provides `env_resolver`, `file_resolver`, `now` timestamp, and `base_dir`.
+- Default values are computed through `ExprValue.eval()` (there is no separate default_value module).
+- `DynValue` trait methods: `is_equal` (equality), `partial_cmp` (ordering), `hash` (hashing).
 
 ## Adding a new function
 

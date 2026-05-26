@@ -25,8 +25,7 @@ All functions propagate null (return `Value::Null` if any argument is null) unle
 | `upper` | `(Text) -> Text` | Uppercase |
 | `lower` | `(Text) -> Text` | Lowercase |
 | `trim` | `(Text) -> Text` | Strip leading/trailing whitespace |
-| `replace` | `(Text, Text, Text) -> Text` | Replace first occurrence |
-| `replaceAll` | `(Text, Text, Text) -> Text` | Replace all occurrences |
+| `replace` | `(Text, Text, Text) -> Text` | Replace all occurrences |
 | `startsWith` | `(Text, Text) -> Bool` | True if string starts with prefix |
 | `endsWith` | `(Text, Text) -> Bool` | True if string ends with suffix |
 | `contains` | `(Text, Text) -> Bool` | True if string contains substring |
@@ -211,6 +210,7 @@ Comparable type categories: numeric, text, bool, date, timestamp, uuid.
 | `sha512` | `(Text/Bytes) -> Text` | SHA-512 hash (hex) |
 | `xxHash64` | `(Text/Bytes) -> Int64` | xxHash64 |
 | `xxHash32` | `(Text/Bytes) -> Int64` | xxHash32 |
+| `cityHash64` | `(Text/Bytes) -> Int64` | CityHash64 (ClickHouse-compatible, uses `ch_cityhash102` crate) |
 | `hmac` | `(Text, Text/Bytes, Text) -> Text` | HMAC (algorithm, data, key) -- hex output |
 
 ## JSON

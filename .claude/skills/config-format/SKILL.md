@@ -8,6 +8,8 @@ user-invocable: false
 
 Air Elt accepts both TOML (`.toml`) and YAML (`.yml`/`.yaml`). Format is detected per file by extension; mixing formats inside one include graph is allowed. The shape is identical — a TOML `[[sources]]`/`[flow.<name>]`/inline-table maps mechanically to a YAML list / nested map / nested mapping under the same keys. All examples below are TOML; translate to YAML by that mapping when needed. Multi-word keys use **kebab-case** (`batch-limit`, `operation-timeout-secs`) in both formats.
 
+**Expression syntax in YAML vs TOML.** In TOML, expression strings require outer quotes: `default = "concat('a', 'b')"`. In YAML, values are already strings — write expressions without outer quotes: `default: concat('a', 'b')`. Same for `url: env('PG_URL')`, `default: if(true, 'yes', 'no')`, etc.
+
 ## Include & duplicate rules
 
 - Each `[[sources]]`, `[[sinks]]`, `[[storages]]` entry and each `[flow.<name>]` must be defined in exactly one file across the root and all included files. Duplicate names across files are an error (`DuplicateName` / `DuplicateFlow`).

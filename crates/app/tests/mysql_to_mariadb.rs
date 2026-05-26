@@ -479,7 +479,8 @@ async fn mysql_to_mariadb_switch_with_default_arm() {
             format!(
                 "CREATE TABLE `{src_db}`.events (
                     id   BIGINT NOT NULL,
-                    code INT NOT NULL
+                    code INT NOT NULL,
+                    note TEXT
                 ) ENGINE=InnoDB"
             )
             .as_str(),
@@ -497,8 +498,12 @@ async fn mysql_to_mariadb_switch_with_default_arm() {
         .execute(
             format!(
                 "CREATE TABLE `{dst_db}`.events_labelled (
-                    id    BIGINT,
-                    label TEXT
+                    id          BIGINT,
+                    label       TEXT,
+                    env_default TEXT,
+                    interp_switch TEXT,
+                    multi_if    TEXT,
+                    null_check  TEXT
                 ) ENGINE=InnoDB"
             )
             .as_str(),
@@ -550,6 +555,10 @@ cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
 [flow.events.mapping]
 id = "id"
 label = {{ from = "code", switch = {{ 10 = "alpha", 20 = "beta" }}, default = "other" }}
+env_default = {{ from = "note", default = "env('AIR_ELT_TEST_LABEL', 'fallback')" }}
+interp_switch = {{ from = "code", switch = {{ 10 = "alpha-{{toString(10)}}", 20 = "beta-{{toString(20)}}" }}, default = "code-{{toString(0)}}" }}
+multi_if = {{ from = "note", default = "multiIf(1 > 2, 'big', 1 == 1, 'equal', 'other')" }}
+null_check = {{ from = "note", default = "ifNull(null, 'was-null')" }}
 "#,
     );
 
@@ -559,21 +568,52 @@ label = {{ from = "code", switch = {{ 10 = "alpha", 20 = "beta" }}, default = "o
     let app = App::from_path(&config_path).expect("App::from_path");
     app.run_once().await.expect("run_once");
 
-    let rows: Vec<(i64, Option<String>)> = sqlx::query_as(&format!(
-        "SELECT id, label FROM `{dst_db}`.events_labelled ORDER BY id"
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(&format!(
+        "SELECT id, label, env_default, interp_switch, multi_if, null_check \
+         FROM `{dst_db}`.events_labelled ORDER BY id"
     ))
     .fetch_all(&mariadb.pool)
     .await
     .unwrap();
 
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0], (1, Some("alpha".to_string())));
-    assert_eq!(rows[1], (2, Some("beta".to_string())));
+
+    // Switch: int keys with default
+    assert_eq!(rows[0].1, Some("alpha".to_string()));
+    assert_eq!(rows[1].1, Some("beta".to_string()));
     assert_eq!(
-        rows[2],
-        (3, Some("other".to_string())),
+        rows[2].1,
+        Some("other".to_string()),
         "miss must fall back to `default`"
     );
+
+    // env() default (note is NULL → default fires, env var not set → fallback)
+    for row in &rows {
+        assert_eq!(row.2, Some("fallback".to_string()));
+    }
+
+    // Interpolation in switch values
+    assert_eq!(rows[0].3, Some("alpha-10".to_string()));
+    assert_eq!(rows[1].3, Some("beta-20".to_string()));
+    assert_eq!(rows[2].3, Some("code-0".to_string()));
+
+    // multiIf: 1 > 2 false, 1 == 1 true → "equal"
+    for row in &rows {
+        assert_eq!(row.4, Some("equal".to_string()));
+    }
+
+    // ifNull(null, 'was-null') → "was-null"
+    for row in &rows {
+        assert_eq!(row.5, Some("was-null".to_string()));
+    }
 
     mysql.pool.close().await;
     mariadb.pool.close().await;

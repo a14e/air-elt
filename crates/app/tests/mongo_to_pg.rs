@@ -330,7 +330,9 @@ async fn mongo_to_pg_switch_string_keys_schemaless_source() {
             format!(
                 "CREATE TABLE \"{dst_schema_pg}\".orders_labelled (
                     id           BIGINT,
-                    status_label TEXT
+                    status_label TEXT,
+                    priority     INT,
+                    env_tag      TEXT
                 )"
             )
             .as_str(),
@@ -351,10 +353,10 @@ async fn mongo_to_pg_switch_string_keys_schemaless_source() {
     // NULL-source branch returns the table default — so rows 4 and 5
     // must land as "unknown" too.
     let docs_seed = vec![
-        doc! { "_id": 1_i64, "status": "ACTIVE" },
-        doc! { "_id": 2_i64, "status": "FINISHED" },
-        doc! { "_id": 3_i64, "status": "OTHER" },
-        doc! { "_id": 4_i64, "status": bson::Bson::Null },
+        doc! { "_id": 1_i64, "status": "ACTIVE", "priority": bson::Bson::Null, "tag": bson::Bson::Null },
+        doc! { "_id": 2_i64, "status": "FINISHED", "priority": bson::Bson::Null, "tag": bson::Bson::Null },
+        doc! { "_id": 3_i64, "status": "OTHER", "priority": bson::Bson::Null, "tag": bson::Bson::Null },
+        doc! { "_id": 4_i64, "status": bson::Bson::Null, "priority": bson::Bson::Null, "tag": bson::Bson::Null },
         doc! { "_id": 5_i64 },
     ];
     for d in &docs_seed {
@@ -394,6 +396,8 @@ cursor = {{ fields = ["_id"], order = "asc", interval = "100ms" }}
 [flow.orders.mapping]
 id = {{ from = "_id", default = 0 }}
 status_label = {{ from = "status", switch = {{ ACTIVE = "active", FINISHED = "finished" }}, default = "unknown" }}
+priority = {{ from = "priority", default = 0 }}
+env_tag = {{ from = "tag", default = "status-{{env('AIR_ELT_TEST_TAG', 'default')}}" }}
 "#,
     );
 
@@ -403,31 +407,43 @@ status_label = {{ from = "status", switch = {{ ACTIVE = "active", FINISHED = "fi
     let app = App::from_path(&config_path).expect("App::from_path");
     app.run_once().await.expect("run_once");
 
-    let rows: Vec<(i64, Option<String>)> = sqlx::query_as(&format!(
-        "SELECT id, status_label FROM \"{dst_schema_pg}\".orders_labelled ORDER BY id"
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(i64, Option<String>, Option<i32>, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT id, status_label, priority, env_tag \
+         FROM \"{dst_schema_pg}\".orders_labelled ORDER BY id"
     ))
     .fetch_all(&pg.pool)
     .await
     .unwrap();
 
     assert_eq!(rows.len(), 5);
-    assert_eq!(rows[0], (1, Some("active".to_string())));
-    assert_eq!(rows[1], (2, Some("finished".to_string())));
+    assert_eq!(rows[0].1, Some("active".to_string()));
+    assert_eq!(rows[1].1, Some("finished".to_string()));
     assert_eq!(
-        rows[2],
-        (3, Some("unknown".to_string())),
+        rows[2].1,
+        Some("unknown".to_string()),
         "miss must fall back to `default`"
     );
     assert_eq!(
-        rows[3],
-        (4, Some("unknown".to_string())),
-        "explicit BSON null source must take the switch default"
+        rows[3].1,
+        Some("unknown".to_string()),
+        "explicit BSON null → switch default"
     );
     assert_eq!(
-        rows[4],
-        (5, Some("unknown".to_string())),
-        "missing source field (absent in document) must take the switch default"
+        rows[4].1,
+        Some("unknown".to_string()),
+        "missing field → switch default"
     );
+
+    // Integer narrowing: default = 0 (Int64 → Int32 via try_narrow_numeric)
+    for row in &rows {
+        assert_eq!(row.2, Some(0));
+    }
+
+    // Interpolation + env: "status-{env('AIR_ELT_TEST_TAG', 'default')}"
+    for row in &rows {
+        assert_eq!(row.3, Some("status-default".to_string()));
+    }
 
     pg.pool.close().await;
 }

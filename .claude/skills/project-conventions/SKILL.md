@@ -15,7 +15,7 @@ Two foundational crates carry the no-internal-dep rule:
 - `air-elt-commons` (`crates/commons/lib`) — utility helpers (`tracing_init`, `identifier`, `pool_timeouts`, `pool_settings`, `bool_flag`, `interval`).
 - `air-elt-types` (`crates/types`) — canonical type model (`DataType`, `Value`, `Key`, conversion matrix, value comparison (`compare_values`, `values_equal`), JSON encoder, `DynType` / `DynValue` traits, `JsonEncodeError`).
 
-**All type casts and value comparisons belong in `air-elt-types`**, not in expression or connector code. Expression functions and connectors call `air_elt_types::compare_values` / `air_elt_types::convert` instead of hand-rolling match arms. Connector-local custom types implement `DynValue::partial_cmp_dyn` and `DynValue::eq_dyn` for ordering/equality of opaque values.
+**All type casts and value comparisons belong in `air-elt-types`**, not in expression or connector code. Expression functions and connectors call `air_elt_types::compare_values` / `air_elt_types::convert` instead of hand-rolling match arms. Connector-local custom types implement `DynValue::partial_cmp` and `DynValue::is_equal` for ordering/equality of opaque values.
 
 Both **MUST NOT depend on any other `air-elt-*` crate**. Direction of dependency is the inverse: `core` (and connectors) depend on both; never the other way around. If a type wants to bridge a foundational crate and `core` (e.g. `impl From<IdentifierError> for RuntimeError`), the impl belongs in `core` — `core` is allowed to know about commons and types. The `commons-pg` / `commons-mysql` / `commons-mongodb` / `commons-clickhouse` / `commons-questdb` crates legitimately depend on both `core` and the two foundational crates; `commons-lib` and `air-elt-types` do not.
 

@@ -575,7 +575,8 @@ async fn pg_to_pg_switch_bool_keys() {
             format!(
                 "CREATE TABLE \"{src_schema}\".users (
                     id     BIGINT NOT NULL,
-                    active BOOLEAN NOT NULL
+                    active BOOLEAN NOT NULL,
+                    note   TEXT
                 )"
             )
             .as_str(),
@@ -587,8 +588,12 @@ async fn pg_to_pg_switch_bool_keys() {
         .execute(
             format!(
                 "CREATE TABLE \"{dst_schema}\".users_labelled (
-                    id    BIGINT,
-                    label TEXT
+                    id            BIGINT,
+                    label         TEXT,
+                    expr_default  TEXT,
+                    interp_default TEXT,
+                    if_true       TEXT,
+                    if_false      TEXT
                 )"
             )
             .as_str(),
@@ -639,6 +644,10 @@ cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
 [flow.users.mapping]
 id = "id"
 label = {{ from = "active", switch = {{ true = "yes", false = "no" }} }}
+expr_default = {{ from = "note", default = "concat('prefix-', 'suffix')" }}
+interp_default = {{ from = "note", default = "hello-{{toString(42)}}" }}
+if_true = {{ from = "note", default = "if(true, 'yes', 'no')" }}
+if_false = {{ from = "note", default = "if(false, 'yes', 'no')" }}
 "#,
     );
 
@@ -648,17 +657,48 @@ label = {{ from = "active", switch = {{ true = "yes", false = "no" }} }}
     let app = App::from_path(&config_path).expect("App::from_path");
     app.run_once().await.expect("run_once");
 
-    let rows: Vec<(i64, Option<String>)> = sqlx::query_as(&format!(
-        "SELECT id, label FROM \"{dst_schema}\".users_labelled ORDER BY id"
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(&format!(
+        "SELECT id, label, expr_default, interp_default, if_true, if_false \
+         FROM \"{dst_schema}\".users_labelled ORDER BY id"
     ))
     .fetch_all(&pg.pool)
     .await
     .unwrap();
 
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0], (1, Some("yes".to_string())));
-    assert_eq!(rows[1], (2, Some("no".to_string())));
-    assert_eq!(rows[2], (3, Some("yes".to_string())));
+
+    // Switch: bool keys
+    assert_eq!(rows[0].1, Some("yes".to_string()));
+    assert_eq!(rows[1].1, Some("no".to_string()));
+    assert_eq!(rows[2].1, Some("yes".to_string()));
+
+    // Expression default: concat()
+    for row in &rows {
+        assert_eq!(row.2, Some("prefix-suffix".to_string()));
+    }
+
+    // Interpolation default: "hello-{toString(42)}"
+    for row in &rows {
+        assert_eq!(row.3, Some("hello-42".to_string()));
+    }
+
+    // if(true, ...) → true branch
+    for row in &rows {
+        assert_eq!(row.4, Some("yes".to_string()));
+    }
+
+    // if(false, ...) → false branch
+    for row in &rows {
+        assert_eq!(row.5, Some("no".to_string()));
+    }
 
     pg.pool.close().await;
 }

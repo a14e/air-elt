@@ -66,6 +66,13 @@ async fn pg_to_clickhouse_round_trip() {
     let pg_url = pg.url_with_search_path();
     let ch_url = &ch.url;
 
+    #[allow(unsafe_code)]
+    // Why: set_var is unsafe in edition 2024 due to potential read races.
+    // Single-threaded test setup, no concurrent readers.
+    unsafe {
+        std::env::set_var("AIR_ELT_TEST_CH_URL", ch_url);
+    }
+
     let config_yaml = format!(
         r#"
 sources:
@@ -78,7 +85,7 @@ sinks:
   - name: snk
     type: clickhouse
     config:
-      url: "{ch_url}"
+      url: env('AIR_ELT_TEST_CH_URL')
       database: "{ch_db}"
       user: "default"
       password: ""
