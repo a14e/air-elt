@@ -2,6 +2,9 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
+use air_elt_expr::ExprValue;
+
+use crate::config::expression::ExpressionContext;
 use crate::config::validation::SamplingConfig;
 use crate::error::ValidationError;
 use crate::mapping::{self, ColumnMapping, DirectMapping, ExpandedMapping};
@@ -12,7 +15,7 @@ use crate::transform::SwitchTable;
 // global registry. The plan / Transform are only cloned at validation
 // / sampling boundaries, which happens a handful of times per flow
 // lifetime; the per-tick path borrows.
-use crate::types::{ConversionContext, DataType};
+use crate::types::{ConversionContext, DataType, Value};
 
 /// A flow with its components built and config-time specs derived, but
 /// without I/O validation yet. Returned by `validation::pipeline::assemble`.
@@ -77,6 +80,12 @@ pub struct AssembledFlow {
     /// via `MonitoringManager::flow_recorder` — flow runners just
     /// clone it. Disabled when monitoring is off.
     pub recorder: air_elt_monitoring::FlowRecorder,
+    /// Expression evaluation context for resolving `default = "env('KEY', 'fallback')"`
+    /// style literals. Built once in `assemble` from the registry's
+    /// `FunctionRegistry` + the config directory. `None` when expression
+    /// evaluation is not available (e.g. tests that build flows without
+    /// a config directory).
+    pub expr_context: Arc<crate::config::expression::ExpressionContext>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -353,6 +362,21 @@ fn derive_schemaless_sink_schema(src: &Schema, expanded: &ExpandedMapping) -> Sc
     )
 }
 
+/// Resolve a default literal: ExprValue.eval() → check/convert to sink type.
+/// All TOML literals, expressions, and interpolations go through the same path.
+fn resolve_default_literal(
+    literal: &toml::Value,
+    sink_dt: &DataType,
+    expr_context: &ExpressionContext,
+) -> Result<Value, String> {
+    let expr_val = ExprValue::from_toml(literal.clone());
+    let value = expr_val
+        .eval(&expr_context.registry, &expr_context.eval_context)
+        .map_err(|e| e.to_string())?;
+
+    crate::config::expression::ensure_sink_compatible(value, sink_dt)
+}
+
 /// Build per-column ColumnConversionPlans from the expanded mapping. Mirrors
 /// the logic in `validation::pipeline::validate_flow` so a rebuild
 /// produces the same plans the pipeline did initially.
@@ -456,7 +480,7 @@ fn build_conversions(
                 // Switch RHS canonicalisation needs a source `DataType`.
                 // For typed sources the sample is the contract; for
                 // schemaless sources fall back to the sink type — the
-                // switch operates on canonical keys (`SwitchKey::from_value`
+                // switch operates on canonical keys (`Key::from_value`
                 // dispatches on the actual `Value` at runtime), so the
                 // declared source type only narrows literal parsing.
                 let src_dt = src_field
@@ -472,6 +496,7 @@ fn build_conversions(
                     &src_dt,
                     &sink_dt,
                     dst_schemaless,
+                    &flow.expr_context,
                 )?)
             }
             None => None,
@@ -480,13 +505,15 @@ fn build_conversions(
             None
         } else {
             match default_literal {
-                Some(lit) => Some(crate::types::default_value::parse(lit, &sink_dt).map_err(
-                    |e| ValidationError::DefaultParse {
-                        flow: flow_name.clone(),
-                        column: from.clone(),
-                        source: e,
-                    },
-                )?),
+                Some(lit) => Some(
+                    resolve_default_literal(lit, &sink_dt, &flow.expr_context).map_err(
+                        |reason| ValidationError::DefaultEval {
+                            flow: flow_name.clone(),
+                            column: from.clone(),
+                            reason,
+                        },
+                    )?,
+                ),
                 None => None,
             }
         };
@@ -605,6 +632,10 @@ mod tests {
                 )
             },
             recorder: air_elt_monitoring::FlowRecorder::disabled(),
+            expr_context: Arc::new(ExpressionContext::new(
+                Arc::new(air_elt_expr_funcs::FunctionRegistry::with_builtins()),
+                std::path::Path::new("/tmp"),
+            )),
         }
     }
 
@@ -926,5 +957,180 @@ mod tests {
         let src = schema(&[("code", DataType::Int32, false)]);
         let dst = schema(&[("label", DataType::Text { size: None }, true)]);
         build_derived_plans(&flow, &src, &dst).expect("nullable sink admits NULL on miss");
+    }
+
+    /// Expression in `default` is evaluated when `expr_context` is set.
+    #[test]
+    fn expression_default_is_evaluated() {
+        use crate::transform::TransformOp;
+        use air_elt_expr_funcs::FunctionRegistry;
+        use std::path::PathBuf;
+
+        let expr_ctx = Arc::new(crate::config::expression::ExpressionContext::new(
+            Arc::new(FunctionRegistry::with_builtins()),
+            &PathBuf::from("/tmp"),
+        ));
+        let mut flow = assembled(vec![ColumnMapping::Direct {
+            from: "name".into(),
+            to: "name".into(),
+            truncate: false,
+            default_literal: Some(toml::Value::String(
+                "concat('hello', ' ', 'world')".to_string(),
+            )),
+        }]);
+        flow.expr_context = expr_ctx;
+
+        let src = schema(&[("name", DataType::Text { size: None }, true)]);
+        let dst = schema(&[("name", DataType::Text { size: None }, false)]);
+        let plans = build_derived_plans(&flow, &src, &dst).unwrap();
+        let default_val = match &plans.transform.cols[0] {
+            TransformOp::Convert { plan, .. } => plan.ctx.default.as_ref().unwrap(),
+            other => panic!("expected Convert op, got {other:?}"),
+        };
+        assert_eq!(*default_val, Value::Text("hello world".to_string()));
+    }
+
+    /// Interpolation in `default` is evaluated via ExprValue.
+    #[test]
+    fn interpolation_default_is_evaluated() {
+        use crate::transform::TransformOp;
+        use air_elt_expr_funcs::FunctionRegistry;
+        use std::path::PathBuf;
+
+        let expr_ctx = Arc::new(crate::config::expression::ExpressionContext::new(
+            Arc::new(FunctionRegistry::with_builtins()),
+            &PathBuf::from("/tmp"),
+        ));
+        let mut flow = assembled(vec![ColumnMapping::Direct {
+            from: "name".into(),
+            to: "name".into(),
+            truncate: false,
+            default_literal: Some(toml::Value::String("prefix_{1 + 2}_suffix".to_string())),
+        }]);
+        flow.expr_context = expr_ctx;
+
+        let src = schema(&[("name", DataType::Text { size: None }, true)]);
+        let dst = schema(&[("name", DataType::Text { size: None }, false)]);
+        let plans = build_derived_plans(&flow, &src, &dst).unwrap();
+        let default_val = match &plans.transform.cols[0] {
+            TransformOp::Convert { plan, .. } => plan.ctx.default.as_ref().unwrap(),
+            other => panic!("expected Convert op, got {other:?}"),
+        };
+        assert_eq!(*default_val, Value::Text("prefix_3_suffix".to_string()));
+    }
+
+    /// Plain string literal evaluates to Text directly.
+    #[test]
+    fn plain_string_default_without_expr_context() {
+        use crate::transform::TransformOp;
+
+        let flow = assembled(vec![ColumnMapping::Direct {
+            from: "name".into(),
+            to: "name".into(),
+            truncate: false,
+            default_literal: Some(toml::Value::String("hello".to_string())),
+        }]);
+        let src = schema(&[("name", DataType::Text { size: None }, true)]);
+        let dst = schema(&[("name", DataType::Text { size: None }, false)]);
+        let plans = build_derived_plans(&flow, &src, &dst).unwrap();
+        let default_val = match &plans.transform.cols[0] {
+            TransformOp::Convert { plan, .. } => plan.ctx.default.as_ref().unwrap(),
+            other => panic!("expected Convert op, got {other:?}"),
+        };
+        assert_eq!(*default_val, Value::Text("hello".to_string()));
+    }
+
+    /// Expression with explicit cast produces the exact sink type.
+    #[test]
+    fn expression_default_with_cast_to_float64() {
+        use crate::transform::TransformOp;
+        use air_elt_expr_funcs::FunctionRegistry;
+        use std::path::PathBuf;
+
+        let expr_ctx = Arc::new(crate::config::expression::ExpressionContext::new(
+            Arc::new(FunctionRegistry::with_builtins()),
+            &PathBuf::from("/tmp"),
+        ));
+        let mut flow = assembled(vec![ColumnMapping::Direct {
+            from: "val".into(),
+            to: "val".into(),
+            truncate: false,
+            default_literal: Some(toml::Value::String("add(1, 2)".to_string())),
+        }]);
+        flow.expr_context = expr_ctx;
+
+        let src = schema(&[("val", DataType::Float64, true)]);
+        let dst = schema(&[("val", DataType::Float64, false)]);
+        let plans = build_derived_plans(&flow, &src, &dst).unwrap();
+        let default_val = match &plans.transform.cols[0] {
+            TransformOp::Convert { plan, .. } => plan.ctx.default.as_ref().unwrap(),
+            other => panic!("expected Convert op, got {other:?}"),
+        };
+        assert_eq!(*default_val, Value::Float64(3.0));
+    }
+
+    /// TOML integer literal is narrowed to Int16 when value fits.
+    #[test]
+    fn literal_integer_narrowed_to_int16() {
+        use crate::transform::TransformOp;
+
+        let flow = assembled(vec![ColumnMapping::Direct {
+            from: "val".into(),
+            to: "val".into(),
+            truncate: false,
+            default_literal: Some(toml::Value::Integer(42)),
+        }]);
+        let src = schema(&[("val", DataType::Int16, true)]);
+        let dst = schema(&[("val", DataType::Int16, false)]);
+        let plans = build_derived_plans(&flow, &src, &dst).unwrap();
+        let default_val = match &plans.transform.cols[0] {
+            TransformOp::Convert { plan, .. } => plan.ctx.default.as_ref().unwrap(),
+            other => panic!("expected Convert op, got {other:?}"),
+        };
+        assert_eq!(*default_val, Value::Int16(42));
+    }
+
+    /// TOML integer literal exceeding Int8 range is rejected.
+    #[test]
+    fn literal_integer_rejected_when_out_of_range() {
+        let flow = assembled(vec![ColumnMapping::Direct {
+            from: "val".into(),
+            to: "val".into(),
+            truncate: false,
+            default_literal: Some(toml::Value::Integer(300)),
+        }]);
+        let src = schema(&[("val", DataType::Int8, true)]);
+        let dst = schema(&[("val", DataType::Int8, false)]);
+        let res = build_derived_plans(&flow, &src, &dst);
+        assert!(res.is_err(), "300 should be out of range for Int8");
+    }
+
+    /// Expression with explicit cast to Int32 from text.
+    #[test]
+    fn expression_text_to_int32_via_cast() {
+        use crate::transform::TransformOp;
+        use air_elt_expr_funcs::FunctionRegistry;
+        use std::path::PathBuf;
+
+        let expr_ctx = Arc::new(crate::config::expression::ExpressionContext::new(
+            Arc::new(FunctionRegistry::with_builtins()),
+            &PathBuf::from("/tmp"),
+        ));
+        let mut flow = assembled(vec![ColumnMapping::Direct {
+            from: "val".into(),
+            to: "val".into(),
+            truncate: false,
+            default_literal: Some(toml::Value::String("toInt32(30)".to_string())),
+        }]);
+        flow.expr_context = expr_ctx;
+
+        let src = schema(&[("val", DataType::Int32, true)]);
+        let dst = schema(&[("val", DataType::Int32, false)]);
+        let plans = build_derived_plans(&flow, &src, &dst).unwrap();
+        let default_val = match &plans.transform.cols[0] {
+            TransformOp::Convert { plan, .. } => plan.ctx.default.as_ref().unwrap(),
+            other => panic!("expected Convert op, got {other:?}"),
+        };
+        assert_eq!(*default_val, Value::Int32(30));
     }
 }

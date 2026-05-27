@@ -26,7 +26,6 @@ use air_elt_core::error::JsonEncodeError;
 use air_elt_core::types::convert::ConvertError;
 use air_elt_core::types::convert::context::ConversionContext;
 use air_elt_core::types::data_type::DataType;
-use air_elt_core::types::default_value::DefaultParseError;
 use air_elt_core::types::dynamic::{DynType, DynValue};
 use air_elt_core::types::value::Value;
 
@@ -188,16 +187,11 @@ impl DynType for PgInetType {
         }
     }
 
-    fn parse_default(&self, literal: &toml::Value) -> Result<Option<Value>, DefaultParseError> {
+    fn parse_default(&self, literal: &toml::Value) -> Result<Option<Value>, String> {
         let s = literal
             .as_str()
-            .ok_or_else(|| DefaultParseError::TypeMismatch {
-                dst: DataType::Custom(Box::new(*self)),
-            })?;
-        let n = IpNetwork::from_str(s.trim()).map_err(|e| DefaultParseError::InvalidIp {
-            family: "inet",
-            reason: e.to_string(),
-        })?;
+            .ok_or_else(|| "expected string literal for inet default".to_owned())?;
+        let n = IpNetwork::from_str(s.trim()).map_err(|e| format!("invalid inet literal: {e}"))?;
         Ok(Some(Value::Custom(Box::new(PgInetValue(n)))))
     }
 
@@ -221,11 +215,26 @@ impl DynValue for PgInetValue {
         self
     }
 
-    fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+    fn is_equal(&self, other: &dyn DynValue) -> bool {
         match other.as_any().downcast_ref::<PgInetValue>() {
             Some(o) => self.0 == o.0,
             None => false,
         }
+    }
+
+    fn partial_cmp(&self, other: &dyn DynValue) -> Option<std::cmp::Ordering> {
+        other
+            .as_any()
+            .downcast_ref::<PgInetValue>()
+            .map(|o| self.0.cmp(&o.0))
+    }
+
+    fn hash(&self, state: &mut dyn std::hash::Hasher) {
+        match self.0.ip() {
+            std::net::IpAddr::V4(v4) => state.write(&v4.octets()),
+            std::net::IpAddr::V6(v6) => state.write(&v6.octets()),
+        }
+        state.write_u8(self.0.prefix());
     }
 
     fn clone_box(&self) -> Box<dyn DynValue> {
@@ -400,10 +409,7 @@ mod tests {
     fn parse_default_rejects_garbage() {
         let lit = toml::Value::String("not-an-inet".into());
         let res = PgInetType.parse_default(&lit);
-        assert!(matches!(
-            res,
-            Err(DefaultParseError::InvalidIp { family: "inet", .. })
-        ));
+        assert!(res.is_err());
     }
 
     #[test]
@@ -411,6 +417,6 @@ mod tests {
         let v = host_v4(10, 1, 2, 3);
         let json = DynValue::to_json(&v).unwrap();
         let decoded = PgInetType.decode_cursor_value(&json).unwrap();
-        assert!(v.eq_dyn(&*decoded));
+        assert!(v.is_equal(&*decoded));
     }
 }

@@ -276,7 +276,7 @@ impl TypeKind {
             DataType::Date => TypeKind::Date,
             DataType::Timestamp => TypeKind::Timestamp,
             DataType::Decimal { .. } => TypeKind::Decimal,
-            DataType::Json => TypeKind::Json,
+            DataType::Json | DataType::Object => TypeKind::Json,
             DataType::Xml => TypeKind::Xml,
             DataType::Union(_) => TypeKind::Union,
             DataType::Custom(_) => TypeKind::Custom(dt.clone()),

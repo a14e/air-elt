@@ -12,6 +12,7 @@ default:
 
 msrv := `grep '^channel' rust-toolchain.toml | cut -d'"' -f2 | cut -d. -f1-2`
 engine := if `which podman 2>/dev/null || true` != "" { "podman" } else { "docker" }
+is_ci := if `test -n "${CI:-}${GITHUB_ACTIONS:-}${GITLAB_CI:-}${BITBUCKET_BUILD_NUMBER:-}${JENKINS_URL:-}" && echo true || echo false` == "true" { "true" } else { "false" }
 
 # ── Build ─────────────────────────────────────────────────────────────
 
@@ -41,8 +42,27 @@ lint-clippy:
 lint-deny:
     cargo deny check --hide-inclusion-graph
 
+# Fetch origin/main if not fetched in the last 4 hours
+_fetch-origin:
+    #!/bin/sh
+    set -eu
+    if [ "{{ is_ci }}" != "false" ]; then
+        exit 0
+    fi
+    stamp="target/.fetch-origin-ts"
+    now=$(date +%s)
+    if [ -f "$stamp" ]; then
+        last=$(cat "$stamp")
+        if [ $((now - last)) -lt 14400 ]; then
+            exit 0
+        fi
+    fi
+    git fetch origin main --quiet 2>/dev/null || true
+    mkdir -p target
+    echo "$now" > "$stamp"
+
 # Build self-lint binary if missing or changed, then run it
-lint-structure:
+lint-structure: _fetch-origin
     #!/bin/sh
     set -eu
     need_build=false

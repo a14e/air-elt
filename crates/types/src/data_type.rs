@@ -79,6 +79,10 @@ pub enum DataType {
     /// in `Debug` order so two equal unions compare equal regardless of
     /// observation order.
     Union(Vec<DataType>),
+    /// Structured key-value document (superset of BSON/JSON). Keys are
+    /// always strings, values can be any type. Serialisable to JSON, BSON,
+    /// or string representation.
+    Object,
     /// Connector-specific opaque type. The descriptor implements
     /// [`crate::dynamic::DynType`] which provides the matrix and
     /// convert hooks. Cursor JSON storage MUST never see this — the
@@ -128,7 +132,7 @@ impl DataType {
     /// to [`DynType::cursor_compatible`].
     pub fn cursor_compatible(&self) -> bool {
         match self {
-            DataType::Json | DataType::Xml | DataType::Union(_) => false,
+            DataType::Json | DataType::Xml | DataType::Object | DataType::Union(_) => false,
             DataType::Custom(t) => t.cursor_compatible(),
             _ => true,
         }
@@ -200,7 +204,7 @@ impl DataType {
     /// types delegate to [`DynType::is_object`].
     pub fn is_object(&self) -> bool {
         match self {
-            DataType::Json => true,
+            DataType::Json | DataType::Object => true,
             DataType::Custom(t) => t.is_object(),
             _ => false,
         }
@@ -233,7 +237,8 @@ impl Hash for DataType {
             | DataType::Ipv4
             | DataType::Ipv6
             | DataType::Json
-            | DataType::Xml => {}
+            | DataType::Xml
+            | DataType::Object => {}
             DataType::BigInt { width } => width.hash(state),
             DataType::Decimal { precision, scale } => {
                 precision.hash(state);
@@ -309,8 +314,9 @@ fn variant_order(d: &DataType) -> u8 {
         DataType::Ipv6 => 19,
         DataType::Json => 20,
         DataType::Xml => 21,
-        DataType::Union(_) => 22,
-        DataType::Custom(_) => 23,
+        DataType::Object => 22,
+        DataType::Union(_) => 23,
+        DataType::Custom(_) => 24,
     }
 }
 
@@ -353,6 +359,7 @@ impl std::fmt::Display for DataType {
             DataType::Ipv6 => f.write_str("ipv6"),
             DataType::Json => f.write_str("json"),
             DataType::Xml => f.write_str("xml"),
+            DataType::Object => f.write_str("object"),
             DataType::Union(vs) => {
                 f.write_str("union<")?;
                 for (i, v) in vs.iter().enumerate() {
@@ -409,6 +416,7 @@ impl Serialize for DataType {
             DataType::Ipv6 => serializer.serialize_str("ipv6"),
             DataType::Json => serializer.serialize_str("json"),
             DataType::Xml => serializer.serialize_str("xml"),
+            DataType::Object => serializer.serialize_str("object"),
             DataType::BigInt { width } => {
                 let mut m = serializer.serialize_map(Some(1))?;
                 m.serialize_entry("big_int", &BigIntPayload { width: *width })?;
@@ -508,6 +516,7 @@ impl<'de> Visitor<'de> for DataTypeVisitor {
             "ipv6" => Ok(DataType::Ipv6),
             "json" => Ok(DataType::Json),
             "xml" => Ok(DataType::Xml),
+            "object" => Ok(DataType::Object),
             // Payload-bearing variants must arrive as a map; if a bare
             // string slips through we report the same error serde_derive
             // would have produced.
@@ -536,6 +545,7 @@ impl<'de> Visitor<'de> for DataTypeVisitor {
                     "ipv6",
                     "json",
                     "xml",
+                    "object",
                     "union",
                 ],
             )),
@@ -595,7 +605,6 @@ mod tests {
     use super::*;
     use crate::convert::ConvertError;
     use crate::convert::context::ConversionContext;
-    use crate::default_value::DefaultParseError;
     use crate::value::Value;
 
     /// Test-only Custom type with `cursor_compatible = true` so `cursor_compatible`
@@ -636,7 +645,7 @@ mod tests {
         ) -> Result<Value, ConvertError> {
             unimplemented!()
         }
-        fn parse_default(&self, _lit: &toml::Value) -> Result<Option<Value>, DefaultParseError> {
+        fn parse_default(&self, _lit: &toml::Value) -> Result<Option<Value>, String> {
             Ok(None)
         }
         fn clone_box(&self) -> Box<dyn DynType> {
@@ -866,7 +875,7 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn Any> {
             self
         }
-        fn eq_dyn(&self, other: &dyn crate::dynamic::DynValue) -> bool {
+        fn is_equal(&self, other: &dyn crate::dynamic::DynValue) -> bool {
             other
                 .as_any()
                 .downcast_ref::<DecodableValue>()

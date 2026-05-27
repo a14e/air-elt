@@ -36,7 +36,6 @@ use air_elt_core::error::JsonEncodeError;
 use air_elt_core::types::convert::ConvertError;
 use air_elt_core::types::convert::context::ConversionContext;
 use air_elt_core::types::data_type::DataType;
-use air_elt_core::types::default_value::DefaultParseError;
 use air_elt_core::types::dynamic::{DynType, DynValue};
 use air_elt_core::types::value::Value;
 
@@ -210,13 +209,12 @@ impl DynType for MongoObjectIdType {
         }
     }
 
-    fn parse_default(&self, literal: &toml::Value) -> Result<Option<Value>, DefaultParseError> {
-        let s = literal.as_str().ok_or(DefaultParseError::TypeMismatch {
-            dst: DataType::Custom(Box::new(MongoObjectIdType)),
-        })?;
-        let arr = parse_hex_24(s).ok_or(DefaultParseError::TypeMismatch {
-            dst: DataType::Custom(Box::new(MongoObjectIdType)),
-        })?;
+    fn parse_default(&self, literal: &toml::Value) -> Result<Option<Value>, String> {
+        let s = literal
+            .as_str()
+            .ok_or_else(|| "expected string literal for ObjectId default".to_owned())?;
+        let arr = parse_hex_24(s)
+            .ok_or_else(|| "invalid ObjectId hex (need 24 lowercase hex chars)".to_owned())?;
         Ok(Some(Value::Custom(Box::new(MongoObjectIdValue(arr)))))
     }
 
@@ -237,7 +235,7 @@ impl DynValue for MongoObjectIdValue {
         self
     }
 
-    fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+    fn is_equal(&self, other: &dyn DynValue) -> bool {
         other
             .as_any()
             .downcast_ref::<MongoObjectIdValue>()
@@ -247,6 +245,17 @@ impl DynValue for MongoObjectIdValue {
 
     fn clone_box(&self) -> Box<dyn DynValue> {
         Box::new(self.clone())
+    }
+
+    fn partial_cmp(&self, other: &dyn DynValue) -> Option<std::cmp::Ordering> {
+        other
+            .as_any()
+            .downcast_ref::<MongoObjectIdValue>()
+            .map(|o| self.0.cmp(&o.0))
+    }
+
+    fn hash(&self, state: &mut dyn std::hash::Hasher) {
+        state.write(&self.0);
     }
 
     /// JSON auto-pack encoding: 24-char lowercase hex, matching the
@@ -522,13 +531,13 @@ mod tests {
     #[test]
     fn parse_default_rejects_non_string() {
         let res = MongoObjectIdType.parse_default(&toml::Value::Integer(42));
-        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+        assert!(res.is_err());
     }
 
     #[test]
     fn parse_default_rejects_short_hex() {
         let res = MongoObjectIdType.parse_default(&toml::Value::String("dead".into()));
-        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+        assert!(res.is_err());
     }
 
     #[test]
@@ -577,8 +586,8 @@ mod tests {
         let mut c_bytes = sample_oid();
         c_bytes[0] ^= 0xff;
         let c: Box<dyn DynValue> = Box::new(MongoObjectIdValue(c_bytes));
-        assert!(a.eq_dyn(&*b));
-        assert!(!a.eq_dyn(&*c));
+        assert!(a.is_equal(&*b));
+        assert!(!a.is_equal(&*c));
     }
 
     #[test]
@@ -592,7 +601,7 @@ mod tests {
     fn dyn_value_clone_box_preserves_payload() {
         let v: Box<dyn DynValue> = Box::new(MongoObjectIdValue(sample_oid()));
         let cloned = v.clone_box();
-        assert!(v.eq_dyn(&*cloned));
+        assert!(v.is_equal(&*cloned));
     }
 
     /// `decode_cursor_value` is the inverse of `DynValue::to_json` —

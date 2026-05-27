@@ -1,0 +1,21 @@
+pub mod arg_extract;
+pub mod arithmetic;
+pub mod bitwise;
+pub mod bytes;
+pub mod cast;
+pub mod comparison;
+pub mod conditional;
+pub mod crypto;
+pub mod datetime;
+pub mod encoding;
+pub mod env;
+pub mod json;
+pub mod logical;
+pub mod math;
+pub mod misc;
+pub mod object;
+pub mod random;
+pub mod register;
+pub mod string;
+
+pub use register::register_builtins;

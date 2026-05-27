@@ -26,7 +26,6 @@ use air_elt_core::error::JsonEncodeError;
 use air_elt_core::types::convert::ConvertError;
 use air_elt_core::types::convert::context::ConversionContext;
 use air_elt_core::types::data_type::DataType;
-use air_elt_core::types::default_value::DefaultParseError;
 use air_elt_core::types::dynamic::{DynType, DynValue};
 use air_elt_core::types::value::Value;
 
@@ -112,10 +111,10 @@ impl DynType for MongoJsType {
         }
     }
 
-    fn parse_default(&self, literal: &toml::Value) -> Result<Option<Value>, DefaultParseError> {
-        let s = literal.as_str().ok_or(DefaultParseError::TypeMismatch {
-            dst: DataType::Custom(Box::new(MongoJsType)),
-        })?;
+    fn parse_default(&self, literal: &toml::Value) -> Result<Option<Value>, String> {
+        let s = literal
+            .as_str()
+            .ok_or_else(|| "expected string literal for javascript default".to_owned())?;
         Ok(Some(Value::Custom(Box::new(MongoJsValue(s.to_string())))))
     }
 
@@ -136,7 +135,7 @@ impl DynValue for MongoJsValue {
         self
     }
 
-    fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+    fn is_equal(&self, other: &dyn DynValue) -> bool {
         other
             .as_any()
             .downcast_ref::<MongoJsValue>()
@@ -302,7 +301,7 @@ mod tests {
     #[test]
     fn parse_default_rejects_non_string() {
         let res = MongoJsType.parse_default(&toml::Value::Integer(1));
-        assert!(matches!(res, Err(DefaultParseError::TypeMismatch { .. })));
+        assert!(res.is_err());
     }
 
     #[test]
@@ -341,7 +340,7 @@ mod tests {
         let a: Box<dyn DynValue> = Box::new(MongoJsValue("x".into()));
         let b: Box<dyn DynValue> = Box::new(MongoJsValue("x".into()));
         let c: Box<dyn DynValue> = Box::new(MongoJsValue("y".into()));
-        assert!(a.eq_dyn(&*b));
-        assert!(!a.eq_dyn(&*c));
+        assert!(a.is_equal(&*b));
+        assert!(!a.is_equal(&*c));
     }
 }

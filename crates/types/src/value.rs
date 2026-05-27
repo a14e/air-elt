@@ -58,6 +58,10 @@ pub enum Value {
     Ipv4(std::net::Ipv4Addr),
     Ipv6(std::net::Ipv6Addr),
     Json(serde_json::Value),
+    /// Ordered key-value document. Keys are always strings, values are
+    /// heterogeneous (any `Value` variant). Order matters for
+    /// deterministic serialisation.
+    Object(Vec<(String, Value)>),
     /// Connector-specific opaque value. Cursor JSON storage admits
     /// this variant iff the underlying `DynType::cursor_compatible()`
     /// returns `true` AND the matching descriptor overrides
@@ -114,9 +118,50 @@ impl Value {
             Value::Ipv4(_) => Some(DataType::Ipv4),
             Value::Ipv6(_) => Some(DataType::Ipv6),
             Value::Json(_) => Some(DataType::Json),
+            Value::Object(_) => Some(DataType::Object),
             Value::Custom(v) => Some(DataType::Custom(v.dyn_type())),
         }
     }
+
+    /// Convert to a TOML value. Returns `None` for types without a
+    /// natural TOML representation (Null, Json, Bytes, Object, Custom).
+    pub fn to_toml(&self) -> Option<toml::Value> {
+        match self {
+            Value::Null
+            | Value::Json(_)
+            | Value::Bytes(_)
+            | Value::Object(_)
+            | Value::Custom(_) => None,
+            Value::Bool(b) => Some(toml::Value::Boolean(*b)),
+            Value::Int8(n) => Some(toml::Value::Integer(i64::from(*n))),
+            Value::Int16(n) => Some(toml::Value::Integer(i64::from(*n))),
+            Value::Int32(n) => Some(toml::Value::Integer(i64::from(*n))),
+            Value::Int64(n) => Some(toml::Value::Integer(*n)),
+            Value::UInt8(n) => Some(toml::Value::Integer(i64::from(*n))),
+            Value::UInt16(n) => Some(toml::Value::Integer(i64::from(*n))),
+            Value::UInt32(n) => Some(toml::Value::Integer(i64::from(*n))),
+            Value::UInt64(n) => Some(
+                i64::try_from(*n)
+                    .map(toml::Value::Integer)
+                    .unwrap_or_else(|_| toml::Value::String(n.to_string())),
+            ),
+            Value::Float32(f) => Some(toml::Value::Float(f64::from(*f))),
+            Value::Float64(f) => Some(toml::Value::Float(*f)),
+            Value::BigInt(b) => Some(toml::Value::String(b.to_string())),
+            Value::Decimal(d) => Some(toml::Value::String(d.to_string())),
+            Value::Text(s) => Some(toml::Value::String(s.clone())),
+            Value::Date(d) => Some(toml::Value::String(d.to_string())),
+            Value::Timestamp(ts) => Some(toml::Value::String(ts.to_rfc3339())),
+            Value::Uuid(u) => Some(toml::Value::String(u.to_string())),
+            Value::Ipv4(ip) => Some(toml::Value::String(ip.to_string())),
+            Value::Ipv6(ip) => Some(toml::Value::String(ip.to_string())),
+        }
+    }
+}
+
+/// Standalone wrapper around [`Value::to_toml`].
+pub fn value_to_toml(value: &Value) -> Option<toml::Value> {
+    value.to_toml()
 }
 
 impl Clone for Value {
@@ -144,40 +189,29 @@ impl Clone for Value {
             Value::Ipv4(a) => Value::Ipv4(*a),
             Value::Ipv6(a) => Value::Ipv6(*a),
             Value::Json(j) => Value::Json(j.clone()),
+            Value::Object(entries) => Value::Object(entries.clone()),
             Value::Custom(v) => Value::Custom((**v).clone_box()),
         }
     }
 }
 
+/// Cross-numeric equality: `Int8(5) == Int64(5)` is `true`.
+/// Delegates to [`crate::compare::values_equal`] which promotes
+/// small ints to i64, floats to f64, etc. before comparing.
+/// NaN == NaN is `false` (IEEE 754). For total equality (NaN == NaN,
+/// hashable), use [`crate::Key`].
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
-        use Value::*;
-        match (self, other) {
-            (Null, Null) => true,
-            (Bool(a), Bool(b)) => a == b,
-            (Int8(a), Int8(b)) => a == b,
-            (Int16(a), Int16(b)) => a == b,
-            (Int32(a), Int32(b)) => a == b,
-            (Int64(a), Int64(b)) => a == b,
-            (UInt8(a), UInt8(b)) => a == b,
-            (UInt16(a), UInt16(b)) => a == b,
-            (UInt32(a), UInt32(b)) => a == b,
-            (UInt64(a), UInt64(b)) => a == b,
-            (Float32(a), Float32(b)) => a == b,
-            (Float64(a), Float64(b)) => a == b,
-            (BigInt(a), BigInt(b)) => a == b,
-            (Decimal(a), Decimal(b)) => a == b,
-            (Text(a), Text(b)) => a == b,
-            (Bytes(a), Bytes(b)) => a == b,
-            (Date(a), Date(b)) => a == b,
-            (Timestamp(a), Timestamp(b)) => a == b,
-            (Uuid(a), Uuid(b)) => a == b,
-            (Ipv4(a), Ipv4(b)) => a == b,
-            (Ipv6(a), Ipv6(b)) => a == b,
-            (Json(a), Json(b)) => a == b,
-            (Custom(a), Custom(b)) => (**a).eq_dyn(&**b),
-            _ => false,
-        }
+        crate::compare::values_equal(self, other)
+    }
+}
+
+/// Cross-numeric ordering: `Int8(5) < Int64(10)` is `Some(Less)`.
+/// Delegates to [`crate::compare::compare_values`].
+/// Incompatible types (e.g. Text vs Int64) return `None`.
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        crate::compare::compare_values(self, other)
     }
 }
 
@@ -234,6 +268,17 @@ impl Serialize for Value {
             Value::Ipv4(a) => emit(serializer, "ipv4", &a.to_string()),
             Value::Ipv6(a) => emit(serializer, "ipv6", &a.to_string()),
             Value::Json(j) => emit(serializer, "json", j),
+            Value::Object(entries) => {
+                let json_map: serde_json::Map<String, serde_json::Value> = entries
+                    .iter()
+                    .map(|(k, v)| {
+                        let json_v =
+                            crate::json_encode::value_to_json(v).unwrap_or(serde_json::Value::Null);
+                        (k.clone(), json_v)
+                    })
+                    .collect();
+                emit(serializer, "object", &serde_json::Value::Object(json_map))
+            }
             Value::Custom(inner) => {
                 let dt = inner.dyn_type();
                 if !dt.cursor_compatible() {
@@ -371,6 +416,16 @@ impl<'de> Visitor<'de> for ValueVisitor {
                     .map_err(de::Error::custom)
             }
             "json" => Ok(Value::Json(v)),
+            "object" => {
+                let map = v
+                    .as_object()
+                    .ok_or_else(|| de::Error::custom("object value must be a JSON object"))?;
+                let entries: Vec<(String, Value)> = map
+                    .iter()
+                    .map(|(k, val)| Ok((k.clone(), Value::Json(val.clone()))))
+                    .collect::<Result<_, A::Error>>()?;
+                Ok(Value::Object(entries))
+            }
             "custom" => {
                 // Custom values can't deserialize through the bare
                 // `Value` path: a `Box<dyn DynValue>` needs the
@@ -592,7 +647,7 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
             self
         }
-        fn eq_dyn(&self, _other: &dyn DynValue) -> bool {
+        fn is_equal(&self, _other: &dyn DynValue) -> bool {
             true
         }
         fn clone_box(&self) -> Box<dyn DynValue> {
@@ -656,7 +711,7 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
             self
         }
-        fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+        fn is_equal(&self, other: &dyn DynValue) -> bool {
             other
                 .as_any()
                 .downcast_ref::<CursorStubValue>()
@@ -846,6 +901,7 @@ mod tests {
             Value::Ipv4(_) => prop_assert_eq!(got, Some(DataType::Ipv4)),
             Value::Ipv6(_) => prop_assert_eq!(got, Some(DataType::Ipv6)),
             Value::Json(_) => prop_assert_eq!(got, Some(DataType::Json)),
+            Value::Object(_) => unreachable!("strategy excludes Object"),
             Value::Custom(_) => unreachable!("strategy excludes Custom"),
         }
     }

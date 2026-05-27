@@ -629,10 +629,11 @@ fn build_docs(
     Ok(docs)
 }
 
-/// `true` when `v` is `Value::Custom(BsonObjectValue)` — the lowered
-/// shape of mongo→mongo `["*"]` raw passthrough.
+/// `true` when `v` is a raw-passthrough document shape — either the
+/// legacy `Value::Custom(BsonObjectValue)` or the new `Value::Object`.
 fn is_bson_object_value(v: &Value) -> bool {
     match v {
+        Value::Object(_) => true,
         Value::Custom(inner) => {
             let dt = inner.dyn_type();
             dt.kind() == BsonObjectType::KIND

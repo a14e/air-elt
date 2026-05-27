@@ -178,6 +178,13 @@ pub fn bind_value_separated_pg(
                 got_kind: "UInt*".to_string(),
             })
         }
+        Value::Object(_) => {
+            // Convert the structured document into JSON for binding.
+            let j = air_elt_core::types::json_encode::value_to_json(value)
+                .expect("Value::Object json encode must not fail after validation");
+            chain.push_bind(j);
+            Ok(())
+        }
         Value::Custom(b) => bind_custom(chain, column, dt, b.as_ref()),
     }
 }
@@ -571,7 +578,7 @@ mod tests {
             fn into_any(self: Box<Self>) -> Box<dyn Any> {
                 self
             }
-            fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+            fn is_equal(&self, other: &dyn DynValue) -> bool {
                 other.as_any().downcast_ref::<UnknownV>().is_some()
             }
             fn clone_box(&self) -> Box<dyn DynValue> {

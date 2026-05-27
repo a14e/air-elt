@@ -90,7 +90,7 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
                 // `inet` OID by routing through `IpNetwork` host bits.
                 sep.push_bind::<Option<sqlx::types::ipnetwork::IpNetwork>>(None);
             }
-            DataType::Json => {
+            DataType::Json | DataType::Object => {
                 sep.push_bind::<Option<serde_json::Value>>(None);
             }
             DataType::BigInt { .. } | DataType::Decimal { .. } => {
@@ -191,6 +191,14 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
         Value::Decimal(d) => {
             sep.push_bind(d.clone());
         }
+        Value::Object(_) => {
+            // Convert the structured document into a serde_json::Value
+            // for JSON/JSONB binding. Validation guarantees only
+            // compatible types reach the sink, so encode should not fail.
+            let j = air_elt_core::types::json_encode::value_to_json(v)
+                .expect("Value::Object json encode must not fail after validation");
+            sep.push_bind(j);
+        }
         Value::UInt8(_) | Value::UInt16(_) | Value::UInt32(_) | Value::UInt64(_) => {
             unreachable!(
                 "unsigned values cannot reach a postgres sink: pg schemas never \
@@ -289,7 +297,7 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
             self
         }
-        fn eq_dyn(&self, _other: &dyn DynValue) -> bool {
+        fn is_equal(&self, _other: &dyn DynValue) -> bool {
             false
         }
         fn clone_box(&self) -> Box<dyn DynValue> {

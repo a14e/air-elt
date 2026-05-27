@@ -65,6 +65,8 @@ pub fn bind_typed_null<'q>(
         // Union never reaches a PG sink: schemaful sinks declare concrete
         // column types, and the validation pipeline rejects Union → PG
         // before any bind happens.
+        // Object is handled as Json in connectors
+        DataType::Object => query.bind::<Option<serde_json::Value>>(None),
         DataType::Union(_) => unreachable!("postgres sinks never carry Union types"),
         // HLL: bind a typed NULL `Vec<u8>` (matches the `bytea`-shaped
         // wire encoding sqlx uses for HLL bytes). The `::hll` cast is

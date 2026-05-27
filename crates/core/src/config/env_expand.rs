@@ -26,8 +26,13 @@ static REF_RE: Lazy<Regex> =
 /// keeps the resolver single-pass and cycle-free for MVP. Operators who need
 /// chained lookups should use env vars directly.
 pub fn expand(raw: &str, secrets: &BTreeMap<String, String>) -> Result<String, ConfigError> {
+    // Handle $$ escaping: replace $$ with a placeholder, expand, then restore.
+    // This allows writing literal ${VAR} in configs as $${VAR}.
+    const ESCAPE_PLACEHOLDER: &str = "\x00DOLLAR\x00";
+    let raw = raw.replace("$$", ESCAPE_PLACEHOLDER);
+
     let mut err: Option<ConfigError> = None;
-    let result = REF_RE.replace_all(raw, |caps: &Captures| {
+    let result = REF_RE.replace_all(&raw, |caps: &Captures| {
         let name = &caps[1];
         let default = caps.get(2).map(|m| m.as_str());
         match std::env::var(name)
@@ -57,7 +62,7 @@ pub fn expand(raw: &str, secrets: &BTreeMap<String, String>) -> Result<String, C
     if let Some(e) = err {
         return Err(e);
     }
-    Ok(result.into_owned())
+    Ok(result.into_owned().replace(ESCAPE_PLACEHOLDER, "$"))
 }
 
 #[cfg(test)]
@@ -138,5 +143,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, r#"url = "aaa://bbb/x""#);
+    }
+
+    #[test]
+    fn double_dollar_escapes_to_literal_dollar() {
+        let out = expand(r#"literal = "$${NOT_EXPANDED}""#, &BTreeMap::new()).unwrap();
+        assert_eq!(out, r#"literal = "${NOT_EXPANDED}""#);
+    }
+
+    #[test]
+    fn double_dollar_mixed_with_real_expansion() {
+        set_env("AIR_ELT_TEST_MIX", "real");
+        let out = expand(
+            r#"a = "${AIR_ELT_TEST_MIX}" b = "$${ESCAPED}""#,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(out, r#"a = "real" b = "${ESCAPED}""#);
+    }
+
+    #[test]
+    fn standalone_double_dollar() {
+        let out = expand("price is $$5", &BTreeMap::new()).unwrap();
+        assert_eq!(out, "price is $5");
     }
 }

@@ -122,7 +122,9 @@ impl<'a> CompatibilityValidator<'a> {
 mod tests {
     use super::*;
     use crate::model::{ColumnConversionPlan, Field};
-    use crate::transform::{SwitchKey, SwitchTable, Transform, TransformOp};
+    use air_elt_types::Key;
+
+    use crate::transform::{SwitchTable, Transform, TransformOp};
     use crate::types::{ConversionContext, Value};
 
     fn schema_of(fields: &[(&str, DataType)]) -> Schema {
@@ -160,8 +162,14 @@ mod tests {
         let src = schema_of(&[("flag", DataType::Bool)]);
         let sink = schema_of(&[("flag_label", DataType::Text { size: None })]);
         let mut cases = ahash::AHashMap::new();
-        cases.insert(SwitchKey::Bool(true), Value::Text("yes".into()));
-        cases.insert(SwitchKey::Bool(false), Value::Text("no".into()));
+        cases.insert(
+            Key::single(Value::Bool(true)).unwrap(),
+            Value::Text("yes".into()),
+        );
+        cases.insert(
+            Key::single(Value::Bool(false)).unwrap(),
+            Value::Text("no".into()),
+        );
         let table = SwitchTable {
             cases,
             default: Some(Value::Text("?".into())),

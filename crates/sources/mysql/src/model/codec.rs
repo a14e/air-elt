@@ -114,6 +114,7 @@ pub fn decode_column(row: &MySqlRow, index: usize, data_type: DataType) -> Runti
         // SQL sources never produce Union — only Mongo's sample-based
         // inference does. Mirrors the mysql sink's `unreachable!` for
         // the same structural invariant.
+        DataType::Object => unreachable!("mysql sources never produce Object types"),
         DataType::Union(_) => unreachable!("mysql sources never produce Union types"),
         DataType::Custom(_) => unreachable!(
             "DataType::Custom must be handled by the connector before reaching decode_column"
@@ -174,6 +175,11 @@ pub fn bind_cursor_value<'q>(
         Value::UInt16(n) => query.bind(*n),
         Value::UInt32(n) => query.bind(*n),
         Value::UInt64(n) => query.bind(*n),
+        Value::Object(_) => {
+            unreachable!(
+                "Value::Object cannot appear in cursor values — it is not cursor-compatible"
+            )
+        }
         Value::Custom(_) => unreachable!(
             "Value::Custom must be handled by the connector before reaching bind_cursor_value"
         ),

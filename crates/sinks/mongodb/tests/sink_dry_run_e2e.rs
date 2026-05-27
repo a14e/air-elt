@@ -194,7 +194,7 @@ impl DynValue for StubValue {
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
     }
-    fn eq_dyn(&self, _other: &dyn DynValue) -> bool {
+    fn is_equal(&self, _other: &dyn DynValue) -> bool {
         false
     }
     fn clone_box(&self) -> Box<dyn DynValue> {

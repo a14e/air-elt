@@ -12,7 +12,6 @@ use air_elt_core::error::JsonEncodeError;
 use air_elt_core::types::convert::ConvertError;
 use air_elt_core::types::convert::context::ConversionContext;
 use air_elt_core::types::data_type::DataType;
-use air_elt_core::types::default_value::DefaultParseError;
 use air_elt_core::types::dynamic::{DynType, DynValue};
 use air_elt_core::types::value::Value;
 
@@ -70,10 +69,10 @@ impl DynType for QuestDbLong256Type {
         }
     }
 
-    fn parse_default(&self, literal: &toml::Value) -> Result<Option<Value>, DefaultParseError> {
-        let raw = literal.as_str().ok_or(DefaultParseError::TypeMismatch {
-            dst: DataType::Custom(Box::new(*self)),
-        })?;
+    fn parse_default(&self, literal: &toml::Value) -> Result<Option<Value>, String> {
+        let raw = literal
+            .as_str()
+            .ok_or_else(|| "expected string literal for long256 default".to_owned())?;
         // Accept either `0x` + 64 hex chars (big-endian textual convention
         // used by QuestDB itself when surfacing LONG256) or 64 bare hex
         // chars. Anything else is rejected.
@@ -82,19 +81,17 @@ impl DynType for QuestDbLong256Type {
             .or_else(|| raw.strip_prefix("0X"))
             .unwrap_or(raw);
         if hex_part.len() != 64 {
-            return Err(DefaultParseError::TypeMismatch {
-                dst: DataType::Custom(Box::new(*self)),
-            });
+            return Err(
+                "long256 default requires exactly 64 hex chars (with optional 0x prefix)"
+                    .to_owned(),
+            );
         }
         let mut be_bytes = [0u8; 32];
         for (i, chunk) in hex_part.as_bytes().chunks_exact(2).enumerate() {
-            let pair = std::str::from_utf8(chunk).map_err(|_| DefaultParseError::TypeMismatch {
-                dst: DataType::Custom(Box::new(*self)),
-            })?;
-            be_bytes[i] =
-                u8::from_str_radix(pair, 16).map_err(|_| DefaultParseError::TypeMismatch {
-                    dst: DataType::Custom(Box::new(*self)),
-                })?;
+            let pair = std::str::from_utf8(chunk)
+                .map_err(|_| "invalid utf-8 in long256 hex literal".to_owned())?;
+            be_bytes[i] = u8::from_str_radix(pair, 16)
+                .map_err(|_| format!("invalid hex digit pair {pair:?} in long256 default"))?;
         }
         // Storage layout is little-endian; reverse the parsed BE bytes.
         let mut le_bytes = [0u8; 32];
@@ -142,7 +139,7 @@ impl DynValue for QuestDbLong256Value {
         self
     }
 
-    fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+    fn is_equal(&self, other: &dyn DynValue) -> bool {
         other
             .as_any()
             .downcast_ref::<QuestDbLong256Value>()
@@ -201,16 +198,14 @@ mod tests {
     fn parse_default_rejects_non_string() {
         let ty = QuestDbLong256Type;
         let lit = toml::Value::Integer(42);
-        let err = ty.parse_default(&lit).unwrap_err();
-        assert!(matches!(err, DefaultParseError::TypeMismatch { .. }));
+        assert!(ty.parse_default(&lit).is_err());
     }
 
     #[test]
     fn parse_default_rejects_wrong_length() {
         let ty = QuestDbLong256Type;
         let lit = toml::Value::String("0xabcd".to_string());
-        let err = ty.parse_default(&lit).unwrap_err();
-        assert!(matches!(err, DefaultParseError::TypeMismatch { .. }));
+        assert!(ty.parse_default(&lit).is_err());
     }
 
     #[test]
@@ -219,7 +214,6 @@ mod tests {
         let mut s = String::from("0x");
         s.push_str(&"zz".repeat(32));
         let lit = toml::Value::String(s);
-        let err = ty.parse_default(&lit).unwrap_err();
-        assert!(matches!(err, DefaultParseError::TypeMismatch { .. }));
+        assert!(ty.parse_default(&lit).is_err());
     }
 }

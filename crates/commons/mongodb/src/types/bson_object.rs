@@ -15,11 +15,11 @@
 //!   dispatcher's both-sides-Custom arm).
 //! - `Json` — encoded via [`crate::bson_value::bson_to_json`] using
 //!   Debezium-compatible wire-format rules (without prefixes).
+//! - `Text` — JSON serialization of the document (same as Json → Text).
 //!
-//! Inbound (`canonical -> BsonObjectType`): not supported. The custom
-//! is produced only by the source's raw-mode path — there's no
-//! `Json -> BsonObject` arm because once a document is JSON-flattened
-//! the BSON variants are gone.
+//! Inbound (`canonical -> BsonObjectType`):
+//! - `Json` — `serde_json::Value::Object` converted to a BSON `Document`
+//!   via `bson::to_bson`.
 //!
 //! ## Cursor
 //!
@@ -72,15 +72,12 @@ impl DynType for BsonObjectType {
 
     fn can_convert_to(&self, target: &DataType, _truncate: bool) -> bool {
         // Identity (Custom→Custom) is handled by the dispatcher arm
-        // outside this method; from here we only need to advertise
-        // Json as a permitted outbound target.
-        matches!(target, DataType::Json)
+        // outside this method.
+        matches!(target, DataType::Json | DataType::Text { .. })
     }
 
-    fn can_construct_from(&self, _src: &DataType, _truncate: bool) -> bool {
-        // Inbound construction is not supported — BsonObject is
-        // produced only by the source's raw-mode path.
-        false
+    fn can_construct_from(&self, src: &DataType, _truncate: bool) -> bool {
+        matches!(src, DataType::Json)
     }
 
     fn convert(
@@ -99,6 +96,20 @@ impl DynType for BsonObjectType {
                     })?;
                 Ok(Value::Json(json))
             }
+            DataType::Text { size } => {
+                let json = bson_value::bson_to_json(&bson::Bson::Document(inner.0.clone()))
+                    .map_err(|_e| ConvertError::Unsupported {
+                        src: DataType::Custom(Box::new(BsonObjectType)),
+                        dst: DataType::Text { size: None },
+                    })?;
+                let serialized = json.to_string();
+                if let Some(max) = size {
+                    let chars: String = serialized.chars().take(*max as usize).collect();
+                    Ok(Value::Text(chars))
+                } else {
+                    Ok(Value::Text(serialized))
+                }
+            }
             other => Err(ConvertError::Unsupported {
                 src: DataType::Custom(Box::new(BsonObjectType)),
                 dst: other.clone(),
@@ -108,14 +119,34 @@ impl DynType for BsonObjectType {
 
     fn construct(
         &self,
-        _value: Value,
+        value: Value,
         src: &DataType,
         _ctx: &ConversionContext,
     ) -> Result<Value, ConvertError> {
-        Err(ConvertError::Unsupported {
-            src: src.clone(),
-            dst: DataType::Custom(Box::new(BsonObjectType)),
-        })
+        match src {
+            DataType::Json => match value {
+                Value::Json(serde_json::Value::Object(map)) => {
+                    let doc = map
+                        .into_iter()
+                        .map(|(k, v)| {
+                            let bson_val =
+                                bson::to_bson(&v).map_err(|_e| ConvertError::Unsupported {
+                                    src: DataType::Json,
+                                    dst: DataType::Custom(Box::new(BsonObjectType)),
+                                })?;
+                            Ok((k, bson_val))
+                        })
+                        .collect::<Result<Document, ConvertError>>()?;
+                    Ok(Value::Custom(Box::new(BsonObjectValue(doc))))
+                }
+                Value::Json(_) => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+                _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+            },
+            other => Err(ConvertError::Unsupported {
+                src: other.clone(),
+                dst: DataType::Custom(Box::new(BsonObjectType)),
+            }),
+        }
     }
 
     fn clone_box(&self) -> Box<dyn DynType> {
@@ -135,7 +166,7 @@ impl DynValue for BsonObjectValue {
         self
     }
 
-    fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+    fn is_equal(&self, other: &dyn DynValue) -> bool {
         other
             .as_any()
             .downcast_ref::<BsonObjectValue>()
@@ -192,18 +223,33 @@ mod tests {
     }
 
     #[test]
-    fn matrix_can_convert_to_json_only() {
-        let t = BsonObjectType;
-        assert!(t.can_convert_to(&DataType::Json, false));
-        assert!(!t.can_convert_to(&DataType::Text { size: None }, false));
-        assert!(!t.can_convert_to(&DataType::Bytes { size: None }, false));
+    fn can_convert_to_json() {
+        assert!(BsonObjectType.can_convert_to(&DataType::Json, false));
     }
 
     #[test]
-    fn matrix_can_construct_from_nothing() {
-        let t = BsonObjectType;
-        assert!(!t.can_construct_from(&DataType::Json, false));
-        assert!(!t.can_construct_from(&DataType::Text { size: None }, false));
+    fn can_convert_to_text() {
+        assert!(BsonObjectType.can_convert_to(&DataType::Text { size: None }, false));
+    }
+
+    #[test]
+    fn cannot_convert_to_bytes() {
+        assert!(!BsonObjectType.can_convert_to(&DataType::Bytes { size: None }, false));
+    }
+
+    #[test]
+    fn can_construct_from_json() {
+        assert!(BsonObjectType.can_construct_from(&DataType::Json, false));
+    }
+
+    #[test]
+    fn cannot_construct_from_int64() {
+        assert!(!BsonObjectType.can_construct_from(&DataType::Int64, false));
+    }
+
+    #[test]
+    fn cannot_construct_from_text() {
+        assert!(!BsonObjectType.can_construct_from(&DataType::Text { size: None }, false));
     }
 
     #[test]
@@ -257,15 +303,15 @@ mod tests {
         let a: Box<dyn DynValue> = Box::new(BsonObjectValue(doc! { "a": 1 }));
         let b: Box<dyn DynValue> = Box::new(BsonObjectValue(doc! { "a": 1 }));
         let c: Box<dyn DynValue> = Box::new(BsonObjectValue(doc! { "a": 2 }));
-        assert!(a.eq_dyn(&*b));
-        assert!(!a.eq_dyn(&*c));
+        assert!(a.is_equal(&*b));
+        assert!(!a.is_equal(&*c));
     }
 
     #[test]
     fn dyn_value_clone_box_preserves_payload() {
         let v: Box<dyn DynValue> = Box::new(BsonObjectValue(doc! { "x": 1 }));
         let c = v.clone_box();
-        assert!(v.eq_dyn(&*c));
+        assert!(v.is_equal(&*c));
     }
 
     #[test]
@@ -431,5 +477,52 @@ mod tests {
             Value::Json(j) => assert_eq!(j, serde_json::json!({ "a": 1, "b": "x" })),
             other => panic!("expected Value::Json, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn convert_to_text() {
+        let v = Value::Custom(Box::new(BsonObjectValue(doc! { "a": 1_i32 })));
+        let dt_src = DataType::Custom(Box::new(BsonObjectType));
+        let out = convert(v, &dt_src, &DataType::Text { size: None }, &ctx()).unwrap();
+        match out {
+            Value::Text(s) => {
+                let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+                assert_eq!(parsed, serde_json::json!({ "a": 1 }));
+            }
+            other => panic!("expected Value::Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_to_text_with_size_limit() {
+        let v = Value::Custom(Box::new(BsonObjectValue(doc! { "key": "value" })));
+        let dt_src = DataType::Custom(Box::new(BsonObjectType));
+        let out = convert(v, &dt_src, &DataType::Text { size: Some(5) }, &ctx()).unwrap();
+        match out {
+            Value::Text(s) => {
+                assert_eq!(s.len(), 5);
+            }
+            other => panic!("expected Value::Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn construct_from_json() {
+        let json = serde_json::json!({ "k": "v", "n": 42 });
+        let v = Value::Json(json);
+        let dt_dst = DataType::Custom(Box::new(BsonObjectType));
+        let out = convert(v, &DataType::Json, &dt_dst, &ctx()).unwrap();
+        let inner = unwrap_bson_object(&out).unwrap();
+        assert_eq!(inner.0.get_str("k").unwrap(), "v");
+        // bson::to_bson maps JSON integers to Int64
+        assert_eq!(inner.0.get_i64("n").unwrap(), 42);
+    }
+
+    #[test]
+    fn construct_from_json_non_object_fails() {
+        let v = Value::Json(serde_json::json!([1, 2, 3]));
+        let dt_dst = DataType::Custom(Box::new(BsonObjectType));
+        let result = convert(v, &DataType::Json, &dt_dst, &ctx());
+        assert!(result.is_err());
     }
 }

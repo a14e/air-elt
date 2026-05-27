@@ -23,7 +23,6 @@ use air_elt_core::error::JsonEncodeError;
 use air_elt_core::types::convert::ConvertError;
 use air_elt_core::types::convert::context::ConversionContext;
 use air_elt_core::types::data_type::DataType;
-use air_elt_core::types::default_value::DefaultParseError;
 use air_elt_core::types::dynamic::{DynType, DynValue};
 use air_elt_core::types::value::Value;
 
@@ -99,7 +98,7 @@ impl DynType for PgHllType {
     /// HLL columns do not accept TOML defaults. There is no sensible
     /// literal grammar for an opaque cardinality sketch; the operator
     /// must populate them via SQL (`hll_empty()`, `hll_add_agg(...)`).
-    fn parse_default(&self, _literal: &toml::Value) -> Result<Option<Value>, DefaultParseError> {
+    fn parse_default(&self, _literal: &toml::Value) -> Result<Option<Value>, String> {
         Ok(None)
     }
 
@@ -126,7 +125,7 @@ impl DynValue for PgHllValue {
         self
     }
 
-    fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+    fn is_equal(&self, other: &dyn DynValue) -> bool {
         match other.as_any().downcast_ref::<PgHllValue>() {
             Some(o) => self.0 == o.0,
             None => false,
@@ -237,7 +236,7 @@ mod tests {
     fn value_roundtrip_through_clone_box_preserves_bytes() {
         let v: Box<dyn DynValue> = Box::new(PgHllValue(vec![9, 8, 7]));
         let cloned = v.clone_box();
-        assert!(v.eq_dyn(&*cloned));
+        assert!(v.is_equal(&*cloned));
     }
 
     #[test]
@@ -263,6 +262,6 @@ mod tests {
     fn value_inequality_for_distinct_bytes() {
         let a: Box<dyn DynValue> = Box::new(PgHllValue(vec![1]));
         let b: Box<dyn DynValue> = Box::new(PgHllValue(vec![2]));
-        assert!(!a.eq_dyn(&*b));
+        assert!(!a.is_equal(&*b));
     }
 }

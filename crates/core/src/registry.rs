@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 
+use air_elt_expr_funcs::FunctionRegistry;
 use air_elt_monitoring::MonitoringManager;
 use async_trait::async_trait;
 
@@ -63,16 +64,39 @@ pub trait StorageFactory: Send + Sync {
     ) -> Result<Box<dyn Storage>, ConfigError>;
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct Registry {
     sources: AHashMap<String, Arc<dyn SourceFactory>>,
     sinks: AHashMap<String, Arc<dyn SinkFactory>>,
     storages: AHashMap<String, Arc<dyn StorageFactory>>,
+    expr_functions: Arc<FunctionRegistry>,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            sources: AHashMap::new(),
+            sinks: AHashMap::new(),
+            storages: AHashMap::new(),
+            expr_functions: Arc::new(FunctionRegistry::new()),
+        }
+    }
 }
 
 impl Registry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the expression function registry. Called once from `app`
+    /// after constructing `FunctionRegistry::with_builtins()`.
+    pub fn set_expr_functions(&mut self, registry: FunctionRegistry) {
+        self.expr_functions = Arc::new(registry);
+    }
+
+    /// Shared reference to the expression function registry.
+    pub fn expr_functions(&self) -> &Arc<FunctionRegistry> {
+        &self.expr_functions
     }
 
     pub fn register_source(&mut self, kind: &str, factory: Arc<dyn SourceFactory>) {

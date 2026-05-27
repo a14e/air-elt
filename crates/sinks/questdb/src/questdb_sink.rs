@@ -304,7 +304,7 @@ pub fn type_supported(dt: &DataType) -> bool {
         DataType::BigInt { .. } | DataType::Decimal { .. } => false,
         // No native IPv6 column in QuestDB.
         DataType::Ipv6 => false,
-        DataType::Xml | DataType::Union(_) => false,
+        DataType::Xml | DataType::Object | DataType::Union(_) => false,
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => false,
     }
 }

@@ -77,7 +77,7 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
                 // NULL string.
                 sep.push_bind::<Option<String>>(None);
             }
-            DataType::Json => {
+            DataType::Json | DataType::Object => {
                 sep.push_bind::<Option<serde_json::Value>>(None);
             }
             DataType::BigInt { .. } | DataType::Decimal { .. } => {
@@ -170,6 +170,13 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
         Value::UInt64(n) => {
             sep.push_bind(*n);
         }
+        Value::Object(_) => {
+            // Convert the structured document into a serde_json::Value
+            // for JSON binding. Validation guarantees compatible types.
+            let j = air_elt_core::types::json_encode::value_to_json(v)
+                .expect("Value::Object json encode must not fail after validation");
+            sep.push_bind(j);
+        }
         Value::Custom(_) => {
             unreachable!("Value::Custom must be handled by the connector before reaching sink_bind")
         }
@@ -241,7 +248,7 @@ mod tests {
         fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
             self
         }
-        fn eq_dyn(&self, _other: &dyn DynValue) -> bool {
+        fn is_equal(&self, _other: &dyn DynValue) -> bool {
             false
         }
         fn clone_box(&self) -> Box<dyn DynValue> {

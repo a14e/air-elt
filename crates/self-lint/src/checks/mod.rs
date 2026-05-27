@@ -4,6 +4,7 @@ pub mod ci_env;
 pub mod containers;
 pub mod dep_graph;
 pub mod doctest;
+pub mod expr_registration;
 pub mod mod_purity;
 pub mod registry;
 pub mod test_aggregator;

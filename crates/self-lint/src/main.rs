@@ -44,6 +44,7 @@ fn main() -> ExitCode {
     let all_checks: Vec<Box<dyn Check>> = vec![
         Box::new(checks::ascii::NonEnglishCheck),
         Box::new(checks::dep_graph::DepGraphCheck),
+        Box::new(checks::expr_registration::ExprRegistrationCheck),
         Box::new(checks::registry::RegistryCheck),
         Box::new(checks::traits::TraitsCheck),
         Box::new(checks::app_tests::AppTestsCheck),

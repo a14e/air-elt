@@ -1,8 +1,10 @@
-//! Wire connector factories into a fresh `Registry`.
+//! Wire connector factories and the expression function registry into a
+//! fresh `Registry`.
 
 use std::sync::Arc;
 
 use air_elt_core::registry::Registry;
+use air_elt_expr_funcs::FunctionRegistry;
 use air_elt_sink_clickhouse::ChSinkFactory;
 use air_elt_sink_mongodb::MongoSinkFactory;
 use air_elt_sink_mysql::MySqlSinkFactory;
@@ -18,6 +20,7 @@ use air_elt_storage_postgres::PgStorageFactory;
 
 pub fn build_registry() -> Registry {
     let mut registry = Registry::new();
+    registry.set_expr_functions(build_function_registry());
     registry.register_source("postgres", Arc::new(PgSourceFactory::postgres()));
     registry.register_sink("postgres", Arc::new(PgSinkFactory::postgres()));
     registry.register_storage("postgres", Arc::new(PgStorageFactory::postgres()));
@@ -47,5 +50,13 @@ pub fn build_registry() -> Registry {
     // in the mapping. INSERTs are chunked at `QDB_PG_MAX_BIND_PARAMS = 9_200`
     // to work around a QuestDB 8.2.3 pg-wire bug.
     registry.register_sink("questdb", Arc::new(QuestDbSinkFactory));
+    registry
+}
+
+/// Build the expression function registry with all built-in functions
+/// plus backend-specific functions.
+fn build_function_registry() -> FunctionRegistry {
+    let mut registry = FunctionRegistry::with_builtins();
+    air_elt_commons_mongodb::expr::register_functions(&mut registry);
     registry
 }

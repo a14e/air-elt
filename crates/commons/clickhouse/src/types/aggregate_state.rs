@@ -24,7 +24,6 @@ use air_elt_core::error::JsonEncodeError;
 use air_elt_core::types::convert::ConvertError;
 use air_elt_core::types::convert::context::ConversionContext;
 use air_elt_core::types::data_type::DataType;
-use air_elt_core::types::default_value::DefaultParseError;
 use air_elt_core::types::dynamic::{DynType, DynValue};
 use air_elt_core::types::value::Value;
 
@@ -132,7 +131,7 @@ impl DynType for ChAggregateStateType {
         })
     }
 
-    fn parse_default(&self, _literal: &toml::Value) -> Result<Option<Value>, DefaultParseError> {
+    fn parse_default(&self, _literal: &toml::Value) -> Result<Option<Value>, String> {
         // No sane TOML literal for an aggregate state; operator must
         // populate via CH-side functions.
         Ok(None)
@@ -171,7 +170,7 @@ impl DynValue for ChAggregateStateValue {
         self
     }
 
-    fn eq_dyn(&self, other: &dyn DynValue) -> bool {
+    fn is_equal(&self, other: &dyn DynValue) -> bool {
         match other.as_any().downcast_ref::<ChAggregateStateValue>() {
             Some(o) => self == o,
             None => false,

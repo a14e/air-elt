@@ -52,7 +52,7 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
         // Two distinct custom types — only `eq_dyn` knows whether
         // they actually represent the same descriptor (parametric
         // types may differ structurally).
-        return a.eq_dyn(&**b);
+        return a.is_equal(&**b);
     }
     if let Custom(a) = &source_t {
         return a.can_convert_to(&sink_t, false);
@@ -190,6 +190,11 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
         (Ipv6, Bytes { size: b }) => b.is_none_or(|n| n >= 16),
         (Bytes { size: a }, Ipv6) => a.is_none_or(|n| n >= 16),
 
+        // Object → Json: lossless (Object can always be represented as JSON)
+        (Object, Json) => true,
+        // Object → Text (unbounded): serialize as JSON string
+        (Object, Text { size: None }) => true,
+
         // Narrowing from BigInt/Decimal back into fixed-width or integer
         // types is *not* supported — every reverse path is potentially
         // lossy. Users adding such pipelines must do an explicit transform.
@@ -228,7 +233,7 @@ pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool
     // (custom types decide their own narrowing rules through
     // `can_convert_to` / `can_construct_from`).
     if let (Custom(a), Custom(b)) = (&source_t, &sink_t) {
-        return a.eq_dyn(&**b);
+        return a.is_equal(&**b);
     }
     if let Custom(a) = &source_t {
         return a.can_convert_to(&sink_t, true);
@@ -302,6 +307,10 @@ pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool
         // runtime; the matrix admits the pair, dispatcher raises
         // `IpV6NotMappable` for non-mapped addresses.
         (Ipv6, Ipv4) => true,
+        // Json → Object with truncate: JSON doesn't guarantee typed values
+        (Json, Object) => true,
+        // Object → Text(n) with truncate: serialize as JSON, may exceed size
+        (Object, Text { size: Some(_) }) => true,
         _ => false,
     }
 }

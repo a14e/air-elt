@@ -18,7 +18,7 @@
 //! `"mongodb.javascript"`, `"postgresql.hll"`. The string is the
 //! **identity** of the type for the purposes of `Eq`, `Hash`, `Ord`,
 //! `Display`, and serde diagnostics. Two `Box<dyn DynType>` compare equal
-//! iff their `kind()` is equal AND `eq_dyn` agrees. `Hash` and `Ord` are
+//! iff their `kind()` is equal AND `is_equal` agrees. `Hash` and `Ord` are
 //! computed solely from `kind()`.
 //!
 //! Because of that, `kind()` MUST be stable across the lifetime of the
@@ -27,12 +27,12 @@
 //! string is `'static` so the trait can stay object-safe and so
 //! implementations don't allocate on the hot path.
 //!
-//! ## `eq_dyn` default
+//! ## `is_equal` default
 //!
-//! The default `eq_dyn` compares `kind()` only. That is correct for
+//! The default `is_equal` compares `kind()` only. That is correct for
 //! parameter-less unit types (the three concrete types we ship).
 //! Any future `DynType` that carries parameters in its descriptor (e.g.
-//! `Bytes { size }`-style) MUST override `eq_dyn` to compare those
+//! `Bytes { size }`-style) MUST override `is_equal` to compare those
 //! parameters; otherwise the matrix would treat structurally-different
 //! descriptors as identical.
 //!
@@ -41,7 +41,7 @@
 //! `Box<dyn DynType>` and `Box<dyn DynValue>` participate in the global
 //! [`DataType`] / [`Value`] derives — `Clone`, `PartialEq`, `Hash`, `Ord`,
 //! `Debug`. Auto-derive can't see through trait objects, so we wire the
-//! trait methods (`clone_box`, `eq_dyn`, `kind`) into hand-rolled impls
+//! trait methods (`clone_box`, `is_equal`, `kind`) into hand-rolled impls
 //! on `Box<dyn …>` here. The downstream enums then derive normally and
 //! everything just works at the `DataType`/`Value` layer.
 
@@ -53,12 +53,11 @@ use std::hash::{Hash, Hasher};
 use crate::convert::ConvertError;
 use crate::convert::context::ConversionContext;
 use crate::data_type::DataType;
-use crate::default_value::DefaultParseError;
 use crate::error::JsonEncodeError;
 use crate::value::Value;
 
 /// Connector-defined schema-side type descriptor. See module docs for the
-/// `kind()` and `eq_dyn` contracts.
+/// `kind()` and `is_equal` contracts.
 pub trait DynType: fmt::Debug + Send + Sync + 'static {
     /// `Any` access for downcasting in connector code.
     fn as_any(&self) -> &dyn Any;
@@ -141,7 +140,7 @@ pub trait DynType: fmt::Debug + Send + Sync + 'static {
     /// Parse a TOML default literal into a value of this type. Default
     /// returns `Ok(None)` meaning "this type does not accept defaults"
     /// — the caller wraps that as `TypeMismatch`.
-    fn parse_default(&self, _literal: &toml::Value) -> Result<Option<Value>, DefaultParseError> {
+    fn parse_default(&self, _literal: &toml::Value) -> Result<Option<Value>, String> {
         Ok(None)
     }
 
@@ -155,7 +154,7 @@ pub trait DynType: fmt::Debug + Send + Sync + 'static {
     /// Equality between this descriptor and `other`. The default
     /// compares `kind()` only — correct for parameter-less unit types.
     /// Implementations carrying descriptor parameters MUST override.
-    fn eq_dyn(&self, other: &dyn DynType) -> bool {
+    fn is_equal(&self, other: &dyn DynType) -> bool {
         self.kind() == other.kind()
     }
 
@@ -185,10 +184,23 @@ pub trait DynValue: fmt::Debug + Send + Sync + 'static {
 
     /// Equality with another opaque value. Implementations typically
     /// downcast via `as_any` and compare concrete fields.
-    fn eq_dyn(&self, other: &dyn DynValue) -> bool;
+    fn is_equal(&self, other: &dyn DynValue) -> bool;
 
     /// Deep-clone behind a `Box<dyn DynValue>`.
     fn clone_box(&self) -> Box<dyn DynValue>;
+
+    /// Optional ordering against another opaque value of the same kind.
+    /// Default `None` (unordered). Override for types that participate in
+    /// expression comparisons (e.g. ObjectId).
+    fn partial_cmp(&self, _other: &dyn DynValue) -> Option<std::cmp::Ordering> {
+        None
+    }
+
+    /// Feed this value into a [`Hasher`](std::hash::Hasher) so that
+    /// cursor-compatible custom values can be used in [`Key`](crate::Key).
+    /// Default does nothing — override together with `is_equal` so that
+    /// `a.is_equal(b)` implies identical hashes.
+    fn hash(&self, _state: &mut dyn std::hash::Hasher) {}
 
     /// Encode this value as a `serde_json::Value` for the JSON
     /// auto-pack path (`*:body` mapping). Default returns
@@ -211,9 +223,9 @@ impl Clone for Box<dyn DynType> {
 
 impl PartialEq for Box<dyn DynType> {
     fn eq(&self, other: &Self) -> bool {
-        // kind() equality is the cheap pre-check; eq_dyn is the
+        // kind() equality is the cheap pre-check; is_equal is the
         // structural follow-up (overridden by parametric types).
-        self.kind() == other.kind() && (**self).eq_dyn(&**other)
+        self.kind() == other.kind() && (**self).is_equal(&**other)
     }
 }
 
@@ -221,7 +233,7 @@ impl Eq for Box<dyn DynType> {}
 
 impl Hash for Box<dyn DynType> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Hash by kind() only. PartialEq narrows further via eq_dyn,
+        // Hash by kind() only. PartialEq narrows further via is_equal,
         // but Hash is permitted to bucket by kind alone — collisions
         // are resolved by Eq.
         self.kind().hash(state);
@@ -254,7 +266,7 @@ impl Clone for Box<dyn DynValue> {
 
 impl PartialEq for Box<dyn DynValue> {
     fn eq(&self, other: &Self) -> bool {
-        (**self).eq_dyn(&**other)
+        (**self).is_equal(&**other)
     }
 }
 
