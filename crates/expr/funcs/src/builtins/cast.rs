@@ -88,8 +88,28 @@ impl ExprFunction for CastToStringFunc {
     }
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        let size = match &args[0].data_type {
+            DataType::Int8 => Some(4),
+            DataType::UInt8 => Some(3),
+            DataType::Int16 => Some(6),
+            DataType::UInt16 => Some(5),
+            DataType::Int32 => Some(11),
+            DataType::UInt32 => Some(10),
+            DataType::Int64 => Some(20),
+            DataType::UInt64 => Some(20),
+            DataType::Float32 => Some(24),
+            DataType::Float64 => Some(24),
+            DataType::Bool => Some(5),
+            DataType::Date => Some(10),
+            DataType::Timestamp => Some(32),
+            DataType::Uuid => Some(36),
+            DataType::Ipv4 => Some(15),
+            DataType::Ipv6 => Some(45),
+            DataType::Text { size } => *size,
+            _ => None,
+        };
         Ok(NullableExprType::new(
-            DataType::Text { size: None },
+            DataType::Text { size },
             args[0].nullable,
         ))
     }

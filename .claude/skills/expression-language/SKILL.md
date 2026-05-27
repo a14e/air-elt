@@ -55,6 +55,39 @@ Config format matters for expression quoting: in YAML, expressions need no outer
 
 `Key` newtype (in `crates/types/src/key.rs`) wraps `SmallVec<[Value; 2]>` for switch dispatch, batch dedup, and cursor comparison. Unlike `Value`, `Key` has total ordering (`Ord`) and total equality (`Eq`) -- NaN == NaN by design so keys are deterministic. Construction rejects Null/Json/Object and canonicalises representation (small ints promote to Int64, Float32 widens to Float64).
 
+## Type algebra
+
+Type algebra determines the output `DataType` at type-check time (before evaluation). Rules live in `crates/expr/types/src/bounds.rs` (arithmetic) and each function's `resolve_type` method.
+
+**Arithmetic promotion** (`bounds::arithmetic_result_type` + `bounds::scalar_arithmetic`):
+
+When both operands carry `int_bound`, bit-level rules apply: add/subtract = `max(a,b)+1` bits, multiply = `a+b` bits, divide = `a` bits, modulo = `min(a,b)` bits. Result stays `Int64` with the computed bound while bits <= 64; above 64 it promotes to `BigInt{width}`. Without `int_bound`, the DataType-level fallback is used:
+
+| Left | Right | Result |
+|------|-------|--------|
+| IntN | IntN | next wider int (8->16->32->64->BigInt) per bit rules |
+| Float32 | Float32 | Float32 |
+| Float32/64 | Float64/32 | Float64 |
+| any int | any float | Float64 |
+| BigInt | BigInt | BigInt (wider width, capped at MAX_BIGINT_WIDTH) |
+| any int | BigInt | BigInt |
+| Decimal | any numeric | Decimal{precision:None, scale:None} |
+| Text | Text | `concat_result_type`: sums sizes when both bounded, else unbounded |
+
+Unary: `negate`/`abs` preserve the input type. `ceil`/`floor`/`round`/`sign` return `Int64`. `power`/`sqrt` return `Float64`.
+
+**String functions:** all return `Text{size:None}` (unbounded). Exception: `length`/`indexOf` return `Int64`; `startsWith`/`endsWith`/`contains` return `Bool`. Size-aware algebra (e.g. `concat(Text(5), Text(5))` returning `Text(10)`) exists in `concat_result_type` but is not wired through `ConcatFunc.resolve_type` yet.
+
+**Comparison functions:** always return `Bool`.
+
+**Cast functions:** return the target type (`toInt64` returns `Int64`, `toBigInt` returns `BigInt{width:None}`, `toDecimal` returns `Decimal{precision:None, scale:None}`, etc.).
+
+**Conditional functions** (parsed as AST nodes, resolved in `type_check.rs`):
+- `if(cond, then, else)`: returns `then`'s data type; nullable if either branch is nullable.
+- `multiIf(c1,v1,...,default)`: returns the first branch's data type; nullable if any branch is nullable.
+- `ifNull(value, alt)`: returns `value`'s data type; nullable = `alt.nullable` (the value itself is non-null after the check).
+- `nullIf(value, sentinel)`: returns `value`'s data type; always nullable (can produce null).
+
 ## Function categories
 
 All functions are registered as static items implementing `ExprFunction`. Brief category summary (full list in [references/functions.md](references/functions.md)):

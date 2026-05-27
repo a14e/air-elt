@@ -222,6 +222,21 @@ impl DynValue for PgInetValue {
         }
     }
 
+    fn partial_cmp(&self, other: &dyn DynValue) -> Option<std::cmp::Ordering> {
+        other
+            .as_any()
+            .downcast_ref::<PgInetValue>()
+            .map(|o| self.0.cmp(&o.0))
+    }
+
+    fn hash(&self, state: &mut dyn std::hash::Hasher) {
+        match self.0.ip() {
+            std::net::IpAddr::V4(v4) => state.write(&v4.octets()),
+            std::net::IpAddr::V6(v6) => state.write(&v6.octets()),
+        }
+        state.write_u8(self.0.prefix());
+    }
+
     fn clone_box(&self) -> Box<dyn DynValue> {
         Box::new(*self)
     }

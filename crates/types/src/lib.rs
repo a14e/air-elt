@@ -27,4 +27,4 @@ pub use error::KeyError;
 pub use json_encode::value_to_json;
 pub use key::Key;
 pub use union_types::collapse_union;
-pub use value::Value;
+pub use value::{Value, value_to_toml};

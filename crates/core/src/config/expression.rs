@@ -59,7 +59,10 @@ fn resolve_toml_value(
                 return Ok(value.clone());
             }
             let result = expr_val.eval(&context.registry, &context.eval_context)?;
-            Ok(value_to_toml(&result))
+            let toml_val = result
+                .to_toml()
+                .unwrap_or_else(|| toml::Value::String(format!("{result:?}")));
+            Ok(toml_val)
         }
         toml::Value::Table(t) => {
             let mut out = toml::Table::new();
@@ -76,38 +79,6 @@ fn resolve_toml_value(
             Ok(toml::Value::Array(out))
         }
         _ => Ok(value.clone()),
-    }
-}
-
-/// Convert a runtime `Value` into a `toml::Value`. Used for config resolution
-/// (expression results back to TOML) and default-literal coercion.
-/// Types that don't map to a native TOML scalar fall back to their string
-/// representation.
-pub(crate) fn value_to_toml(value: &air_elt_types::Value) -> toml::Value {
-    use air_elt_types::Value;
-    match value {
-        Value::Text(s) => toml::Value::String(s.clone()),
-        Value::Int64(n) => toml::Value::Integer(*n),
-        Value::Float64(f) => toml::Value::Float(*f),
-        Value::Bool(b) => toml::Value::Boolean(*b),
-        Value::Int8(n) => toml::Value::Integer(*n as i64),
-        Value::Int16(n) => toml::Value::Integer(*n as i64),
-        Value::Int32(n) => toml::Value::Integer(*n as i64),
-        Value::UInt8(n) => toml::Value::Integer(*n as i64),
-        Value::UInt16(n) => toml::Value::Integer(*n as i64),
-        Value::UInt32(n) => toml::Value::Integer(*n as i64),
-        Value::UInt64(n) => i64::try_from(*n)
-            .map(toml::Value::Integer)
-            .unwrap_or_else(|_| toml::Value::String(n.to_string())),
-        Value::Float32(f) => toml::Value::Float(*f as f64),
-        Value::BigInt(b) => toml::Value::String(b.to_string()),
-        Value::Decimal(d) => toml::Value::String(d.to_string()),
-        Value::Date(d) => toml::Value::String(d.to_string()),
-        Value::Timestamp(ts) => toml::Value::String(ts.to_rfc3339()),
-        Value::Uuid(u) => toml::Value::String(u.to_string()),
-        Value::Ipv4(ip) => toml::Value::String(ip.to_string()),
-        Value::Ipv6(ip) => toml::Value::String(ip.to_string()),
-        _ => toml::Value::String(format!("{value:?}")),
     }
 }
 

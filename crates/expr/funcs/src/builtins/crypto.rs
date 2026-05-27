@@ -80,7 +80,7 @@ impl ExprFunction for Md5Func {
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
         Ok(NullableExprType::new(
-            DataType::Text { size: None },
+            DataType::Text { size: Some(32) },
             args[0].nullable,
         ))
     }
@@ -116,7 +116,7 @@ impl ExprFunction for Sha1Func {
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
         Ok(NullableExprType::new(
-            DataType::Text { size: None },
+            DataType::Text { size: Some(40) },
             args[0].nullable,
         ))
     }
@@ -152,7 +152,7 @@ impl ExprFunction for Sha256Func {
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
         Ok(NullableExprType::new(
-            DataType::Text { size: None },
+            DataType::Text { size: Some(64) },
             args[0].nullable,
         ))
     }
@@ -188,7 +188,7 @@ impl ExprFunction for Sha512Func {
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
         Ok(NullableExprType::new(
-            DataType::Text { size: None },
+            DataType::Text { size: Some(128) },
             args[0].nullable,
         ))
     }
@@ -390,10 +390,7 @@ impl ExprFunction for CityHash64Func {
 }
 
 fn city_hash_64(data: &[u8]) -> u64 {
-    use std::hash::Hasher;
-    let mut hasher = ahash::AHasher::default();
-    hasher.write(data);
-    hasher.finish()
+    ch_cityhash102::cityhash64(data)
 }
 
 // ---------------------------------------------------------------------------
@@ -688,14 +685,19 @@ mod tests {
     // --- cityHash64 ---
 
     #[test]
-    fn city_hash64_deterministic() {
-        let input = Value::Text("test data".to_owned());
-        let result_a = CityHash64Func
-            .evaluate(vec![input.clone()], &ctx())
+    fn city_hash64_deterministic_with_golden_value() {
+        let result = CityHash64Func
+            .evaluate(vec![Value::Text("test data".to_owned())], &ctx())
             .unwrap();
-        let result_b = CityHash64Func.evaluate(vec![input], &ctx()).unwrap();
-        assert_eq!(result_a, result_b);
-        assert!(matches!(result_a, Value::Int64(_)));
+        // Golden value from ch_cityhash102 reference (ClickHouse CityHash v1.0.2)
+        let expected = ch_cityhash102::cityhash64(b"test data") as i64;
+        assert_eq!(result, Value::Int64(expected));
+
+        let empty = CityHash64Func
+            .evaluate(vec![Value::Text(String::new())], &ctx())
+            .unwrap();
+        let expected_empty = ch_cityhash102::cityhash64(b"") as i64;
+        assert_eq!(empty, Value::Int64(expected_empty));
     }
 
     #[test]

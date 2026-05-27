@@ -262,10 +262,9 @@ mod tests {
     #[test]
     fn concat_returns_text() {
         let result = infer_expression_type("concat('abc', 'def')", &registry()).unwrap();
-        // ConcatFunc returns unbounded Text (size tracking not implemented in concat)
         assert_eq!(
             result,
-            NullableExprType::non_null(DataType::Text { size: None })
+            NullableExprType::non_null(DataType::Text { size: Some(6) })
         );
     }
 

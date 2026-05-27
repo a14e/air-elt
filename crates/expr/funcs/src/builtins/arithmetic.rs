@@ -344,7 +344,11 @@ impl ExprFunction for ModuloFunc {
         }
         match (a, b) {
             (Value::Int64(_), Value::Int64(0)) => Err(FuncError::DivisionByZero),
-            (Value::Int64(x), Value::Int64(y)) => Ok(Value::Int64(x % y)),
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_rem(y) {
+                Some(result) => Ok(Value::Int64(result)),
+                // i64::MIN % -1 overflows; promote to BigInt (result is 0).
+                None => Ok(Value::BigInt(BigInt::from(x) % BigInt::from(y))),
+            },
             (Value::BigInt(_), Value::BigInt(ref y)) if y.is_zero() => {
                 Err(FuncError::DivisionByZero)
             }
@@ -1192,5 +1196,399 @@ mod tests {
         let b = Value::Decimal("2.7".parse().unwrap());
         let result = f.evaluate(vec![a, b], &ctx()).unwrap();
         assert_eq!(result, Value::Decimal("2.7".parse().unwrap()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Property tests: crash-freedom and arithmetic bounds
+    // -----------------------------------------------------------------------
+
+    mod proptests {
+        use super::*;
+        use crate::registry::FunctionRegistry;
+        use crate::signature::ExprFunction;
+        use crate::test_support::ctx;
+        use proptest::prelude::*;
+
+        fn arb_numeric_value() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                any::<i64>().prop_map(Value::Int64),
+                any::<f64>().prop_map(Value::Float64),
+                any::<i64>().prop_map(|n| Value::BigInt(BigInt::from(n))),
+                prop_oneof![
+                    Just("0"),
+                    Just("1.5"),
+                    Just("-999999999999999999.123456789"),
+                    Just("0.000000001"),
+                ]
+                .prop_map(|s| Value::Decimal(s.parse().unwrap())),
+            ]
+        }
+
+        /// Numeric values biased toward edge cases that commonly trigger
+        /// overflow, division-by-zero, and special-float behaviour.
+        fn arb_edge_numeric_value() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                prop_oneof![
+                    Just(Value::Int64(0)),
+                    Just(Value::Int64(1)),
+                    Just(Value::Int64(-1)),
+                    Just(Value::Int64(i64::MIN)),
+                    Just(Value::Int64(i64::MAX)),
+                    any::<i64>().prop_map(Value::Int64),
+                ],
+                prop_oneof![
+                    Just(Value::Float64(0.0)),
+                    Just(Value::Float64(-0.0)),
+                    Just(Value::Float64(f64::NAN)),
+                    Just(Value::Float64(f64::INFINITY)),
+                    Just(Value::Float64(f64::NEG_INFINITY)),
+                    Just(Value::Float64(f64::MIN)),
+                    Just(Value::Float64(f64::MAX)),
+                    any::<f64>().prop_map(Value::Float64),
+                ],
+                prop_oneof![
+                    Just(Value::BigInt(BigInt::from(0))),
+                    Just(Value::BigInt(BigInt::from(i64::MIN))),
+                    Just(Value::BigInt(BigInt::from(i64::MAX))),
+                    Just(Value::BigInt(
+                        BigInt::from(i64::MAX) * BigInt::from(i64::MAX)
+                    )),
+                    any::<i64>().prop_map(|n| Value::BigInt(BigInt::from(n))),
+                ],
+                prop_oneof![
+                    Just("0"),
+                    Just("1.5"),
+                    Just("-999999999999999999.123456789"),
+                    Just("0.000000001"),
+                ]
+                .prop_map(|s| Value::Decimal(s.parse().unwrap())),
+            ]
+        }
+
+        fn eval_binary(func: &dyn ExprFunction, a: Value, b: Value) -> Result<Value, FuncError> {
+            func.evaluate(vec![a, b], &ctx())
+        }
+
+        fn eval_unary(func: &dyn ExprFunction, a: Value) -> Result<Value, FuncError> {
+            func.evaluate(vec![a], &ctx())
+        }
+
+        // --- Property 1: Eval crash-freedom for binary arithmetic ---
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(2000))]
+
+            #[test]
+            fn add_never_panics(a in arb_edge_numeric_value(), b in arb_edge_numeric_value()) {
+                let _ = eval_binary(&AddFunc, a, b);
+            }
+
+            #[test]
+            fn subtract_never_panics(a in arb_edge_numeric_value(), b in arb_edge_numeric_value()) {
+                let _ = eval_binary(&SubtractFunc, a, b);
+            }
+
+            #[test]
+            fn multiply_never_panics(a in arb_edge_numeric_value(), b in arb_edge_numeric_value()) {
+                let _ = eval_binary(&MultiplyFunc, a, b);
+            }
+
+            #[test]
+            fn divide_never_panics(a in arb_edge_numeric_value(), b in arb_edge_numeric_value()) {
+                let _ = eval_binary(&DivideFunc, a, b);
+            }
+
+            #[test]
+            fn modulo_never_panics(a in arb_edge_numeric_value(), b in arb_edge_numeric_value()) {
+                let _ = eval_binary(&ModuloFunc, a, b);
+            }
+
+            #[test]
+            fn power_never_panics(a in arb_edge_numeric_value(), b in arb_edge_numeric_value()) {
+                let _ = eval_binary(&PowerFunc, a, b);
+            }
+        }
+
+        // --- Property 1b: Unary arithmetic crash-freedom ---
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(2000))]
+
+            #[test]
+            fn negate_never_panics(a in arb_edge_numeric_value()) {
+                let _ = eval_unary(&NegateFunc, a);
+            }
+
+            #[test]
+            fn abs_never_panics(a in arb_edge_numeric_value()) {
+                let _ = eval_unary(&AbsFunc, a);
+            }
+
+            #[test]
+            fn ceil_never_panics(a in arb_edge_numeric_value()) {
+                let _ = eval_unary(&CeilFunc, a);
+            }
+
+            #[test]
+            fn floor_never_panics(a in arb_edge_numeric_value()) {
+                let _ = eval_unary(&FloorFunc, a);
+            }
+
+            #[test]
+            fn round_never_panics(a in arb_edge_numeric_value()) {
+                let _ = eval_unary(&RoundFunc, a);
+            }
+
+            #[test]
+            fn sqrt_never_panics(a in arb_edge_numeric_value()) {
+                let _ = eval_unary(&SqrtFunc, a);
+            }
+
+            #[test]
+            fn sign_never_panics(a in arb_edge_numeric_value()) {
+                let _ = eval_unary(&SignFunc, a);
+            }
+        }
+
+        // --- Property 1c: Min/Max crash-freedom ---
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1000))]
+
+            #[test]
+            fn min_never_panics(a in arb_edge_numeric_value(), b in arb_edge_numeric_value()) {
+                let _ = eval_binary(&MinFunc, a, b);
+            }
+
+            #[test]
+            fn max_never_panics(a in arb_edge_numeric_value(), b in arb_edge_numeric_value()) {
+                let _ = eval_binary(&MaxFunc, a, b);
+            }
+        }
+
+        // --- Property 2: Bounds arithmetic ---
+
+        #[test]
+        fn int64_max_plus_one_promotes_to_bigint() {
+            let result = eval_binary(&AddFunc, Value::Int64(i64::MAX), Value::Int64(1)).unwrap();
+            assert_eq!(
+                result,
+                Value::BigInt(BigInt::from(i64::MAX) + BigInt::from(1))
+            );
+        }
+
+        #[test]
+        fn int64_min_minus_one_promotes_to_bigint() {
+            let result =
+                eval_binary(&SubtractFunc, Value::Int64(i64::MIN), Value::Int64(1)).unwrap();
+            assert_eq!(
+                result,
+                Value::BigInt(BigInt::from(i64::MIN) - BigInt::from(1))
+            );
+        }
+
+        #[test]
+        fn int64_min_times_neg_one_promotes_to_bigint() {
+            let result =
+                eval_binary(&MultiplyFunc, Value::Int64(i64::MIN), Value::Int64(-1)).unwrap();
+            assert_eq!(
+                result,
+                Value::BigInt(BigInt::from(i64::MIN) * BigInt::from(-1i64))
+            );
+        }
+
+        #[test]
+        fn int64_division_by_zero_returns_error() {
+            let result = eval_binary(&DivideFunc, Value::Int64(42), Value::Int64(0));
+            assert!(matches!(result, Err(FuncError::DivisionByZero)));
+        }
+
+        #[test]
+        fn bigint_division_by_zero_returns_error() {
+            let result = eval_binary(
+                &DivideFunc,
+                Value::BigInt(BigInt::from(42)),
+                Value::BigInt(BigInt::from(0)),
+            );
+            assert!(matches!(result, Err(FuncError::DivisionByZero)));
+        }
+
+        #[test]
+        fn decimal_division_by_zero_returns_error() {
+            let result = eval_binary(
+                &DivideFunc,
+                Value::Decimal("42.5".parse().unwrap()),
+                Value::Decimal("0".parse().unwrap()),
+            );
+            assert!(matches!(result, Err(FuncError::DivisionByZero)));
+        }
+
+        #[test]
+        fn float64_division_by_zero_returns_error() {
+            let result = eval_binary(&DivideFunc, Value::Float64(42.0), Value::Float64(0.0));
+            assert!(matches!(result, Err(FuncError::DivisionByZero)));
+        }
+
+        #[test]
+        fn int64_min_div_neg_one_promotes_to_bigint() {
+            let result =
+                eval_binary(&DivideFunc, Value::Int64(i64::MIN), Value::Int64(-1)).unwrap();
+            assert_eq!(
+                result,
+                Value::BigInt(BigInt::from(i64::MIN) / BigInt::from(-1i64))
+            );
+        }
+
+        #[test]
+        fn int64_min_modulo_neg_one_promotes_to_bigint() {
+            let result =
+                eval_binary(&ModuloFunc, Value::Int64(i64::MIN), Value::Int64(-1)).unwrap();
+            assert_eq!(
+                result,
+                Value::BigInt(BigInt::from(i64::MIN) % BigInt::from(-1i64))
+            );
+        }
+
+        #[test]
+        fn int64_modulo_by_zero_returns_error() {
+            let result = eval_binary(&ModuloFunc, Value::Int64(42), Value::Int64(0));
+            assert!(matches!(result, Err(FuncError::DivisionByZero)));
+        }
+
+        #[test]
+        fn int64_max_squared_promotes_to_bigint() {
+            let result = eval_binary(&PowerFunc, Value::Int64(i64::MAX), Value::Int64(2)).unwrap();
+            assert_eq!(result, Value::BigInt(BigInt::from(i64::MAX).pow(2)));
+        }
+
+        #[test]
+        fn negate_int64_min_promotes_to_bigint() {
+            let result = eval_unary(&NegateFunc, Value::Int64(i64::MIN)).unwrap();
+            assert_eq!(result, Value::BigInt(-BigInt::from(i64::MIN)));
+        }
+
+        #[test]
+        fn abs_int64_min_promotes_to_bigint() {
+            let result = eval_unary(&AbsFunc, Value::Int64(i64::MIN)).unwrap();
+            let expected = BigInt::from(i64::MIN).magnitude().clone().into();
+            assert_eq!(result, Value::BigInt(expected));
+        }
+
+        // --- Property 3: Comparison crash-freedom ---
+
+        // Comparison and cast function structs are module-private, so we
+        // resolve them through the builtin registry by name.
+
+        use std::sync::LazyLock;
+
+        static REGISTRY: LazyLock<FunctionRegistry> =
+            LazyLock::new(FunctionRegistry::with_builtins);
+
+        fn comparison_func(name: &str) -> &'static dyn ExprFunction {
+            REGISTRY.resolve(name, 2).expect("function must exist")
+        }
+
+        fn cast_func(name: &str, arity: usize) -> &'static dyn ExprFunction {
+            REGISTRY.resolve(name, arity).expect("function must exist")
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1000))]
+
+            #[test]
+            fn equals_never_panics(a in arb_numeric_value(), b in arb_numeric_value()) {
+                let f = comparison_func("equals");
+                let _ = eval_binary(f, a, b);
+            }
+
+            #[test]
+            fn not_equals_never_panics(a in arb_numeric_value(), b in arb_numeric_value()) {
+                let f = comparison_func("notEquals");
+                let _ = eval_binary(f, a, b);
+            }
+
+            #[test]
+            fn greater_never_panics(a in arb_numeric_value(), b in arb_numeric_value()) {
+                let f = comparison_func("greater");
+                let _ = eval_binary(f, a, b);
+            }
+
+            #[test]
+            fn less_never_panics(a in arb_numeric_value(), b in arb_numeric_value()) {
+                let f = comparison_func("less");
+                let _ = eval_binary(f, a, b);
+            }
+
+            #[test]
+            fn greater_or_equals_never_panics(a in arb_numeric_value(), b in arb_numeric_value()) {
+                let f = comparison_func("greaterOrEquals");
+                let _ = eval_binary(f, a, b);
+            }
+
+            #[test]
+            fn less_or_equals_never_panics(a in arb_numeric_value(), b in arb_numeric_value()) {
+                let f = comparison_func("lessOrEquals");
+                let _ = eval_binary(f, a, b);
+            }
+        }
+
+        // --- Property 4: Cast crash-freedom ---
+
+        /// Broader value generation including non-numeric types for cast tests.
+        fn arb_any_value() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                Just(Value::Null),
+                any::<bool>().prop_map(Value::Bool),
+                any::<i64>().prop_map(Value::Int64),
+                any::<f64>().prop_map(Value::Float64),
+                any::<i64>().prop_map(|n| Value::BigInt(BigInt::from(n))),
+                prop_oneof![Just("0"), Just("1.5"), Just("-42.0"), Just("0.000000001"),]
+                    .prop_map(|s| Value::Decimal(s.parse().unwrap())),
+                ".*".prop_map(Value::Text),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1000))]
+
+            #[test]
+            fn cast_to_int64_never_panics(a in arb_any_value()) {
+                let f = cast_func("toInt64", 1);
+                let _ = eval_unary(f, a);
+            }
+
+            #[test]
+            fn cast_to_float64_never_panics(a in arb_any_value()) {
+                let f = cast_func("toFloat64", 1);
+                let _ = eval_unary(f, a);
+            }
+
+            #[test]
+            fn cast_to_bigint_never_panics(a in arb_any_value()) {
+                let f = cast_func("toBigInt", 1);
+                let _ = eval_unary(f, a);
+            }
+
+            #[test]
+            fn cast_to_string_never_panics(a in arb_any_value()) {
+                let f = cast_func("toStringCast", 1);
+                let _ = eval_unary(f, a);
+            }
+
+            #[test]
+            fn cast_to_bool_never_panics(a in arb_any_value()) {
+                let f = cast_func("toBool", 1);
+                let _ = eval_unary(f, a);
+            }
+
+            #[test]
+            fn cast_to_decimal_never_panics(a in arb_any_value()) {
+                let f = cast_func("toDecimal", 3);
+                let _ = f.evaluate(
+                    vec![a, Value::Int64(38), Value::Int64(10)],
+                    &ctx(),
+                );
+            }
+        }
     }
 }

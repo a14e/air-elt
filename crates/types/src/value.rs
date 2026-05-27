@@ -122,6 +122,46 @@ impl Value {
             Value::Custom(v) => Some(DataType::Custom(v.dyn_type())),
         }
     }
+
+    /// Convert to a TOML value. Returns `None` for types without a
+    /// natural TOML representation (Null, Json, Bytes, Object, Custom).
+    pub fn to_toml(&self) -> Option<toml::Value> {
+        match self {
+            Value::Null
+            | Value::Json(_)
+            | Value::Bytes(_)
+            | Value::Object(_)
+            | Value::Custom(_) => None,
+            Value::Bool(b) => Some(toml::Value::Boolean(*b)),
+            Value::Int8(n) => Some(toml::Value::Integer(i64::from(*n))),
+            Value::Int16(n) => Some(toml::Value::Integer(i64::from(*n))),
+            Value::Int32(n) => Some(toml::Value::Integer(i64::from(*n))),
+            Value::Int64(n) => Some(toml::Value::Integer(*n)),
+            Value::UInt8(n) => Some(toml::Value::Integer(i64::from(*n))),
+            Value::UInt16(n) => Some(toml::Value::Integer(i64::from(*n))),
+            Value::UInt32(n) => Some(toml::Value::Integer(i64::from(*n))),
+            Value::UInt64(n) => Some(
+                i64::try_from(*n)
+                    .map(toml::Value::Integer)
+                    .unwrap_or_else(|_| toml::Value::String(n.to_string())),
+            ),
+            Value::Float32(f) => Some(toml::Value::Float(f64::from(*f))),
+            Value::Float64(f) => Some(toml::Value::Float(*f)),
+            Value::BigInt(b) => Some(toml::Value::String(b.to_string())),
+            Value::Decimal(d) => Some(toml::Value::String(d.to_string())),
+            Value::Text(s) => Some(toml::Value::String(s.clone())),
+            Value::Date(d) => Some(toml::Value::String(d.to_string())),
+            Value::Timestamp(ts) => Some(toml::Value::String(ts.to_rfc3339())),
+            Value::Uuid(u) => Some(toml::Value::String(u.to_string())),
+            Value::Ipv4(ip) => Some(toml::Value::String(ip.to_string())),
+            Value::Ipv6(ip) => Some(toml::Value::String(ip.to_string())),
+        }
+    }
+}
+
+/// Standalone wrapper around [`Value::to_toml`].
+pub fn value_to_toml(value: &Value) -> Option<toml::Value> {
+    value.to_toml()
 }
 
 impl Clone for Value {

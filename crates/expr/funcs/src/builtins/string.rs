@@ -5,6 +5,13 @@ use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
 use crate::signature::{EvalContext, ExprFunction};
 
+fn text_size(dt: &DataType) -> Option<u32> {
+    match dt {
+        DataType::Text { size } => *size,
+        _ => None,
+    }
+}
+
 static CONCAT: ConcatFunc = ConcatFunc;
 static LENGTH: LengthFunc = LengthFunc;
 static SUBSTRING: SubstringFunc = SubstringFunc;
@@ -62,10 +69,11 @@ impl ExprFunction for ConcatFunc {
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
         let nullable = args.iter().any(|a| a.nullable);
-        Ok(NullableExprType::new(
-            DataType::Text { size: None },
-            nullable,
-        ))
+        let size = args.iter().try_fold(0u32, |acc, a| match &a.data_type {
+            DataType::Text { size: Some(s) } => Some(acc.saturating_add(*s)),
+            _ => None,
+        });
+        Ok(NullableExprType::new(DataType::Text { size }, nullable))
     }
 
     fn evaluate(&self, args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
@@ -108,7 +116,13 @@ impl ExprFunction for LengthFunc {
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
         validate_text_arg("length", &args[0].data_type)?;
-        Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
+        let int_bound =
+            text_size(&args[0].data_type).map(|s| 64 - (s as u64).leading_zeros() as u8);
+        Ok(NullableExprType {
+            data_type: DataType::Int64,
+            nullable: args[0].nullable,
+            int_bound,
+        })
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
@@ -145,10 +159,8 @@ impl ExprFunction for SubstringFunc {
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
         validate_text_arg("substring", &args[0].data_type)?;
         let nullable = args.iter().any(|a| a.nullable);
-        Ok(NullableExprType::new(
-            DataType::Text { size: None },
-            nullable,
-        ))
+        let size = text_size(&args[0].data_type);
+        Ok(NullableExprType::new(DataType::Text { size }, nullable))
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
@@ -254,7 +266,7 @@ impl ExprFunction for CharAtFunc {
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
         validate_text_arg("charAt", &args[0].data_type)?;
-        Ok(NullableExprType::nullable(DataType::Text { size: None }))
+        Ok(NullableExprType::nullable(DataType::Text { size: Some(1) }))
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
@@ -307,8 +319,9 @@ impl ExprFunction for UpperFunc {
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
         validate_text_arg("upper", &args[0].data_type)?;
+        let size = text_size(&args[0].data_type);
         Ok(NullableExprType::new(
-            DataType::Text { size: None },
+            DataType::Text { size },
             args[0].nullable,
         ))
     }
@@ -346,8 +359,9 @@ impl ExprFunction for LowerFunc {
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
         validate_text_arg("lower", &args[0].data_type)?;
+        let size = text_size(&args[0].data_type);
         Ok(NullableExprType::new(
-            DataType::Text { size: None },
+            DataType::Text { size },
             args[0].nullable,
         ))
     }
@@ -385,8 +399,9 @@ impl ExprFunction for TrimFunc {
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
         validate_text_arg("trim", &args[0].data_type)?;
+        let size = text_size(&args[0].data_type);
         Ok(NullableExprType::new(
-            DataType::Text { size: None },
+            DataType::Text { size },
             args[0].nullable,
         ))
     }
@@ -570,7 +585,13 @@ impl ExprFunction for IndexOfFunc {
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
         let nullable = args.iter().any(|a| a.nullable);
-        Ok(NullableExprType::new(DataType::Int64, nullable))
+        let int_bound =
+            text_size(&args[0].data_type).map(|s| 64 - (s as u64).leading_zeros() as u8);
+        Ok(NullableExprType {
+            data_type: DataType::Int64,
+            nullable,
+            int_bound,
+        })
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
@@ -694,8 +715,9 @@ impl ExprFunction for ReverseFunc {
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
         validate_text_arg("reverse", &args[0].data_type)?;
+        let size = text_size(&args[0].data_type);
         Ok(NullableExprType::new(
-            DataType::Text { size: None },
+            DataType::Text { size },
             args[0].nullable,
         ))
     }
@@ -761,6 +783,13 @@ impl ExprFunction for RepeatFunc {
         };
         if n < 0 {
             return Ok(Value::Text(String::new()));
+        }
+        let total_len = s.len().saturating_mul(n as usize);
+        if total_len > air_elt_expr_types::limits::MAX_EXPR_STRING_BYTES {
+            return Err(FuncError::StringTooLarge {
+                len: total_len,
+                max: air_elt_expr_types::limits::MAX_EXPR_STRING_BYTES,
+            });
         }
         Ok(Value::Text(s.repeat(n as usize)))
     }
@@ -831,7 +860,14 @@ impl ExprFunction for LeftPadFunc {
             return Ok(Value::Text(s));
         }
         let pad_count = target_len as usize - char_count;
-        let mut result = String::with_capacity(s.len() + pad_count * pad_char.len_utf8());
+        let total_len = s.len() + pad_count * pad_char.len_utf8();
+        if total_len > air_elt_expr_types::limits::MAX_EXPR_STRING_BYTES {
+            return Err(FuncError::StringTooLarge {
+                len: total_len,
+                max: air_elt_expr_types::limits::MAX_EXPR_STRING_BYTES,
+            });
+        }
+        let mut result = String::with_capacity(total_len);
         for _ in 0..pad_count {
             result.push(pad_char);
         }
@@ -905,7 +941,14 @@ impl ExprFunction for RightPadFunc {
             return Ok(Value::Text(s));
         }
         let pad_count = target_len as usize - char_count;
-        let mut result = String::with_capacity(s.len() + pad_count * pad_char.len_utf8());
+        let total_len = s.len() + pad_count * pad_char.len_utf8();
+        if total_len > air_elt_expr_types::limits::MAX_EXPR_STRING_BYTES {
+            return Err(FuncError::StringTooLarge {
+                len: total_len,
+                max: air_elt_expr_types::limits::MAX_EXPR_STRING_BYTES,
+            });
+        }
+        let mut result = String::with_capacity(total_len);
         result.push_str(&s);
         for _ in 0..pad_count {
             result.push(pad_char);

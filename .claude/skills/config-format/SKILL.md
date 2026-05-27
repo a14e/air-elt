@@ -51,16 +51,29 @@ Examples:
 
 ### Component config expressions
 
-String values inside source/sink/storage `config = { ... }` tables are evaluated as expressions before factory deserialization via `resolve_config_expressions`. The function walks the TOML table recursively: string values detected as expressions or interpolations are evaluated; non-string values and plain string literals pass through unchanged. The result is coerced back to a TOML string (since component config values like `url` are strings anyway).
+String values inside source/sink/storage `config = { ... }` tables are evaluated as expressions before factory deserialization via `resolve_config_expressions` (`crates/core/src/config/expression.rs`). The function walks the TOML table recursively with no key filtering: every string value detected as an expression or interpolation is evaluated; non-string values and plain string literals pass through unchanged. The result is coerced back to a TOML value. Resolution runs on ALL component configs (sources, sinks, storages) before the factory deserializes the TOML into a typed config struct (`resolve_component_config` in `crates/core/src/validation/pipeline.rs`).
+
+This means every string field in every connector config supports expressions and interpolations, including credentials and connection parameters:
+- **Postgres / CockroachDB / MySQL**: `url`
+- **MongoDB / Mongo-CDC**: `url`, `database`
+- **ClickHouse**: `url`, `database`, `user`, `password`
 
 ```toml
+# Postgres — url from environment
 [[sinks]]
 name = "pg"
 type = "postgres"
 config = { url = "env('PG_URL')", connect-timeout = "5s" }
 
-# Interpolation works too:
+# ClickHouse — credentials from environment
+[[sinks]]
+name = "ch"
+type = "clickhouse"
+config = { url = "env('CH_URL')", database = "analytics", user = "env('CH_USER')", password = "env('CH_PASSWORD')" }
+
+# Interpolation works in any string field:
 # url = "postgres://{env('PG_HOST')}:5432/db"
+# password = "file('secrets/ch_password.txt')"
 ```
 
 ## `[[sources]]` / `[[sinks]]` / `[[storages]]`

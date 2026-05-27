@@ -417,7 +417,12 @@ mod tests {
 
     mod proptests {
         use super::*;
+        use chrono::{NaiveDate, TimeZone, Utc};
         use proptest::prelude::*;
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        use uuid::Uuid;
+
+        // ─── Strategies ───────────────────────────────────────────────
 
         fn arb_key_value() -> impl Strategy<Value = Value> {
             prop_oneof![
@@ -434,25 +439,162 @@ mod tests {
                 any::<f32>().prop_map(Value::Float32),
                 ".*".prop_map(Value::Text),
                 proptest::collection::vec(any::<u8>(), 0..32).prop_map(Value::Bytes),
+                arb_bigint().prop_map(Value::BigInt),
+                arb_ipv4().prop_map(Value::Ipv4),
+                arb_ipv6().prop_map(Value::Ipv6),
+                arb_uuid().prop_map(Value::Uuid),
+                arb_date().prop_map(Value::Date),
+                arb_timestamp().prop_map(Value::Timestamp),
             ]
         }
 
+        fn arb_bigint() -> impl Strategy<Value = BigInt> {
+            prop_oneof![
+                // Small values that fit i64 — should hash-agree with Int64
+                any::<i64>().prop_map(BigInt::from),
+                // Large values exceeding i64
+                any::<u64>()
+                    .prop_filter("must exceed i64", |n| *n > i64::MAX as u64)
+                    .prop_map(BigInt::from),
+                // Negative large values
+                any::<i64>().prop_map(|n| BigInt::from(n) * BigInt::from(i64::MAX)),
+            ]
+        }
+
+        fn arb_ipv4() -> impl Strategy<Value = Ipv4Addr> {
+            any::<[u8; 4]>().prop_map(Ipv4Addr::from)
+        }
+
+        fn arb_ipv6() -> impl Strategy<Value = Ipv6Addr> {
+            any::<[u8; 16]>().prop_map(Ipv6Addr::from)
+        }
+
+        fn arb_uuid() -> impl Strategy<Value = Uuid> {
+            any::<[u8; 16]>().prop_map(Uuid::from_bytes)
+        }
+
+        fn arb_date() -> impl Strategy<Value = NaiveDate> {
+            // Valid date range for chrono
+            (1970i32..2100i32, 1u32..13u32, 1u32..29u32).prop_map(|(y, m, d)| {
+                NaiveDate::from_ymd_opt(y, m, d)
+                    .unwrap_or_else(|| NaiveDate::from_ymd_opt(y, m, 1).unwrap())
+            })
+        }
+
+        fn arb_timestamp() -> impl Strategy<Value = chrono::DateTime<Utc>> {
+            // Seconds since epoch in a reasonable range
+            (0i64..4_000_000_000i64).prop_map(|secs| Utc.timestamp_opt(secs, 0).unwrap())
+        }
+
+        // ─── 1. Hash/Eq consistency across canonicalized types ────────
+
         #[test_strategy::proptest]
-        fn key_construction_never_panics(#[strategy(arb_key_value())] v: Value) {
-            let _ = Key::single(v);
+        fn hash_eq_int8_vs_int64(n: i8) {
+            let k8 = Key::single(Value::Int8(n)).unwrap();
+            let k64 = Key::single(Value::Int64(i64::from(n))).unwrap();
+            assert_eq!(k8, k64, "Int8({n}) != Int64({n})");
+            assert_eq!(
+                hash_of(&k8),
+                hash_of(&k64),
+                "Int8({n}) hash != Int64({n}) hash"
+            );
         }
 
         #[test_strategy::proptest]
-        fn eq_implies_same_hash(
-            #[strategy(arb_key_value())] a: Value,
-            #[strategy(arb_key_value())] b: Value,
-        ) {
-            let ka = Key::single(a).unwrap();
-            let kb = Key::single(b).unwrap();
-            if ka == kb {
-                assert_eq!(hash_of(&ka), hash_of(&kb));
-            }
+        fn hash_eq_uint16_vs_int64(n: u16) {
+            let ku16 = Key::single(Value::UInt16(n)).unwrap();
+            let k64 = Key::single(Value::Int64(i64::from(n))).unwrap();
+            assert_eq!(ku16, k64);
+            assert_eq!(hash_of(&ku16), hash_of(&k64));
         }
+
+        #[test_strategy::proptest]
+        fn hash_eq_uint32_vs_int64(n: u32) {
+            let ku32 = Key::single(Value::UInt32(n)).unwrap();
+            let k64 = Key::single(Value::Int64(i64::from(n))).unwrap();
+            assert_eq!(ku32, k64);
+            assert_eq!(hash_of(&ku32), hash_of(&k64));
+        }
+
+        #[test_strategy::proptest]
+        fn hash_eq_uint64_vs_int64_when_fits(#[strategy(0u64..=(i64::MAX as u64))] n: u64) {
+            let ku64 = Key::single(Value::UInt64(n)).unwrap();
+            let k64 = Key::single(Value::Int64(n as i64)).unwrap();
+            assert_eq!(ku64, k64);
+            assert_eq!(hash_of(&ku64), hash_of(&k64));
+        }
+
+        #[test_strategy::proptest]
+        fn hash_eq_bigint_small_vs_int64(n: i64) {
+            let k_big = Key::single(Value::BigInt(BigInt::from(n))).unwrap();
+            let k64 = Key::single(Value::Int64(n)).unwrap();
+            assert_eq!(k_big, k64);
+            assert_eq!(
+                hash_of(&k_big),
+                hash_of(&k64),
+                "BigInt({n}) hash != Int64({n}) hash"
+            );
+        }
+
+        #[test_strategy::proptest]
+        fn hash_eq_float32_vs_float64(#[strategy(proptest::num::f32::ANY)] f: f32) {
+            if !f.is_finite() && !f.is_nan() {
+                // +/- infinity
+                let k32 = Key::single(Value::Float32(f)).unwrap();
+                let k64 = Key::single(Value::Float64(f64::from(f))).unwrap();
+                assert_eq!(k32, k64);
+                assert_eq!(hash_of(&k32), hash_of(&k64));
+            } else if f.is_finite() {
+                let k32 = Key::single(Value::Float32(f)).unwrap();
+                let k64 = Key::single(Value::Float64(f64::from(f))).unwrap();
+                assert_eq!(k32, k64);
+                assert_eq!(hash_of(&k32), hash_of(&k64));
+            }
+            // NaN case is covered separately
+        }
+
+        #[test_strategy::proptest]
+        fn hash_eq_float32_nan_vs_float64_nan(
+            // Use any f32 NaN bit pattern
+            #[strategy(proptest::num::f32::ANY.prop_filter("nan", |f| f.is_nan()))] f: f32,
+        ) {
+            let k32 = Key::single(Value::Float32(f)).unwrap();
+            let k64 = Key::single(Value::Float64(f64::NAN)).unwrap();
+            assert_eq!(k32, k64, "Float32(NaN) must == Float64(NaN)");
+            assert_eq!(
+                hash_of(&k32),
+                hash_of(&k64),
+                "Float32(NaN) hash must == Float64(NaN) hash"
+            );
+        }
+
+        #[test_strategy::proptest]
+        fn hash_eq_float64_nan_all_bit_patterns(
+            #[strategy(proptest::num::f64::ANY.prop_filter("nan", |f| f.is_nan()))] nan1: f64,
+            #[strategy(proptest::num::f64::ANY.prop_filter("nan", |f| f.is_nan()))] nan2: f64,
+        ) {
+            let k1 = Key::single(Value::Float64(nan1)).unwrap();
+            let k2 = Key::single(Value::Float64(nan2)).unwrap();
+            assert_eq!(k1, k2, "all NaN patterns must be equal");
+            assert_eq!(
+                hash_of(&k1),
+                hash_of(&k2),
+                "all NaN patterns must hash same"
+            );
+        }
+
+        #[test_strategy::proptest]
+        fn hash_eq_float64_zero_variants(
+            #[strategy(Just(0.0f64).prop_union(Just(-0.0f64)))] z1: f64,
+            #[strategy(Just(0.0f64).prop_union(Just(-0.0f64)))] z2: f64,
+        ) {
+            let k1 = Key::single(Value::Float64(z1)).unwrap();
+            let k2 = Key::single(Value::Float64(z2)).unwrap();
+            assert_eq!(k1, k2, "0.0 and -0.0 must be equal");
+            assert_eq!(hash_of(&k1), hash_of(&k2), "0.0 and -0.0 must hash same");
+        }
+
+        // ─── 2. Ord/Eq consistency ───────────────────────────────────
 
         #[test_strategy::proptest]
         fn ord_consistent_with_eq(
@@ -463,8 +605,16 @@ mod tests {
             let kb = Key::single(b).unwrap();
             let is_eq = ka == kb;
             let is_cmp_eq = ka.cmp(&kb) == Ordering::Equal;
-            assert_eq!(is_eq, is_cmp_eq);
+            assert_eq!(
+                is_eq,
+                is_cmp_eq,
+                "Eq and Ord disagree for {:?} vs {:?}",
+                ka.values(),
+                kb.values()
+            );
         }
+
+        // ─── 3. Ord antisymmetry ─────────────────────────────────────
 
         #[test_strategy::proptest]
         fn ord_antisymmetric(
@@ -473,8 +623,198 @@ mod tests {
         ) {
             let ka = Key::single(a).unwrap();
             let kb = Key::single(b).unwrap();
-            assert_eq!(ka.cmp(&kb), kb.cmp(&ka).reverse());
+            assert_eq!(
+                ka.cmp(&kb),
+                kb.cmp(&ka).reverse(),
+                "antisymmetry violated for {:?} vs {:?}",
+                ka.values(),
+                kb.values()
+            );
         }
+
+        // ─── 4. Ord transitivity ─────────────────────────────────────
+
+        #[test_strategy::proptest]
+        fn ord_transitive(
+            #[strategy(arb_key_value())] a: Value,
+            #[strategy(arb_key_value())] b: Value,
+            #[strategy(arb_key_value())] c: Value,
+        ) {
+            let ka = Key::single(a).unwrap();
+            let kb = Key::single(b).unwrap();
+            let kc = Key::single(c).unwrap();
+            let ab = ka.cmp(&kb);
+            let bc = kb.cmp(&kc);
+            let ac = ka.cmp(&kc);
+
+            // If a < b and b < c then a < c
+            if ab == Ordering::Less && bc == Ordering::Less {
+                assert_eq!(
+                    ac,
+                    Ordering::Less,
+                    "transitivity violated: {:?} < {:?} < {:?} but first.cmp(last) = {:?}",
+                    ka.values(),
+                    kb.values(),
+                    kc.values(),
+                    ac
+                );
+            }
+            // If a > b and b > c then a > c
+            if ab == Ordering::Greater && bc == Ordering::Greater {
+                assert_eq!(
+                    ac,
+                    Ordering::Greater,
+                    "transitivity violated (greater): {:?} > {:?} > {:?} but first.cmp(last) = {:?}",
+                    ka.values(),
+                    kb.values(),
+                    kc.values(),
+                    ac
+                );
+            }
+            // If a == b and b == c then a == c
+            if ab == Ordering::Equal && bc == Ordering::Equal {
+                assert_eq!(
+                    ac,
+                    Ordering::Equal,
+                    "transitivity violated (equal): {:?} == {:?} == {:?} but first.cmp(last) = {:?}",
+                    ka.values(),
+                    kb.values(),
+                    kc.values(),
+                    ac
+                );
+            }
+        }
+
+        // ─── 5. Composite key lexicographic ordering ─────────────────
+
+        #[test_strategy::proptest]
+        fn composite_lexicographic(
+            #[strategy(any::<i64>())] prefix: i64,
+            #[strategy(".*")] s1: String,
+            #[strategy(".*")] s2: String,
+        ) {
+            let k1 = Key::composite(vec![Value::Int64(prefix), Value::Text(s1.clone())]).unwrap();
+            let k2 = Key::composite(vec![Value::Int64(prefix), Value::Text(s2.clone())]).unwrap();
+            // When prefix is equal, ordering is determined by second element
+            assert_eq!(k1.cmp(&k2), s1.cmp(&s2));
+        }
+
+        #[test_strategy::proptest]
+        fn composite_shorter_prefix_is_less(
+            #[strategy(arb_key_value())] a: Value,
+            #[strategy(arb_key_value())] b: Value,
+        ) {
+            let short = Key::single(a.clone()).unwrap();
+            let long = Key::composite(vec![a, b]).unwrap();
+            // If first elements are equal, shorter < longer
+            if short.values()[0] == long.values()[0]
+                || cmp_element(&short.values()[0], &long.values()[0]) == Ordering::Equal
+            {
+                assert!(
+                    short < long,
+                    "shorter prefix must be less: {:?} vs {:?}",
+                    short.values(),
+                    long.values()
+                );
+            }
+        }
+
+        // ─── 6. NaN total order ──────────────────────────────────────
+
+        #[test_strategy::proptest]
+        fn nan_greater_than_any_finite(
+            #[strategy(proptest::num::f64::ANY.prop_filter("finite", |f| f.is_finite()))]
+            finite: f64,
+        ) {
+            let k_nan = Key::single(Value::Float64(f64::NAN)).unwrap();
+            let k_finite = Key::single(Value::Float64(finite)).unwrap();
+            assert!(k_nan > k_finite, "NaN must sort after finite {finite}");
+        }
+
+        #[test_strategy::proptest]
+        fn nan_greater_than_infinity() {
+            let k_nan = Key::single(Value::Float64(f64::NAN)).unwrap();
+            let k_inf = Key::single(Value::Float64(f64::INFINITY)).unwrap();
+            let k_neg_inf = Key::single(Value::Float64(f64::NEG_INFINITY)).unwrap();
+            assert!(k_nan > k_inf, "NaN must sort after +inf");
+            assert!(k_nan > k_neg_inf, "NaN must sort after -inf");
+        }
+
+        // ─── 7. Construction never panics ────────────────────────────
+
+        #[test_strategy::proptest]
+        fn key_construction_never_panics(#[strategy(arb_key_value())] v: Value) {
+            // Must not panic; may return Ok or Err
+            let _ = Key::single(v);
+        }
+
+        #[test_strategy::proptest]
+        fn composite_construction_never_panics(
+            #[strategy(proptest::collection::vec(arb_key_value(), 1..5))] values: Vec<Value>,
+        ) {
+            let _ = Key::composite(values);
+        }
+
+        // ─── 8. UInt64 overflow promotes to BigInt correctly ─────────
+
+        #[test_strategy::proptest]
+        fn uint64_overflow_promotes_to_bigint(
+            #[strategy((i64::MAX as u64 + 1)..=u64::MAX)] n: u64,
+        ) {
+            let k_u64 = Key::single(Value::UInt64(n)).unwrap();
+            let k_big = Key::single(Value::BigInt(BigInt::from(n))).unwrap();
+            assert_eq!(k_u64, k_big, "UInt64({n}) must equal BigInt({n})");
+            assert_eq!(
+                hash_of(&k_u64),
+                hash_of(&k_big),
+                "UInt64({n}) must hash same as BigInt({n})"
+            );
+        }
+
+        // ─── 9. Decimal normalized hash agreement ────────────────────
+
+        #[test_strategy::proptest]
+        fn decimal_normalized_hash_agreement(
+            #[strategy(-1_000_000i64..1_000_000i64)] mantissa: i64,
+            #[strategy(0u32..5u32)] extra_zeros: u32,
+        ) {
+            use std::str::FromStr;
+            // Build two representations of the same numeric value
+            // e.g. "42.0" and "42.00"
+            let base = format!("{mantissa}.0");
+            let extended = format!("{mantissa}.{}", "0".repeat(1 + extra_zeros as usize));
+            let d1 = BigDecimal::from_str(&base).unwrap();
+            let d2 = BigDecimal::from_str(&extended).unwrap();
+            let k1 = Key::single(Value::Decimal(d1)).unwrap();
+            let k2 = Key::single(Value::Decimal(d2)).unwrap();
+            assert_eq!(
+                hash_of(&k1),
+                hash_of(&k2),
+                "Decimal({base}) and Decimal({extended}) must hash the same (normalized)"
+            );
+        }
+
+        // ─── Broad eq_implies_hash across all types ──────────────────
+
+        #[test_strategy::proptest]
+        fn eq_implies_same_hash(
+            #[strategy(arb_key_value())] a: Value,
+            #[strategy(arb_key_value())] b: Value,
+        ) {
+            let ka = Key::single(a).unwrap();
+            let kb = Key::single(b).unwrap();
+            if ka == kb {
+                assert_eq!(
+                    hash_of(&ka),
+                    hash_of(&kb),
+                    "equal keys must hash the same: {:?} vs {:?}",
+                    ka.values(),
+                    kb.values()
+                );
+            }
+        }
+
+        // ─── Cross-width Int hash agreement (all widths) ─────────────
 
         #[test_strategy::proptest]
         fn cross_int_width_hash_agreement(#[strategy(i8::MIN..=i8::MAX)] n: i8) {
@@ -482,6 +822,58 @@ mod tests {
             let k64 = Key::single(Value::Int64(n as i64)).unwrap();
             assert_eq!(k8, k64);
             assert_eq!(hash_of(&k8), hash_of(&k64));
+        }
+
+        #[test_strategy::proptest]
+        fn cross_int16_width_hash_agreement(n: i16) {
+            let k16 = Key::single(Value::Int16(n)).unwrap();
+            let k64 = Key::single(Value::Int64(i64::from(n))).unwrap();
+            assert_eq!(k16, k64);
+            assert_eq!(hash_of(&k16), hash_of(&k64));
+        }
+
+        #[test_strategy::proptest]
+        fn cross_int32_width_hash_agreement(n: i32) {
+            let k32 = Key::single(Value::Int32(n)).unwrap();
+            let k64 = Key::single(Value::Int64(i64::from(n))).unwrap();
+            assert_eq!(k32, k64);
+            assert_eq!(hash_of(&k32), hash_of(&k64));
+        }
+
+        #[test_strategy::proptest]
+        fn cross_uint8_width_hash_agreement(n: u8) {
+            let ku8 = Key::single(Value::UInt8(n)).unwrap();
+            let k64 = Key::single(Value::Int64(i64::from(n))).unwrap();
+            assert_eq!(ku8, k64);
+            assert_eq!(hash_of(&ku8), hash_of(&k64));
+        }
+
+        // ─── Composite hash/eq consistency ───────────────────────────
+
+        #[test_strategy::proptest]
+        fn composite_eq_implies_hash(
+            #[strategy(proptest::collection::vec(arb_key_value(), 1..4))] vals_a: Vec<Value>,
+            #[strategy(proptest::collection::vec(arb_key_value(), 1..4))] vals_b: Vec<Value>,
+        ) {
+            let ka = Key::composite(vals_a).unwrap();
+            let kb = Key::composite(vals_b).unwrap();
+            if ka == kb {
+                assert_eq!(
+                    hash_of(&ka),
+                    hash_of(&kb),
+                    "equal composite keys must hash the same"
+                );
+            }
+        }
+
+        // ─── Reflexivity ─────────────────────────────────────────────
+
+        #[test_strategy::proptest]
+        fn key_reflexive_eq(#[strategy(arb_key_value())] v: Value) {
+            let k = Key::single(v).unwrap();
+            assert_eq!(k, k.clone());
+            assert_eq!(hash_of(&k), hash_of(&k.clone()));
+            assert_eq!(k.cmp(&k.clone()), Ordering::Equal);
         }
     }
 }

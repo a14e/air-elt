@@ -247,6 +247,17 @@ impl DynValue for MongoObjectIdValue {
         Box::new(self.clone())
     }
 
+    fn partial_cmp(&self, other: &dyn DynValue) -> Option<std::cmp::Ordering> {
+        other
+            .as_any()
+            .downcast_ref::<MongoObjectIdValue>()
+            .map(|o| self.0.cmp(&o.0))
+    }
+
+    fn hash(&self, state: &mut dyn std::hash::Hasher) {
+        state.write(&self.0);
+    }
+
     /// JSON auto-pack encoding: 24-char lowercase hex, matching the
     /// canonical `Text` projection.
     fn to_json(&self) -> Result<serde_json::Value, JsonEncodeError> {
