@@ -27,11 +27,12 @@ members = [
     "crates/self-lint",
     "crates/expr/types",
     "crates/expr/funcs",
-    "crates/expr/expr",
+    "crates/expr/parse",
+    "crates/expr/runtime",
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -39,31 +40,32 @@ repository = "https://github.com/a14e/air-elt"
 authors = ["Air Elt contributors"]
 
 [workspace.dependencies]
-air-elt-core = { path = "crates/core", version = "0.1.2" }
-air-elt-types = { path = "crates/types", version = "0.1.2" }
-air-elt-commons = { path = "crates/commons/lib", version = "0.1.2" }
-air-elt-commons-pg = { path = "crates/commons/pg", version = "0.1.2" }
-air-elt-commons-mysql = { path = "crates/commons/mysql", version = "0.1.2" }
-air-elt-commons-testing = { path = "crates/commons/testing", version = "0.1.2" }
-air-elt-source-postgres = { path = "crates/sources/postgres", version = "0.1.2" }
-air-elt-source-mysql = { path = "crates/sources/mysql", version = "0.1.2" }
-air-elt-sink-postgres = { path = "crates/sinks/postgres", version = "0.1.2" }
-air-elt-sink-mysql = { path = "crates/sinks/mysql", version = "0.1.2" }
-air-elt-storage-postgres = { path = "crates/storages/postgres", version = "0.1.2" }
-air-elt-storage-mysql = { path = "crates/storages/mysql", version = "0.1.2" }
-air-elt-commons-mongodb = { path = "crates/commons/mongodb", version = "0.1.2" }
-air-elt-source-mongodb = { path = "crates/sources/mongodb", version = "0.1.2" }
-air-elt-source-mongo-cdc = { path = "crates/sources/mongo-cdc", version = "0.1.2" }
-air-elt-sink-mongodb = { path = "crates/sinks/mongodb", version = "0.1.2" }
-air-elt-storage-mongodb = { path = "crates/storages/mongodb", version = "0.1.2" }
-air-elt-commons-clickhouse = { path = "crates/commons/clickhouse", version = "0.1.2" }
-air-elt-sink-clickhouse = { path = "crates/sinks/clickhouse", version = "0.1.2" }
-air-elt-commons-questdb = { path = "crates/commons/questdb", version = "0.1.2" }
-air-elt-sink-questdb = { path = "crates/sinks/questdb", version = "0.1.2" }
-air-elt-monitoring = { path = "crates/monitoring", version = "0.1.2" }
-air-elt-expr-types = { path = "crates/expr/types", version = "0.1.2" }
-air-elt-expr-funcs = { path = "crates/expr/funcs", version = "0.1.2" }
-air-elt-expr = { path = "crates/expr/expr", version = "0.1.2" }
+air-elt-core = { path = "crates/core", version = "0.1.3" }
+air-elt-types = { path = "crates/types", version = "0.1.3" }
+air-elt-commons = { path = "crates/commons/lib", version = "0.1.3" }
+air-elt-commons-pg = { path = "crates/commons/pg", version = "0.1.3" }
+air-elt-commons-mysql = { path = "crates/commons/mysql", version = "0.1.3" }
+air-elt-commons-testing = { path = "crates/commons/testing", version = "0.1.3" }
+air-elt-source-postgres = { path = "crates/sources/postgres", version = "0.1.3" }
+air-elt-source-mysql = { path = "crates/sources/mysql", version = "0.1.3" }
+air-elt-sink-postgres = { path = "crates/sinks/postgres", version = "0.1.3" }
+air-elt-sink-mysql = { path = "crates/sinks/mysql", version = "0.1.3" }
+air-elt-storage-postgres = { path = "crates/storages/postgres", version = "0.1.3" }
+air-elt-storage-mysql = { path = "crates/storages/mysql", version = "0.1.3" }
+air-elt-commons-mongodb = { path = "crates/commons/mongodb", version = "0.1.3" }
+air-elt-source-mongodb = { path = "crates/sources/mongodb", version = "0.1.3" }
+air-elt-source-mongo-cdc = { path = "crates/sources/mongo-cdc", version = "0.1.3" }
+air-elt-sink-mongodb = { path = "crates/sinks/mongodb", version = "0.1.3" }
+air-elt-storage-mongodb = { path = "crates/storages/mongodb", version = "0.1.3" }
+air-elt-commons-clickhouse = { path = "crates/commons/clickhouse", version = "0.1.3" }
+air-elt-sink-clickhouse = { path = "crates/sinks/clickhouse", version = "0.1.3" }
+air-elt-commons-questdb = { path = "crates/commons/questdb", version = "0.1.3" }
+air-elt-sink-questdb = { path = "crates/sinks/questdb", version = "0.1.3" }
+air-elt-monitoring = { path = "crates/monitoring", version = "0.1.3" }
+air-elt-expr-types = { path = "crates/expr/types", version = "0.1.3" }
+air-elt-expr-funcs = { path = "crates/expr/funcs", version = "0.1.3" }
+air-elt-expr-parse = { path = "crates/expr/parse", version = "0.1.3" }
+air-elt-expr-runtime = { path = "crates/expr/runtime", version = "0.1.3" }
 
 aes = "0.8.4"
 ahash = "0.8.12"
@@ -114,7 +116,7 @@ sha1 = "0.10.6"
 sha2 = "0.10.9"
 sketches-ddsketch = "0.4.0"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "macros", "migrate", "chrono", "uuid", "json", "bigdecimal", "ipnetwork"] }
-sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39.2", default-features = false, features = ["system"] }
 tempfile = "3.27.0"
 test-strategy = "0.4.0"
 testcontainers = { version = "0.27.3", features = ["reusable-containers"] }

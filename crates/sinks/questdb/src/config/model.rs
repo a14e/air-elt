@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use air_elt_core::config::interval;
+use air_elt_commons::interval;
 use air_elt_core::config::model::ComponentConfig;
 use air_elt_core::error::ConfigError;
 

@@ -31,10 +31,10 @@ Flat `key = "value"` map. Used by `${VAR}` expansion (env → secrets → defaul
 ## Expression support
 
 Config string values support expressions in these fields:
-- `default` in mapping entries — all defaults go through `ExprValue.eval()`
-- Switch table values (RHS of switch pairs) — all values go through `ExprValue.eval()`
+- `default` in mapping entries — evaluated via `Evaluator::evaluate_expr_value()`
+- Switch table values (RHS of switch pairs) — evaluated via `Evaluator::evaluate_expr_value()`
 - `[secrets]` values
-- Component config string values (URLs, connection strings) — via `resolve_config_expressions`
+- Component config string values (URLs, connection strings) — via `ConfigExprPatcher` in `loader::load`
 
 Detection rules:
 - String starting with `name(...)` → evaluated as expression
@@ -51,7 +51,7 @@ Examples:
 
 ### Component config expressions
 
-String values inside source/sink/storage `config = { ... }` tables are evaluated as expressions before factory deserialization via `resolve_config_expressions` (`crates/core/src/config/expression.rs`). The function walks the TOML table recursively with no key filtering: every string value detected as an expression or interpolation is evaluated; non-string values and plain string literals pass through unchanged. The result is coerced back to a TOML value. Resolution runs on ALL component configs (sources, sinks, storages) before the factory deserializes the TOML into a typed config struct (`resolve_component_config` in `crates/core/src/validation/pipeline.rs`).
+String values inside source/sink/storage `config = { ... }` tables are evaluated as expressions before factory deserialization via `ConfigExprPatcher` (`crates/expr/runtime/src/patcher.rs`). For TOML configs, the patcher walks the raw TOML tree using trie-based pattern matching (patterns: `sources[*].config`, `sinks[*].config`, `storages[*].config`) before deserialization. For YAML configs, component config tables are patched after deserialization. Every string value detected as an expression or interpolation is evaluated; non-string values and plain string literals pass through unchanged. The result is coerced back to a TOML value. Resolution runs inside `loader::load` (`crates/core/src/config/loader.rs`) before `assemble`.
 
 This means every string field in every connector config supports expressions and interpolations, including credentials and connection parameters:
 - **Postgres / CockroachDB / MySQL**: `url`
@@ -287,7 +287,7 @@ status_label = { from = "status", switch = { ACTIVE = "active", FINISHED = "fini
 |-------|------|---------|-------------|
 | `from` | string | required | Source column name |
 | `truncate` | bool | `false` | Opt the column into narrowing conversions: text/bytes shrink (UTF-safe for text), integer/float saturate to target's max/min, decimal scale drop, decimal → float magnitude overflow saturates to `±INFINITY`, json/xml → `text(n)` serialize. `Decimal → Float64`/`Float32` is lossless without `truncate` when the declared precision fits the target's mantissa (≤ 15 / ≤ 7 respectively); wider or unbounded Decimal requires `truncate = true`. Forbidden combinations (`Json → Json`, `Xml → Xml`, UUID truncations, `Date → Timestamp`, `Float → Decimal/BigInt`) remain rejected. |
-| `default` | scalar / table | none | Fallback value substituted when the source value is `Null` and when `switch` produces no match. Permits mapping a nullable source into a `NOT NULL` sink. On the Direct path validation rejects `default` if the source column is `NOT NULL`. The value is expression-evaluated via `ExprValue.eval()` and checked against the resolved sink `DataType` (see `default` value evaluation below). |
+| `default` | scalar / table | none | Fallback value substituted when the source value is `Null` and when `switch` produces no match. Permits mapping a nullable source into a `NOT NULL` sink. On the Direct path validation rejects `default` if the source column is `NOT NULL`. The value is expression-evaluated via `Evaluator::evaluate_expr_value()` and checked against the resolved sink `DataType` (see `default` value evaluation below). |
 | `switch` | inline table | none | Value-to-value lookup. Keys (inline-table keys — always strings in TOML) are parsed against the source column's `DataType`; values are parsed against the sink column's `DataType` (or contribute to union-collapse for schemaless sinks). Output: the matched value, or `default` on miss / NULL input, or `Value::Null` if no `default`. See **Switch** below. |
 
 `#[serde(deny_unknown_fields)]` rejects any additional keys at parse time on the long form — including a stray `to` field (the map key already carries it).
@@ -339,7 +339,7 @@ Behaviour:
 - Miss → `default` (if set) or `Value::Null`.
 - NULL source → `default` (if set) or `Value::Null`. The switch is NOT consulted on NULL.
 
-**Value evaluation:** All switch values (RHS of each case and `default`) go through `ExprValue.eval()` — not just expression-detected ones. `ExprValue::from_toml` classifies each TOML value as Expression, Interpolated, or Literal, then `eval()` handles all three uniformly. Plain string literals like `"open"` are classified as Literal and evaluated to `Value::Text("open")`. TOML integers produce `Value::Int64`; after evaluation, typed sinks run `ensure_sink_compatible` for auto-narrowing.
+**Value evaluation:** All switch values (RHS of each case and `default`) go through `Parser::parse_toml(&value)` → `Evaluator::create(&ctx).evaluate(&program)`. `Parser::parse_toml` (in `air_elt_expr_parse`) recursively maps TOML values to AST: strings flow through `Parser::parse` (which auto-detects expressions, interpolations, or plain literals via `detect`); ints/floats/bools become `LiteralValue`; tables become `Expr::Object`. Plain string literals like `"open"` are classified as literals and evaluated to `Value::Text("open")`. TOML integers produce `Value::Int64`; after evaluation, typed sinks run `ensure_sink_compatible` for auto-narrowing.
 
 **Key canonicalization:** Switch keys are canonicalized through `Key::from_value` so that integer subtypes are unified: `Int8(1)`, `Int32(1)`, `BigInt(1)` all collapse onto the same `SwitchKey::Int(1)`. Float keys use `f64::to_bits` with NaN-bit-pattern normalisation (all NaNs collapse, `-0.0` collapses with `+0.0`). Sources whose declared `DataType` is `Json`/`Xml`/`Union`/`Custom` cannot host a switch — surfaces `SwitchUnsupportedSource`.
 
@@ -377,7 +377,7 @@ Custom values delegate to `DynValue::to_json()`. New custom types must implement
 
 #### `default` value evaluation
 
-All default values are expression-evaluated via `ExprValue.eval()`. The TOML literal is classified as an expression, interpolation, or plain literal at parse time, then evaluated uniformly through the expression engine. After evaluation, the result is checked against the sink `DataType` via `ensure_sink_compatible`.
+All default values are expression-evaluated via `Evaluator::evaluate_expr_value()`. The TOML literal is classified as an expression, interpolation, or plain literal at parse time, then evaluated uniformly through the expression engine. After evaluation, the result is checked against the sink `DataType` via `ensure_sink_compatible`.
 
 **Auto-narrowing:** TOML integer literals produce `Int64`; when the sink type is narrower (e.g. `Int8`), `try_narrow_numeric` checks the actual value fits and casts automatically. TOML float literals (`Float64`) auto-narrow to `Float32` the same way. For non-matching types, use an explicit cast expression: `default = "toInt8(42)"`.
 
@@ -390,7 +390,7 @@ default = 3.14           # Float64 → auto-narrows to Float32 if sink is Float3
 default = false          # Bool
 default = "n/a"          # Text (plain string, no expression detected)
 
-# Expression defaults — evaluated via ExprValue
+# Expression defaults — evaluated via Parser::parse_toml + Evaluator
 default = "env('DB_HOST', 'localhost')"
 default = "toDate('2024-01-15')"
 default = "toInt8(42)"                    # explicit cast for non-matching types

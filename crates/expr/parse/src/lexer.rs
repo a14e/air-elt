@@ -19,6 +19,20 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    pub fn tokenize_as_interpolation(&mut self) -> Result<Vec<SpannedToken>, ExprError> {
+        let token = self.read_interpolation_template()?;
+        Ok(vec![
+            SpannedToken {
+                token,
+                line: self.line,
+            },
+            SpannedToken {
+                token: Token::Eof,
+                line: self.line,
+            },
+        ])
+    }
+
     pub fn tokenize(&mut self) -> Result<Vec<SpannedToken>, ExprError> {
         let mut tokens = Vec::new();
         loop {
@@ -192,21 +206,29 @@ impl<'a> Lexer<'a> {
 
     fn read_double_quoted_string(&mut self) -> Result<Token, ExprError> {
         let start = self.pos;
-        self.pos += 1; // skip opening "
+        self.pos += 1;
+        self.read_string_body(true, start)
+    }
+
+    fn read_interpolation_template(&mut self) -> Result<Token, ExprError> {
+        self.read_string_body(false, 0)
+    }
+
+    fn read_string_body(&mut self, quoted: bool, start: usize) -> Result<Token, ExprError> {
         let mut parts: Vec<StringPart> = Vec::new();
         let mut current_literal = String::new();
 
         while self.pos < self.input.len() {
             let b = self.input.as_bytes()[self.pos];
             match b {
-                b'"' => {
+                b'"' if quoted => {
                     self.pos += 1;
                     if !current_literal.is_empty() {
                         parts.push(StringPart::Literal(current_literal));
                     }
                     return Ok(Token::StringLit(parts));
                 }
-                b'\\' => {
+                b'\\' if quoted => {
                     self.pos += 1;
                     if self.pos >= self.input.len() {
                         return Err(ExprError::UnterminatedString { position: start });
@@ -234,10 +256,17 @@ impl<'a> Lexer<'a> {
                         if !current_literal.is_empty() {
                             parts.push(StringPart::Literal(std::mem::take(&mut current_literal)));
                         }
-                        self.pos += 1; // skip {
+                        self.pos += 1;
                         let expr_source = self.read_interpolation_body(start)?;
                         parts.push(StringPart::Expr(expr_source));
                     }
+                }
+                b'}' if !quoted
+                    && self.pos + 1 < self.input.len()
+                    && self.input.as_bytes()[self.pos + 1] == b'}' =>
+                {
+                    current_literal.push('}');
+                    self.pos += 2;
                 }
                 b'\n' => {
                     self.line += 1;
@@ -251,7 +280,14 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
-        Err(ExprError::UnterminatedString { position: start })
+
+        if quoted {
+            return Err(ExprError::UnterminatedString { position: start });
+        }
+        if !current_literal.is_empty() {
+            parts.push(StringPart::Literal(current_literal));
+        }
+        Ok(Token::StringLit(parts))
     }
 
     fn read_interpolation_body(&mut self, string_start: usize) -> Result<String, ExprError> {

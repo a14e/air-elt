@@ -8,13 +8,29 @@
 /// - `"(not a func)"` → false
 pub fn is_expression(s: &str) -> bool {
     let trimmed = s.trim();
-    let Some(paren_pos) = trimmed.find('(') else {
+    for stmt in trimmed.split([';', '\n']) {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        if statement_looks_like_expression(stmt) {
+            return true;
+        }
+    }
+    false
+}
+
+fn statement_looks_like_expression(stmt: &str) -> bool {
+    let Some(stop) = stmt.find(['(', '=']) else {
         return false;
     };
-    if paren_pos == 0 {
+    if stop == 0 {
         return false;
     }
-    let prefix = &trimmed[..paren_pos];
+    let prefix = stmt[..stop].trim_end();
+    if prefix.is_empty() {
+        return false;
+    }
     let first_byte = prefix.as_bytes()[0];
     first_byte.is_ascii_alphabetic()
         && prefix
@@ -67,6 +83,28 @@ mod tests {
         assert!(!is_expression("123func(x)"));
         assert!(!is_expression("true"));
         assert!(!is_expression("null"));
+    }
+
+    #[test]
+    fn detects_statements() {
+        assert!(is_expression("x = 5; x + 1"));
+        assert!(is_expression("x = add(1, 2); x"));
+        assert!(is_expression("  x = 5; x"));
+        assert!(is_expression("name = 'value'"));
+    }
+
+    #[test]
+    fn detects_newline_separated_statements() {
+        assert!(is_expression("x = 5\nx + 1"));
+        assert!(is_expression("x = add(1, 2)\ny = mul(x, 2)\ny"));
+        assert!(is_expression("\nx = 5\n"));
+    }
+
+    #[test]
+    fn rejects_assignment_like_strings() {
+        assert!(!is_expression("123 = 5"));
+        assert!(!is_expression("= bad"));
+        assert!(!is_expression("has spaces = bad"));
     }
 
     #[test]

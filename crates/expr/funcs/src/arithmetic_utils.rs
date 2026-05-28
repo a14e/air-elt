@@ -1,8 +1,7 @@
+use air_elt_expr_types::error::ExprTypeError;
+use air_elt_expr_types::limits::MAX_BIGINT_WIDTH;
+use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::DataType;
-
-use crate::error::ExprTypeError;
-use crate::limits::MAX_BIGINT_WIDTH;
-use crate::nullable::NullableExprType;
 
 /// Compute the result type of arithmetic between two expression types.
 /// When both operands carry `int_bound`, uses precise bit arithmetic.

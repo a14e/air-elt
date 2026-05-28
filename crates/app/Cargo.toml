@@ -35,6 +35,7 @@ air-elt-storage-mongodb = { workspace = true }
 air-elt-sink-clickhouse = { workspace = true }
 air-elt-sink-questdb = { workspace = true }
 air-elt-expr-funcs = { workspace = true }
+air-elt-expr-runtime = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

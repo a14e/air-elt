@@ -1,116 +1,48 @@
 use ahash::AHashMap;
 use air_elt_expr_funcs::FunctionRegistry;
 use air_elt_expr_funcs::signature::EvalContext;
+use air_elt_expr_parse::model::{
+    ConditionalExpr, Expr, InterpolationSegment, LiteralValue, Program, Statement,
+};
 use air_elt_expr_types::limits::MAX_EXPR_DEPTH;
 use air_elt_types::Value;
 
-use crate::ast::{ConditionalExpr, Expr, InterpolationSegment, LiteralValue, Program, Statement};
+use crate::context::ExpressionContext;
 use crate::error::ExprError;
 
-/// Evaluate a parsed program with a function registry and evaluation context.
-pub fn evaluate(
+pub struct Evaluator<'a> {
+    context: &'a ExpressionContext,
+}
+
+impl<'a> Evaluator<'a> {
+    pub fn create(context: &'a ExpressionContext) -> Self {
+        Self { context }
+    }
+
+    pub fn evaluate(&self, program: &Program) -> Result<Value, ExprError> {
+        let mut state = EvaluatorState::new(&self.context.registry, &self.context.eval_context);
+        state.eval_program(program)
+    }
+}
+
+#[cfg(test)]
+fn evaluate(
     program: &Program,
     registry: &FunctionRegistry,
     context: &EvalContext,
 ) -> Result<Value, ExprError> {
-    let mut evaluator = Evaluator::new(registry, context);
-    evaluator.eval_program(program)
+    let mut state = EvaluatorState::new(registry, context);
+    state.eval_program(program)
 }
 
-/// Parse and evaluate an expression string in one call.
-pub fn eval_expression(
-    input: &str,
-    registry: &FunctionRegistry,
-    context: &EvalContext,
-) -> Result<Value, ExprError> {
-    let program = crate::parser::parse(input)?;
-    evaluate(&program, registry, context)
-}
-
-/// Evaluate a string with interpolation segments.
-/// Scans for unescaped `{expr}` markers, parses each inner expression,
-/// evaluates it, and concatenates the results into a single string.
-pub fn eval_interpolated(
-    input: &str,
-    registry: &FunctionRegistry,
-    context: &EvalContext,
-) -> Result<String, ExprError> {
-    let mut result = String::new();
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    let mut literal_start = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if literal_start < i {
-                result.push_str(&input[literal_start..i]);
-            }
-
-            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                result.push('{');
-                i += 2;
-                literal_start = i;
-                continue;
-            }
-
-            let start = i + 1;
-            let mut depth = 1u32;
-            let mut j = start;
-            while j < bytes.len() && depth > 0 {
-                if bytes[j] == b'{' {
-                    depth += 1;
-                } else if bytes[j] == b'}' {
-                    depth -= 1;
-                }
-                if depth > 0 {
-                    j += 1;
-                }
-            }
-
-            if depth != 0 {
-                return Err(ExprError::UnterminatedInterpolation { position: i });
-            }
-
-            let expr_source = &input[start..j];
-            let value = eval_expression(expr_source, registry, context)?;
-            result.push_str(&value_to_string(&value));
-            if result.len() > air_elt_expr_types::limits::MAX_EXPR_STRING_BYTES {
-                return Err(ExprError::Function(
-                    air_elt_expr_funcs::FuncError::StringTooLarge {
-                        len: result.len(),
-                        max: air_elt_expr_types::limits::MAX_EXPR_STRING_BYTES,
-                    },
-                ));
-            }
-            i = j + 1;
-            literal_start = i;
-        } else if bytes[i] == b'}' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
-            if literal_start < i {
-                result.push_str(&input[literal_start..i]);
-            }
-            result.push('}');
-            i += 2;
-            literal_start = i;
-        } else {
-            i += 1;
-        }
-    }
-
-    if literal_start < bytes.len() {
-        result.push_str(&input[literal_start..]);
-    }
-
-    Ok(result)
-}
-
-struct Evaluator<'a> {
+struct EvaluatorState<'a> {
     registry: &'a FunctionRegistry,
     context: &'a EvalContext,
     variables: AHashMap<String, Value>,
     depth: usize,
 }
 
-impl<'a> Evaluator<'a> {
+impl<'a> EvaluatorState<'a> {
     fn new(registry: &'a FunctionRegistry, context: &'a EvalContext) -> Self {
         Self {
             registry,
@@ -157,9 +89,10 @@ impl<'a> Evaluator<'a> {
         self.depth += 1;
         if self.depth > MAX_EXPR_DEPTH {
             self.depth -= 1;
-            return Err(ExprError::NestingTooDeep {
+            return Err(air_elt_expr_parse::ExprError::NestingTooDeep {
                 max: MAX_EXPR_DEPTH,
-            });
+            }
+            .into());
         }
 
         let function = self.registry.resolve(name, args.len())?;
@@ -178,9 +111,10 @@ impl<'a> Evaluator<'a> {
         self.depth += 1;
         if self.depth > MAX_EXPR_DEPTH {
             self.depth -= 1;
-            return Err(ExprError::NestingTooDeep {
+            return Err(air_elt_expr_parse::ExprError::NestingTooDeep {
                 max: MAX_EXPR_DEPTH,
-            });
+            }
+            .into());
         }
 
         let result = match conditional {
@@ -436,10 +370,11 @@ mod tests {
 
     use air_elt_expr_funcs::signature::{EnvResolver, EvalContext, FileResolver};
     use air_elt_expr_funcs::{FuncError, FunctionRegistry};
+    use air_elt_expr_parse::Parser;
+    use air_elt_expr_types::limits::MAX_EXPR_DEPTH;
     use air_elt_types::Value;
 
     use super::*;
-    use crate::parser::parse;
 
     struct TestEnv {
         vars: AHashMap<String, String>,
@@ -496,7 +431,8 @@ mod tests {
     fn eval(input: &str) -> Result<Value, ExprError> {
         let registry = FunctionRegistry::with_builtins();
         let context = test_context();
-        eval_expression(input, &registry, &context)
+        let program = Parser::create().parse_expression(input)?;
+        evaluate(&program, &registry, &context)
     }
 
     #[test]
@@ -588,11 +524,10 @@ mod tests {
 
     #[test]
     fn string_interpolation() {
-        let registry = FunctionRegistry::with_builtins();
-        let context = test_context();
-        let program = parse("\"value: {1 + 2}\"").unwrap();
-        let result = evaluate(&program, &registry, &context).unwrap();
-        assert_eq!(result, Value::Text("value: 3".to_string()));
+        assert_eq!(
+            eval("\"value: {1 + 2}\"").unwrap(),
+            Value::Text("value: 3".to_string())
+        );
     }
 
     #[test]
@@ -638,7 +573,8 @@ mod tests {
         let registry = FunctionRegistry::with_builtins();
         let env = TestEnv::new().with_var("MY_KEY", "my_value");
         let context = test_context_with_env(env);
-        let result = eval_expression("env('MY_KEY')", &registry, &context).unwrap();
+        let program = Parser::create().parse_expression("env('MY_KEY')").unwrap();
+        let result = evaluate(&program, &registry, &context).unwrap();
         assert_eq!(result, Value::Text("my_value".to_string()));
     }
 
@@ -666,34 +602,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn eval_interpolated_basic() {
+    fn eval_interpolation_template(input: &str) -> Result<Value, ExprError> {
         let registry = FunctionRegistry::with_builtins();
         let context = test_context();
-        let result = eval_interpolated("hello {1 + 2} world", &registry, &context).unwrap();
-        assert_eq!(result, "hello 3 world");
+        let program = Parser::create().parse(input)?;
+        evaluate(&program, &registry, &context)
+    }
+
+    #[test]
+    fn eval_interpolated_basic() {
+        assert_eq!(
+            eval_interpolation_template("hello {1 + 2} world").unwrap(),
+            Value::Text("hello 3 world".to_string())
+        );
     }
 
     #[test]
     fn eval_interpolated_escaped_braces() {
-        let registry = FunctionRegistry::with_builtins();
-        let context = test_context();
-        let result = eval_interpolated("no {{interpolation}}", &registry, &context).unwrap();
-        assert_eq!(result, "no {interpolation}");
+        // No unescaped `{...}` markers — `Parser::parse` returns the literal verbatim.
+        // (Escape unwrapping only happens when the parser sees the string as an
+        // interpolation template, which requires at least one real interpolation marker.)
+        assert_eq!(
+            eval_interpolation_template("no {{interpolation}}").unwrap(),
+            Value::Text("no {{interpolation}}".to_string())
+        );
     }
 
     #[test]
     fn eval_interpolated_no_markers() {
-        let registry = FunctionRegistry::with_builtins();
-        let context = test_context();
-        let result = eval_interpolated("plain text", &registry, &context).unwrap();
-        assert_eq!(result, "plain text");
+        // Plain text — parser returns it as a literal string.
+        assert_eq!(
+            eval_interpolation_template("plain text").unwrap(),
+            Value::Text("plain text".to_string())
+        );
     }
 
     #[test]
     fn nesting_depth_limit() {
-        // Build a deeply nested function call: f(f(f(...(1)...)))
-        // where f is toString — each adds a depth level
         let mut input = String::new();
         for _ in 0..(MAX_EXPR_DEPTH + 1) {
             input.push_str("toString(");
@@ -712,7 +657,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ExprError::NestingTooDeep { max } => {
+            ExprError::Parse(air_elt_expr_parse::ExprError::NestingTooDeep { max }) => {
                 assert_eq!(max, MAX_EXPR_DEPTH);
             }
             other => panic!("expected NestingTooDeep, got {other:?}"),
@@ -748,11 +693,8 @@ mod tests {
         assert_eq!(eval("x = 1; x = x + 1; x").unwrap(), Value::Int64(2));
     }
 
-    // --- Lazy evaluation (short-circuit) proof tests ---
-
     #[test]
     fn if_true_skips_else_branch() {
-        // 1/0 would fail if evaluated — proves else is not evaluated
         let result = eval("if(true, 42, 1/0)").unwrap();
         assert_eq!(result, Value::Int64(42));
     }
@@ -777,14 +719,12 @@ mod tests {
 
     #[test]
     fn and_false_skips_right() {
-        // false && (1/0 == 1) — right side not evaluated
         let result = eval("false && (1/0 == 1)").unwrap();
         assert_eq!(result, Value::Bool(false));
     }
 
     #[test]
     fn or_true_skips_right() {
-        // true || (1/0 == 1) — right side not evaluated
         let result = eval("true || (1/0 == 1)").unwrap();
         assert_eq!(result, Value::Bool(true));
     }
@@ -803,30 +743,28 @@ mod tests {
 
     #[test]
     fn interpolation_non_ascii() {
-        let registry = FunctionRegistry::with_builtins();
-        let ctx = test_context();
-        let result = eval_interpolated("Привет {1 + 1} мир", &registry, &ctx).unwrap();
-        assert_eq!(result, "Привет 2 мир");
+        assert_eq!(
+            eval_interpolation_template("Привет {1 + 1} мир").unwrap(),
+            Value::Text("Привет 2 мир".to_string())
+        );
     }
 
     #[test]
     fn interpolation_emoji() {
-        let registry = FunctionRegistry::with_builtins();
-        let ctx = test_context();
-        let result = eval_interpolated("🎉{42}🎊", &registry, &ctx).unwrap();
-        assert_eq!(result, "🎉42🎊");
+        assert_eq!(
+            eval_interpolation_template("🎉{42}🎊").unwrap(),
+            Value::Text("🎉42🎊".to_string())
+        );
     }
 
     #[test]
     fn or_null_true_is_true() {
-        // SQL three-valued logic: NULL OR TRUE = TRUE
         let result = eval("null || true").unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
     #[test]
     fn or_null_false_is_null() {
-        // SQL three-valued logic: NULL OR FALSE = NULL
         let result = eval("null || false").unwrap();
         assert_eq!(result, Value::Null);
     }
@@ -839,14 +777,12 @@ mod tests {
 
     #[test]
     fn and_null_false_is_false() {
-        // SQL three-valued logic: NULL AND FALSE = FALSE
         let result = eval("null && false").unwrap();
         assert_eq!(result, Value::Bool(false));
     }
 
     #[test]
     fn and_null_true_is_null() {
-        // SQL three-valued logic: NULL AND TRUE = NULL
         let result = eval("null && true").unwrap();
         assert_eq!(result, Value::Null);
     }
@@ -859,7 +795,6 @@ mod tests {
 
     #[test]
     fn power_operator_right_associative() {
-        // 2 ** 3 ** 2 = 2 ** (3 ** 2) = 2 ** 9 = 512
         let result = eval("2 ** 3 ** 2").unwrap();
         assert_eq!(result, Value::Int64(512));
     }
@@ -873,9 +808,7 @@ mod tests {
     #[test]
     fn interpolation_size_cap_rejects_oversized_result() {
         let input = "{repeat('x', 600000)}{repeat('y', 600000)}";
-        let registry = air_elt_expr_funcs::FunctionRegistry::with_builtins();
-        let ctx = test_context();
-        let err = eval_interpolated(input, &registry, &ctx).unwrap_err();
+        let err = eval_interpolation_template(input).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -883,5 +816,25 @@ mod tests {
             ),
             "expected StringTooLarge, got {err:?}"
         );
+    }
+
+    #[test]
+    fn evaluator_struct_basic() {
+        let registry = Arc::new(FunctionRegistry::with_builtins());
+        let expr_ctx = ExpressionContext::create(registry, std::path::Path::new("/tmp"));
+        let evaluator = Evaluator::create(&expr_ctx);
+        let program = Parser::create().parse_expression("1 + 2").unwrap();
+        let result = evaluator.evaluate(&program).unwrap();
+        assert_eq!(result, Value::Int64(3));
+    }
+
+    #[test]
+    fn evaluator_struct_interpolated() {
+        let registry = Arc::new(FunctionRegistry::with_builtins());
+        let expr_ctx = ExpressionContext::create(registry, std::path::Path::new("/tmp"));
+        let evaluator = Evaluator::create(&expr_ctx);
+        let program = Parser::create().parse("hello {1 + 2} world").unwrap();
+        let result = evaluator.evaluate(&program).unwrap();
+        assert_eq!(result, Value::Text("hello 3 world".to_string()));
     }
 }
