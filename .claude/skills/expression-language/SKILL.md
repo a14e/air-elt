@@ -57,7 +57,7 @@ Config format matters for expression quoting: in YAML, expressions need no outer
 
 ## Type algebra
 
-Type algebra determines the output `DataType` at type-check time (before evaluation). Rules live in `crates/expr/types/src/bounds.rs` (arithmetic) and each function's `resolve_type` method.
+Type algebra determines the output `DataType` at type-check time (before evaluation). Rules live in `crates/expr/funcs/src/arithmetic_utils.rs` (arithmetic) and each function's `resolve_type` method.
 
 **Arithmetic promotion** (`bounds::arithmetic_result_type` + `bounds::scalar_arithmetic`):
 
@@ -82,7 +82,7 @@ Unary: `negate`/`abs` preserve the input type. `ceil`/`floor`/`round`/`sign` ret
 
 **Cast functions:** return the target type (`toInt64` returns `Int64`, `toBigInt` returns `BigInt{width:None}`, `toDecimal` returns `Decimal{precision:None, scale:None}`, etc.).
 
-**Conditional functions** (parsed as AST nodes, resolved in `type_check.rs`):
+**Conditional functions** (parsed as AST nodes, resolved in `type_resolver.rs`):
 - `if(cond, then, else)`: returns `then`'s data type; nullable if either branch is nullable.
 - `multiIf(c1,v1,...,default)`: returns the first branch's data type; nullable if any branch is nullable.
 - `ifNull(value, alt)`: returns `value`'s data type; nullable = `alt.nullable` (the value itself is non-null after the check).
@@ -116,22 +116,26 @@ All functions are registered as static items implementing `ExprFunction`. Brief 
 
 ```
 crates/expr/
-  types/   NullableExprType, int_bound arithmetic, DataType limits
-  funcs/   ExprFunction trait, FunctionRegistry, all builtins
-  expr/    Lexer, Token, Parser, AST, Evaluator, TypeCheck, detection
+  types/     NullableExprType, int_bound arithmetic, DataType limits
+  funcs/     ExprFunction trait, FunctionRegistry, all builtins, arithmetic_utils
+  parse/     Parser struct, AST model (Program, Expr, ...), detection, lexer, token
+  runtime/   ExpressionContext, Evaluator, TypeResolver, ConfigExprPatcher
 ```
 
 - `crates/expr/types` -- type algebra (bounds, promotion rules, conversion).
-- `crates/expr/funcs` -- `ExprFunction` trait in `signature.rs`, `FunctionRegistry` in `registry.rs`, builtins in `builtins/` (one file per category).
-- `crates/expr/expr` -- parser pipeline: `detect.rs` (is_expression / has_interpolation), `lexer.rs` (tokenizer), `token.rs` (Token enum), `parser.rs` (AST builder), `evaluator.rs` (runtime), `type_check.rs` (compile-time).
+- `crates/expr/funcs` -- `ExprFunction` trait in `signature.rs`, `FunctionRegistry` in `registry.rs`, builtins in `builtins/` (one file per category), `arithmetic_utils.rs` (bounds helpers).
+- `crates/expr/parse` -- `Parser` struct with `create()`, `parse()`, `is_expr()` methods; AST model in `model/` (Program, Expr, ...), `lexer.rs` (tokenizer), `token.rs` (Token enum), detection.
+- `crates/expr/runtime` -- `ExpressionContext` (context), `Evaluator` (evaluation), `TypeResolver` (compile-time type resolution), `ConfigExprPatcher` (trie-based TOML patcher).
 
 ## Integration points
 
-- Config loader calls `detect::is_expression` / `detect::has_interpolation` to classify mapping values.
-- `ExpressionContext` on `AssembledFlow` holds the compiled program.
-- Evaluation happens during **assemble** (no I/O), not validate.
+- `ConfigExprPatcher` walks the config TOML at load time, replacing matched string values with their evaluated `Value` (rendered back into TOML). It calls `Parser::parse` (which internally classifies the string as expression / interpolation template / plain literal) and feeds the resulting `Program` to `Evaluator::evaluate`.
+- `ExpressionContext` (from `air_elt_expr_runtime::context`) on `AssembledFlow` holds the compiled program.
+- Expression evaluation now uses `Evaluator::create(&context).evaluate(&program)` — no convenience wrappers (`eval_expression`, `eval_interpolated`, `evaluate_interpolated` are all gone). `ExprValue` was deleted entirely.
+- `Parser::parse_expression` is the explicit "I already know this is expression source" entry point — used by tests and by internal callers that bypass detection.
+- `ConfigExprPatcher` replaces heuristic string detection with path-based TOML matching.
+- `ensure_sink_compatible` moved from core to `air_elt_types::sink_compat`.
 - `EvalContext` provides `env_resolver`, `file_resolver`, `now` timestamp, and `base_dir`.
-- Default values are computed through `ExprValue.eval()` (there is no separate default_value module).
 - `DynValue` trait methods: `is_equal` (equality), `partial_cmp` (ordering), `hash` (hashing).
 
 ## Adding a new function

@@ -125,8 +125,8 @@ pub struct FlowConfig {
     pub batch_limit: usize,
     #[serde(
         default,
-        deserialize_with = "crate::config::interval::deserialize_opt",
-        serialize_with = "crate::config::interval::serialize_opt"
+        deserialize_with = "air_elt_commons::interval::deserialize_opt",
+        serialize_with = "air_elt_commons::interval::serialize_opt"
     )]
     pub query_timeout: Option<Duration>,
 
@@ -390,8 +390,8 @@ pub struct CursorConfig {
     pub order: CursorOrder,
     #[serde(
         default = "default_interval",
-        deserialize_with = "crate::config::interval::deserialize",
-        serialize_with = "crate::config::interval::serialize"
+        deserialize_with = "air_elt_commons::interval::deserialize",
+        serialize_with = "air_elt_commons::interval::serialize"
     )]
     pub interval: std::time::Duration,
     /// Per-flow startup jitter that shifts the first-tick schedule grid
@@ -405,8 +405,8 @@ pub struct CursorConfig {
     /// against `jitter <= interval`.
     #[serde(
         default,
-        deserialize_with = "crate::config::interval::deserialize_opt_allow_zero",
-        serialize_with = "crate::config::interval::serialize_opt"
+        deserialize_with = "air_elt_commons::interval::deserialize_opt_allow_zero",
+        serialize_with = "air_elt_commons::interval::serialize_opt"
     )]
     pub jitter: Option<std::time::Duration>,
 }

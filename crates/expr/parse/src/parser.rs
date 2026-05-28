@@ -2,12 +2,96 @@ use air_elt_expr_types::limits::{
     MAX_AST_NODES, MAX_EXPR_DEPTH, MAX_EXPR_SOURCE_LEN, MAX_FUNCTION_ARGS, MAX_VARIABLES,
 };
 
-use crate::ast::{ConditionalExpr, Expr, InterpolationSegment, LiteralValue, Program, Statement};
+use crate::detect;
 use crate::error::ExprError;
 use crate::lexer::Lexer;
+use crate::model::{ConditionalExpr, Expr, InterpolationSegment, LiteralValue, Program, Statement};
 use crate::token::{SpannedToken, StringPart, Token};
 
+/// Expression parser. Converts expression source strings into [`Program`] ASTs.
+pub struct Parser;
+
+impl Parser {
+    /// Create a new parser instance.
+    pub fn create() -> Self {
+        Self
+    }
+
+    pub fn parse(&self, input: &str) -> Result<Program, ExprError> {
+        if detect::is_expression(input) {
+            return parse(input);
+        }
+        if detect::has_interpolation(input) {
+            return parse_interpolation_template(input);
+        }
+        Ok(Program {
+            statements: vec![],
+            result: Expr::Literal(LiteralValue::String(input.to_owned())),
+        })
+    }
+
+    /// Parse `input` as expression source directly, bypassing config-value detection.
+    /// Use this only when you already know the string is an expression (e.g. when
+    /// implementing a new evaluator pathway or in unit tests).
+    pub fn parse_expression(&self, input: &str) -> Result<Program, ExprError> {
+        parse(input)
+    }
+
+    pub fn parse_toml(&self, value: &toml::Value) -> Result<Program, ExprError> {
+        let result = self.parse_toml_expr(value)?;
+        Ok(Program {
+            statements: vec![],
+            result,
+        })
+    }
+
+    fn parse_toml_expr(&self, value: &toml::Value) -> Result<Expr, ExprError> {
+        match value {
+            toml::Value::String(s) => Ok(self.parse(s)?.result),
+            toml::Value::Integer(n) => Ok(Expr::Literal(LiteralValue::Int(*n))),
+            toml::Value::Float(f) => Ok(Expr::Literal(LiteralValue::Float(*f))),
+            toml::Value::Boolean(b) => Ok(Expr::Literal(LiteralValue::Bool(*b))),
+            toml::Value::Table(t) => {
+                let mut entries = Vec::with_capacity(t.len());
+                for (key, val) in t {
+                    entries.push((key.clone(), self.parse_toml_expr(val)?));
+                }
+                Ok(Expr::Object(entries))
+            }
+            toml::Value::Array(arr) => {
+                let mut elements = Vec::with_capacity(arr.len());
+                for val in arr {
+                    elements.push(self.parse_toml_expr(val)?);
+                }
+                Ok(Expr::Literal(LiteralValue::String(
+                    toml::Value::Array(arr.clone()).to_string(),
+                )))
+            }
+            _ => Ok(Expr::Literal(LiteralValue::String(value.to_string()))),
+        }
+    }
+
+    pub fn is_expr(&self, input: &str) -> bool {
+        detect::is_expression(input) || detect::has_interpolation(input)
+    }
+}
+
+fn parse_interpolation_template(input: &str) -> Result<Program, ExprError> {
+    if input.len() > MAX_EXPR_SOURCE_LEN {
+        return Err(ExprError::ExpressionTooLong {
+            len: input.len(),
+            max: MAX_EXPR_SOURCE_LEN,
+        });
+    }
+    let mut lexer = Lexer::new(input);
+    let tokens = lexer.tokenize_as_interpolation()?;
+    let mut state = ParseState::new(tokens);
+    state.parse_program()
+}
+
 /// Parse an expression source string into a [`Program`] AST.
+///
+/// Convenience wrapper around `Parser::create().parse(input)`.
 pub fn parse(input: &str) -> Result<Program, ExprError> {
     if input.len() > MAX_EXPR_SOURCE_LEN {
         return Err(ExprError::ExpressionTooLong {
@@ -18,11 +102,11 @@ pub fn parse(input: &str) -> Result<Program, ExprError> {
 
     let mut lexer = Lexer::new(input);
     let spanned_tokens = lexer.tokenize()?;
-    let mut parser = Parser::new(spanned_tokens);
-    parser.parse_program()
+    let mut state = ParseState::new(spanned_tokens);
+    state.parse_program()
 }
 
-struct Parser {
+struct ParseState {
     tokens: Vec<SpannedToken>,
     pos: usize,
     depth: usize,
@@ -30,7 +114,7 @@ struct Parser {
     variable_count: usize,
 }
 
-impl Parser {
+impl ParseState {
     fn new(tokens: Vec<SpannedToken>) -> Self {
         Self {
             tokens,

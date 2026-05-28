@@ -30,6 +30,8 @@ The codebase favours clarity over cleverness. Code is read far more often than w
 - Do not use abbreviations or acronyms except for commonly accepted ones. Use commonly accepted abbreviations only when
   other alternatives are unwieldy
 - Do not use Box::leak in production code
+- **Static construction methods:** Prefer `Type::create(...)` as the named constructor, even when returning `Result`. This makes construction explicit and avoids bare `new()` which can hide fallibility.
+- **Strict encapsulation:** Do not expose internal data structures through public API. Minimize the public surface of each crate. Internal structs, helper functions, and implementation details must be `pub(crate)` or private.
 
 ## Timeouts and cancellation safety
 

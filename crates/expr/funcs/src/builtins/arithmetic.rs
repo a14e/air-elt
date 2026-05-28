@@ -1,4 +1,4 @@
-use air_elt_expr_types::bounds::{ArithmeticOp, arithmetic_result_type, concat_result_type};
+use crate::arithmetic_utils::{ArithmeticOp, arithmetic_result_type, concat_result_type};
 use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::{DataType, Value};
 use bigdecimal::BigDecimal;

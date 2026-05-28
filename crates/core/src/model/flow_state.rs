@@ -2,15 +2,13 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
-use air_elt_expr::ExprValue;
-
-use crate::config::expression::ExpressionContext;
 use crate::config::validation::SamplingConfig;
 use crate::error::ValidationError;
 use crate::mapping::{self, ColumnMapping, DirectMapping, ExpandedMapping};
 use crate::model::{ConfigReadSpec, ConfigWriteSpec, ReadSpec, Schema, WriteSpec};
 use crate::traits::{Sink, Source, Storage};
 use crate::transform::SwitchTable;
+use air_elt_expr_runtime::ExpressionContext;
 // Switch tables travel inline on the conversion plan — no Arc, no
 // global registry. The plan / Transform are only cloned at validation
 // / sampling boundaries, which happens a handful of times per flow
@@ -85,7 +83,7 @@ pub struct AssembledFlow {
     /// `FunctionRegistry` + the config directory. `None` when expression
     /// evaluation is not available (e.g. tests that build flows without
     /// a config directory).
-    pub expr_context: Arc<crate::config::expression::ExpressionContext>,
+    pub expr_context: Arc<air_elt_expr_runtime::ExpressionContext>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -362,19 +360,20 @@ fn derive_schemaless_sink_schema(src: &Schema, expanded: &ExpandedMapping) -> Sc
     )
 }
 
-/// Resolve a default literal: ExprValue.eval() → check/convert to sink type.
-/// All TOML literals, expressions, and interpolations go through the same path.
+/// Resolve a default literal: evaluate via `Evaluator`, then check/convert to
+/// the sink type. All TOML literals, expressions, and interpolations go
+/// through the same path.
 fn resolve_default_literal(
     literal: &toml::Value,
     sink_dt: &DataType,
     expr_context: &ExpressionContext,
 ) -> Result<Value, String> {
-    let expr_val = ExprValue::from_toml(literal.clone());
-    let value = expr_val
-        .eval(&expr_context.registry, &expr_context.eval_context)
-        .map_err(|e| e.to_string())?;
+    let parser = air_elt_expr_parse::Parser::create();
+    let program = parser.parse_toml(literal).map_err(|e| e.to_string())?;
+    let evaluator = air_elt_expr_runtime::Evaluator::create(expr_context);
+    let value = evaluator.evaluate(&program).map_err(|e| e.to_string())?;
 
-    crate::config::expression::ensure_sink_compatible(value, sink_dt)
+    air_elt_types::ensure_sink_compatible(value, sink_dt)
 }
 
 /// Build per-column ColumnConversionPlans from the expanded mapping. Mirrors
@@ -632,7 +631,7 @@ mod tests {
                 )
             },
             recorder: air_elt_monitoring::FlowRecorder::disabled(),
-            expr_context: Arc::new(ExpressionContext::new(
+            expr_context: Arc::new(ExpressionContext::create(
                 Arc::new(air_elt_expr_funcs::FunctionRegistry::with_builtins()),
                 std::path::Path::new("/tmp"),
             )),
@@ -966,7 +965,7 @@ mod tests {
         use air_elt_expr_funcs::FunctionRegistry;
         use std::path::PathBuf;
 
-        let expr_ctx = Arc::new(crate::config::expression::ExpressionContext::new(
+        let expr_ctx = Arc::new(air_elt_expr_runtime::ExpressionContext::create(
             Arc::new(FunctionRegistry::with_builtins()),
             &PathBuf::from("/tmp"),
         ));
@@ -990,14 +989,14 @@ mod tests {
         assert_eq!(*default_val, Value::Text("hello world".to_string()));
     }
 
-    /// Interpolation in `default` is evaluated via ExprValue.
+    /// Interpolation in `default` is evaluated via `Evaluator`.
     #[test]
     fn interpolation_default_is_evaluated() {
         use crate::transform::TransformOp;
         use air_elt_expr_funcs::FunctionRegistry;
         use std::path::PathBuf;
 
-        let expr_ctx = Arc::new(crate::config::expression::ExpressionContext::new(
+        let expr_ctx = Arc::new(air_elt_expr_runtime::ExpressionContext::create(
             Arc::new(FunctionRegistry::with_builtins()),
             &PathBuf::from("/tmp"),
         ));
@@ -1047,7 +1046,7 @@ mod tests {
         use air_elt_expr_funcs::FunctionRegistry;
         use std::path::PathBuf;
 
-        let expr_ctx = Arc::new(crate::config::expression::ExpressionContext::new(
+        let expr_ctx = Arc::new(air_elt_expr_runtime::ExpressionContext::create(
             Arc::new(FunctionRegistry::with_builtins()),
             &PathBuf::from("/tmp"),
         ));
@@ -1112,7 +1111,7 @@ mod tests {
         use air_elt_expr_funcs::FunctionRegistry;
         use std::path::PathBuf;
 
-        let expr_ctx = Arc::new(crate::config::expression::ExpressionContext::new(
+        let expr_ctx = Arc::new(air_elt_expr_runtime::ExpressionContext::create(
             Arc::new(FunctionRegistry::with_builtins()),
             &PathBuf::from("/tmp"),
         ));

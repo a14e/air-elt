@@ -1,8 +1,6 @@
 use thiserror::Error;
 
-use air_elt_expr_funcs::FuncError;
-
-/// Top-level expression error covering parsing, type-checking, and evaluation.
+/// Expression parse errors.
 #[derive(Debug, Error)]
 pub enum ExprError {
     #[error("parse error at position {position}: {message}")]
@@ -25,13 +23,4 @@ pub enum ExprError {
 
     #[error("too many variables: {count} (max {max})")]
     TooManyVariables { count: usize, max: usize },
-
-    #[error("undefined variable: {name}")]
-    UndefinedVariable { name: String },
-
-    #[error("type error: {0}")]
-    Type(#[from] air_elt_expr_types::error::ExprTypeError),
-
-    #[error("function error: {0}")]
-    Function(#[from] FuncError),
 }

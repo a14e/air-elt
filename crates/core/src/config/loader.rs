@@ -35,7 +35,11 @@ enum ConfigFormat {
 ///
 /// Format dispatch is per-file by extension, so a TOML root can include YAML
 /// fragments and vice versa.
-pub fn load<P: AsRef<Path>>(path: P) -> Result<RootConfig, ConfigError> {
+pub fn load<P: AsRef<Path>>(
+    path: P,
+    patcher: &air_elt_expr_runtime::ConfigExprPatcher,
+    expr_context: &air_elt_expr_runtime::ExpressionContext,
+) -> Result<RootConfig, ConfigError> {
     let path = path.as_ref().to_path_buf();
     let mut cycle = PathCycleDetector::new();
 
@@ -48,7 +52,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<RootConfig, ConfigError> {
         secrets_origin.insert(k.clone(), path.clone());
     }
     let expanded_root = env_expand::expand(&raw_root, &secrets)?;
-    let mut root = parse_root(&expanded_root, &path, format)?;
+    let mut root = parse_and_patch(&expanded_root, &path, format, patcher, expr_context)?;
 
     let base_dir = path
         .parent()
@@ -69,6 +73,8 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<RootConfig, ConfigError> {
             &secrets,
             &mut cycle,
             &mut secrets_origin,
+            patcher,
+            expr_context,
         )?;
     }
 
@@ -110,20 +116,61 @@ fn read_single(path: &Path) -> Result<String, ConfigError> {
     })
 }
 
-fn parse_root(
+fn parse_and_patch(
     expanded: &str,
     path: &Path,
     format: ConfigFormat,
+    patcher: &air_elt_expr_runtime::ConfigExprPatcher,
+    expr_context: &air_elt_expr_runtime::ExpressionContext,
 ) -> Result<RootConfig, ConfigError> {
     match format {
         ConfigFormat::Toml => {
-            toml::from_str::<RootConfig>(expanded).map_err(|source| ConfigError::TomlParse {
-                path: path.to_path_buf(),
-                source,
-            })
+            let mut table =
+                expanded
+                    .parse::<toml::Table>()
+                    .map_err(|source| ConfigError::TomlParse {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+            patcher
+                .patch(&mut table, expr_context)
+                .map_err(|e| ConfigError::Invalid {
+                    reason: format!("expression resolution in {}: {e}", path.display(),),
+                })?;
+            toml::Value::Table(table)
+                .try_into()
+                .map_err(|source| ConfigError::TomlParse {
+                    path: path.to_path_buf(),
+                    source,
+                })
         }
-        ConfigFormat::Yaml => parse_yaml_root(expanded, path),
+        ConfigFormat::Yaml => {
+            let mut root = parse_yaml_root(expanded, path)?;
+            patch_component_configs(&mut root, patcher, expr_context).map_err(|e| {
+                ConfigError::Invalid {
+                    reason: format!("expression resolution in {}: {e}", path.display()),
+                }
+            })?;
+            Ok(root)
+        }
     }
+}
+
+fn patch_component_configs(
+    root: &mut RootConfig,
+    patcher: &air_elt_expr_runtime::ConfigExprPatcher,
+    expr_context: &air_elt_expr_runtime::ExpressionContext,
+) -> Result<(), air_elt_expr_runtime::ExprError> {
+    for source in &mut root.sources {
+        patcher.patch_table(&mut source.config, expr_context)?;
+    }
+    for sink in &mut root.sinks {
+        patcher.patch_table(&mut sink.config, expr_context)?;
+    }
+    for storage in &mut root.storages {
+        patcher.patch_table(&mut storage.config, expr_context)?;
+    }
+    Ok(())
 }
 
 /// Parse a YAML payload that may contain multiple `---`-separated documents
@@ -234,6 +281,8 @@ fn merge_include(
     secrets: &BTreeMap<String, String>,
     cycle: &mut PathCycleDetector,
     secrets_origin: &mut BTreeMap<String, PathBuf>,
+    patcher: &air_elt_expr_runtime::ConfigExprPatcher,
+    expr_context: &air_elt_expr_runtime::ExpressionContext,
 ) -> Result<(), ConfigError> {
     if include.is_dir() {
         let mut entries: Vec<PathBuf> = std::fs::read_dir(include)
@@ -256,7 +305,15 @@ fn merge_include(
                 debug!(path = ?entry, "skipping already-visited include file");
                 continue;
             }
-            merge_file(root, &entry, secrets, cycle, secrets_origin)?;
+            merge_file(
+                root,
+                &entry,
+                secrets,
+                cycle,
+                secrets_origin,
+                patcher,
+                expr_context,
+            )?;
         }
         Ok(())
     } else {
@@ -264,7 +321,15 @@ fn merge_include(
             debug!(path = ?include, "skipping already-visited include file");
             return Ok(());
         }
-        merge_file(root, include, secrets, cycle, secrets_origin)
+        merge_file(
+            root,
+            include,
+            secrets,
+            cycle,
+            secrets_origin,
+            patcher,
+            expr_context,
+        )
     }
 }
 
@@ -274,12 +339,14 @@ fn merge_file(
     secrets: &BTreeMap<String, String>,
     cycle: &mut PathCycleDetector,
     secrets_origin: &mut BTreeMap<String, PathBuf>,
+    patcher: &air_elt_expr_runtime::ConfigExprPatcher,
+    expr_context: &air_elt_expr_runtime::ExpressionContext,
 ) -> Result<(), ConfigError> {
     cycle.mark(path);
     let format = detect_format(path)?;
     let raw = read_single(path)?;
     let expanded = env_expand::expand(&raw, secrets)?;
-    let extra = parse_root(&expanded, path, format)?;
+    let extra = parse_and_patch(&expanded, path, format, patcher, expr_context)?;
     merge_extra_into(root, extra, path, secrets_origin)
 }
 
@@ -423,8 +490,8 @@ fn validate_post_merge(root: &RootConfig) -> Result<(), ConfigError> {
                 return Err(ConfigError::Invalid {
                     reason: format!(
                         "flow {flow_name:?} cursor.jitter must be ≤ interval (got jitter={}, interval={})",
-                        crate::config::interval::to_iso(&jitter),
-                        crate::config::interval::to_iso(&flow.cursor.interval),
+                        air_elt_commons::interval::to_iso(&jitter),
+                        air_elt_commons::interval::to_iso(&flow.cursor.interval),
                     ),
                 });
             }
@@ -524,6 +591,20 @@ mod tests {
         path
     }
 
+    fn test_load<P: AsRef<Path>>(path: P) -> Result<RootConfig, ConfigError> {
+        let patcher = air_elt_expr_runtime::ConfigExprPatcher::create(&[
+            "sinks[*].config",
+            "sources[*].config",
+            "storages[*].config",
+        ])
+        .expect("static patterns are valid");
+        let context = air_elt_expr_runtime::ExpressionContext::create(
+            std::sync::Arc::new(air_elt_expr_funcs::FunctionRegistry::with_builtins()),
+            path.as_ref().parent().unwrap_or(Path::new(".")),
+        );
+        load(path, &patcher, &context)
+    }
+
     #[test]
     fn load_single_file_config() {
         let dir = tempfile::tempdir().unwrap();
@@ -558,7 +639,7 @@ id = "id"
 name = "name"
 "#,
         );
-        let root = load(&path).unwrap();
+        let root = test_load(&path).unwrap();
         assert_eq!(root.sources.len(), 1);
         assert_eq!(root.flow.len(), 1);
         assert_eq!(root.flow["users"].from, "public.users");
@@ -603,7 +684,7 @@ cursor = { fields = ["id"] }
 id = "id"
 "#,
         );
-        let root = load(&path).unwrap();
+        let root = test_load(&path).unwrap();
         assert_eq!(
             root.sources[0].config.get("url").unwrap().as_str(),
             Some("postgres://expanded")
@@ -650,7 +731,7 @@ cursor = {{ fields = ["created_at"] }}
 "#
             );
             let path = write(dir.path(), "config.toml", &cfg);
-            let err = load(&path).unwrap_err();
+            let err = test_load(&path).unwrap_err();
             assert!(
                 matches!(err, ConfigError::TomlParse { .. }),
                 "expected TomlParse for reserved field {field:?}, got {err:?}"
@@ -688,7 +769,7 @@ cursor = { fields = ["created_at"] }
 id = "id"
 "#,
         );
-        let err = load(&path).unwrap_err();
+        let err = test_load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid { .. }));
     }
 
@@ -729,7 +810,7 @@ cursor = {{ fields = ["c0"] }}
 "#
             ),
         );
-        let err = load(&path).unwrap_err();
+        let err = test_load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid { .. }));
     }
 
@@ -763,7 +844,7 @@ cursor = { fields = ["id"], interval = "0s" }
 id = "id"
 "#,
         );
-        let err = load(&path).unwrap_err();
+        let err = test_load(&path).unwrap_err();
         assert!(
             err.to_string().contains("zero"),
             "expected zero-duration error, got: {err}"
@@ -805,7 +886,7 @@ cursor = { fields = ["id"], interval = "10s", jitter = "11s" }
 id = "id"
 "#,
         );
-        let err = load(&path).unwrap_err();
+        let err = test_load(&path).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("jitter") && msg.contains("≤ interval"),
@@ -846,7 +927,7 @@ cursor = { fields = ["id"], interval = "10s", jitter = "10s" }
 id = "id"
 "#,
         );
-        let root = load(&path).expect("jitter == interval must load");
+        let root = test_load(&path).expect("jitter == interval must load");
         let flow = root.flow.get("f").expect("flow f present");
         assert_eq!(flow.cursor.jitter, Some(std::time::Duration::from_secs(10)));
         assert_eq!(
@@ -887,7 +968,7 @@ cursor = { fields = ["id"], interval = "1s", jitter = "0s" }
 id = "id"
 "#,
         );
-        let root = load(&path).expect("zero jitter must load");
+        let root = test_load(&path).expect("zero jitter must load");
         let flow = root.flow.get("f").expect("flow f present");
         assert_eq!(flow.cursor.jitter, Some(std::time::Duration::ZERO));
         assert_eq!(flow.cursor.effective_jitter(), std::time::Duration::ZERO);
@@ -924,7 +1005,7 @@ cursor = { fields = ["id"] }
 id = "id"
 "#,
         );
-        let err = load(&path).unwrap_err();
+        let err = test_load(&path).unwrap_err();
         assert!(
             err.to_string().contains("zero"),
             "expected zero-duration error, got: {err}"
@@ -955,7 +1036,7 @@ type = "postgres"
 config = {}
 "#,
         );
-        let err = load(&path).unwrap_err();
+        let err = test_load(&path).unwrap_err();
         assert!(matches!(err, ConfigError::AbsoluteIncludeNotAllowed { .. }));
     }
 
@@ -1000,7 +1081,7 @@ flow:
       interval: "1s"
 "#,
         );
-        let root = load(&path).unwrap();
+        let root = test_load(&path).unwrap();
         assert_eq!(root.sources.len(), 1);
         assert_eq!(root.flow.len(), 1);
         assert_eq!(root.flow["users"].from, "public.users");
@@ -1043,7 +1124,7 @@ flow:
     cursor: { fields: [id] }
 "#,
         );
-        let root = load(&path).unwrap();
+        let root = test_load(&path).unwrap();
         let cfg = &root.sources[0].config;
         assert_eq!(
             cfg.get("max-connections").and_then(|v| v.as_integer()),
@@ -1098,7 +1179,7 @@ flow:
     cursor: { fields: [id] }
 "#,
         );
-        let root = load(dir.path().join("config.toml")).unwrap();
+        let root = test_load(dir.path().join("config.toml")).unwrap();
         assert!(root.flow.contains_key("users"));
     }
 
@@ -1135,7 +1216,7 @@ cursor = { fields = ["id"] }
 id = "id"
 "#,
         );
-        let root = load(dir.path().join("config.yml")).unwrap();
+        let root = test_load(dir.path().join("config.yml")).unwrap();
         assert!(root.flow.contains_key("users"));
     }
 
@@ -1208,7 +1289,7 @@ flow:
     cursor: { fields: [id] }
 "#,
         );
-        let root = load(dir.path().join("config.toml")).unwrap();
+        let root = test_load(dir.path().join("config.toml")).unwrap();
         assert!(root.flow.contains_key("a"));
         assert!(root.flow.contains_key("b"));
         assert!(root.flow.contains_key("c"));
@@ -1268,7 +1349,7 @@ flow:
     cursor: { fields: [id] }
 "#,
         );
-        let err = load(dir.path().join("config.toml")).unwrap_err();
+        let err = test_load(dir.path().join("config.toml")).unwrap_err();
         assert!(matches!(err, ConfigError::DuplicateFlow { .. }));
     }
 
@@ -1307,7 +1388,7 @@ secrets:
   TOKEN: "second"
 "#,
         );
-        let err = load(dir.path().join("config.toml")).unwrap_err();
+        let err = test_load(dir.path().join("config.toml")).unwrap_err();
         match err {
             ConfigError::DuplicateSecret {
                 ref key,
@@ -1372,7 +1453,7 @@ secrets:
   TOKEN: "second"
 "#,
         );
-        let err = load(dir.path().join("config.toml")).unwrap_err();
+        let err = test_load(dir.path().join("config.toml")).unwrap_err();
         match err {
             ConfigError::DuplicateSecret {
                 ref key,
@@ -1396,7 +1477,7 @@ secrets:
         // purely on the extension. Empty bodies pass trivially and don't
         // discriminate between extension- vs content-driven rejection.
         let path = write(dir.path(), "config.json", "name = \"x\"\n");
-        let err = load(&path).unwrap_err();
+        let err = test_load(&path).unwrap_err();
         assert!(
             matches!(err, ConfigError::UnknownConfigExtension { ref ext, .. } if ext == "json"),
             "expected UnknownConfigExtension(json), got {err:?}"
@@ -1408,7 +1489,7 @@ secrets:
         let dir = tempfile::tempdir().unwrap();
         // Unterminated array-of-tables header — hard syntax error in TOML.
         let path = write(dir.path(), "config.toml", "[[sources\n");
-        let err = load(&path).unwrap_err();
+        let err = test_load(&path).unwrap_err();
         assert!(
             matches!(err, ConfigError::TomlParse { .. }),
             "expected TomlParse, got {err:?}"
@@ -1422,7 +1503,7 @@ secrets:
         // shape error — guarantees we hit serde_yaml's parser branch and
         // surface it as `YamlParse`, not `Invalid`.
         let path = write(dir.path(), "config.yml", "sources: [{name: pg, type:\n");
-        let err = load(&path).unwrap_err();
+        let err = test_load(&path).unwrap_err();
         assert!(
             matches!(err, ConfigError::YamlParse { .. }),
             "expected YamlParse, got {err:?}"
@@ -1484,7 +1565,7 @@ cursor = { fields = ["id"] }
 id = "id"
 "#,
         );
-        let err = load(dir.path().join("config.toml")).unwrap_err();
+        let err = test_load(dir.path().join("config.toml")).unwrap_err();
         assert!(matches!(err, ConfigError::DuplicateFlow { .. }));
     }
 
@@ -1518,7 +1599,7 @@ flow:
     cursor: { fields: [id] }
 "#,
         );
-        let root = load(&path).unwrap();
+        let root = test_load(&path).unwrap();
         assert_eq!(root.sources.len(), 1);
         assert_eq!(root.sinks.len(), 1);
         assert_eq!(root.storages.len(), 1);
@@ -1545,7 +1626,7 @@ sources:
   - { name: pg, type: postgres, config: {} }
 "#,
         );
-        let err = load(&path).unwrap_err();
+        let err = test_load(&path).unwrap_err();
         assert!(
             matches!(&err, ConfigError::DuplicateName { kind: "source", name } if name == "pg"),
             "got {err:?}"
@@ -1588,7 +1669,7 @@ flow:
     cursor: { fields: [id] }
 "#,
         );
-        let err = load(&path).unwrap_err();
+        let err = test_load(&path).unwrap_err();
         assert!(matches!(&err, ConfigError::DuplicateFlow { name } if name == "users"));
     }
 
@@ -1618,7 +1699,7 @@ storages:
   - { name: pg, type: postgres, config: {} }
 "#,
         );
-        let root = load(&path).unwrap();
+        let root = test_load(&path).unwrap();
         assert_eq!(
             root.sources[0].config.get("url").and_then(|v| v.as_str()),
             Some("postgres://db.local:5432/x")
@@ -1641,7 +1722,7 @@ secrets:
   PG_HOST: "b"
 "#,
         );
-        let err = load(&path).unwrap_err();
+        let err = test_load(&path).unwrap_err();
         assert!(
             matches!(&err, ConfigError::DuplicateSecret { key, .. } if key == "PG_HOST"),
             "got {err:?}"
@@ -1682,7 +1763,7 @@ cursor = { fields = ["id"] }
 "*" = "*"
 "#,
         );
-        let root = load(&path).unwrap();
+        let root = test_load(&path).unwrap();
         // Wildcard rule survives to validation as a Short("*") token
         // keyed by the wildcard sink "*".
         let mapping = &root.flow["f"].mapping;
@@ -1728,7 +1809,7 @@ conflict = { key = ["id"], strategy = "overwrite" }
 "*" = "*"
 "#,
         );
-        let root = load(&path).unwrap();
+        let root = test_load(&path).unwrap();
         assert!(root.flow["f"].conflict.is_some());
     }
 
@@ -1767,7 +1848,7 @@ id = "id"
 "*" = "*"
 "#,
         );
-        let root = load(&path).unwrap();
+        let root = test_load(&path).unwrap();
         assert_eq!(root.flow["f"].mapping.len(), 2);
     }
 
@@ -1832,8 +1913,8 @@ flow:
       body: "*"
 "#,
         );
-        let toml_root = load(&toml_path).unwrap();
-        let yaml_root = load(&yaml_path).unwrap();
+        let toml_root = test_load(&toml_path).unwrap();
+        let yaml_root = test_load(&yaml_path).unwrap();
 
         let toml_mapping = &toml_root.flow["f"].mapping;
         let yaml_mapping = &yaml_root.flow["f"].mapping;
@@ -1888,7 +1969,7 @@ flow:
     cursor: { fields: [id] }
 "#,
         );
-        let err = load(&path).unwrap_err();
+        let err = test_load(&path).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("string") && msg.contains("table"),

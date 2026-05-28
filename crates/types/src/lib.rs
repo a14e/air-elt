@@ -16,6 +16,7 @@ pub mod error;
 pub mod json_encode;
 pub mod key;
 pub mod matrix;
+pub mod sink_compat;
 pub mod union_types;
 pub mod value;
 
@@ -26,5 +27,6 @@ pub use dynamic::{DynType, DynValue};
 pub use error::KeyError;
 pub use json_encode::value_to_json;
 pub use key::Key;
+pub use sink_compat::ensure_sink_compatible;
 pub use union_types::collapse_union;
 pub use value::{Value, value_to_toml};

@@ -1,0 +1,24 @@
+[package]
+name = "air-elt-expr-parse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+[lib]
+doctest = false
+
+[dependencies]
+air-elt-expr-types = { workspace = true }
+air-elt-types = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+test-strategy = { workspace = true }
+
+[lints]
+workspace = true

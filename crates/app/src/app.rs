@@ -107,25 +107,63 @@ impl Drop for MonitoringGuard<'_> {
 }
 
 impl App {
-    /// Load the config from disk and wire the default registry.
     pub fn from_path(path: &Path) -> Result<Self> {
-        let config = loader::load(path)?;
         let config_dir = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
-        Ok(Self::from_config_with_dir(config, config_dir))
+        let registry = build_registry();
+        let patcher = air_elt_expr_runtime::ConfigExprPatcher::create(&[
+            "sinks[*].config",
+            "sources[*].config",
+            "storages[*].config",
+        ])?;
+        let expr_context = air_elt_expr_runtime::ExpressionContext::create(
+            registry.expr_functions().clone(),
+            &config_dir,
+        );
+        let config = loader::load(path, &patcher, &expr_context)?;
+        Ok(Self::from_config_with_registry(
+            config, config_dir, registry,
+        ))
     }
 
-    /// Wrap an already-loaded config (used by tests that build configs in
-    /// memory). Wires the default registry. Uses cwd as config_dir.
-    pub fn from_config(config: RootConfig) -> Self {
-        Self::from_config_with_dir(config, std::path::PathBuf::from("."))
+    pub fn from_config(mut config: RootConfig) -> Self {
+        let config_dir = std::path::PathBuf::from(".");
+        let registry = build_registry();
+        let patcher = air_elt_expr_runtime::ConfigExprPatcher::create(&[
+            "sinks[*].config",
+            "sources[*].config",
+            "storages[*].config",
+        ])
+        .expect("static patterns are valid");
+        let expr_context = air_elt_expr_runtime::ExpressionContext::create(
+            registry.expr_functions().clone(),
+            &config_dir,
+        );
+        for source in &mut config.sources {
+            patcher
+                .patch_table(&mut source.config, &expr_context)
+                .expect("expression resolution in source config");
+        }
+        for sink in &mut config.sinks {
+            patcher
+                .patch_table(&mut sink.config, &expr_context)
+                .expect("expression resolution in sink config");
+        }
+        for storage in &mut config.storages {
+            patcher
+                .patch_table(&mut storage.config, &expr_context)
+                .expect("expression resolution in storage config");
+        }
+        Self::from_config_with_registry(config, config_dir, registry)
     }
 
-    /// Wrap an already-loaded config with an explicit config directory
-    /// for expression resolution.
-    fn from_config_with_dir(config: RootConfig, config_dir: std::path::PathBuf) -> Self {
+    fn from_config_with_registry(
+        config: RootConfig,
+        config_dir: std::path::PathBuf,
+        registry: Registry,
+    ) -> Self {
         let mut monitoring = match config
             .metrics
             .prometheus
@@ -147,7 +185,7 @@ impl App {
         );
         Self {
             config,
-            registry: build_registry(),
+            registry,
             config_dir,
             monitoring: Mutex::new(Some(monitoring)),
             migrated: AtomicBool::new(false),
@@ -361,7 +399,17 @@ mod tests {
     #[test]
     fn from_config_uses_default_registry() {
         let cfg_path = workspace_root().join("examples/pg-to-cockroachdb/config.yml");
-        let raw = loader::load(&cfg_path).expect("load");
+        let patcher = air_elt_expr_runtime::ConfigExprPatcher::create(&[
+            "sinks[*].config",
+            "sources[*].config",
+            "storages[*].config",
+        ])
+        .expect("static patterns");
+        let context = air_elt_expr_runtime::ExpressionContext::create(
+            std::sync::Arc::new(air_elt_expr_funcs::FunctionRegistry::with_builtins()),
+            cfg_path.parent().unwrap_or(Path::new(".")),
+        );
+        let raw = loader::load(&cfg_path, &patcher, &context).expect("load");
         let app = App::from_config(raw);
         let kinds = app.list_kinds();
         assert!(kinds.sources.contains(&"postgres".to_string()));

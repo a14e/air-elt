@@ -1,35 +1,34 @@
 use ahash::AHashMap;
 use air_elt_expr_funcs::FunctionRegistry;
+use air_elt_expr_parse::model::{
+    ConditionalExpr, Expr, InterpolationSegment, LiteralValue, Program, Statement,
+};
 use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::DataType;
 
-use crate::ast::{ConditionalExpr, Expr, LiteralValue, Program, Statement};
 use crate::error::ExprError;
 
-/// Infer the output type of a program without evaluating it.
-pub fn infer_type(
-    program: &Program,
-    registry: &FunctionRegistry,
-) -> Result<NullableExprType, ExprError> {
-    let mut checker = TypeChecker::new(registry);
-    checker.check_program(program)
+pub struct TypeResolver<'a> {
+    registry: &'a FunctionRegistry,
 }
 
-/// Parse and infer type in one call.
-pub fn infer_expression_type(
-    input: &str,
-    registry: &FunctionRegistry,
-) -> Result<NullableExprType, ExprError> {
-    let program = crate::parser::parse(input)?;
-    infer_type(&program, registry)
+impl<'a> TypeResolver<'a> {
+    pub fn create(registry: &'a FunctionRegistry) -> Self {
+        Self { registry }
+    }
+
+    pub fn infer_type(&self, program: &Program) -> Result<NullableExprType, ExprError> {
+        let mut checker = TypeCheckerState::new(self.registry);
+        checker.check_program(program)
+    }
 }
 
-struct TypeChecker<'a> {
+struct TypeCheckerState<'a> {
     registry: &'a FunctionRegistry,
     variables: AHashMap<String, NullableExprType>,
 }
 
-impl<'a> TypeChecker<'a> {
+impl<'a> TypeCheckerState<'a> {
     fn new(registry: &'a FunctionRegistry) -> Self {
         Self {
             registry,
@@ -56,8 +55,8 @@ impl<'a> TypeChecker<'a> {
             Expr::Variable(name) => self.check_variable(name),
             Expr::FunctionCall { name, args } => self.check_function_call(name, args),
             Expr::Conditional(conditional) => self.check_conditional(conditional),
-            Expr::Interpolation(_segments) => Ok(self.check_interpolation()),
-            Expr::Object(_entries) => Ok(self.check_object()),
+            Expr::Interpolation(segments) => self.check_interpolation(segments),
+            Expr::Object(entries) => self.check_object(entries),
         }
     }
 
@@ -167,12 +166,23 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    fn check_interpolation(&self) -> NullableExprType {
-        NullableExprType::non_null(DataType::Text { size: None })
+    fn check_interpolation(
+        &self,
+        segments: &[InterpolationSegment],
+    ) -> Result<NullableExprType, ExprError> {
+        for segment in segments {
+            if let InterpolationSegment::Expression(expr) = segment {
+                self.check_expr(expr)?;
+            }
+        }
+        Ok(NullableExprType::non_null(DataType::Text { size: None }))
     }
 
-    fn check_object(&self) -> NullableExprType {
-        NullableExprType::non_null(DataType::Object)
+    fn check_object(&self, entries: &[(String, Expr)]) -> Result<NullableExprType, ExprError> {
+        for (_key, value_expr) in entries {
+            self.check_expr(value_expr)?;
+        }
+        Ok(NullableExprType::non_null(DataType::Object))
     }
 }
 
@@ -181,9 +191,19 @@ impl<'a> TypeChecker<'a> {
 mod tests {
     use super::*;
     use air_elt_expr_funcs::FunctionRegistry;
+    use air_elt_expr_parse::Parser;
 
     fn registry() -> FunctionRegistry {
         FunctionRegistry::with_builtins()
+    }
+
+    fn infer_expression_type(
+        input: &str,
+        registry: &FunctionRegistry,
+    ) -> Result<NullableExprType, ExprError> {
+        let program = Parser::create().parse_expression(input)?;
+        let resolver = TypeResolver::create(registry);
+        resolver.infer_type(&program)
     }
 
     #[test]
@@ -191,7 +211,6 @@ mod tests {
         let result = infer_expression_type("42", &registry()).unwrap();
         assert_eq!(result.data_type, DataType::Int64);
         assert!(!result.nullable);
-        // 42 needs 6 bits (64 - 42u64.leading_zeros() = 6)
         assert_eq!(result.int_bound, Some(6));
     }
 
@@ -206,7 +225,6 @@ mod tests {
 
     #[test]
     fn arithmetic_uses_resolve_type() {
-        // 1 has bound=1, 2 has bound=2 -> add: max(1,2)+1 = 3
         let result = infer_expression_type("1 + 2", &registry()).unwrap();
         assert_eq!(result.data_type, DataType::Int64);
         assert!(!result.nullable);
@@ -224,14 +242,12 @@ mod tests {
         let result = infer_expression_type("x = 42; x", &registry()).unwrap();
         assert_eq!(result.data_type, DataType::Int64);
         assert!(!result.nullable);
-        // Variable inherits int_bound from the assigned literal
         assert_eq!(result.int_bound, Some(6));
     }
 
     #[test]
     fn function_return_type() {
         let result = infer_expression_type("if(true, 1, 2)", &registry()).unwrap();
-        // Conditional type checking uses NullableExprType::new() which does not propagate int_bound
         assert_eq!(result.data_type, DataType::Int64);
         assert!(!result.nullable);
         assert_eq!(result.int_bound, None);
@@ -240,9 +256,6 @@ mod tests {
     #[test]
     fn interpolation_type() {
         let result = infer_expression_type("'hello ${1 + 2} world'", &registry());
-        // If the parser produces an interpolation node, it should be text(None)
-        // If it produces a plain string literal, it will be text(Some(n))
-        // Either way it should succeed
         assert!(result.is_ok());
         let typ = result.unwrap();
         assert!(!typ.nullable);
@@ -252,11 +265,25 @@ mod tests {
     #[test]
     fn object_type() {
         let result = infer_expression_type("object('key', 1)", &registry());
-        // If object() is a function it goes through resolve_type
-        // Otherwise we test the Object literal form
         if let Ok(typ) = result {
             assert!(!typ.nullable);
         }
+    }
+
+    #[test]
+    fn interpolation_catches_undefined_variable() {
+        let result = infer_expression_type("\"hello {undefined_var} world\"", &registry());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ExprError::UndefinedVariable { .. }));
+    }
+
+    #[test]
+    fn object_catches_undefined_variable() {
+        let result = infer_expression_type("{\"key\" = undefined_var}", &registry());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ExprError::UndefinedVariable { .. }));
     }
 
     #[test]
@@ -270,7 +297,6 @@ mod tests {
 
     #[test]
     fn add_text_concat_bounded() {
-        // The add function does track bounds when both args are Text
         let result = infer_expression_type("'abc' + 'def'", &registry()).unwrap();
         assert!(!result.nullable);
         assert!(matches!(result.data_type, DataType::Text { .. }));
@@ -278,7 +304,6 @@ mod tests {
 
     #[test]
     fn null_propagation_via_if() {
-        // if(true, null, 1) should propagate nullability from the null branch
         let result = infer_expression_type("if(true, null, 1)", &registry()).unwrap();
         assert!(result.nullable);
     }
@@ -301,8 +326,6 @@ mod tests {
 
     #[test]
     fn int_bound_precision_small_multiply() {
-        // 1 * 1 * 1: each literal is 1 bit
-        // 1 * 1 = 2 bits, then * 1 = 3 bits -> still Int64, not BigInt
         let result = infer_expression_type("1 * 1 * 1", &registry()).unwrap();
         assert_eq!(result.data_type, DataType::Int64);
         assert!(!result.nullable);
@@ -319,7 +342,6 @@ mod tests {
 
     #[test]
     fn int_bound_add_one_plus_one() {
-        // 1 + 1: each is 1 bit, add -> max(1,1)+1 = 2
         let result = infer_expression_type("1 + 1", &registry()).unwrap();
         assert_eq!(result.data_type, DataType::Int64);
         assert!(!result.nullable);
@@ -328,7 +350,6 @@ mod tests {
 
     #[test]
     fn int_bound_add_255_plus_255() {
-        // 255 needs 8 bits, add -> max(8,8)+1 = 9
         let result = infer_expression_type("255 + 255", &registry()).unwrap();
         assert_eq!(result.data_type, DataType::Int64);
         assert!(!result.nullable);
@@ -337,7 +358,6 @@ mod tests {
 
     #[test]
     fn int_bound_multiply_100_times_100() {
-        // 100 needs 7 bits, multiply -> 7+7 = 14
         let result = infer_expression_type("100 * 100", &registry()).unwrap();
         assert_eq!(result.data_type, DataType::Int64);
         assert!(!result.nullable);
@@ -346,18 +366,15 @@ mod tests {
 
     #[test]
     fn int_bound_five_ones_multiplied() {
-        // 1 * 1 * 1 * 1 * 1: bound accumulates 1+1+1+1+1 = 5
         let result = infer_expression_type("1 * 1 * 1 * 1 * 1", &registry()).unwrap();
         assert_eq!(result.data_type, DataType::Int64);
         assert!(!result.nullable);
         assert_eq!(result.int_bound, Some(5));
-        // 5 bits fits in Int8
         assert_eq!(result.materialized_data_type(), DataType::Int8);
     }
 
     #[test]
     fn int_bound_255_times_255() {
-        // 255 needs 8 bits, multiply -> 8+8 = 16, still Int64
         let result = infer_expression_type("255 * 255", &registry()).unwrap();
         assert_eq!(result.data_type, DataType::Int64);
         assert!(!result.nullable);
@@ -366,9 +383,6 @@ mod tests {
 
     #[test]
     fn int_bound_cast_to_int64_drops_bound() {
-        // toInt64(1) + toInt64(1): toInt64 returns Int64 without int_bound
-        // so arithmetic falls back to DataType-level bounds (no precise tracking)
-        // Int64 + Int64 via scalar_arithmetic -> 64+1=65 bits -> BigInt
         let result = infer_expression_type("toInt64(1) + toInt64(1)", &registry()).unwrap();
         assert!(matches!(result.data_type, DataType::BigInt { .. }));
         assert!(!result.nullable);

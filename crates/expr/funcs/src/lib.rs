@@ -1,3 +1,4 @@
+pub(crate) mod arithmetic_utils;
 pub mod builtins;
 pub mod error;
 pub mod registry;

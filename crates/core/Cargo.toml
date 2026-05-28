@@ -12,8 +12,9 @@ doctest = false
 
 [dependencies]
 air-elt-commons = { workspace = true }
-air-elt-expr = { workspace = true }
+air-elt-expr-parse = { workspace = true }
 air-elt-expr-funcs = { workspace = true }
+air-elt-expr-runtime = { workspace = true }
 air-elt-expr-types = { workspace = true }
 air-elt-monitoring = { workspace = true }
 air-elt-types = { workspace = true }

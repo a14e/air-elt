@@ -24,14 +24,14 @@ use chrono::{DateTime, NaiveDate, Utc};
 use num_bigint::BigInt;
 use uuid::Uuid;
 
-use air_elt_expr::ExprValue;
+use air_elt_expr_runtime::Evaluator;
 use air_elt_types::Key;
 
-use crate::config::expression::{self, ExpressionContext};
 use crate::error::ValidationError;
 use crate::mapping::column::SwitchCase;
 use crate::types::union_types::collapse_union;
 use crate::types::{DataType, Value};
+use air_elt_expr_runtime::ExpressionContext;
 
 /// Compiled switch lookup. Keys are canonicalised through
 /// [`Key::from_value`] so that integer subtypes
@@ -85,6 +85,7 @@ pub fn compile_switch(
         });
     }
 
+    let evaluator = Evaluator::create(expr_context);
     let mut table_cases: ahash::AHashMap<Key, Value> = ahash::AHashMap::with_capacity(cases.len());
     let mut observed_value_types: Vec<DataType> = Vec::with_capacity(cases.len() + 1);
 
@@ -114,18 +115,26 @@ pub fn compile_switch(
             });
         }
 
-        // All values go through ExprValue.eval() — handles expressions,
-        // interpolations, and plain literals uniformly.
-        let expr_val = ExprValue::from_toml(case.value.clone());
-        let resolved = expr_val
-            .eval(&expr_context.registry, &expr_context.eval_context)
-            .map_err(|e| ValidationError::SwitchValueTypeMismatch {
+        let parser = air_elt_expr_parse::Parser::create();
+        let program = parser.parse_toml(&case.value).map_err(|e| {
+            ValidationError::SwitchValueTypeMismatch {
                 flow: flow.into(),
                 column: column.into(),
                 key: case.key.clone(),
                 sink_type: sink_dt.clone(),
                 detail: e.to_string(),
-            })?;
+            }
+        })?;
+        let resolved =
+            evaluator
+                .evaluate(&program)
+                .map_err(|e| ValidationError::SwitchValueTypeMismatch {
+                    flow: flow.into(),
+                    column: column.into(),
+                    key: case.key.clone(),
+                    sink_type: sink_dt.clone(),
+                    detail: e.to_string(),
+                })?;
 
         let (out_value, out_type) = if schemaless_sink {
             let dt = resolved
@@ -134,7 +143,7 @@ pub fn compile_switch(
             (resolved, dt)
         } else {
             let value =
-                expression::ensure_sink_compatible(resolved, sink_dt).map_err(|reason| {
+                air_elt_types::ensure_sink_compatible(resolved, sink_dt).map_err(|reason| {
                     ValidationError::SwitchValueTypeMismatch {
                         flow: flow.into(),
                         column: column.into(),
@@ -150,16 +159,27 @@ pub fn compile_switch(
     }
 
     let default = if let Some(lit) = default_literal {
-        let expr_val = ExprValue::from_toml(lit.clone());
-        let resolved = expr_val
-            .eval(&expr_context.registry, &expr_context.eval_context)
-            .map_err(|e| ValidationError::SwitchValueTypeMismatch {
-                flow: flow.into(),
-                column: column.into(),
-                key: "<default>".into(),
-                sink_type: sink_dt.clone(),
-                detail: e.to_string(),
-            })?;
+        let parser = air_elt_expr_parse::Parser::create();
+        let program =
+            parser
+                .parse_toml(lit)
+                .map_err(|e| ValidationError::SwitchValueTypeMismatch {
+                    flow: flow.into(),
+                    column: column.into(),
+                    key: "<default>".into(),
+                    sink_type: sink_dt.clone(),
+                    detail: e.to_string(),
+                })?;
+        let resolved =
+            evaluator
+                .evaluate(&program)
+                .map_err(|e| ValidationError::SwitchValueTypeMismatch {
+                    flow: flow.into(),
+                    column: column.into(),
+                    key: "<default>".into(),
+                    sink_type: sink_dt.clone(),
+                    detail: e.to_string(),
+                })?;
         if schemaless_sink {
             let dt = resolved
                 .data_type()
@@ -168,7 +188,7 @@ pub fn compile_switch(
             Some(resolved)
         } else {
             let value =
-                expression::ensure_sink_compatible(resolved, sink_dt).map_err(|reason| {
+                air_elt_types::ensure_sink_compatible(resolved, sink_dt).map_err(|reason| {
                     ValidationError::SwitchValueTypeMismatch {
                         flow: flow.into(),
                         column: column.into(),
@@ -330,7 +350,7 @@ mod tests {
     use super::*;
 
     fn test_expr_context() -> ExpressionContext {
-        ExpressionContext::new(
+        ExpressionContext::create(
             Arc::new(air_elt_expr_funcs::FunctionRegistry::with_builtins()),
             std::path::Path::new("/tmp"),
         )
@@ -547,8 +567,8 @@ mod tests {
             &test_expr_context(),
         )
         .unwrap();
-        // ExprValue.eval() on TOML integers always produces Int64 —
-        // both values collapse to Int64 without narrowing.
+        // Evaluating TOML integers always produces Int64 — both values
+        // collapse to Int64 without narrowing.
         assert_eq!(res.output_type, DataType::Int64);
         let k1 = Key::from_value(&Value::Int32(1)).unwrap();
         let k2 = Key::from_value(&Value::Int32(2)).unwrap();
@@ -775,8 +795,8 @@ mod tests {
             &test_expr_context(),
         )
         .unwrap();
-        // ExprValue.eval() on TOML integers produces Int64, so the
-        // union members are Int64 + Text.
+        // Evaluating TOML integers produces Int64, so the union
+        // members are Int64 + Text.
         match &res.output_type {
             DataType::Union(members) => {
                 assert!(members.contains(&DataType::Int64), "Int64 must be in union");
@@ -1168,7 +1188,7 @@ mod tests {
     /// uses passthrough conversion, so a `Text` value ("hex:deadbeef")
     /// that does not match the sized `Bytes` sink is rejected regardless
     /// of the `truncate` flag. The `hex:` prefix is no longer parsed at
-    /// the switch RHS level — `ExprValue.eval()` returns plain text.
+    /// the switch RHS level — `evaluate_expr_value` returns plain text.
     #[test]
     fn compile_switch_typed_bytes_truncate_shortens_rhs() {
         let cases = vec![SwitchCase {
