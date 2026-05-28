@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::hash::Hash;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use ahash::AHashMap;
 
@@ -15,9 +15,20 @@ struct Inner<K, V> {
 /// A bounded thread-safe cache with FIFO eviction. `cap == 0` disables
 /// caching entirely (every lookup recomputes). Values are cloned out on
 /// hit, so callers should store cheap-to-clone values (e.g. `Arc<T>`).
+///
+/// The shared state lives behind an `Arc`, so the cache is a cheap-to-clone
+/// handle: every clone refers to the same underlying store (the idiomatic
+/// shared-cache shape — no need to wrap it in an `Arc` at the call site).
+///
+/// FIFO is deliberate (not LRU): a hit takes only a shared read lock, so
+/// concurrent reads of hot entries never contend. LRU would need a write
+/// lock on every read to bump recency, serialising the read path. For the
+/// expected workload — compiled regex / JSON-path that are almost always
+/// constant (folded at compile time), with dynamic source/sink patterns
+/// being rare — simple overflow protection is plenty.
 pub struct FifoCache<K, V> {
     cap: usize,
-    inner: RwLock<Inner<K, V>>,
+    inner: Arc<RwLock<Inner<K, V>>>,
 }
 
 impl<K, V> FifoCache<K, V> {
@@ -30,7 +41,18 @@ impl<K, V> FifoCache<K, V> {
         };
         Self {
             cap,
-            inner: RwLock::new(inner),
+            inner: Arc::new(RwLock::new(inner)),
+        }
+    }
+}
+
+// Hand-written so cloning the handle never requires `K: Clone` / `V: Clone`
+// (a `#[derive(Clone)]` would impose those bounds). Clones share one store.
+impl<K, V> Clone for FifoCache<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            cap: self.cap,
+            inner: Arc::clone(&self.inner),
         }
     }
 }
@@ -90,7 +112,6 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use std::convert::Infallible;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
@@ -223,16 +244,31 @@ mod tests {
     }
 
     #[test]
+    fn clone_shares_the_same_store() {
+        let cache: FifoCache<&str, i32> = FifoCache::new(4);
+        let clone = cache.clone();
+
+        // Insert through one handle.
+        cache.get_or_try_insert_with("k", build_ok(7)).unwrap();
+
+        // The clone observes it (shared store): the build returning 999 must
+        // not run.
+        let via_clone = clone.get_or_try_insert_with("k", build_ok(999)).unwrap();
+        assert_eq!(via_clone, 7, "clone must share the underlying cache");
+    }
+
+    #[test]
     fn concurrent_access_is_consistent_and_panic_free() {
         const THREADS: usize = 8;
         const KEYS: i32 = 16;
         const ITERATIONS: usize = 500;
 
-        let cache: Arc<FifoCache<i32, i32>> = Arc::new(FifoCache::new(KEYS as usize));
+        // The cache clones into each thread directly — no outer `Arc` needed.
+        let cache: FifoCache<i32, i32> = FifoCache::new(KEYS as usize);
 
         let mut handles = Vec::new();
         for _ in 0..THREADS {
-            let cache = Arc::clone(&cache);
+            let cache = cache.clone();
             let handle = thread::spawn(move || {
                 for iteration in 0..ITERATIONS {
                     let key = (iteration as i32) % KEYS;
