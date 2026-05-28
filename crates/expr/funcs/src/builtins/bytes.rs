@@ -73,6 +73,10 @@ fn extract_int64(val: Value, func_name: &str) -> Result<i64, FuncError> {
 struct ByteLengthFunc;
 
 impl ExprFunction for ByteLengthFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "byteLength"
     }
@@ -105,6 +109,10 @@ impl ExprFunction for ByteLengthFunc {
 struct ByteAtFunc;
 
 impl ExprFunction for ByteAtFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "byteAt"
     }
@@ -146,6 +154,10 @@ impl ExprFunction for ByteAtFunc {
 struct ByteSliceFunc;
 
 impl ExprFunction for ByteSliceFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "byteSlice"
     }
@@ -217,6 +229,10 @@ impl ExprFunction for ByteSliceFunc {
 struct BytesFromHexFunc;
 
 impl ExprFunction for BytesFromHexFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bytesFromHex"
     }
@@ -255,6 +271,10 @@ impl ExprFunction for BytesFromHexFunc {
 struct BytesFromBase64Func;
 
 impl ExprFunction for BytesFromBase64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bytesFromBase64"
     }
@@ -295,6 +315,10 @@ impl ExprFunction for BytesFromBase64Func {
 struct BytesFromUtf8Func;
 
 impl ExprFunction for BytesFromUtf8Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bytesFromUtf8"
     }
@@ -330,6 +354,10 @@ impl ExprFunction for BytesFromUtf8Func {
 struct HexFunc;
 
 impl ExprFunction for HexFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "hex"
     }
@@ -365,6 +393,10 @@ impl ExprFunction for HexFunc {
 struct Base64Func;
 
 impl ExprFunction for Base64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "base64"
     }
@@ -400,6 +432,10 @@ impl ExprFunction for Base64Func {
 struct Base64UrlFunc;
 
 impl ExprFunction for Base64UrlFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "base64Url"
     }
@@ -435,6 +471,10 @@ impl ExprFunction for Base64UrlFunc {
 struct BytesEqualFunc;
 
 impl ExprFunction for BytesEqualFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bytesEqual"
     }
@@ -491,6 +531,10 @@ fn validate_text_arg(function: &str, dt: &DataType) -> Result<(), FuncError> {
 struct UrlEncodeFunc;
 
 impl ExprFunction for UrlEncodeFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "urlEncode"
     }
@@ -524,6 +568,10 @@ impl ExprFunction for UrlEncodeFunc {
 struct UrlDecodeFunc;
 
 impl ExprFunction for UrlDecodeFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "urlDecode"
     }

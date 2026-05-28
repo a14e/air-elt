@@ -1,6 +1,9 @@
-use rand::RngExt;
+use core::convert::Infallible;
+
 use rand::distr::{Alphanumeric, SampleString};
-use uuid::Uuid;
+use rand::rngs::{StdRng, ThreadRng};
+use rand::{Rng, RngExt, SeedableRng, TryRng};
+use uuid::Builder;
 
 use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::{DataType, Value};
@@ -33,6 +36,108 @@ pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&RANDOM_CHOICE);
 }
 
+/// Random source for the `random*` builtins. A constant `seed` argument
+/// makes the source deterministic — which is what lets the optimizer
+/// const-fold a seeded call (see each function's `purity`). Without a seed
+/// the per-row thread RNG is used and the call stays impure.
+enum Prng {
+    Thread(ThreadRng),
+    // Boxed because `StdRng` is ~320 bytes — keeping it inline makes every
+    // `Prng` that large even for the common thread-RNG variant.
+    Seeded(Box<StdRng>),
+}
+
+impl Prng {
+    /// `Some(seed)` → deterministic `StdRng`; `None` → thread RNG.
+    fn new(seed: Option<i64>) -> Self {
+        match seed {
+            Some(s) => Prng::Seeded(Box::new(StdRng::seed_from_u64(s as u64))),
+            None => Prng::Thread(rand::rng()),
+        }
+    }
+}
+
+// Delegate the fallible core trait to the inner source. `Rng` (infallible)
+// is then provided by the blanket `impl Rng for R: TryRng<Error=Infallible>`,
+// and `RngExt` (random_range/fill/…) by `impl RngExt for R: Rng` — so the
+// existing call sites work unchanged on both variants.
+impl TryRng for Prng {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(match self {
+            Prng::Thread(r) => r.next_u32(),
+            Prng::Seeded(r) => r.next_u32(),
+        })
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(match self {
+            Prng::Thread(r) => r.next_u64(),
+            Prng::Seeded(r) => r.next_u64(),
+        })
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        match self {
+            Prng::Thread(r) => r.fill_bytes(dst),
+            Prng::Seeded(r) => r.fill_bytes(dst),
+        }
+        Ok(())
+    }
+}
+
+/// Outcome of inspecting the optional trailing `seed` argument.
+enum SeedArg {
+    /// No seed slot present — use the thread RNG (impure).
+    None,
+    /// Constant/explicit `Int64` seed — deterministic RNG.
+    Seed(i64),
+    /// Seed was `Null` — the whole call short-circuits to `Null`, so a
+    /// const-folded null-seeded call is deterministic (always `Null`).
+    Null,
+}
+
+/// Pop an optional trailing `seed` argument when `args.len()` exceeds the
+/// function's base arity.
+fn take_seed(
+    function: &str,
+    args: &mut Vec<Value>,
+    base_arity: usize,
+) -> Result<SeedArg, FuncError> {
+    if args.len() <= base_arity {
+        return Ok(SeedArg::None);
+    }
+    match args.remove(base_arity) {
+        Value::Int64(s) => Ok(SeedArg::Seed(s)),
+        Value::Null => Ok(SeedArg::Null),
+        other => Err(FuncError::TypeMismatch {
+            function: function.to_owned(),
+            expected: "Int64 seed".to_owned(),
+            actual: format!("{:?}", other.data_type()),
+        }),
+    }
+}
+
+impl SeedArg {
+    /// `Some(rng)` to proceed, or `None` when the seed was `Null` and the
+    /// call must return `Null`.
+    fn rng(self) -> Option<Prng> {
+        match self {
+            SeedArg::None => Some(Prng::new(None)),
+            SeedArg::Seed(s) => Some(Prng::new(Some(s))),
+            SeedArg::Null => None,
+        }
+    }
+}
+
+/// Purity for a `random*` function: pure iff a `seed` argument is present
+/// (so the call is deterministic) and that seed is itself constant.
+/// `base_arity` is the argument count without the seed.
+fn seeded_purity(const_args: &[bool], base_arity: usize) -> bool {
+    const_args.len() == base_arity + 1 && const_args[base_arity]
+}
+
 // ---------------------------------------------------------------------------
 // randomUuid
 // ---------------------------------------------------------------------------
@@ -49,16 +154,24 @@ impl ExprFunction for RandomUuidFunc {
     }
 
     fn max_args(&self) -> Option<usize> {
-        Some(0)
+        Some(1)
+    }
+
+    fn purity(&self, const_args: &[bool]) -> bool {
+        seeded_purity(const_args, 0)
     }
 
     fn resolve_type(&self, _args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
         Ok(NullableExprType::non_null(DataType::Uuid))
     }
 
-    fn evaluate(&self, _args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let id = Uuid::new_v4();
-        Ok(Value::Uuid(id))
+    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let Some(mut rng) = take_seed("randomUuid", &mut args, 0)?.rng() else {
+            return Ok(Value::Null);
+        };
+        let mut bytes = [0u8; 16];
+        rng.fill_bytes(&mut bytes);
+        Ok(Value::Uuid(Builder::from_random_bytes(bytes).into_uuid()))
     }
 }
 
@@ -78,7 +191,11 @@ impl ExprFunction for RandomIntFunc {
     }
 
     fn max_args(&self) -> Option<usize> {
-        Some(2)
+        Some(3)
+    }
+
+    fn purity(&self, const_args: &[bool]) -> bool {
+        seeded_purity(const_args, 2)
     }
 
     fn resolve_type(&self, _args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
@@ -86,6 +203,7 @@ impl ExprFunction for RandomIntFunc {
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let seed = take_seed("randomInt", &mut args, 2)?;
         let max_val = args.remove(1);
         let min_val = args.remove(0);
 
@@ -99,7 +217,9 @@ impl ExprFunction for RandomIntFunc {
             });
         }
 
-        let mut rng = rand::rng();
+        let Some(mut rng) = seed.rng() else {
+            return Ok(Value::Null);
+        };
         let val = rng.random_range(min..=max);
         Ok(Value::Int64(val))
     }
@@ -121,7 +241,11 @@ impl ExprFunction for RandomFloatFunc {
     }
 
     fn max_args(&self) -> Option<usize> {
-        Some(2)
+        Some(3)
+    }
+
+    fn purity(&self, const_args: &[bool]) -> bool {
+        seeded_purity(const_args, 2)
     }
 
     fn resolve_type(&self, _args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
@@ -129,6 +253,7 @@ impl ExprFunction for RandomFloatFunc {
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let seed = take_seed("randomFloat", &mut args, 2)?;
         let max_val = args.remove(1);
         let min_val = args.remove(0);
 
@@ -142,7 +267,9 @@ impl ExprFunction for RandomFloatFunc {
             });
         }
 
-        let mut rng = rand::rng();
+        let Some(mut rng) = seed.rng() else {
+            return Ok(Value::Null);
+        };
         let val: f64 = rng.random_range(min..max);
         Ok(Value::Float64(val))
     }
@@ -164,7 +291,11 @@ impl ExprFunction for RandomAlphanumericFunc {
     }
 
     fn max_args(&self) -> Option<usize> {
-        Some(1)
+        Some(2)
+    }
+
+    fn purity(&self, const_args: &[bool]) -> bool {
+        seeded_purity(const_args, 1)
     }
 
     fn resolve_type(&self, _args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
@@ -172,10 +303,13 @@ impl ExprFunction for RandomAlphanumericFunc {
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let seed = take_seed("randomAlphanumeric", &mut args, 1)?;
         let length_val = args.remove(0);
         let length = extract_length("randomAlphanumeric", &length_val, MAX_STRING_LENGTH)?;
 
-        let mut rng = rand::rng();
+        let Some(mut rng) = seed.rng() else {
+            return Ok(Value::Null);
+        };
         let s = Alphanumeric.sample_string(&mut rng, length as usize);
         Ok(Value::Text(s))
     }
@@ -197,7 +331,11 @@ impl ExprFunction for RandomHexFunc {
     }
 
     fn max_args(&self) -> Option<usize> {
-        Some(1)
+        Some(2)
+    }
+
+    fn purity(&self, const_args: &[bool]) -> bool {
+        seeded_purity(const_args, 1)
     }
 
     fn resolve_type(&self, _args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
@@ -205,10 +343,13 @@ impl ExprFunction for RandomHexFunc {
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let seed = take_seed("randomHex", &mut args, 1)?;
         let length_val = args.remove(0);
         let length = extract_length("randomHex", &length_val, MAX_STRING_LENGTH)?;
 
-        let mut rng = rand::rng();
+        let Some(mut rng) = seed.rng() else {
+            return Ok(Value::Null);
+        };
         let s: String = (0..length)
             .map(|_| {
                 let nibble: u8 = rng.random_range(0..16);
@@ -239,7 +380,11 @@ impl ExprFunction for RandomBytesFunc {
     }
 
     fn max_args(&self) -> Option<usize> {
-        Some(1)
+        Some(2)
+    }
+
+    fn purity(&self, const_args: &[bool]) -> bool {
+        seeded_purity(const_args, 1)
     }
 
     fn resolve_type(&self, _args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
@@ -247,10 +392,13 @@ impl ExprFunction for RandomBytesFunc {
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        let seed = take_seed("randomBytes", &mut args, 1)?;
         let length_val = args.remove(0);
         let length = extract_length("randomBytes", &length_val, MAX_BYTES_LENGTH)?;
 
-        let mut rng = rand::rng();
+        let Some(mut rng) = seed.rng() else {
+            return Ok(Value::Null);
+        };
         let mut bytes = vec![0u8; length as usize];
         rng.fill(&mut bytes[..]);
         Ok(Value::Bytes(bytes))
@@ -516,5 +664,91 @@ mod tests {
         let f = RandomChoiceFunc;
         let result = f.evaluate(vec![Value::Int64(42)], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(42));
+    }
+
+    #[test]
+    fn random_int_seeded_is_deterministic() {
+        let f = RandomIntFunc;
+        let args = || vec![Value::Int64(0), Value::Int64(1_000_000), Value::Int64(42)];
+        let a = f.evaluate(args(), &ctx()).unwrap();
+        let b = f.evaluate(args(), &ctx()).unwrap();
+        assert_eq!(a, b, "same seed must yield the same value");
+        match a {
+            Value::Int64(n) => assert!((0..=1_000_000).contains(&n)),
+            other => panic!("expected Int64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn random_int_different_seed_differs() {
+        let f = RandomIntFunc;
+        let a = f
+            .evaluate(
+                vec![Value::Int64(0), Value::Int64(i64::MAX), Value::Int64(1)],
+                &ctx(),
+            )
+            .unwrap();
+        let b = f
+            .evaluate(
+                vec![Value::Int64(0), Value::Int64(i64::MAX), Value::Int64(2)],
+                &ctx(),
+            )
+            .unwrap();
+        assert_ne!(
+            a, b,
+            "distinct seeds should produce distinct values over a wide range"
+        );
+    }
+
+    #[test]
+    fn random_uuid_seeded_is_deterministic() {
+        let f = RandomUuidFunc;
+        let a = f.evaluate(vec![Value::Int64(7)], &ctx()).unwrap();
+        let b = f.evaluate(vec![Value::Int64(7)], &ctx()).unwrap();
+        assert_eq!(a, b);
+        match a {
+            Value::Uuid(id) => assert_eq!(id.get_version_num(), 4),
+            other => panic!("expected Uuid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn random_null_seed_returns_null() {
+        let int_f = RandomIntFunc;
+        let r = int_f
+            .evaluate(vec![Value::Int64(0), Value::Int64(10), Value::Null], &ctx())
+            .unwrap();
+        assert_eq!(r, Value::Null);
+
+        let uuid_f = RandomUuidFunc;
+        assert_eq!(
+            uuid_f.evaluate(vec![Value::Null], &ctx()).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn random_non_int_seed_errors() {
+        let f = RandomIntFunc;
+        let r = f.evaluate(
+            vec![Value::Int64(0), Value::Int64(10), Value::Text("x".into())],
+            &ctx(),
+        );
+        assert!(matches!(r, Err(FuncError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn random_purity_requires_constant_seed() {
+        // No seed arg → impure (cannot be const-folded).
+        assert!(!RandomIntFunc.purity(&[true, true]));
+        // Seed present and constant → pure.
+        assert!(RandomIntFunc.purity(&[true, true, true]));
+        // Seed present but non-constant → impure.
+        assert!(!RandomIntFunc.purity(&[true, true, false]));
+        // randomUuid: base arity 0.
+        assert!(!RandomUuidFunc.purity(&[]));
+        assert!(RandomUuidFunc.purity(&[true]));
+        // Bare is_pure (no arg info) stays false for random.
+        assert!(!RandomIntFunc.is_pure());
     }
 }

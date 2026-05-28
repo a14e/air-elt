@@ -47,6 +47,10 @@ fn extract_text(val: Value, func_name: &str) -> Result<String, FuncError> {
 struct EncodeFunc;
 
 impl ExprFunction for EncodeFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "encode"
     }
@@ -97,6 +101,10 @@ impl ExprFunction for EncodeFunc {
 struct DecodeFunc;
 
 impl ExprFunction for DecodeFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "decode"
     }
@@ -158,6 +166,10 @@ impl ExprFunction for DecodeFunc {
 struct EncodeTextFunc;
 
 impl ExprFunction for EncodeTextFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "encodeText"
     }
@@ -211,6 +223,10 @@ impl ExprFunction for EncodeTextFunc {
 struct DecodeTextFunc;
 
 impl ExprFunction for DecodeTextFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "decodeText"
     }

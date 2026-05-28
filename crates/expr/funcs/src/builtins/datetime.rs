@@ -144,6 +144,11 @@ fn timestamp_input_type(args: &[NullableExprType], func: &str) -> Result<(), Fun
 struct NowFunc;
 
 impl ExprFunction for NowFunc {
+    /// Impure: depends on the runtime clock — never const-foldable.
+    fn is_pure(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &str {
         "now"
     }
@@ -168,6 +173,11 @@ impl ExprFunction for NowFunc {
 struct TodayFunc;
 
 impl ExprFunction for TodayFunc {
+    /// Impure: depends on the runtime clock — never const-foldable.
+    fn is_pure(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &str {
         "today"
     }
@@ -198,6 +208,10 @@ macro_rules! extract_component_func {
         struct $struct_name;
 
         impl ExprFunction for $struct_name {
+            fn is_pure(&self) -> bool {
+                true
+            }
+
             fn name(&self) -> &str {
                 $func_name
             }
@@ -258,6 +272,10 @@ extract_component_func!(DayOfYearFunc, "dayOfYear", |dt: DateTime<Utc>| {
 struct ToSecondsFunc;
 
 impl ExprFunction for ToSecondsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toSeconds"
     }
@@ -288,6 +306,10 @@ impl ExprFunction for ToSecondsFunc {
 struct ToMillisFunc;
 
 impl ExprFunction for ToMillisFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toMillis"
     }
@@ -322,6 +344,10 @@ impl ExprFunction for ToMillisFunc {
 struct FromSecondsFunc;
 
 impl ExprFunction for FromSecondsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "fromSeconds"
     }
@@ -355,6 +381,10 @@ impl ExprFunction for FromSecondsFunc {
 struct FromMillisFunc;
 
 impl ExprFunction for FromMillisFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "fromMillis"
     }
@@ -394,6 +424,10 @@ macro_rules! duration_arithmetic_func {
         struct $struct_name;
 
         impl ExprFunction for $struct_name {
+            fn is_pure(&self) -> bool {
+                true
+            }
+
             fn name(&self) -> &str {
                 $func_name
             }
@@ -449,6 +483,10 @@ macro_rules! duration_subtract_func {
         struct $struct_name;
 
         impl ExprFunction for $struct_name {
+            fn is_pure(&self) -> bool {
+                true
+            }
+
             fn name(&self) -> &str {
                 $func_name
             }
@@ -529,6 +567,10 @@ duration_subtract_func!(SubtractMillisecondsFunc, "subtractMilliseconds", |n| {
 struct AddMonthsFunc;
 
 impl ExprFunction for AddMonthsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "addMonths"
     }
@@ -562,6 +604,10 @@ impl ExprFunction for AddMonthsFunc {
 struct SubtractMonthsFunc;
 
 impl ExprFunction for SubtractMonthsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "subtractMonths"
     }
@@ -595,6 +641,10 @@ impl ExprFunction for SubtractMonthsFunc {
 struct AddYearsFunc;
 
 impl ExprFunction for AddYearsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "addYears"
     }
@@ -632,6 +682,10 @@ impl ExprFunction for AddYearsFunc {
 struct SubtractYearsFunc;
 
 impl ExprFunction for SubtractYearsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "subtractYears"
     }
@@ -729,6 +783,10 @@ fn subtract_months_from_dt(dt: DateTime<Utc>, n: i64, func: &str) -> Result<Valu
 struct DateDiffFunc;
 
 impl ExprFunction for DateDiffFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "dateDiff"
     }
@@ -782,6 +840,10 @@ impl ExprFunction for DateDiffFunc {
 struct FormatDateTimeFunc;
 
 impl ExprFunction for FormatDateTimeFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "formatDateTime"
     }
@@ -839,6 +901,7 @@ mod tests {
             file_resolver: Arc::new(crate::test_support::NoopFiles),
             now: Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 45).unwrap(),
             base_dir: PathBuf::new(),
+            is_compile_time: false,
         }
     }
 

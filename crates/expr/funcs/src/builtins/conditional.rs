@@ -16,6 +16,10 @@ pub fn register(registry: &mut FunctionRegistry) {
 struct IsNullFunc;
 
 impl ExprFunction for IsNullFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "isNull"
     }
@@ -41,6 +45,10 @@ impl ExprFunction for IsNullFunc {
 struct IsNotNullFunc;
 
 impl ExprFunction for IsNotNullFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "isNotNull"
     }

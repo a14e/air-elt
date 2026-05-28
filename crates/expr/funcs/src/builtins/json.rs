@@ -67,6 +67,10 @@ fn value_to_serde_json(val: &Value) -> Result<serde_json::Value, FuncError> {
 struct ParseJsonFunc;
 
 impl ExprFunction for ParseJsonFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "parseJson"
     }
@@ -110,6 +114,10 @@ impl ExprFunction for ParseJsonFunc {
 struct ToJsonFunc;
 
 impl ExprFunction for ToJsonFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toJson"
     }
@@ -144,6 +152,10 @@ impl ExprFunction for ToJsonFunc {
 struct JsPathFunc;
 
 impl ExprFunction for JsPathFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "jsPath"
     }
@@ -190,6 +202,10 @@ impl ExprFunction for JsPathFunc {
 struct JsPathStringFunc;
 
 impl ExprFunction for JsPathStringFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "jsPathString"
     }
@@ -236,6 +252,10 @@ impl ExprFunction for JsPathStringFunc {
 struct JsPathIntFunc;
 
 impl ExprFunction for JsPathIntFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "jsPathInt"
     }
@@ -285,6 +305,10 @@ impl ExprFunction for JsPathIntFunc {
 struct JsPathFloatFunc;
 
 impl ExprFunction for JsPathFloatFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "jsPathFloat"
     }
@@ -334,6 +358,10 @@ impl ExprFunction for JsPathFloatFunc {
 struct JsPathBoolFunc;
 
 impl ExprFunction for JsPathBoolFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "jsPathBool"
     }
@@ -380,6 +408,10 @@ impl ExprFunction for JsPathBoolFunc {
 struct JsonLengthFunc;
 
 impl ExprFunction for JsonLengthFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "jsonLength"
     }

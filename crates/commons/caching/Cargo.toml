@@ -1,0 +1,19 @@
+[package]
+name = "air-elt-commons-caching"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Foundation-level crate — it MUST NOT depend on any other air-elt-*
+# crate. See `project-conventions` skill, "Commons isolation".
+ahash = { workspace = true }
+
+[lints]
+workspace = true

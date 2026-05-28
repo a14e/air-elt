@@ -198,6 +198,7 @@ mod tests {
             file_resolver: Arc::new(NoopFiles),
             now: Utc::now(),
             base_dir: PathBuf::from("."),
+            is_compile_time: false,
         }
     }
 

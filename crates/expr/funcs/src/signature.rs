@@ -24,6 +24,26 @@ pub trait ExprFunction: Send + Sync {
     /// Evaluate the function with concrete values.
     /// Arguments are passed by ownership for zero-copy absorb-when-last optimization.
     fn evaluate(&self, args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError>;
+
+    /// Whether this function may be evaluated at compile time (const
+    /// folding / compile-time context). Default is **`false`** (fail-closed):
+    /// a function must explicitly opt into purity. An unmarked function is
+    /// merely not const-folded (a missed optimization, never a correctness
+    /// bug); impure functions (`now`, `today`, unseeded `random*`) correctly
+    /// stay impure by default.
+    fn is_pure(&self) -> bool {
+        false
+    }
+
+    /// Purity refined by which arguments are constant. `const_args[i]` is
+    /// `true` when argument `i` folds to a constant. The default ignores
+    /// argument constness and defers to [`Self::is_pure`]; functions whose
+    /// purity depends on an argument (e.g. `random(min, max, seed)` is pure
+    /// only when `seed` is constant) override this.
+    fn purity(&self, const_args: &[bool]) -> bool {
+        let _ = const_args;
+        self.is_pure()
+    }
 }
 
 /// Context available to functions during evaluation.
@@ -34,6 +54,10 @@ pub struct EvalContext {
     pub file_resolver: Arc<dyn FileResolver>,
     pub now: chrono::DateTime<chrono::Utc>,
     pub base_dir: std::path::PathBuf,
+    /// `true` when evaluating in a compile-time context (config patching,
+    /// const folding). Impure functions (`is_pure() == false`) are
+    /// rejected in this mode.
+    pub is_compile_time: bool,
 }
 
 /// Resolves environment variables.

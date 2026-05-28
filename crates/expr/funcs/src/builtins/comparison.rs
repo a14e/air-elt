@@ -40,6 +40,10 @@ fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering, FuncError>
 struct EqualsFunc;
 
 impl ExprFunction for EqualsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "equals"
     }
@@ -71,6 +75,10 @@ impl ExprFunction for EqualsFunc {
 struct NotEqualsFunc;
 
 impl ExprFunction for NotEqualsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "notEquals"
     }
@@ -102,6 +110,10 @@ impl ExprFunction for NotEqualsFunc {
 struct GreaterFunc;
 
 impl ExprFunction for GreaterFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "greater"
     }
@@ -134,6 +146,10 @@ impl ExprFunction for GreaterFunc {
 struct LessFunc;
 
 impl ExprFunction for LessFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "less"
     }
@@ -166,6 +182,10 @@ impl ExprFunction for LessFunc {
 struct GreaterOrEqualsFunc;
 
 impl ExprFunction for GreaterOrEqualsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "greaterOrEquals"
     }
@@ -198,6 +218,10 @@ impl ExprFunction for GreaterOrEqualsFunc {
 struct LessOrEqualsFunc;
 
 impl ExprFunction for LessOrEqualsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "lessOrEquals"
     }

@@ -17,5 +17,6 @@ pub fn register_builtins(registry: &mut FunctionRegistry) {
     super::misc::register(registry);
     super::object::register(registry);
     super::random::register(registry);
+    super::regex::register(registry);
     super::string::register(registry);
 }

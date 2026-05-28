@@ -20,6 +20,10 @@ pub fn register(registry: &mut FunctionRegistry) {
 struct EnvOneArgFunc;
 
 impl ExprFunction for EnvOneArgFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "env"
     }
@@ -63,6 +67,10 @@ impl ExprFunction for EnvOneArgFunc {
 struct EnvTwoArgFunc;
 
 impl ExprFunction for EnvTwoArgFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "env"
     }
@@ -108,6 +116,10 @@ impl ExprFunction for EnvTwoArgFunc {
 struct FileFunc;
 
 impl ExprFunction for FileFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "file"
     }
@@ -171,6 +183,7 @@ mod tests {
             file_resolver: Arc::new(crate::test_support::NoopFiles),
             now: chrono::Utc::now(),
             base_dir: PathBuf::new(),
+            is_compile_time: false,
         }
     }
 

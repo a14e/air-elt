@@ -75,6 +75,10 @@ fn convert_error_to_func_error(function: &str, error: ConvertError) -> FuncError
 struct CastToStringFunc;
 
 impl ExprFunction for CastToStringFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toStringCast"
     }
@@ -133,6 +137,10 @@ impl ExprFunction for CastToStringFunc {
 struct CastToInt8Func;
 
 impl ExprFunction for CastToInt8Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toInt8"
     }
@@ -170,6 +178,10 @@ impl ExprFunction for CastToInt8Func {
 struct CastToInt16Func;
 
 impl ExprFunction for CastToInt16Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toInt16"
     }
@@ -207,6 +219,10 @@ impl ExprFunction for CastToInt16Func {
 struct CastToInt32Func;
 
 impl ExprFunction for CastToInt32Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toInt32"
     }
@@ -244,6 +260,10 @@ impl ExprFunction for CastToInt32Func {
 struct CastToInt64Func;
 
 impl ExprFunction for CastToInt64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toInt64"
     }
@@ -277,6 +297,10 @@ impl ExprFunction for CastToInt64Func {
 struct CastToUInt8Func;
 
 impl ExprFunction for CastToUInt8Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toUInt8"
     }
@@ -320,6 +344,10 @@ impl ExprFunction for CastToUInt8Func {
 struct CastToUInt16Func;
 
 impl ExprFunction for CastToUInt16Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toUInt16"
     }
@@ -363,6 +391,10 @@ impl ExprFunction for CastToUInt16Func {
 struct CastToUInt32Func;
 
 impl ExprFunction for CastToUInt32Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toUInt32"
     }
@@ -406,6 +438,10 @@ impl ExprFunction for CastToUInt32Func {
 struct CastToUInt64Func;
 
 impl ExprFunction for CastToUInt64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toUInt64"
     }
@@ -487,6 +523,10 @@ impl ExprFunction for CastToUInt64Func {
 struct CastToFloat32Func;
 
 impl ExprFunction for CastToFloat32Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toFloat32"
     }
@@ -544,6 +584,10 @@ impl ExprFunction for CastToFloat32Func {
 struct CastToFloat64Func;
 
 impl ExprFunction for CastToFloat64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toFloat64"
     }
@@ -591,6 +635,10 @@ impl ExprFunction for CastToFloat64Func {
 struct CastToBoolFunc;
 
 impl ExprFunction for CastToBoolFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toBool"
     }
@@ -639,6 +687,10 @@ impl ExprFunction for CastToBoolFunc {
 struct CastToDateFunc;
 
 impl ExprFunction for CastToDateFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toDate"
     }
@@ -697,6 +749,10 @@ impl ExprFunction for CastToDateFunc {
 struct CastToTimestampFunc;
 
 impl ExprFunction for CastToTimestampFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toTimestamp"
     }
@@ -765,6 +821,10 @@ impl ExprFunction for CastToTimestampFunc {
 struct CastToUuidFunc;
 
 impl ExprFunction for CastToUuidFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toUuid"
     }
@@ -807,6 +867,10 @@ impl ExprFunction for CastToUuidFunc {
 struct CastToBigIntFunc;
 
 impl ExprFunction for CastToBigIntFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toBigInt"
     }
@@ -865,6 +929,10 @@ impl ExprFunction for CastToBigIntFunc {
 struct CastToDecimalFunc;
 
 impl ExprFunction for CastToDecimalFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toDecimal"
     }

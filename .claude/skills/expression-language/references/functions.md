@@ -37,6 +37,15 @@ All functions propagate null (return `Value::Null` if any argument is null) unle
 | `leftPad` | `(Text, Int64, Text?) -> Text` | Pad left to target length |
 | `rightPad` | `(Text, Int64, Text?) -> Text` | Pad right to target length |
 
+## Regex
+
+Patterns use the `regex` crate syntax. The pattern compiles on every call (no per-flow cache yet) and an invalid pattern raises `RegexCompileFailed`. Both functions are pure and null-propagate on any null argument.
+
+| Function | Signature | Description |
+|---|---|---|
+| `regexMatch` | `(Text, Text) -> Bool` | True if `text` contains a match for `pattern` |
+| `regexReplace` | `(Text, Text, Text) -> Text` | Replace all matches of `pattern` in `text` with `replacement` |
+
 ## Arithmetic
 
 | Function | Signature | Description |

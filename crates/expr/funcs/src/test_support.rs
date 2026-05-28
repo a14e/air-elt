@@ -29,5 +29,6 @@ pub fn ctx() -> EvalContext {
         file_resolver: Arc::new(NoopFiles),
         now: chrono::Utc::now(),
         base_dir: PathBuf::new(),
+        is_compile_time: false,
     }
 }

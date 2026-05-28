@@ -55,6 +55,10 @@ fn extract_text(val: Value, func_name: &str) -> Result<String, FuncError> {
 struct ObjectLengthFunc;
 
 impl ExprFunction for ObjectLengthFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "objectLength"
     }
@@ -84,6 +88,10 @@ impl ExprFunction for ObjectLengthFunc {
 struct ObjectKeysFunc;
 
 impl ExprFunction for ObjectKeysFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "objectKeys"
     }
@@ -122,6 +130,10 @@ impl ExprFunction for ObjectKeysFunc {
 struct ObjectValuesFunc;
 
 impl ExprFunction for ObjectValuesFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "objectValues"
     }
@@ -161,6 +173,10 @@ impl ExprFunction for ObjectValuesFunc {
 struct ObjectHasKeyFunc;
 
 impl ExprFunction for ObjectHasKeyFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "objectHasKey"
     }
@@ -194,6 +210,10 @@ impl ExprFunction for ObjectHasKeyFunc {
 struct ObjectGetFunc;
 
 impl ExprFunction for ObjectGetFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "objectGet"
     }

@@ -90,6 +90,10 @@ fn to_f64(val: &Value, func_name: &str) -> Result<f64, FuncError> {
 struct SinFunc;
 
 impl ExprFunction for SinFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "sin"
     }
@@ -119,6 +123,10 @@ impl ExprFunction for SinFunc {
 struct CosFunc;
 
 impl ExprFunction for CosFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cos"
     }
@@ -148,6 +156,10 @@ impl ExprFunction for CosFunc {
 struct TanFunc;
 
 impl ExprFunction for TanFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "tan"
     }
@@ -177,6 +189,10 @@ impl ExprFunction for TanFunc {
 struct AsinFunc;
 
 impl ExprFunction for AsinFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "asin"
     }
@@ -206,6 +222,10 @@ impl ExprFunction for AsinFunc {
 struct AcosFunc;
 
 impl ExprFunction for AcosFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "acos"
     }
@@ -235,6 +255,10 @@ impl ExprFunction for AcosFunc {
 struct AtanFunc;
 
 impl ExprFunction for AtanFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "atan"
     }
@@ -264,6 +288,10 @@ impl ExprFunction for AtanFunc {
 struct Atan2Func;
 
 impl ExprFunction for Atan2Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "atan2"
     }
@@ -300,6 +328,10 @@ impl ExprFunction for Atan2Func {
 struct LogFunc;
 
 impl ExprFunction for LogFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "log"
     }
@@ -329,6 +361,10 @@ impl ExprFunction for LogFunc {
 struct Log2Func;
 
 impl ExprFunction for Log2Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "log2"
     }
@@ -358,6 +394,10 @@ impl ExprFunction for Log2Func {
 struct Log10Func;
 
 impl ExprFunction for Log10Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "log10"
     }
@@ -387,6 +427,10 @@ impl ExprFunction for Log10Func {
 struct ExpFunc;
 
 impl ExprFunction for ExpFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "exp"
     }
@@ -420,6 +464,10 @@ impl ExprFunction for ExpFunc {
 struct CbrtFunc;
 
 impl ExprFunction for CbrtFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cbrt"
     }
@@ -453,6 +501,10 @@ impl ExprFunction for CbrtFunc {
 struct PiFunc;
 
 impl ExprFunction for PiFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "pi"
     }
@@ -477,6 +529,10 @@ impl ExprFunction for PiFunc {
 struct EFunc;
 
 impl ExprFunction for EFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "e"
     }
@@ -501,6 +557,10 @@ impl ExprFunction for EFunc {
 struct PhiFunc;
 
 impl ExprFunction for PhiFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "phi"
     }
@@ -526,6 +586,10 @@ impl ExprFunction for PhiFunc {
 struct TauFunc;
 
 impl ExprFunction for TauFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "tau"
     }
@@ -554,6 +618,10 @@ impl ExprFunction for TauFunc {
 struct ErfFunc;
 
 impl ExprFunction for ErfFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "erf"
     }
@@ -583,6 +651,10 @@ impl ExprFunction for ErfFunc {
 struct ErfcFunc;
 
 impl ExprFunction for ErfcFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "erfc"
     }
@@ -616,6 +688,10 @@ impl ExprFunction for ErfcFunc {
 struct GammaFunc;
 
 impl ExprFunction for GammaFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "gamma"
     }
@@ -645,6 +721,10 @@ impl ExprFunction for GammaFunc {
 struct LnGammaFunc;
 
 impl ExprFunction for LnGammaFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "lnGamma"
     }
@@ -678,6 +758,10 @@ impl ExprFunction for LnGammaFunc {
 struct BetaFunc;
 
 impl ExprFunction for BetaFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "beta"
     }
@@ -714,6 +798,10 @@ impl ExprFunction for BetaFunc {
 struct LambertWFunc;
 
 impl ExprFunction for LambertWFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "lambertW"
     }
@@ -747,6 +835,10 @@ impl ExprFunction for LambertWFunc {
 struct SinhFunc;
 
 impl ExprFunction for SinhFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "sinh"
     }
@@ -776,6 +868,10 @@ impl ExprFunction for SinhFunc {
 struct CoshFunc;
 
 impl ExprFunction for CoshFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cosh"
     }
@@ -805,6 +901,10 @@ impl ExprFunction for CoshFunc {
 struct TanhFunc;
 
 impl ExprFunction for TanhFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "tanh"
     }
@@ -834,6 +934,10 @@ impl ExprFunction for TanhFunc {
 struct AsinhFunc;
 
 impl ExprFunction for AsinhFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "asinh"
     }
@@ -863,6 +967,10 @@ impl ExprFunction for AsinhFunc {
 struct AcoshFunc;
 
 impl ExprFunction for AcoshFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "acosh"
     }
@@ -892,6 +1000,10 @@ impl ExprFunction for AcoshFunc {
 struct AtanhFunc;
 
 impl ExprFunction for AtanhFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "atanh"
     }
@@ -925,6 +1037,10 @@ impl ExprFunction for AtanhFunc {
 struct IsNanFunc;
 
 impl ExprFunction for IsNanFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "isNaN"
     }
@@ -954,6 +1070,10 @@ impl ExprFunction for IsNanFunc {
 struct IsInfiniteFunc;
 
 impl ExprFunction for IsInfiniteFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "isInfinite"
     }
@@ -983,6 +1103,10 @@ impl ExprFunction for IsInfiniteFunc {
 struct ClampFunc;
 
 impl ExprFunction for ClampFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "clamp"
     }

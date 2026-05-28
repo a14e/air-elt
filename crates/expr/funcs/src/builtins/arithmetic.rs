@@ -46,6 +46,10 @@ pub fn register(registry: &mut FunctionRegistry) {
 struct AddFunc;
 
 impl ExprFunction for AddFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "add"
     }
@@ -122,6 +126,10 @@ impl ExprFunction for AddFunc {
 struct SubtractFunc;
 
 impl ExprFunction for SubtractFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "subtract"
     }
@@ -178,6 +186,10 @@ impl ExprFunction for SubtractFunc {
 struct MultiplyFunc;
 
 impl ExprFunction for MultiplyFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "multiply"
     }
@@ -234,6 +246,10 @@ impl ExprFunction for MultiplyFunc {
 struct DivideFunc;
 
 impl ExprFunction for DivideFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "divide"
     }
@@ -310,6 +326,10 @@ impl ExprFunction for DivideFunc {
 struct ModuloFunc;
 
 impl ExprFunction for ModuloFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "modulo"
     }
@@ -387,6 +407,10 @@ impl ExprFunction for ModuloFunc {
 struct NegateFunc;
 
 impl ExprFunction for NegateFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "negate"
     }
@@ -428,6 +452,10 @@ impl ExprFunction for NegateFunc {
 struct AbsFunc;
 
 impl ExprFunction for AbsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "abs"
     }
@@ -475,6 +503,10 @@ impl ExprFunction for AbsFunc {
 struct CeilFunc;
 
 impl ExprFunction for CeilFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "ceil"
     }
@@ -511,6 +543,10 @@ impl ExprFunction for CeilFunc {
 struct FloorFunc;
 
 impl ExprFunction for FloorFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "floor"
     }
@@ -547,6 +583,10 @@ impl ExprFunction for FloorFunc {
 struct RoundFunc;
 
 impl ExprFunction for RoundFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "round"
     }
@@ -583,6 +623,10 @@ impl ExprFunction for RoundFunc {
 struct MinFunc;
 
 impl ExprFunction for MinFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "min"
     }
@@ -647,6 +691,10 @@ impl ExprFunction for MinFunc {
 struct MaxFunc;
 
 impl ExprFunction for MaxFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "max"
     }
@@ -711,6 +759,10 @@ impl ExprFunction for MaxFunc {
 struct SignFunc;
 
 impl ExprFunction for SignFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "sign"
     }
@@ -775,6 +827,10 @@ impl ExprFunction for SignFunc {
 struct PowerFunc;
 
 impl ExprFunction for PowerFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "power"
     }
@@ -823,6 +879,10 @@ impl ExprFunction for PowerFunc {
 struct SqrtFunc;
 
 impl ExprFunction for SqrtFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "sqrt"
     }
@@ -1485,11 +1545,17 @@ mod tests {
             LazyLock::new(FunctionRegistry::with_builtins);
 
         fn comparison_func(name: &str) -> &'static dyn ExprFunction {
-            REGISTRY.resolve(name, 2).expect("function must exist")
+            let r = REGISTRY
+                .get_ref(name, Some(2))
+                .expect("function must exist");
+            REGISTRY.get_by_ref(r)
         }
 
         fn cast_func(name: &str, arity: usize) -> &'static dyn ExprFunction {
-            REGISTRY.resolve(name, arity).expect("function must exist")
+            let r = REGISTRY
+                .get_ref(name, Some(arity))
+                .expect("function must exist");
+            REGISTRY.get_by_ref(r)
         }
 
         proptest! {

@@ -95,7 +95,8 @@ impl<'a> EvaluatorState<'a> {
             .into());
         }
 
-        let function = self.registry.resolve(name, args.len())?;
+        let func_ref = self.registry.get_ref(name, Some(args.len()))?;
+        let function = self.registry.get_by_ref(func_ref);
 
         let mut evaluated_args = Vec::with_capacity(args.len());
         for arg in args {
@@ -416,6 +417,7 @@ mod tests {
             file_resolver: Arc::new(NoopFiles),
             now: chrono::Utc::now(),
             base_dir: PathBuf::from("/tmp"),
+            is_compile_time: false,
         }
     }
 
@@ -425,6 +427,7 @@ mod tests {
             file_resolver: Arc::new(NoopFiles),
             now: chrono::Utc::now(),
             base_dir: PathBuf::from("/tmp"),
+            is_compile_time: false,
         }
     }
 

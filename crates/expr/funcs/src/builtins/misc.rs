@@ -14,6 +14,10 @@ pub fn register(registry: &mut FunctionRegistry) {
 struct TypeOfFunc;
 
 impl ExprFunction for TypeOfFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "typeof"
     }

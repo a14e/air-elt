@@ -25,6 +25,7 @@ fn build_eval_context(config_dir: &Path) -> EvalContext {
         file_resolver: Arc::new(SystemFileResolver),
         now: chrono::Utc::now(),
         base_dir: config_dir.to_path_buf(),
+        is_compile_time: false,
     }
 }
 

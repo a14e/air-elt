@@ -15,6 +15,7 @@ pub mod math;
 pub mod misc;
 pub mod object;
 pub mod random;
+pub mod regex;
 pub mod register;
 pub mod string;
 

@@ -55,6 +55,10 @@ pub fn register(registry: &mut FunctionRegistry) {
 struct ConcatFunc;
 
 impl ExprFunction for ConcatFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "concat"
     }
@@ -102,6 +106,10 @@ impl ExprFunction for ConcatFunc {
 struct LengthFunc;
 
 impl ExprFunction for LengthFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "length"
     }
@@ -144,6 +152,10 @@ impl ExprFunction for LengthFunc {
 struct SubstringFunc;
 
 impl ExprFunction for SubstringFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "substring"
     }
@@ -252,6 +264,10 @@ impl ExprFunction for SubstringFunc {
 struct CharAtFunc;
 
 impl ExprFunction for CharAtFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "charAt"
     }
@@ -305,6 +321,10 @@ impl ExprFunction for CharAtFunc {
 struct UpperFunc;
 
 impl ExprFunction for UpperFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "upper"
     }
@@ -345,6 +365,10 @@ impl ExprFunction for UpperFunc {
 struct LowerFunc;
 
 impl ExprFunction for LowerFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "lower"
     }
@@ -385,6 +409,10 @@ impl ExprFunction for LowerFunc {
 struct TrimFunc;
 
 impl ExprFunction for TrimFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "trim"
     }
@@ -435,6 +463,10 @@ impl ExprFunction for TrimFunc {
 struct ReplaceFunc;
 
 impl ExprFunction for ReplaceFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "replace"
     }
@@ -475,6 +507,10 @@ impl ExprFunction for ReplaceFunc {
 struct StartsWithFunc;
 
 impl ExprFunction for StartsWithFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "startsWith"
     }
@@ -507,6 +543,10 @@ impl ExprFunction for StartsWithFunc {
 struct EndsWithFunc;
 
 impl ExprFunction for EndsWithFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "endsWith"
     }
@@ -539,6 +579,10 @@ impl ExprFunction for EndsWithFunc {
 struct ContainsFunc;
 
 impl ExprFunction for ContainsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "contains"
     }
@@ -571,6 +615,10 @@ impl ExprFunction for ContainsFunc {
 struct IndexOfFunc;
 
 impl ExprFunction for IndexOfFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "indexOf"
     }
@@ -615,6 +663,10 @@ impl ExprFunction for IndexOfFunc {
 struct FormatFunc;
 
 impl ExprFunction for FormatFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "format"
     }
@@ -667,6 +719,10 @@ impl ExprFunction for FormatFunc {
 struct ToStringFunc;
 
 impl ExprFunction for ToStringFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toString"
     }
@@ -701,6 +757,10 @@ impl ExprFunction for ToStringFunc {
 struct ReverseFunc;
 
 impl ExprFunction for ReverseFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "reverse"
     }
@@ -744,6 +804,10 @@ impl ExprFunction for ReverseFunc {
 struct RepeatFunc;
 
 impl ExprFunction for RepeatFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "repeat"
     }
@@ -798,6 +862,10 @@ impl ExprFunction for RepeatFunc {
 struct LeftPadFunc;
 
 impl ExprFunction for LeftPadFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "leftPad"
     }
@@ -879,6 +947,10 @@ impl ExprFunction for LeftPadFunc {
 struct RightPadFunc;
 
 impl ExprFunction for RightPadFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "rightPad"
     }

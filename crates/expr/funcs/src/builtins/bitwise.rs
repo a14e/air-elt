@@ -41,6 +41,10 @@ fn to_i64(val: &Value, func_name: &str) -> Result<i64, FuncError> {
 struct BitAndFunc;
 
 impl ExprFunction for BitAndFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bitAnd"
     }
@@ -73,6 +77,10 @@ impl ExprFunction for BitAndFunc {
 struct BitOrFunc;
 
 impl ExprFunction for BitOrFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bitOr"
     }
@@ -105,6 +113,10 @@ impl ExprFunction for BitOrFunc {
 struct BitXorFunc;
 
 impl ExprFunction for BitXorFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bitXor"
     }
@@ -137,6 +149,10 @@ impl ExprFunction for BitXorFunc {
 struct BitNotFunc;
 
 impl ExprFunction for BitNotFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bitNot"
     }
@@ -166,6 +182,10 @@ impl ExprFunction for BitNotFunc {
 struct BitShiftLeftFunc;
 
 impl ExprFunction for BitShiftLeftFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bitShiftLeft"
     }
@@ -204,6 +224,10 @@ impl ExprFunction for BitShiftLeftFunc {
 struct BitShiftRightFunc;
 
 impl ExprFunction for BitShiftRightFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bitShiftRight"
     }
@@ -243,6 +267,10 @@ impl ExprFunction for BitShiftRightFunc {
 struct BitCountFunc;
 
 impl ExprFunction for BitCountFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bitCount"
     }

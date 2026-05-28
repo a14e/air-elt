@@ -66,6 +66,10 @@ fn extract_bytes(value: Value, function_name: &str) -> Result<Vec<u8>, FuncError
 struct Md5Func;
 
 impl ExprFunction for Md5Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "md5"
     }
@@ -102,6 +106,10 @@ impl ExprFunction for Md5Func {
 struct Sha1Func;
 
 impl ExprFunction for Sha1Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "sha1"
     }
@@ -138,6 +146,10 @@ impl ExprFunction for Sha1Func {
 struct Sha256Func;
 
 impl ExprFunction for Sha256Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "sha256"
     }
@@ -174,6 +186,10 @@ impl ExprFunction for Sha256Func {
 struct Sha512Func;
 
 impl ExprFunction for Sha512Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "sha512"
     }
@@ -210,6 +226,10 @@ impl ExprFunction for Sha512Func {
 struct XxHash64Func;
 
 impl ExprFunction for XxHash64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "xxHash64"
     }
@@ -244,6 +264,10 @@ impl ExprFunction for XxHash64Func {
 struct XxHash32Func;
 
 impl ExprFunction for XxHash32Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "xxHash32"
     }
@@ -281,6 +305,10 @@ type HmacSha512 = Hmac<Sha512>;
 struct HmacFunc;
 
 impl ExprFunction for HmacFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "hmac"
     }
@@ -362,6 +390,10 @@ impl ExprFunction for HmacFunc {
 struct CityHash64Func;
 
 impl ExprFunction for CityHash64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cityHash64"
     }
@@ -400,6 +432,10 @@ fn city_hash_64(data: &[u8]) -> u64 {
 struct SipHash64Func;
 
 impl ExprFunction for SipHash64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "sipHash64"
     }
@@ -442,6 +478,10 @@ fn sip_hash_64(data: &[u8]) -> u64 {
 struct Fnv1a64Func;
 
 impl ExprFunction for Fnv1a64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "fnv1a64"
     }

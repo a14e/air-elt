@@ -4,28 +4,27 @@ use air_elt_expr_types::limits::RESERVED_CONTROL_FLOW_NAMES;
 use crate::error::FuncError;
 use crate::signature::ExprFunction;
 
-/// A reference into the function registry's flat array.
-/// Represents a slice `functions[start..end]` containing all overloads for a name.
+/// A resolved reference to a single function in the registry's flat array.
+///
+/// Arity selection happens once at resolution time
+/// ([`FunctionRegistry::get_ref`]); the resolved index travels into the
+/// optimized program so the runtime never re-resolves by name or arity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuncRef(u16);
+
+/// Internal: the contiguous range of overloads registered under one name.
+/// Overloads for a name are stored consecutively in `functions`.
 #[derive(Debug, Clone, Copy)]
-pub struct FuncRef {
+struct OverloadRange {
     start: u16,
     end: u16,
-}
-
-impl FuncRef {
-    pub fn resolve<'a>(
-        &self,
-        functions: &'a [&'static dyn ExprFunction],
-    ) -> &'a [&'static dyn ExprFunction] {
-        &functions[self.start as usize..self.end as usize]
-    }
 }
 
 /// Registry of expression functions, supporting overloading by name.
 /// Multiple functions can share a name if they differ in arity.
 /// Functions are stored as `&'static dyn ExprFunction` references into a flat array.
 pub struct FunctionRegistry {
-    names: AHashMap<String, FuncRef>,
+    names: AHashMap<String, OverloadRange>,
     functions: Vec<&'static dyn ExprFunction>,
 }
 
@@ -38,27 +37,38 @@ impl FunctionRegistry {
     }
 
     /// Register a static function reference.
-    /// Overloads for the same name must be registered consecutively.
+    ///
+    /// Overloads for the same name must be registered consecutively, and
+    /// must not share or overlap an arity range with an existing overload
+    /// (two `[min,max]` ranges intersect, treating `max_args == None` as
+    /// unbounded) — that would make arity-based resolution ambiguous, so
+    /// it panics at registration time.
     pub fn register(&mut self, function: &'static dyn ExprFunction) {
         let name = function.name().to_string();
         assert!(
             !RESERVED_CONTROL_FLOW_NAMES.contains(&name.as_str()),
             "cannot register '{name}' as a function — reserved control flow keyword"
         );
-        if let Some(func_ref) = self.names.get_mut(&name) {
+        if let Some(range) = self.names.get_mut(&name) {
             assert_eq!(
-                func_ref.end as usize,
+                range.end as usize,
                 self.functions.len(),
                 "overloads for '{name}' must be registered consecutively"
             );
+            for existing in &self.functions[range.start as usize..range.end as usize] {
+                assert!(
+                    !arity_ranges_overlap(*existing, function),
+                    "cannot register '{name}' — its arity range overlaps an existing overload"
+                );
+            }
             self.functions.push(function);
-            func_ref.end += 1;
+            range.end += 1;
         } else {
             let start = self.functions.len() as u16;
             self.functions.push(function);
             self.names.insert(
                 name,
-                FuncRef {
+                OverloadRange {
                     start,
                     end: start + 1,
                 },
@@ -66,45 +76,44 @@ impl FunctionRegistry {
         }
     }
 
-    /// Look up a FuncRef by name.
-    pub fn get_ref(&self, name: &str) -> Option<FuncRef> {
-        self.names.get(name).copied()
-    }
-
-    /// Resolve the best matching overload for a function call with given argument count.
-    pub fn resolve(
-        &self,
-        name: &str,
-        arg_count: usize,
-    ) -> Result<&'static dyn ExprFunction, FuncError> {
-        let func_ref = self
+    /// Resolve a function name (and optional arity) to a single
+    /// [`FuncRef`].
+    ///
+    /// * `arity = Some(n)` selects the overload whose `[min_args,max_args]`
+    ///   range admits `n` arguments.
+    /// * `arity = None` selects the variadic overload (`max_args == None`)
+    ///   — used by optimizer rules that need an operator's `FuncRef`
+    ///   without binding to a concrete argument count.
+    pub fn get_ref(&self, name: &str, arity: Option<usize>) -> Result<FuncRef, FuncError> {
+        let range = self
             .names
             .get(name)
             .ok_or_else(|| FuncError::UnknownFunction {
                 name: name.to_string(),
             })?;
+        let (start, end) = (range.start as usize, range.end as usize);
+        let overloads = &self.functions[start..end];
 
-        let overloads = &self.functions[func_ref.start as usize..func_ref.end as usize];
+        let matched = match arity {
+            Some(n) => overloads
+                .iter()
+                .position(|f| n >= f.min_args() && f.max_args().is_none_or(|max| n <= max)),
+            None => overloads.iter().position(|f| f.max_args().is_none()),
+        };
 
-        let matching: Vec<_> = overloads
-            .iter()
-            .filter(|f| {
-                arg_count >= f.min_args() && f.max_args().is_none_or(|max| arg_count <= max)
-            })
-            .collect();
-
-        match matching.len() {
-            0 => Err(FuncError::ArityMismatch {
+        match matched {
+            Some(offset) => Ok(FuncRef((start + offset) as u16)),
+            None => Err(FuncError::ArityMismatch {
                 function: name.to_string(),
                 expected: format_arity_options(overloads),
-                actual: arg_count,
-            }),
-            1 => Ok(*matching[0]),
-            _ => Err(FuncError::AmbiguousOverload {
-                function: name.to_string(),
-                arg_types: format!("{arg_count} arguments"),
+                actual: arity.unwrap_or(0),
             }),
         }
+    }
+
+    /// Dereference a resolved [`FuncRef`] to its function.
+    pub fn get_by_ref(&self, func_ref: FuncRef) -> &'static dyn ExprFunction {
+        self.functions[func_ref.0 as usize]
     }
 
     /// Create a registry pre-loaded with all builtin functions.
@@ -128,6 +137,15 @@ impl Default for FunctionRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether two functions' `[min_args, max_args]` arity ranges intersect
+/// (treating `max_args == None` as unbounded). Overlapping ranges make
+/// arity-based overload resolution ambiguous.
+fn arity_ranges_overlap(a: &dyn ExprFunction, b: &dyn ExprFunction) -> bool {
+    let a_max = a.max_args().unwrap_or(usize::MAX);
+    let b_max = b.max_args().unwrap_or(usize::MAX);
+    a.min_args() <= b_max && b.min_args() <= a_max
 }
 
 fn format_arity_options(overloads: &[&'static dyn ExprFunction]) -> String {
@@ -197,19 +215,25 @@ mod tests {
         max_args: None,
     };
 
+    static TEST_FN_DUP: DummyFunc = DummyFunc {
+        name: "test_fn",
+        min_args: 1,
+        max_args: Some(1),
+    };
+
     #[test]
     fn register_and_resolve() {
         let mut registry = FunctionRegistry::new();
         registry.register(&TEST_FN);
 
-        let func = registry.resolve("test_fn", 1).unwrap();
-        assert_eq!(func.name(), "test_fn");
+        let func_ref = registry.get_ref("test_fn", Some(1)).unwrap();
+        assert_eq!(registry.get_by_ref(func_ref).name(), "test_fn");
     }
 
     #[test]
     fn unknown_function_errors() {
         let registry = FunctionRegistry::new();
-        let result = registry.resolve("nonexistent", 0);
+        let result = registry.get_ref("nonexistent", Some(0));
         assert!(matches!(result, Err(FuncError::UnknownFunction { .. })));
     }
 
@@ -218,7 +242,7 @@ mod tests {
         let mut registry = FunctionRegistry::new();
         registry.register(&FIXED);
 
-        let result = registry.resolve("fixed", 5);
+        let result = registry.get_ref("fixed", Some(5));
         assert!(matches!(result, Err(FuncError::ArityMismatch { .. })));
     }
 
@@ -227,9 +251,51 @@ mod tests {
         let mut registry = FunctionRegistry::new();
         registry.register(&VARIADIC);
 
-        assert!(registry.resolve("variadic", 1).is_ok());
-        assert!(registry.resolve("variadic", 10).is_ok());
-        assert!(registry.resolve("variadic", 100).is_ok());
-        assert!(registry.resolve("variadic", 0).is_err());
+        assert!(registry.get_ref("variadic", Some(1)).is_ok());
+        assert!(registry.get_ref("variadic", Some(10)).is_ok());
+        assert!(registry.get_ref("variadic", Some(100)).is_ok());
+        assert!(registry.get_ref("variadic", Some(0)).is_err());
+        // `None` arity selects the variadic overload directly.
+        assert!(registry.get_ref("variadic", None).is_ok());
+    }
+
+    #[test]
+    fn overlapping_arity_panics() {
+        let result = std::panic::catch_unwind(|| {
+            let mut registry = FunctionRegistry::new();
+            registry.register(&TEST_FN); // test_fn: 1..=1
+            registry.register(&TEST_FN_DUP); // test_fn: 1..=1 again — overlaps
+        });
+        assert!(
+            result.is_err(),
+            "expected overlapping-arity registration to panic"
+        );
+    }
+
+    /// Fail-closed purity contract, resolved end-to-end through the real
+    /// builtin registry: pure functions opt into `is_pure`, clock-dependent
+    /// and unseeded-random functions stay impure (the default).
+    #[test]
+    fn builtin_purity_classification() {
+        let registry = FunctionRegistry::with_builtins();
+        let is_pure = |name: &str, arity: usize| {
+            let r = registry
+                .get_ref(name, Some(arity))
+                .expect("builtin must exist");
+            registry.get_by_ref(r).is_pure()
+        };
+        // Pure builtins explicitly opt in.
+        assert!(is_pure("add", 2));
+        assert!(is_pure("concat", 2));
+        assert!(is_pure("upper", 1));
+        assert!(is_pure("toInt64", 1));
+        assert!(is_pure("addDays", 2));
+        assert!(is_pure("regexMatch", 2));
+        // Clock-dependent → impure.
+        assert!(!is_pure("now", 0));
+        assert!(!is_pure("today", 0));
+        // Random without a constant seed → impure (bare `is_pure`).
+        assert!(!is_pure("randomInt", 2));
+        assert!(!is_pure("randomUuid", 0));
     }
 }

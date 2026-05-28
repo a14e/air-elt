@@ -107,6 +107,7 @@ All functions are registered as static items implementing `ExprFunction`. Brief 
 | Crypto | `md5`, `sha1`, `sha256`, `sha512`, `xxHash64`, `xxHash32`, `cityHash64`, `hmac` |
 | JSON | `parseJson`, `toJson`, `jsPath`, `jsPathString`, `jsPathInt`, `jsPathFloat`, `jsPathBool`, `jsonLength` |
 | Object | `objectLength`, `objectKeys`, `objectValues`, `objectHasKey`, `objectGet` |
+| Regex | `regexMatch`, `regexReplace` |
 | Random | `randomUuid`, `randomInt`, `randomFloat`, `randomAlphanumeric`, `randomHex`, `randomBytes`, `randomChoice` |
 | Bitwise | `bitAnd`, `bitOr`, `bitXor`, `bitNot`, `bitShiftLeft`, `bitShiftRight`, `bitCount` |
 | Env | `env` (1 or 2 args) |

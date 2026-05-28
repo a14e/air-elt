@@ -14,6 +14,10 @@ pub fn register(registry: &mut FunctionRegistry) {
 struct NotFunc;
 
 impl ExprFunction for NotFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "not"
     }
