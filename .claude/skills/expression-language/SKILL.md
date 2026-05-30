@@ -33,6 +33,8 @@ Function calls: `name(arg1, arg2, ...)`.
 Object literals: `{ "key" = expr, "other" = expr }`.
 String interpolation: `"prefix {expr} suffix"`.
 
+Comments: `#` starts a line comment that runs to the end of the line (a trailing comment on a statement or a whole comment line). The newline is preserved, so a comment never merges two statements. A `#` inside a string literal (`'a # b'`, `"#fff"`) is a literal character, not a comment — only top-level expression source (and `{...}` interpolation segments) treats `#` as a comment.
+
 ## Detection rules
 
 The config loader determines what is an expression vs a plain string:
@@ -59,36 +61,14 @@ Config format matters for expression quoting: in YAML, expressions need no outer
 
 ## Type algebra
 
-Type algebra determines the output `DataType` at type-check time (before evaluation). Rules live in `crates/expr/funcs/src/arithmetic_utils.rs` (arithmetic) and each function's `resolve_type` method.
+Type algebra fixes a function's output `DataType` at type-check time (before evaluation), in `crates/expr/funcs/src/arithmetic_utils.rs` and each `resolve_type`. The load-bearing rules:
 
-**Arithmetic promotion** (`bounds::arithmetic_result_type` + `bounds::scalar_arithmetic`):
+- **Arithmetic** promotes by `int_bound` bit-width (add/sub `max+1`, mul `a+b`, div `a`, mod `min`), staying `Int64` until bits exceed 64 then `BigInt{width}`; mixed int/float → `Float64`, anything with `Decimal` → `Decimal`. `negate`/`abs` preserve type; `ceil`/`floor`/`round`/`sign` → `Int64`; `power`/`sqrt` → `Float64`.
+- **String functions** return `Text` (`length`/`indexOf` → `Int64`; `startsWith`/`endsWith`/`contains` → `Bool`) and are **strict** — a non-text argument is a `TypeMismatch`, never silently stringified (`trim(1)`, `concat(x, 5)` are errors). Stringify explicitly with `toString`; interpolation (`"{expr}"`) renders any type via `value_to_string`, not through `concat`. The optimizer turns `concat(x, "")` / `concat(x)` into a `TypeAssert{String}`.
+- **Comparisons** return total **non-null `Bool`**: `==`/`!=` treat null as a value (`null==null`→true, so `x==null` is a real null test); `<`/`>`/`<=`/`>=` return `false` on any null operand. They never leak null into `&&`/`||`/`if`.
+- **Casts** return their target type. **Conditionals** (`if`/`multiIf`/`ifNull`/`nullIf`, resolved in `type_resolver.rs`) take the first/value branch's type with per-form nullability; an `if`/`else if` chain folds to a flat `multiIf` at parse time (bounded by `MAX_AST_NODES`, not depth), and a large equality `multiIf` over 1–2 pure keys lowers to an O(1) `Switch`.
 
-When both operands carry `int_bound`, bit-level rules apply: add/subtract = `max(a,b)+1` bits, multiply = `a+b` bits, divide = `a` bits, modulo = `min(a,b)` bits. Result stays `Int64` with the computed bound while bits <= 64; above 64 it promotes to `BigInt{width}`. Without `int_bound`, the DataType-level fallback is used:
-
-| Left | Right | Result |
-|------|-------|--------|
-| IntN | IntN | next wider int (8->16->32->64->BigInt) per bit rules |
-| Float32 | Float32 | Float32 |
-| Float32/64 | Float64/32 | Float64 |
-| any int | any float | Float64 |
-| BigInt | BigInt | BigInt (wider width, capped at MAX_BIGINT_WIDTH) |
-| any int | BigInt | BigInt |
-| Decimal | any numeric | Decimal{precision:None, scale:None} |
-| Text | Text | `concat_result_type`: sums sizes when both bounded, else unbounded |
-
-Unary: `negate`/`abs` preserve the input type. `ceil`/`floor`/`round`/`sign` return `Int64`. `power`/`sqrt` return `Float64`.
-
-**String functions:** all return `Text{size:None}` (unbounded). Exception: `length`/`indexOf` return `Int64`; `startsWith`/`endsWith`/`contains` return `Bool`. Size-aware algebra (e.g. `concat(Text(5), Text(5))` returning `Text(10)`) exists in `concat_result_type` but is not wired through `ConcatFunc.resolve_type` yet.
-
-**Comparison functions:** always return **non-null `Bool`** — all six are total. `==`/`!=` treat null as a value (`null==null` → true, `null==x` → false), so `x==null` is a real null test that matches `values_equal`/`Key`; the ordering operators (`<`/`>`/`<=`/`>=`) return `false` on any null operand (null is unordered, mirroring SQL filtering and deliberately unlike `==`). Because they never produce null, comparisons do not propagate operand nullability into `&&`/`||`/`if`.
-
-**Cast functions:** return the target type (`toInt64` returns `Int64`, `toBigInt` returns `BigInt{width:None}`, `toDecimal` returns `Decimal{precision:None, scale:None}`, etc.).
-
-**Conditional functions** (parsed as AST nodes, resolved in `type_resolver.rs`):
-- `if(cond, then, else)`: returns `then`'s data type; nullable if either branch is nullable. An `if`/`else if` chain (`if(c1, v1, if(c2, v2, …, default))`) folds at parse time into a flat `multiIf` — identical meaning, parsed/evaluated iteratively, so a long ladder costs no nesting depth. Use a flat `multiIf` (or a chain) rather than deep nesting for many cases (`MAX_AST_NODES`, not `MAX_EXPR_DEPTH`, is the bound — thousands of branches are fine).
-- `multiIf(c1,v1,...,default)`: returns the first branch's data type; nullable if any branch is nullable. A large equality `multiIf` over one or two pure keys lowers to an O(1) `Switch` (see the optimizer).
-- `ifNull(value, alt)`: returns `value`'s data type; nullable = `alt.nullable` (the value itself is non-null after the check).
-- `nullIf(value, sentinel)`: returns `value`'s data type; always nullable (can produce null).
+Full promotion matrix, DataType fallbacks, size-aware `concat`, and exhaustive per-function rules: [references/type-algebra.md](references/type-algebra.md).
 
 ## Function categories
 

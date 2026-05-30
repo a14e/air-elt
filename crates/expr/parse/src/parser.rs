@@ -1266,6 +1266,25 @@ mod tests {
     }
 
     #[test]
+    fn line_comments_do_not_change_the_program() {
+        // Trailing, whole-line, and EOF comments are stripped; newline statement
+        // separation survives across a commented line.
+        let commented = parse("x = 10 # set x\n# a standalone note\nx + 1 # use x").unwrap();
+        let plain = parse("x = 10\nx + 1").unwrap();
+        assert_eq!(commented, plain);
+    }
+
+    #[test]
+    fn hash_in_interpolation_segment_is_a_comment() {
+        // A `#` inside a `{...}` interpolation segment is a comment (the segment is
+        // re-parsed as an expression), so it matches the same segment without it.
+        assert_eq!(
+            parse(r#""value={a # note}""#).unwrap(),
+            parse(r#""value={a}""#).unwrap()
+        );
+    }
+
+    #[test]
     fn parse_string_interpolation() {
         let program = parse("\"hello {name}\"").unwrap();
         match &program.result {

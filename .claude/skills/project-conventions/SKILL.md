@@ -39,61 +39,21 @@ Initialise the subscriber once via `air_elt_commons::tracing_init` in `app::main
 
 ## SQL helpers
 
-All dynamic SQL identifiers must go through these helpers. Raw `format!` quoting is forbidden.
+All dynamic SQL identifiers go through per-backend helpers — raw `format!` quoting is forbidden. `air_elt_commons::identifier` (validation + `IdentifierError`), `commons_pg`/`commons_mysql::identifier` (quoting). Native↔canonical type mapping in `commons-{pg,mysql}::{pg,mysql}_type`; value binding via `null_bind` / `sink_bind::bind_value_separated`; pools via `commons-{pg,mysql}::pool` (+ `pool_timeouts`); schema via `schema::fetch_schema`. Bind values with `$N` / `push_bind`, never interpolate. The Postgres crates also serve CockroachDB via a `#[serde(skip)]` `Dialect` flag — `with_serialization_retry` wraps every write, `Xml` is rejected, migrations are separate.
 
-- **`air_elt_commons::identifier`** — db-agnostic validation primitives + `IdentifierError`.
-- **`air_elt_commons_pg::identifier`** — pg quoting (`"`).
-- **`air_elt_commons_mysql::identifier`** — mysql quoting (backtick).
-- **`IdentifierError → RuntimeError`** via `impl From` in `core::error` — use `?` directly.
-
-Source-side type resolution lives in `commons-pg::pg_type` / `commons-mysql::mysql_type` (native ↔ canonical `DataType`). Notable quirks: pg accepts `timestamptz` only (naive `timestamp` rejected); mysql `tinyint(1)` → `Bool`, other signed tinyints → `Int8` (was `Int16` before AIR-22), `datetime` rejected (only `timestamp` accepted, UTC).
-
-NULL binding goes through `commons-pg::null_bind` / `commons-mysql::null_bind` (extracted helper) on the source side. On the sink side use **`commons-pg::sink_bind::bind_value_separated`** / **`commons-mysql::sink_bind::bind_value_separated`** for binding a `Value` inside a sqlx `Separated` chain. They are shared between the insert (`push_values`) and delete (`push_tuples` for the `(c1,c2) IN ((...))` predicate) paths — do not reimplement per-Value-variant binding inline.
-
-Pool construction goes through `commons-pg::pool` / `commons-mysql::pool`, both consuming `air_elt_commons::pool_timeouts::PoolTimeouts`. They wire UTC time-zone + statement-timeout pragmas. Defaults: connect 5s, acquire 10s, idle 300s, max_lifetime 1800s, statement 30s, max_connections 5.
-
-Schema introspection is `commons-pg::schema::fetch_schema` / `commons-mysql::schema::fetch_schema`. Both read `character_maximum_length`; mysql additionally reads `column_type` for `tinyint(1)` discrimination.
-
-Each connector owns its `sql_statements.rs`. Bind values via sqlx `$N` + `query.bind()` / `QueryBuilder::push_bind` — never interpolate values into SQL.
-
-**Postgres dialect flag (`air_elt_commons_pg::Dialect`)**. The Postgres connector crates serve both `type = "postgres"` and `type = "cockroachdb"`. `PgSourceConfig`/`PgSinkConfig`/`PgStorageConfig` carry a `dialect: Dialect` set by the factory (`PgXxxFactory::postgres()` vs `::cockroach()`); the field is `#[serde(skip)]` so users never touch it. The dialect flag drives only:
-
-- `Dialect::excludes_type(&DataType)` — reject `Xml` columns at `validate_access` for Cockroach (no XML type there).
-- `air_elt_commons_pg::retry::with_serialization_retry(dialect, op)` — **mandatory** wrapper around any write-path statement when adding new code paths. On Postgres it's a single-shot pass-through (zero behaviour change). On Cockroach it retries on SQLSTATE `40001 RETRY_SERIALIZABLE` with exponential backoff up to `MAX_ATTEMPTS = 10` total executions (base 50ms, capped at 2s). Reuse this helper rather than rolling your own retry loop.
-
-Conflict resolution emits the standard `INSERT … ON CONFLICT (key) DO …` SQL on both dialects. Cockroach's native `UPSERT` is deliberately not used: it silently uses the primary key as the conflict arbiter regardless of any user-declared `conflict.key`, which would mask misconfiguration if a user pointed at a UNIQUE secondary index instead.
-
-Cockroach storage migrations live in `migrations/storage-cockroachdb/` (byte-identical copies of `storage-postgres/`); `PgStorage::migrate()` branches on `self.dialect` between the two `sqlx::migrate!` paths.
+Full helper inventory, type quirks (`timestamptz`-only, `tinyint(1)`→Bool), pool defaults, and the Cockroach/`Dialect` specifics: [references/sql-helpers.md](references/sql-helpers.md).
 
 ## MongoDB helpers
 
-Mongo has no SQL surface, so `commons-mongodb` ships its own helper set:
+Mongo has no SQL surface, so `commons-mongodb` owns its own set: `client` (builder + pool/timeouts), `identifier`, `path` (nested BSON via `FieldPath`), `bson_value` (BSON↔`Value` codec — unrepresentable variants error, never drop), `infer` + `sampling` (`$sample`-based schema, shared by `mongodb`/`mongo-cdc`), `key_bson::KeyBson` (total `Eq`/`Hash` for `_id` dedup), and `task::detached` (cancel-safety for the non-cancel-safe `mongodb` 3.x driver). Reuse these instead of duplicating pipelines.
 
-- **`commons-mongodb::client`** — `mongodb::Client` builder + project-wide pool/timeout settings, reusing `commons::pool_timeouts`. Mongo has no per-statement timeout; the runner's per-call `tokio::time::timeout` covers that.
-- **`commons-mongodb::identifier`** — gates database / collection names on the same character class as SQL identifiers.
-- **`commons-mongodb::path`** — read / write nested BSON via `core::mapping::FieldPath`. `set` creates missing intermediate documents.
-- **`commons-mongodb::bson_value`** — bidirectional codec between BSON and the canonical `Value`/`DataType`. ObjectId → `Bytes(12)`; BSON Date → `Timestamp` (UTC, sub-ms truncation documented inline); Decimal128 → `Decimal`; Document/Array → `Json`; Binary(uuid subtype) → `Uuid`. Unrepresentable BSON variants (regex, JS code, MinKey/MaxKey, …) error rather than silently dropping data.
-- **`commons-mongodb::infer`** — sample-based schema inference. Folds per-field types; widens `int32 + int64` → `Int64`, `int + float` → `Float64`.
-- **`commons-mongodb::sampling`** — `sample_documents` / `describe_collection_schema` / `rows_from_documents`. Shared between the `mongodb` and `mongo-cdc` sources. New mongo-shaped sources should call these instead of duplicating `$sample` aggregation pipelines.
+Full helper inventory and BSON↔canonical type mapping: [references/mongodb-helpers.md](references/mongodb-helpers.md).
 
 ## ClickHouse helpers
 
-ClickHouse is sink-only today; `commons-clickhouse` carries the helpers shared with any future CH source. Reuse these — do not roll up ad-hoc HTTP / type-parsing per call site.
+ClickHouse is sink-only today; `commons-clickhouse` carries the shared helpers — reuse them, don't roll up ad-hoc HTTP / type-parsing. `client` (`reqwest` + `ChClientConfig`; we avoid the `clickhouse` crate because its typed `Row` API doesn't fit dynamic `Vec<Value>`), `identifier` (backtick), `ch_type_parser` (`system.columns.type` → `ParsedType`), `schema::fetch_schema`, `row_binary::encode_value` (RowBinary cell encoder), and the `types` `DynType`/`DynValue` registry for CH-specific columns (`fixed_string`, `enum8/16`, `int128/256`, `aggregate_state`; IPv4/IPv6 are canonical).
 
-- **`commons-clickhouse::client`** — `reqwest::Client` wrapper plus `ChClientConfig` (URL, database, `user`, `password`, `PoolSettings`). `user` and `password` are required strings — use `""` for the authless variant on CH instances with `<networks>` open for the `default` user. Both auth headers (`X-ClickHouse-User` / `X-ClickHouse-Key`) are always emitted regardless of value; no "skip header when empty" branching. `ping()`, `query_text()`, `insert_row_binary()`. We use `reqwest` directly rather than the `clickhouse` 0.13 crate because that crate's typed `Client::insert::<T: Row>` API doesn't fit dynamic `Vec<Value>` batches.
-- **`commons-clickhouse::identifier`** — backtick quoting (CH shares MySQL's backtick syntax). `quote_ident`, `quote_qualified`, `quote_columns`, `split_qualified`.
-- **`commons-clickhouse::ch_type_parser`** — recursive parser for `system.columns.type` strings. Returns `ParsedType { data_type, nullable }`. `Nullable(T)` strips onto the `nullable` flag; `LowCardinality(T)` strips transparently. Composite shapes (`Array`, `Tuple`, `Map`, `Nested`, geo) map onto `DataType::Json`.
-- **`commons-clickhouse::schema`** — `fetch_schema(client, table)` runs `SELECT name, type FROM system.columns … FORMAT JSON` and folds the result into a canonical `Schema`.
-- **`commons-clickhouse::row_binary`** — `encode_value(out, &Field, &Value)` writes one column-cell into a `RowBinary` byte buffer. Handles `Nullable` flag bytes, UTF-8 string LEB128 length prefix, CH's mixed-endian UUID layout, Date as `u16` days, DateTime as `u32` seconds (UTC, no TZ), `Decimal` as fixed-width signed LE (width by precision: ≤9=i32, ≤18=i64, ≤38=i128, ≤76=i256).
-- **`commons-clickhouse::types`** — the CH `DynType`/`DynValue` registry:
-  - `aggregate_state` — `ChAggregateStateType { fn_name, arg_types, simple }` + opaque-bytes `ChAggregateStateValue`. `kind()` is `clickhouse.aggregate.<snake_fn>` (leak-interned at first observation per process — bounded by user-declared columns).
-  - IPv4 / IPv6 are canonical (`DataType::Ipv4` / `DataType::Ipv6`, `Value::Ipv4(Ipv4Addr)` / `Value::Ipv6(Ipv6Addr)`); CH `IPv4` columns encode as LE u32 and `IPv6` as 16 BE octets inside `commons-clickhouse::row_binary`.
-  - `fixed_string` — `ChFixedStringType { size }` + bytes carrier. Cross-canonical to/from `Bytes(N)`.
-  - `enum_` — `ChEnum8Type` / `ChEnum16Type` (variants table) + `ChEnumValue { name }`. Cross-canonical to/from `Text` (variant name).
-  - `int128` — `ChInt128Type` / `ChUInt128Type` + `ChInt128Value(i128)` / `ChUInt128Value(u128)`. 16-byte LE. Cross-canonical to/from `BigInt`.
-  - `int256` — `ChInt256Type` / `ChUInt256Type` + `ChInt256Value { le_bytes: [u8; 32] }` / `ChUInt256Value { le_bytes: [u8; 32] }`. 32-byte LE two's-complement. Cross-canonical to/from `BigInt`. Helpers: `bigint_to_le32`, `le32_to_bigint`, `biguint_to_le32`.
-
-**Custom `kind` values shipped**: `clickhouse.fixed_string`, `clickhouse.enum8`, `clickhouse.enum16`, `clickhouse.int128`, `clickhouse.uint128`, `clickhouse.int256`, `clickhouse.uint256`, `clickhouse.aggregate.<fn>` (e.g. `clickhouse.aggregate.quantiles_t_digest`, `clickhouse.aggregate.quantiles_d_d_sketch`). IPv4 / IPv6 used to live here as `clickhouse.ipv4` / `clickhouse.ipv6`; they have been promoted to canonical `DataType::Ipv4` / `DataType::Ipv6` (AIR-88).
+Full client/encoder/registry detail and the shipped `clickhouse.*` custom `kind` list: [references/clickhouse-helpers.md](references/clickhouse-helpers.md).
 
 ## Sink::supports_deletes (append-only ingest)
 
@@ -159,27 +119,9 @@ Body construction for relational sources goes through **`air_elt_core::transform
 
 ## Validation pipeline
 
-Two stages: `assemble` (no I/O) → `validate` (probes, schema introspection, matrix, sampling). All assembled flows are driven concurrently through `futures::stream::iter(...).for_each_concurrent(None, validate_flow)` — no per-source grouping. Backend contention is bounded purely by the per-component `tokio::sync::Semaphore`s built in `assemble`, sized to each backend's `max-connections`. The CLI prints `running validation for {N} flows; semaphores cap {source=K, sink=L, storage=M}` at start. Output is sorted back into config order so error reporting is deterministic.
+Two stages: `assemble` (no I/O — build components, derive specs, compile the Transform) → `validate` (probes, schema introspection, matrix, sampling). Flows run concurrently via `for_each_concurrent`; backend contention is bounded by per-component `tokio::sync::Semaphore`s (one per declared source/sink/storage, sized to `max-connections`). **Permits are strictly local** — held only across the single I/O call, never across two backend calls or an unrelated `await` — so deadlock between flows is structurally impossible. Probes retry transient `Backend` errors (`retry_transient`); `max-connections = 0` is rejected up front. The `[flow.<name>.validation]` toggles (`access`/`fields`/`inserts`/`sampling`) gate each stage; `Sink::schemaless()` (Mongo) derives the sink schema from the source; `Source::sample` drives sampling-validation (CDC sources override to `$sample`). `core::mapping::FieldPath` validates dot-paths (SQL rejects nested, Mongo accepts).
 
-### Concurrency: per-component semaphores
-
-`assemble` builds one `tokio::sync::Semaphore` per declared `[[sources]]`/`[[sinks]]`/`[[storages]]` instance, with permit count = the component's `max-connections` (capped at `Semaphore::MAX_PERMITS`). Flows sharing a component share the same `Arc<Semaphore>`. Each flow gets a `FlowLockHandle` (`core::util::concurrency`) that exposes `acquire_source()` / `acquire_sink()` / `acquire_storage()` — one permit per component kind.
-
-**Locks must be strictly local — held only across the single I/O call that touches the component, then released. Never hold a permit across an unrelated `await` or across two backend calls; that's a parasitic block on sibling flows that share the pool.** The runner enforces this by scoping each `acquire_*` to a tight `{ let _g = ...acquire_X().await?; <single call> }` block: `ensure_built` takes source for source `build_context`, releases, takes sink for sink `build_context`, releases; cursor load/save take storage; `read_batch` / `sample` take source; `write_batch` takes sink. Transform runs without any permit (pure compute). The validation pipeline mirrors this — each probe / schema fetch scopes its own permit.
-
-Because no call site ever holds two permits at once, **deadlock between flows is structurally impossible** — there is no canonical lock order to maintain, no AB-BA hazard to defend against. A long PG read in one flow no longer blocks an unrelated CH write in another flow that happens to share the storage; the two only contend on permits they both actually use.
-
-Access probes inside validation are additionally wrapped in `retry_transient` (`core::util::retry`): three attempts (50 ms → 250 ms → 1.25 s), retrying only `RuntimeError::Backend`; every other error is authoritative and fails immediately. The runtime tick has its own exponential backoff (`1s → 4× → 1h cap`) on `Err`; the inter-tick idle sleep and the backoff sleep both happen AFTER the tick returns, so they never hold any permit. `dry_run` governs *what* the tick does (`sample` vs `read_batch`, no-op sink write, skip cursor save) — not *whether* it acquires.
-
-`max-connections = 0` is rejected at `build_*` time (`PoolSettingsError::ZeroMaxConnections`): a zero-permit semaphore would hang every flow forever. Operators see a config error before any I/O is attempted.
-
-The flow-level `[flow.<name>.validation]` block exposes four toggles: `access`, `fields`, `inserts`, `sampling`. The first three default `true` and gate the access probes / matrix / sink write probe respectively. `sampling` follows the per-backend `SourceFactory::sampling_default()` — Mongo enables it (size 100), SQL keeps it disabled.
-
-`Sink::schemaless()` is `true` for Mongo. The pipeline then derives the sink schema from the source's declared types, skipping the matrix narrowing check.
-
-`Source::sample` is a single probe used by sampling-validation. The default delegates to `read_batch` with `spec.limit = n` and no cursor state — pull-based sources stay on the default so the probe exercises the same query the runner runs. CDC sources (`mongo-cdc`) override because their `read_batch` would block on the open change stream; the override aggregates `$sample` on the watched collection. Sampling-validation feeds the returned `RawBatch` through the compiled Transform.
-
-`core::mapping::FieldPath` — `parse(&str)` produces a validated dot-notation path. SQL connectors reject `is_nested()` paths; Mongo accepts them.
+Full semaphore/locking model, retry/backoff timings, toggle defaults, and sampling specifics: [references/validation-pipeline.md](references/validation-pipeline.md).
 
 ## Conflict resolution
 

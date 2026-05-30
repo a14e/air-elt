@@ -30,7 +30,10 @@
 //! `typeof`/width-sensitive consumers — those are left for the typed Phase-3 pass.
 //! Equality and the null tests are TOTAL (never null), so threading a true-fact
 //! into an `&&` right operand is sound (the right runs only when the left is
-//! true).
+//! true). An `ifNull(value, alternative)` is itself a guard: its `alternative`
+//! runs only when `value` is null, so when `value` is a frozen operand that fact
+//! (`operand` is `Null`) threads into the `alternative` — the same shape as the
+//! `then` branch of `if(isNull(x), …)`.
 //!
 //! The pass is size-non-increasing (an operand and a constant are both one node),
 //! so it runs inside the optimizer's program fixpoint, where the substitution it
@@ -176,10 +179,21 @@ impl GuardPropagation {
                     .map(|arg| self.propagate(arg, env))
                     .collect(),
             },
-            OptExpr::IfNull { value, alternative } => OptExpr::IfNull {
-                value: Box::new(self.propagate(*value, env)),
-                alternative: Box::new(self.propagate(*alternative, env)),
-            },
+            OptExpr::IfNull { value, alternative } => {
+                let value = self.propagate(*value, env);
+                // `ifNull` evaluates `value` once; the alternative runs only on the
+                // null path. So if `value` is a frozen operand, it is null
+                // throughout the alternative — thread that fact in, exactly like the
+                // `then` branch of `if(isNull(x), …)`.
+                let alternative_env = match value.frozen_operand() {
+                    Some(operand) => env.with(operand, Value::Null),
+                    None => env.clone(),
+                };
+                OptExpr::IfNull {
+                    value: Box::new(value),
+                    alternative: Box::new(self.propagate(*alternative, &alternative_env)),
+                }
+            }
             OptExpr::NullIf { value, sentinel } => OptExpr::NullIf {
                 value: Box::new(self.propagate(*value, env)),
                 sentinel: Box::new(self.propagate(*sentinel, env)),

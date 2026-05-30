@@ -5,9 +5,11 @@
 //! (`true`/`false`/`null`) semantics as the heap evaluator, so the optimizer
 //! and the runtime always agree. These rules assume a well-typed program
 //! (conditions and boolean operands are `Bool`/`Null`), which the type-check
-//! pass guarantees.
+//! pass guarantees. A `Switch` whose key inputs are all constant folds to the
+//! matched branch (or the default on a miss) — its key is built exactly as the
+//! evaluator builds it, so the dispatch is resolved at compile time.
 
-use air_elt_types::Value;
+use air_elt_types::{Key, Value};
 
 use super::{Rewrite, Rule, RuleCx};
 use crate::model::opt_expr::OptExpr;
@@ -27,6 +29,11 @@ impl Rule for BranchPrune {
             OptExpr::NullIf { value, sentinel } => self.prune_null_if(value, sentinel),
             OptExpr::And { left, right } => self.prune_and(left, right),
             OptExpr::Or { left, right } => self.prune_or(left, right),
+            OptExpr::Switch {
+                inputs,
+                table,
+                default,
+            } => self.prune_switch(inputs, table, default),
             other => Rewrite::Same(other),
         }
     }
@@ -94,6 +101,13 @@ impl BranchPrune {
     }
 
     fn prune_if_null(&self, value: Box<OptExpr>, alternative: Box<OptExpr>) -> Rewrite {
+        // `ifNull(value, null)` returns `value` in every case — a null `value`
+        // yields the null alternative, which equals `value` — so the wrapper is
+        // redundant. (This is what collapses an alternative that guard propagation
+        // folded to null, e.g. `ifNull(x, upper(x))` → `ifNull(x, null)` → `x`.)
+        if matches!(alternative.as_const(), Some(Value::Null)) {
+            return Rewrite::Changed(*value);
+        }
         match value.as_const() {
             Some(constant) => {
                 if constant.is_null() {
@@ -116,6 +130,45 @@ impl BranchPrune {
                 }
             }
             _ => Rewrite::Same(OptExpr::NullIf { value, sentinel }),
+        }
+    }
+
+    /// Fold a `Switch` whose key inputs are all constant: build the dispatch key
+    /// exactly as the evaluator does (one input keys on the value, two form a
+    /// composite key; an unkeyable value misses) and select the matched branch,
+    /// or the default on a miss. The branch value need not be constant, so this is
+    /// branch selection (dead-branch elimination), not constant folding.
+    fn prune_switch(
+        &self,
+        inputs: Vec<OptExpr>,
+        table: Vec<(Key, OptExpr)>,
+        default: Box<OptExpr>,
+    ) -> Rewrite {
+        let Some(values): Option<Vec<&Value>> = inputs.iter().map(OptExpr::as_const).collect()
+        else {
+            return Rewrite::Same(OptExpr::Switch {
+                inputs,
+                table,
+                default,
+            });
+        };
+
+        let key = if values.len() == 1 {
+            Key::from_value(values[0])
+        } else {
+            Key::composite(values.iter().map(|value| (*value).clone()).collect()).ok()
+        };
+
+        let matched = key
+            .as_ref()
+            .and_then(|key| table.iter().position(|(entry, _)| entry == key));
+        match matched {
+            Some(position) => {
+                let mut table = table;
+                let (_, value) = table.swap_remove(position);
+                Rewrite::Changed(value)
+            }
+            None => Rewrite::Changed(*default),
         }
     }
 

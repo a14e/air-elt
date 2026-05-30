@@ -72,6 +72,14 @@ impl ExprFunction for ConcatFunc {
     }
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+        // `concat` is strict: every argument must be textual. There is no
+        // implicit string coercion in expressions — `concat(x, "")` is therefore
+        // a string type-check on `x`, not a stringification (use `toString` for
+        // that). Interpolation renders any type, but it does not route through
+        // `concat`.
+        for arg in args {
+            validate_text_arg("concat", &arg.data_type)?;
+        }
         let nullable = args.iter().any(|a| a.nullable);
         let size = args.iter().try_fold(0u32, |acc, a| match &a.data_type {
             DataType::Text { size: Some(s) } => Some(acc.saturating_add(*s)),
@@ -88,7 +96,7 @@ impl ExprFunction for ConcatFunc {
         }
         let mut result = match first {
             Value::Text(s) => s,
-            other => format_value(&other),
+            other => return Err(concat_type_mismatch(&other)),
         };
         for val in iter {
             if val.is_null() {
@@ -96,10 +104,19 @@ impl ExprFunction for ConcatFunc {
             }
             match val {
                 Value::Text(s) => result.push_str(&s),
-                other => result.push_str(&format_value(&other)),
+                other => return Err(concat_type_mismatch(&other)),
             }
         }
         Ok(Value::Text(result))
+    }
+}
+
+/// The strict-`concat` type error for a non-text, non-null argument.
+fn concat_type_mismatch(value: &Value) -> FuncError {
+    FuncError::TypeMismatch {
+        function: "concat".to_owned(),
+        expected: "Text".to_owned(),
+        actual: format!("{:?}", value.data_type()),
     }
 }
 
@@ -1120,6 +1137,30 @@ mod tests {
             .evaluate(vec![Value::Text("a".into()), Value::Null], &ctx())
             .unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn concat_rejects_non_text_value() {
+        // Strict concat: a non-text, non-null argument is a TypeMismatch, not a
+        // silent stringification.
+        let f = ConcatFunc;
+        let result = f.evaluate(vec![Value::Text("a".into()), Value::Int64(5)], &ctx());
+        assert!(matches!(result, Err(FuncError::TypeMismatch { .. })));
+        let leading = f.evaluate(vec![Value::Int64(5), Value::Text("a".into())], &ctx());
+        assert!(matches!(leading, Err(FuncError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn concat_resolve_type_rejects_non_text() {
+        let f = ConcatFunc;
+        let args = [
+            NullableExprType::new(DataType::Text { size: None }, false),
+            NullableExprType::new(DataType::Int64, false),
+        ];
+        assert!(matches!(
+            f.resolve_type(&args),
+            Err(FuncError::TypeMismatch { .. })
+        ));
     }
 
     #[test]

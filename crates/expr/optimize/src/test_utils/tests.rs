@@ -21,6 +21,8 @@ use crate::model::opt_expr::{AssertYield, OptExpr};
 use crate::model::opt_program::{OptProgram, OptStatement};
 use crate::model::{CompactProgram, NodeRef, OptNode, RegisterId, TypeClass};
 use crate::optimizer::Optimizer;
+use crate::pass::Pass;
+use crate::rules::{RewriteDriver, RuleSet};
 
 // Thin wrappers exercising the OOP API once, so the test bodies stay terse.
 
@@ -108,6 +110,50 @@ fn eval_unoptimized(source: &str) -> Value {
     eval_const_program(&compile_unoptimized(source), &registry, &context).unwrap()
 }
 
+/// Run the bottom-up rewrite fixpoint and the one-shot finalizers over a
+/// hand-built result expression. For rules whose trigger shape cannot arise from
+/// source — a nested `Switch` (`flatten_conditionals` would merge a conditional
+/// chain first) or a register-keyed membership `Or` (a register pinned to a
+/// constant is inlined before it) — this exercises just the rewrite stage of
+/// [`Optimizer::optimize`].
+fn rewrite_result(result: OptExpr, register_count: RegisterId) -> OptExpr {
+    let registry = registry();
+    let context = context();
+    let rule_set = RuleSet::create(&registry);
+    let driver = RewriteDriver::create(&rule_set, &registry, &context);
+    let mut program = OptProgram {
+        statements: vec![],
+        result,
+        register_count,
+    };
+    driver.optimize(&mut program);
+    driver.finalize(&mut program);
+    program.result
+}
+
+/// `equals(Register(register), constant)` — a single membership clause.
+fn register_equals(register: RegisterId, constant: Value) -> OptExpr {
+    let equals = registry().get_ref("equals", Some(2)).unwrap();
+    OptExpr::Call {
+        func: equals,
+        args: vec![OptExpr::Register(register), OptExpr::Const(constant)],
+    }
+}
+
+/// Evaluate a hand-built result expression with register 0 pinned to `seed`.
+fn eval_with_register0(result: OptExpr, seed: Value) -> Value {
+    let program = OptProgram {
+        statements: vec![OptStatement {
+            register: 0,
+            value: OptExpr::Const(seed),
+        }],
+        result,
+        register_count: 1,
+    };
+    let compiled = compact(program).unwrap();
+    eval_const_program(&compiled, &registry(), &context()).unwrap()
+}
+
 // ---- Golden structural rewrites -------------------------------------------
 
 // ---- Guard propagation (operand substitution) -----------------------------
@@ -131,6 +177,26 @@ fn substitutes_null_operand_in_is_null_branch() {
     assert!(
         matches!(*else_branch, OptExpr::Register(_) | OptExpr::SourceField(_)),
         "expected the operand read to survive, got {else_branch:?}"
+    );
+}
+
+#[test]
+fn if_null_alternative_folds_through_null_to_the_value() {
+    // `ifNull(c, upper(c))`: the alternative runs only when `c` is null, so guard
+    // propagation threads that fact in and `upper(c)` folds to null; the resulting
+    // `ifNull(c, null)` then collapses to `c`.
+    assert_eq!(
+        optimized_result(r#"ifNull(field("c"), upper(field("c")))"#),
+        OptExpr::SourceField("c".to_string())
+    );
+}
+
+#[test]
+fn if_null_with_null_alternative_folds_to_value() {
+    // `ifNull(value, null)` ≡ `value` — the redundant wrapper is dropped.
+    assert_eq!(
+        optimized_result(r#"ifNull(field("c"), null)"#),
+        OptExpr::SourceField("c".to_string())
     );
 }
 
@@ -802,6 +868,449 @@ fn keeps_non_empty_needle_and_single_reverse() {
         optimized_result("bytesFromHex(base64(field(\"x\")))"),
         OptExpr::Call { .. }
     ));
+}
+
+// ---- concat algebra (strict concat) ---------------------------------------
+
+#[test]
+fn concat_with_empty_string_becomes_string_assert() {
+    // concat(x, "") and concat("", x) → TypeAssert{String, Identity}: strict
+    // concat requires `x` to be a string, and appending "" is a no-op.
+    for source in [r#"concat(field("x"), "")"#, r#"concat("", field("x"))"#] {
+        match optimized_result(source) {
+            OptExpr::TypeAssert {
+                inner,
+                expect,
+                on_present,
+            } => {
+                assert!(matches!(*inner, OptExpr::SourceField(name) if name == "x"));
+                assert_eq!(expect, TypeClass::String);
+                assert_eq!(on_present, AssertYield::Identity);
+            }
+            other => panic!("{source}: expected a TypeAssert, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn single_argument_concat_becomes_string_assert() {
+    // concat(x) of one dynamic operand is a bare string type-check.
+    match optimized_result(r#"concat(field("x"))"#) {
+        OptExpr::TypeAssert {
+            inner,
+            expect,
+            on_present,
+        } => {
+            assert!(matches!(*inner, OptExpr::SourceField(name) if name == "x"));
+            assert_eq!(expect, TypeClass::String);
+            assert_eq!(on_present, AssertYield::Identity);
+        }
+        other => panic!("expected a TypeAssert, got {other:?}"),
+    }
+}
+
+#[test]
+fn concat_drops_empty_string_arguments() {
+    // concat(a, "", b) → concat(a, b): empty constants contribute nothing.
+    match optimized_result(r#"concat(field("a"), "", field("b"))"#) {
+        OptExpr::Call { args, .. } => {
+            assert_eq!(args.len(), 2);
+            assert!(matches!(&args[0], OptExpr::SourceField(name) if name == "a"));
+            assert!(matches!(&args[1], OptExpr::SourceField(name) if name == "b"));
+        }
+        other => panic!("expected a two-arg concat, got {other:?}"),
+    }
+}
+
+#[test]
+fn concat_of_only_empty_strings_folds_to_empty() {
+    assert_eq!(
+        optimized_result(r#"concat("", "")"#),
+        OptExpr::Const(Value::Text(String::new()))
+    );
+}
+
+#[test]
+fn trim_of_concat_strips_whitespace_constant_edges() {
+    // trim(concat("  ", x, "  ")) drops the whitespace-only edges; the inner
+    // concat then collapses to a single string assert, with `trim` kept.
+    match optimized_result(r#"trim(concat("  ", field("x"), "  "))"#) {
+        OptExpr::Call { args, .. } => {
+            assert_eq!(args.len(), 1);
+            match &args[0] {
+                OptExpr::TypeAssert { inner, expect, .. } => {
+                    assert!(matches!(&**inner, OptExpr::SourceField(name) if name == "x"));
+                    assert_eq!(*expect, TypeClass::String);
+                }
+                other => panic!("expected a string assert under trim, got {other:?}"),
+            }
+        }
+        other => panic!("expected trim(...), got {other:?}"),
+    }
+}
+
+#[test]
+fn trim_of_concat_left_trims_partial_whitespace_edge() {
+    // A partially-whitespace leading constant keeps its non-whitespace tail.
+    match optimized_result(r#"trim(concat("  hi", field("x")))"#) {
+        OptExpr::Call { args, .. } => {
+            assert_eq!(args.len(), 1);
+            match &args[0] {
+                OptExpr::Call {
+                    args: concat_args, ..
+                } => {
+                    assert_eq!(concat_args.len(), 2);
+                    assert_eq!(concat_args[0], OptExpr::Const(Value::Text("hi".into())));
+                    assert!(matches!(&concat_args[1], OptExpr::SourceField(name) if name == "x"));
+                }
+                other => panic!("expected inner concat, got {other:?}"),
+            }
+        }
+        other => panic!("expected trim(...), got {other:?}"),
+    }
+}
+
+// ---- encode/decode label-matched round-trip -------------------------------
+
+#[test]
+fn decode_of_encode_same_label_collapses_to_bytes_assert() {
+    for algorithm in ["hex", "base64", "base64url"] {
+        let source = format!(r#"decode(encode(field("x"), "{algorithm}"), "{algorithm}")"#);
+        match optimized_result(&source) {
+            OptExpr::TypeAssert {
+                inner,
+                expect,
+                on_present,
+            } => {
+                assert!(matches!(*inner, OptExpr::SourceField(name) if name == "x"));
+                assert_eq!(expect, TypeClass::Bytes);
+                assert_eq!(on_present, AssertYield::Identity);
+            }
+            other => panic!("{algorithm}: expected a Bytes assert, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn decode_of_encode_mismatched_or_reversed_is_kept() {
+    // Different algorithms do not round-trip.
+    assert!(matches!(
+        optimized_result(r#"decode(encode(field("x"), "hex"), "base64")"#),
+        OptExpr::Call { .. }
+    ));
+    // encode(decode(...)) is NOT collapsed — `decode` can fail on malformed text,
+    // so that error must be preserved.
+    assert!(matches!(
+        optimized_result(r#"encode(decode(field("x"), "hex"), "hex")"#),
+        OptExpr::Call { .. }
+    ));
+}
+
+// ---- nested TypeAssert collapse -------------------------------------------
+
+#[test]
+fn nested_type_asserts_collapse_to_one() {
+    // concat(reverse(reverse(x)), "") stacks a String assert inside a String
+    // assert; the nested-assert collapse flattens them to one.
+    match optimized_result(r#"concat(reverse(reverse(field("x"))), "")"#) {
+        OptExpr::TypeAssert {
+            inner,
+            expect,
+            on_present,
+        } => {
+            assert!(matches!(*inner, OptExpr::SourceField(name) if name == "x"));
+            assert_eq!(expect, TypeClass::String);
+            assert_eq!(on_present, AssertYield::Identity);
+        }
+        other => panic!("expected a single TypeAssert, got {other:?}"),
+    }
+}
+
+#[test]
+fn type_assert_with_const_inner_yield_does_not_collapse() {
+    // A `Const` inner yield is not provably of the outer class, so the outer
+    // assert over it is NOT redundant — the nesting is kept.
+    let inner = OptExpr::TypeAssert {
+        inner: Box::new(OptExpr::Register(0)),
+        expect: TypeClass::String,
+        on_present: AssertYield::Const(Value::Bool(true)),
+    };
+    let outer = OptExpr::TypeAssert {
+        inner: Box::new(inner),
+        expect: TypeClass::String,
+        on_present: AssertYield::Identity,
+    };
+    match rewrite_result(outer, 1) {
+        OptExpr::TypeAssert { inner, .. } => assert!(matches!(*inner, OptExpr::TypeAssert { .. })),
+        other => panic!("expected kept nesting, got {other:?}"),
+    }
+}
+
+// ---- OR-of-equals → membership Switch -------------------------------------
+
+#[test]
+fn long_or_of_equals_lowers_to_membership_switch() {
+    // k==1 || k==2 || ... || k==6 → Switch{1..6 → true, default false}.
+    let mut source = String::from(r#"field("k") == 1"#);
+    for index in 2..=6 {
+        source.push_str(&format!(r#" || field("k") == {index}"#));
+    }
+    match optimized_result(&source) {
+        OptExpr::Switch {
+            inputs,
+            table,
+            default,
+        } => {
+            assert_eq!(inputs.len(), 1);
+            assert!(matches!(&inputs[0], OptExpr::SourceField(name) if name == "k"));
+            assert_eq!(table.len(), 6);
+            assert!(
+                table
+                    .iter()
+                    .all(|(_, value)| *value == OptExpr::Const(Value::Bool(true)))
+            );
+            assert_eq!(*default, OptExpr::Const(Value::Bool(false)));
+        }
+        other => panic!("expected a membership Switch, got {other:?}"),
+    }
+}
+
+#[test]
+fn short_or_of_equals_stays_disjunction() {
+    let mut source = String::from(r#"field("k") == 1"#);
+    for index in 2..=5 {
+        source.push_str(&format!(r#" || field("k") == {index}"#));
+    }
+    assert!(matches!(optimized_result(&source), OptExpr::Or { .. }));
+}
+
+#[test]
+fn or_of_equals_below_distinct_threshold_after_dedup_stays_disjunction() {
+    // Six clauses but only five DISTINCT keys (`k==1` twice) — after dedup the
+    // membership table is below threshold, so it stays an `Or`.
+    let mut source = String::from(r#"field("k") == 1"#);
+    for index in [1, 2, 3, 4, 5] {
+        source.push_str(&format!(r#" || field("k") == {index}"#));
+    }
+    assert!(matches!(optimized_result(&source), OptExpr::Or { .. }));
+}
+
+#[test]
+fn membership_switch_evaluates_like_the_disjunction() {
+    let mut chain = register_equals(0, Value::Int64(1));
+    for index in 2..=6i64 {
+        chain = OptExpr::Or {
+            left: Box::new(chain),
+            right: Box::new(register_equals(0, Value::Int64(index))),
+        };
+    }
+    let switch = rewrite_result(chain, 1);
+    assert!(matches!(switch, OptExpr::Switch { .. }));
+    assert_eq!(
+        eval_with_register0(switch.clone(), Value::Int64(3)),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        eval_with_register0(switch, Value::Int64(9)),
+        Value::Bool(false)
+    );
+}
+
+// ---- nested Switch collapse -----------------------------------------------
+
+/// A `Switch` over `Register(0)` keyed on `Int64` constants.
+fn int_switch(entries: Vec<(i64, &str)>, default: &str) -> OptExpr {
+    OptExpr::Switch {
+        inputs: vec![OptExpr::Register(0)],
+        table: entries
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    Key::from_value(&Value::Int64(key)).unwrap(),
+                    OptExpr::Const(Value::Text(value.to_owned())),
+                )
+            })
+            .collect(),
+        default: Box::new(OptExpr::Const(Value::Text(default.to_owned()))),
+    }
+}
+
+#[test]
+fn nested_switch_over_same_key_collapses() {
+    // Switch{k, {1→a}, default: Switch{k, {1→x, 2→b}, default d}}
+    //   → Switch{k, {1→a, 2→b}, default d}   (outer wins on key 1).
+    let inner = int_switch(vec![(1, "x"), (2, "b")], "d");
+    let outer = OptExpr::Switch {
+        inputs: vec![OptExpr::Register(0)],
+        table: vec![(
+            Key::from_value(&Value::Int64(1)).unwrap(),
+            OptExpr::Const(Value::Text("a".into())),
+        )],
+        default: Box::new(inner),
+    };
+    match rewrite_result(outer, 1) {
+        OptExpr::Switch {
+            inputs,
+            table,
+            default,
+        } => {
+            assert_eq!(inputs, vec![OptExpr::Register(0)]);
+            assert_eq!(table.len(), 2);
+            let one = Key::from_value(&Value::Int64(1)).unwrap();
+            let entry = table.iter().find(|(key, _)| *key == one).unwrap();
+            // Outer wins on the shared key 1; the inner-only key 2 carries over.
+            assert_eq!(entry.1, OptExpr::Const(Value::Text("a".into())));
+            let two = Key::from_value(&Value::Int64(2)).unwrap();
+            let entry_two = table.iter().find(|(key, _)| *key == two).unwrap();
+            assert_eq!(entry_two.1, OptExpr::Const(Value::Text("b".into())));
+            assert_eq!(*default, OptExpr::Const(Value::Text("d".into())));
+        }
+        other => panic!("expected a merged Switch, got {other:?}"),
+    }
+}
+
+#[test]
+fn nested_switch_over_different_key_is_kept() {
+    let inner = OptExpr::Switch {
+        inputs: vec![OptExpr::Register(1)],
+        table: vec![(
+            Key::from_value(&Value::Int64(2)).unwrap(),
+            OptExpr::Const(Value::Text("b".into())),
+        )],
+        default: Box::new(OptExpr::Const(Value::Text("d".into()))),
+    };
+    let outer = OptExpr::Switch {
+        inputs: vec![OptExpr::Register(0)],
+        table: vec![(
+            Key::from_value(&Value::Int64(1)).unwrap(),
+            OptExpr::Const(Value::Text("a".into())),
+        )],
+        default: Box::new(inner),
+    };
+    match rewrite_result(outer, 2) {
+        OptExpr::Switch { default, .. } => assert!(matches!(*default, OptExpr::Switch { .. })),
+        other => panic!("expected the outer Switch kept, got {other:?}"),
+    }
+}
+
+#[test]
+fn nested_switch_over_impure_key_is_kept() {
+    // The two switches read the SAME key expression, but it is impure (random):
+    // merging to one evaluation would change the result, so it must not collapse.
+    let random_key = || {
+        let random_int = registry().get_ref("randomInt", Some(2)).unwrap();
+        OptExpr::Call {
+            func: random_int,
+            args: vec![
+                OptExpr::Const(Value::Int64(0)),
+                OptExpr::Const(Value::Int64(10)),
+            ],
+        }
+    };
+    let inner = OptExpr::Switch {
+        inputs: vec![random_key()],
+        table: vec![(
+            Key::from_value(&Value::Int64(2)).unwrap(),
+            OptExpr::Const(Value::Text("b".into())),
+        )],
+        default: Box::new(OptExpr::Const(Value::Text("d".into()))),
+    };
+    let outer = OptExpr::Switch {
+        inputs: vec![random_key()],
+        table: vec![(
+            Key::from_value(&Value::Int64(1)).unwrap(),
+            OptExpr::Const(Value::Text("a".into())),
+        )],
+        default: Box::new(inner),
+    };
+    match rewrite_result(outer, 0) {
+        OptExpr::Switch { default, .. } => assert!(matches!(*default, OptExpr::Switch { .. })),
+        other => panic!("expected the outer Switch kept, got {other:?}"),
+    }
+}
+
+#[test]
+fn switch_with_constant_key_folds_to_matched_branch() {
+    let switch = OptExpr::Switch {
+        inputs: vec![OptExpr::Const(Value::Int64(2))],
+        table: vec![
+            (
+                Key::from_value(&Value::Int64(1)).unwrap(),
+                OptExpr::Const(Value::Text("a".into())),
+            ),
+            (
+                Key::from_value(&Value::Int64(2)).unwrap(),
+                OptExpr::Const(Value::Text("b".into())),
+            ),
+            (
+                Key::from_value(&Value::Int64(3)).unwrap(),
+                OptExpr::Const(Value::Text("c".into())),
+            ),
+        ],
+        default: Box::new(OptExpr::Const(Value::Text("z".into()))),
+    };
+    assert_eq!(
+        rewrite_result(switch, 0),
+        OptExpr::Const(Value::Text("b".into()))
+    );
+}
+
+#[test]
+fn switch_with_constant_key_miss_folds_to_default() {
+    let switch = OptExpr::Switch {
+        inputs: vec![OptExpr::Const(Value::Int64(9))],
+        table: vec![(
+            Key::from_value(&Value::Int64(1)).unwrap(),
+            OptExpr::Const(Value::Text("a".into())),
+        )],
+        default: Box::new(OptExpr::Const(Value::Text("z".into()))),
+    };
+    assert_eq!(
+        rewrite_result(switch, 0),
+        OptExpr::Const(Value::Text("z".into()))
+    );
+}
+
+#[test]
+fn switch_on_inlined_constant_key_folds_through_the_pipeline() {
+    // `x` is a constant binding used as the switch key: switch_lower builds the
+    // Switch over the register, constant_inliner inlines `x = 3`, and BranchPrune
+    // then folds the now constant-key Switch to its matched branch.
+    let mut source = String::from("x = 3; multiIf(");
+    for index in 1..=6 {
+        source.push_str(&format!(r#"x == {index}, "v{index}", "#));
+    }
+    source.push_str(r#""default")"#);
+    assert_eq!(
+        optimized_result(&source),
+        OptExpr::Const(Value::Text("v3".into()))
+    );
+}
+
+#[test]
+fn collapsed_switch_evaluates_correctly() {
+    let inner = int_switch(vec![(2, "b")], "d");
+    let outer = OptExpr::Switch {
+        inputs: vec![OptExpr::Register(0)],
+        table: vec![(
+            Key::from_value(&Value::Int64(1)).unwrap(),
+            OptExpr::Const(Value::Text("a".into())),
+        )],
+        default: Box::new(inner),
+    };
+    let merged = rewrite_result(outer, 1);
+    assert_eq!(
+        eval_with_register0(merged.clone(), Value::Int64(1)),
+        Value::Text("a".into())
+    );
+    assert_eq!(
+        eval_with_register0(merged.clone(), Value::Int64(2)),
+        Value::Text("b".into())
+    );
+    assert_eq!(
+        eval_with_register0(merged, Value::Int64(9)),
+        Value::Text("d".into())
+    );
 }
 
 /// Evaluate a `TypeAssert` over a constant operand directly (the rewrites need a
@@ -1869,13 +2378,15 @@ fn keeps_always_run_operand_clone_under_short_circuit() {
 
 #[test]
 fn clones_value_read_when_ifnull_alternative_reads_register() {
-    // `ifNull(x, upper(x))`: `x` (always-run value) must clone because the lazy
-    // alternative re-reads it; the alternative's read is the last use and moves.
-    let compiled = compile_optimized(r#"x = randomHex(4); ifNull(x, upper(x))"#);
+    // `ifNull(upper(x), lower(x))`: `x` in the always-run value must clone because
+    // the lazy alternative re-reads it; the alternative's read is the last use and
+    // moves. The value is `upper(x)` (not a bare operand) so guard propagation does
+    // not fold the alternative — keeping both register reads live for this test.
+    let compiled = compile_optimized(r#"x = randomHex(4); ifNull(upper(x), lower(x))"#);
     let OptNode::IfNull { value, alternative } = compiled.node(compiled.result()) else {
         panic!("expected an ifNull result");
     };
-    let value_read = compiled.node(*value);
+    let value_read = register_read_arg(&compiled, *value);
     let alternative_read = register_read_arg(&compiled, *alternative);
     assert!(
         matches!(value_read, OptNode::Register(_)),

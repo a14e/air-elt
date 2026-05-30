@@ -4,6 +4,8 @@ use crate::token::{SpannedToken, StringPart, Token};
 /// Hand-rolled lexer for the expression language.
 /// Supports double-quoted strings with interpolation and single-quoted raw strings.
 /// Tracks line numbers for newline-aware statement separation.
+/// `#` starts a line comment that runs to the end of the line (the newline itself
+/// is left in place so it still separates statements).
 pub struct Lexer<'a> {
     input: &'a str,
     pos: usize,
@@ -36,7 +38,7 @@ impl<'a> Lexer<'a> {
     pub fn tokenize(&mut self) -> Result<Vec<SpannedToken>, ExprError> {
         let mut tokens = Vec::new();
         loop {
-            self.skip_whitespace();
+            self.skip_trivia();
             if self.pos >= self.input.len() {
                 tokens.push(SpannedToken {
                     token: Token::Eof,
@@ -55,12 +57,21 @@ impl<'a> Lexer<'a> {
         self.input.as_bytes()[self.pos]
     }
 
-    fn skip_whitespace(&mut self) {
+    /// Skip whitespace and `#` line comments between tokens. A comment runs to the
+    /// end of the line; the terminating newline is deliberately left for the next
+    /// iteration so the line counter advances and newline-based statement
+    /// separation is preserved. A `#` inside a string literal never reaches here —
+    /// the string is consumed as a single token in [`Self::next_token`].
+    fn skip_trivia(&mut self) {
         while self.pos < self.input.len() {
             let b = self.input.as_bytes()[self.pos];
             if b == b'\n' {
                 self.line += 1;
                 self.pos += 1;
+            } else if b == b'#' {
+                while self.pos < self.input.len() && self.input.as_bytes()[self.pos] != b'\n' {
+                    self.pos += 1;
+                }
             } else if b.is_ascii_whitespace() {
                 self.pos += 1;
             } else {
@@ -607,6 +618,49 @@ mod tests {
     #[test]
     fn tokenize_float() {
         assert_eq!(tokens("3.14"), vec![Token::FloatLit(3.14), Token::Eof]);
+    }
+
+    #[test]
+    fn line_comment_is_skipped_to_end_of_line() {
+        // A trailing comment is dropped; the newline still separates statements.
+        assert_eq!(
+            tokens("x = 1 # assign\ny = 2 # use"),
+            vec![
+                Token::Ident("x".to_string()),
+                Token::Eq,
+                Token::IntLit(1),
+                Token::Ident("y".to_string()),
+                Token::Eq,
+                Token::IntLit(2),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn whole_line_comment_yields_no_tokens() {
+        assert_eq!(tokens("# just a comment"), vec![Token::Eof]);
+        // Comment at EOF with no trailing newline.
+        assert_eq!(
+            tokens("a # trailing"),
+            vec![Token::Ident("a".to_string()), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn hash_inside_string_literal_is_not_a_comment() {
+        // `#` within a raw or double-quoted string is a literal character.
+        assert_eq!(
+            tokens("'a # b'"),
+            vec![Token::RawStringLit("a # b".to_string()), Token::Eof]
+        );
+        assert_eq!(
+            tokens("\"color: #fff\""),
+            vec![
+                Token::StringLit(vec![StringPart::Literal("color: #fff".to_string())]),
+                Token::Eof,
+            ]
+        );
     }
 
     #[test]
