@@ -16,6 +16,7 @@
 //! An `or` of clauses expands to several table entries pointing at one branch;
 //! duplicate keys keep the first (preserving `multiIf` first-match order).
 
+use ahash::AHashSet;
 use air_elt_expr_funcs::{FuncRef, FunctionRegistry};
 use air_elt_types::{Key, Value};
 
@@ -78,6 +79,10 @@ fn try_lower(
 ) -> Option<(KeyExprs, SwitchEntries)> {
     let mut key_exprs: Option<KeyExprs> = None;
     let mut table: SwitchEntries = Vec::new();
+    // `Key` is hashable with a cross-numeric-consistent `Eq`/`Hash`, so dedup is
+    // an O(1) set membership rather than a linear table scan — the table can hold
+    // thousands of entries for a generated dispatch.
+    let mut seen: AHashSet<Key> = AHashSet::new();
 
     for (condition, value) in branches {
         let clauses = parse_condition(condition, equals)?;
@@ -86,8 +91,8 @@ fn try_lower(
         }
         for clause in clauses {
             let key = clause_to_key(clause, &mut key_exprs)?;
-            // First-match wins: a key already in the table keeps its branch.
-            if table.iter().any(|(existing, _)| existing == &key) {
+            // First-match wins: a key already seen keeps its branch.
+            if !seen.insert(key.clone()) {
                 continue;
             }
             table.push((key, value.clone()));

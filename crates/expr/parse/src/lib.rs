@@ -1,6 +1,7 @@
 pub(crate) mod error;
 pub mod model;
 pub(crate) mod parser;
+pub(crate) mod pratt_operator;
 
 pub(crate) mod detect;
 pub(crate) mod lexer;

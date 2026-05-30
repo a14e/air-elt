@@ -10,6 +10,8 @@
 //! categorical checks this fires in every position: a conjunction that always
 //! raises is a definite bug regardless of which branch reaches it.
 
+use ahash::AHashMap;
+
 use super::engine::{Check, CheckCx};
 use crate::error::OptimizeError;
 use crate::model::opt_expr::{FrozenOperand, OptExpr};
@@ -26,9 +28,10 @@ impl Check for ConjunctionInfeasibility {
         let mut conjuncts = Vec::new();
         flatten_and(node, &mut conjuncts);
 
-        // The type class each conjunct asserts on a frozen operand. A later assert
-        // on the same operand demanding a different class is the contradiction.
-        let mut asserted: Vec<(FrozenOperand, TypeClass)> = Vec::new();
+        // The type class each conjunct asserts on a frozen operand, keyed by
+        // operand for O(1) conflict lookup. A later assert on the same operand
+        // demanding a different class is the contradiction.
+        let mut asserted: AHashMap<FrozenOperand, TypeClass> = AHashMap::new();
         for conjunct in conjuncts {
             let OptExpr::TypeAssert { inner, expect, .. } = conjunct else {
                 continue;
@@ -36,16 +39,16 @@ impl Check for ConjunctionInfeasibility {
             let Some(key) = inner.frozen_operand() else {
                 continue;
             };
-            let conflict = asserted
-                .iter()
-                .find(|(operand, class)| *operand == key && *class != *expect);
-            if let Some((_, other)) = conflict {
-                return Err(OptimizeError::InfeasibleConjunction {
-                    first: other.describe(),
-                    second: expect.describe(),
-                });
+            if let Some(other) = asserted.get(&key) {
+                if *other != *expect {
+                    return Err(OptimizeError::InfeasibleConjunction {
+                        first: other.describe(),
+                        second: expect.describe(),
+                    });
+                }
+            } else {
+                asserted.insert(key, *expect);
             }
-            asserted.push((key, *expect));
         }
         Ok(())
     }

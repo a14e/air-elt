@@ -110,7 +110,7 @@ pub(crate) enum OptExpr {
 /// read is total and deterministic per row, so a fact proved about either still
 /// holds wherever it is read again. Shared by guard propagation and the
 /// conjunction-infeasibility check, which both reason over the same operands.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum FrozenOperand {
     Register(u16),
     SourceField(String),

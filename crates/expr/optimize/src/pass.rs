@@ -10,14 +10,15 @@
 //! it converges.
 //!
 //! The scope is deliberately the *in-place* `OptProgram` passes only. The
-//! pipeline-stage engines ([`OptProgramConverter`](crate::engines),
-//! [`Compactor`](crate::engines), [`ProgramEvaluator`](crate::engines)) transform
-//! *between* program types (`Program → OptProgram → CompactProgram → Value`)
-//! rather than rewriting one in place, so they keep their own verbs (`convert` /
-//! `compact` / `evaluate`) — naming them `optimize` would misdescribe them. The
-//! [`MoveAnnotator`](crate::engines) is the same: it rewrites a `CompactProgram`
-//! (a different type than `OptProgram`) in place, so it is not a `Pass` and keeps
-//! its own verb (`annotate`).
+//! pipeline-stage engines ([`OptProgramConverter`](crate::engines) and
+//! [`Compactor`](crate::engines)) transform *between* program types
+//! (`Program → OptProgram → CompactProgram`) rather than rewriting one in place,
+//! so they keep their own verbs (`convert` / `compact`) — naming them `optimize`
+//! would misdescribe them. The [`MoveAnnotator`](crate::engines) is the same: it
+//! rewrites a `CompactProgram` (a different type than `OptProgram`) in place, so
+//! it is not a `Pass` and keeps its own verb (`annotate`). The
+//! [`ProgramEvaluator`](crate::engines) (`CompactProgram → Value`) is not in the
+//! compile pipeline at all — it is the tests' correctness oracle.
 
 use crate::model::opt_program::OptProgram;
 

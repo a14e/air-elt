@@ -14,18 +14,20 @@ Literals: integer (`42`), float (`3.14`), bool (`true`/`false`), null (`null`), 
 
 Variables: `x = expr` (assignment via `=`, separated by `;`).
 
-Operators (in precedence order, low to high):
+Operators (in precedence order, low to high; binary operators are left-associative unless noted):
 - `||` logical OR
 - `&&` logical AND
-- `==`, `!=` equality
-- `<`, `>`, `<=`, `>=` comparison
 - `|` bitwise OR
 - `^` bitwise XOR
 - `&` bitwise AND
+- `==`, `!=`, `<`, `>`, `<=`, `>=` comparison — **non-associative** (`a < b < c` is a parse error; parenthesize)
 - `<<`, `>>` shift
 - `+`, `-` additive
 - `*`, `/`, `%` multiplicative
+- `**` power — **right-associative**
 - `!`, `~`, unary `-` (prefix)
+
+The parser is precedence-climbing (one `PrattOperator` table in `pratt_operator.rs`), so deeply nested expressions stay shallow on the native stack and the depth guard (`MAX_EXPR_DEPTH`) returns a clean error instead of overflowing.
 
 Function calls: `name(arg1, arg2, ...)`.
 Object literals: `{ "key" = expr, "other" = expr }`.
@@ -83,8 +85,8 @@ Unary: `negate`/`abs` preserve the input type. `ceil`/`floor`/`round`/`sign` ret
 **Cast functions:** return the target type (`toInt64` returns `Int64`, `toBigInt` returns `BigInt{width:None}`, `toDecimal` returns `Decimal{precision:None, scale:None}`, etc.).
 
 **Conditional functions** (parsed as AST nodes, resolved in `type_resolver.rs`):
-- `if(cond, then, else)`: returns `then`'s data type; nullable if either branch is nullable.
-- `multiIf(c1,v1,...,default)`: returns the first branch's data type; nullable if any branch is nullable.
+- `if(cond, then, else)`: returns `then`'s data type; nullable if either branch is nullable. An `if`/`else if` chain (`if(c1, v1, if(c2, v2, …, default))`) folds at parse time into a flat `multiIf` — identical meaning, parsed/evaluated iteratively, so a long ladder costs no nesting depth. Use a flat `multiIf` (or a chain) rather than deep nesting for many cases (`MAX_AST_NODES`, not `MAX_EXPR_DEPTH`, is the bound — thousands of branches are fine).
+- `multiIf(c1,v1,...,default)`: returns the first branch's data type; nullable if any branch is nullable. A large equality `multiIf` over one or two pure keys lowers to an O(1) `Switch` (see the optimizer).
 - `ifNull(value, alt)`: returns `value`'s data type; nullable = `alt.nullable` (the value itself is non-null after the check).
 - `nullIf(value, sentinel)`: returns `value`'s data type; always nullable (can produce null).
 

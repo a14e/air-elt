@@ -1,9 +1,11 @@
 //! The standalone (non-rule) engines that [`Optimizer`](crate::optimizer)
-//! composes: IR conversion, downward guard propagation, heap evaluation, arena
-//! compaction, and register move annotation. These are not rule plugins — each is
-//! a whole-program pass — so they live here rather than with the rule-based
-//! engines in [`rules`](crate::rules), [`second_pass_rules`](crate::second_pass_rules),
-//! and [`check`](crate::check).
+//! composes: IR conversion, downward guard propagation, arena compaction, and
+//! register move annotation. These are not rule plugins — each is a whole-program
+//! pass — so they live here rather than with the rule-based engines in
+//! [`rules`](crate::rules), [`second_pass_rules`](crate::second_pass_rules), and
+//! [`check`](crate::check). [`ProgramEvaluator`] also lives here but is not part
+//! of the compile pipeline — it is the field-free correctness oracle the tests
+//! run over a `CompactProgram`.
 
 pub(crate) mod compact;
 pub(crate) mod evaluator;

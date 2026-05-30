@@ -171,6 +171,28 @@ fn threads_equality_fact_into_and_right_operand() {
 }
 
 #[test]
+fn substitutes_null_in_is_not_null_else_branch() {
+    // `isNotNull(x)` false ⇒ `x` is null, so the ELSE branch's `upper(x)` folds to
+    // null — the symmetric, negative-truth counterpart of the `isNull` then-branch.
+    let result = optimized_result(r#"if(isNotNull(field("c")), field("c"), upper(field("c")))"#);
+    let OptExpr::If { else_branch, .. } = result else {
+        panic!("expected if, got {result:?}");
+    };
+    assert_eq!(*else_branch, OptExpr::Const(Value::Null));
+}
+
+#[test]
+fn folds_not_equals_fact_in_else_branch() {
+    // `x != "yes"` false ⇒ `x == "yes"`, so the ELSE branch pins `x` to "yes" and
+    // `upper(x)` folds to "YES" — the `notEquals` guard on the negative path.
+    let result = optimized_result(r#"if(field("c") != "yes", field("c"), upper(field("c")))"#);
+    let OptExpr::If { else_branch, .. } = result else {
+        panic!("expected if, got {result:?}");
+    };
+    assert_eq!(*else_branch, OptExpr::Const(Value::Text("YES".to_string())));
+}
+
+#[test]
 fn rejects_conjunction_asserting_incompatible_types() {
     // `contains(x,"")` asserts `x` is a string; `!(!x)` asserts it is a bool. A
     // `&&` of the two raises for every non-null row, so it is a compile error.
@@ -1540,6 +1562,46 @@ fn keeps_small_or_float_keyed_multi_if() {
 }
 
 #[test]
+fn keeps_impure_keyed_multi_if_unlowered() {
+    // Lowering a `multiIf` to a `Switch` evaluates the key ONCE; that is only sound
+    // for a pure key. An impure key (`randomInt`) must keep the `multiIf`, which
+    // re-evaluates the condition per branch.
+    let source = "multiIf(\
+        randomInt(0, 10) == 1, 10, randomInt(0, 10) == 2, 20, randomInt(0, 10) == 3, 30, \
+        randomInt(0, 10) == 4, 40, randomInt(0, 10) == 5, 50, randomInt(0, 10) == 6, 60, 0)";
+    assert!(
+        matches!(optimized_result(source), OptExpr::MultiIf { .. }),
+        "an impure-keyed multiIf must not be switch-lowered"
+    );
+}
+
+#[test]
+fn switch_lowering_keeps_first_branch_on_duplicate_key() {
+    // Two branches share key 1; switch lowering is first-match (like the original
+    // `multiIf`), so the table entry for 1 must keep the FIRST branch's value (10),
+    // not the later 999.
+    let source = "multiIf(\
+        field(\"x\") == 1, 10, field(\"x\") == 1, 999, field(\"x\") == 2, 20, \
+        field(\"x\") == 3, 30, field(\"x\") == 4, 40, field(\"x\") == 5, 50, \
+        field(\"x\") == 6, 60, 0)";
+    let OptExpr::Switch { table, .. } = optimized_result(source) else {
+        panic!("expected a Switch");
+    };
+    let key_one = Key::single(Value::Int64(1)).unwrap();
+    let matches: Vec<&OptExpr> = table
+        .iter()
+        .filter(|(key, _)| *key == key_one)
+        .map(|(_, value)| value)
+        .collect();
+    assert_eq!(matches.len(), 1, "the duplicate key collapses to one entry");
+    assert_eq!(
+        *matches[0],
+        OptExpr::Const(Value::Int64(10)),
+        "first branch wins"
+    );
+}
+
+#[test]
 fn evaluates_switch_dispatch() {
     // A const-keyed switch built directly (the optimizer would const-fold one
     // away), to exercise compaction of the table + `eval_switch`.
@@ -1574,6 +1636,65 @@ fn evaluates_switch_dispatch() {
     };
     assert_eq!(dispatch(Value::Int64(2)), Value::Int64(20)); // hit
     assert_eq!(dispatch(Value::Int64(99)), Value::Int64(0)); // miss → default
+}
+
+#[test]
+fn compiles_large_if_else_if_chain_to_a_switch() {
+    // A long if/else-if equality ladder desugars to a flat multiIf at parse time,
+    // then lowers to an O(1) Switch — exercising the raised node cap and the
+    // hashed switch-table dedup. The key (`field("k")`, deterministic per row) is
+    // collapsed to a single dispatch input.
+    let count = 2000usize;
+    // Built linearly (`if(...,` prefixes, default, then the `)` tail) rather than
+    // re-formatting a growing accumulator, which would be quadratic.
+    let mut chain = String::with_capacity(count * 28);
+    for n in 0..count {
+        chain.push_str(&format!("if(field(\"k\") == {n}, {n}, "));
+    }
+    chain.push('0');
+    for _ in 0..count {
+        chain.push(')');
+    }
+    let compiled = compile_optimized(&chain);
+    let OptNode::Switch { table, .. } = compiled.node(compiled.result()) else {
+        panic!(
+            "expected the ladder to lower to a Switch, got {:?}",
+            compiled.node(compiled.result())
+        );
+    };
+    assert_eq!(
+        compiled.switch_table(*table).branches().count(),
+        count,
+        "every distinct key becomes one dispatch entry"
+    );
+}
+
+#[test]
+fn if_else_if_chain_evaluates_like_the_nested_form() {
+    // The parse-time desugar to multiIf preserves if/else-if semantics: the first
+    // matching branch wins, otherwise the default.
+    assert_eq!(
+        eval_unoptimized("if(1 == 2, 10, if(3 == 3, 20, 30))"),
+        Value::Int64(20)
+    );
+    assert_eq!(
+        eval_unoptimized("if(1 == 1, 10, if(3 == 3, 20, 30))"),
+        Value::Int64(10)
+    );
+    assert_eq!(
+        eval_unoptimized("if(1 == 2, 10, if(3 == 4, 20, 30))"),
+        Value::Int64(30)
+    );
+    // A null in a non-taken branch must not leak; a taken null branch yields null
+    // (the desugar preserves the nested form's null behaviour, not just values).
+    assert_eq!(
+        eval_unoptimized("if(1 == 2, null, if(3 == 3, 20, 30))"),
+        Value::Int64(20)
+    );
+    assert_eq!(
+        eval_unoptimized("if(1 == 1, null, if(3 == 3, 20, 30))"),
+        Value::Null
+    );
 }
 
 // ---- Move annotation: register clone elision ------------------------------

@@ -8,6 +8,7 @@ use crate::lexer::Lexer;
 use crate::model::{
     ConditionalExpr, Expr, FieldsSelector, InterpolationSegment, LiteralValue, Program, Statement,
 };
+use crate::pratt_operator::{Associativity, PrattOperator};
 use crate::token::{SpannedToken, StringPart, Token};
 
 /// Expression parser. Converts expression source strings into [`Program`] ASTs.
@@ -309,228 +310,92 @@ impl ParseState {
 
     fn parse_expr(&mut self) -> Result<Expr, ExprError> {
         self.increment_depth()?;
-        let result = self.parse_or_expr();
+        let result = self.parse_binary_expr(0);
         self.decrement_depth();
         result
     }
 
-    fn parse_or_expr(&mut self) -> Result<Expr, ExprError> {
-        let mut left = self.parse_and_expr()?;
+    /// Precedence climbing over the [`PrattOperator`] table — one loop in place
+    /// of the ten-level recursive ladder it replaces. `min_binding_power` is the
+    /// lowest binding power this call may consume; an operator binding looser than
+    /// that belongs to an enclosing call.
+    ///
+    /// Each fold deepens the left-nested result by one level and holds a depth
+    /// unit (via [`fold_binary_chain`](Self::fold_binary_chain)) for the duration,
+    /// so the depth guard bounds the *tree* depth — a long flat chain
+    /// (`a + b + c + …`) or a right-associative one (`a ** b ** …`) can never
+    /// build an AST too deep to recurse over (evaluate, optimize, or even drop),
+    /// exactly like parenthesized nesting. Folding the ladder into one loop also
+    /// keeps the native parse stack shallow (a handful of frames per level, not
+    /// ~13), so the guard returns a clean error instead of overflowing.
+    fn parse_binary_expr(&mut self, min_binding_power: u8) -> Result<Expr, ExprError> {
+        let mut folds = 0usize;
+        let result = self.fold_binary_chain(min_binding_power, &mut folds);
+        // Release the depth units this call held, on success and on error alike.
+        for _ in 0..folds {
+            self.decrement_depth();
+        }
+        result
+    }
 
-        while *self.peek() == Token::Or {
+    fn fold_binary_chain(
+        &mut self,
+        min_binding_power: u8,
+        folds: &mut usize,
+    ) -> Result<Expr, ExprError> {
+        let mut left = self.parse_unary_expr()?;
+
+        while let Some(operator) = PrattOperator::for_token(self.peek()) {
+            let (left_binding_power, right_binding_power) = operator.binding_powers();
+            if left_binding_power < min_binding_power {
+                break;
+            }
+            let non_associative = operator.associativity() == Associativity::NonAssociative;
+
             self.advance();
-            let right = self.parse_and_expr()?;
+            *folds += 1;
+            self.increment_depth()?;
+            let right = self.parse_binary_expr(right_binding_power)?;
             self.count_node()?;
-            left = Expr::Conditional(ConditionalExpr::Or {
-                left: Box::new(left),
-                right: Box::new(right),
-            });
+            left = operator.build(left, right);
+
+            // A non-associative operator (comparison) does not chain: in the old
+            // ladder a second one was left unconsumed and rejected downstream, so
+            // reproduce that rejection here with a clearer message.
+            if non_associative
+                && PrattOperator::for_token(self.peek())
+                    .is_some_and(|next| next.associativity() == Associativity::NonAssociative)
+            {
+                return Err(ExprError::Parse {
+                    position: self.pos,
+                    message: "comparison operators do not chain; add parentheses".to_string(),
+                });
+            }
         }
 
         Ok(left)
-    }
-
-    fn parse_and_expr(&mut self) -> Result<Expr, ExprError> {
-        let mut left = self.parse_bit_or_expr()?;
-
-        while *self.peek() == Token::And {
-            self.advance();
-            let right = self.parse_bit_or_expr()?;
-            self.count_node()?;
-            left = Expr::Conditional(ConditionalExpr::And {
-                left: Box::new(left),
-                right: Box::new(right),
-            });
-        }
-
-        Ok(left)
-    }
-
-    fn parse_bit_or_expr(&mut self) -> Result<Expr, ExprError> {
-        let mut left = self.parse_bit_xor_expr()?;
-
-        while *self.peek() == Token::Pipe {
-            self.advance();
-            let right = self.parse_bit_xor_expr()?;
-            self.count_node()?;
-            left = Expr::FunctionCall {
-                name: "bitOr".to_string(),
-                args: vec![left, right],
-            };
-        }
-
-        Ok(left)
-    }
-
-    fn parse_bit_xor_expr(&mut self) -> Result<Expr, ExprError> {
-        let mut left = self.parse_bit_and_expr()?;
-
-        while *self.peek() == Token::Caret {
-            self.advance();
-            let right = self.parse_bit_and_expr()?;
-            self.count_node()?;
-            left = Expr::FunctionCall {
-                name: "bitXor".to_string(),
-                args: vec![left, right],
-            };
-        }
-
-        Ok(left)
-    }
-
-    fn parse_bit_and_expr(&mut self) -> Result<Expr, ExprError> {
-        let mut left = self.parse_cmp_expr()?;
-
-        while *self.peek() == Token::Ampersand {
-            self.advance();
-            let right = self.parse_cmp_expr()?;
-            self.count_node()?;
-            left = Expr::FunctionCall {
-                name: "bitAnd".to_string(),
-                args: vec![left, right],
-            };
-        }
-
-        Ok(left)
-    }
-
-    fn parse_cmp_expr(&mut self) -> Result<Expr, ExprError> {
-        let left = self.parse_shift_expr()?;
-
-        let operator_name = match self.peek() {
-            Token::EqEq => "equals",
-            Token::NotEq => "notEquals",
-            Token::Lt => "less",
-            Token::Gt => "greater",
-            Token::LtEq => "lessOrEquals",
-            Token::GtEq => "greaterOrEquals",
-            _ => return Ok(left),
-        };
-
-        self.advance();
-        let right = self.parse_shift_expr()?;
-        self.count_node()?;
-
-        Ok(Expr::FunctionCall {
-            name: operator_name.to_string(),
-            args: vec![left, right],
-        })
-    }
-
-    fn parse_shift_expr(&mut self) -> Result<Expr, ExprError> {
-        let mut left = self.parse_add_expr()?;
-
-        loop {
-            let operator_name = match self.peek() {
-                Token::ShiftLeft => "bitShiftLeft",
-                Token::ShiftRight => "bitShiftRight",
-                _ => break,
-            };
-
-            self.advance();
-            let right = self.parse_add_expr()?;
-            self.count_node()?;
-            left = Expr::FunctionCall {
-                name: operator_name.to_string(),
-                args: vec![left, right],
-            };
-        }
-
-        Ok(left)
-    }
-
-    fn parse_add_expr(&mut self) -> Result<Expr, ExprError> {
-        let mut left = self.parse_mul_expr()?;
-
-        loop {
-            let operator_name = match self.peek() {
-                Token::Plus => "add",
-                Token::Minus => "subtract",
-                _ => break,
-            };
-
-            self.advance();
-            let right = self.parse_mul_expr()?;
-            self.count_node()?;
-            left = Expr::FunctionCall {
-                name: operator_name.to_string(),
-                args: vec![left, right],
-            };
-        }
-
-        Ok(left)
-    }
-
-    fn parse_mul_expr(&mut self) -> Result<Expr, ExprError> {
-        let mut left = self.parse_power_expr()?;
-
-        loop {
-            let operator_name = match self.peek() {
-                Token::Star => "multiply",
-                Token::Slash => "divide",
-                Token::Percent => "modulo",
-                _ => break,
-            };
-
-            self.advance();
-            let right = self.parse_power_expr()?;
-            self.count_node()?;
-            left = Expr::FunctionCall {
-                name: operator_name.to_string(),
-                args: vec![left, right],
-            };
-        }
-
-        Ok(left)
-    }
-
-    fn parse_power_expr(&mut self) -> Result<Expr, ExprError> {
-        let base = self.parse_unary_expr()?;
-
-        if *self.peek() == Token::Power {
-            self.advance();
-            let exponent = self.parse_power_expr()?;
-            self.count_node()?;
-            return Ok(Expr::FunctionCall {
-                name: "power".to_string(),
-                args: vec![base, exponent],
-            });
-        }
-
-        Ok(base)
     }
 
     fn parse_unary_expr(&mut self) -> Result<Expr, ExprError> {
-        match self.peek() {
-            Token::Minus => {
-                self.advance();
-                let operand = self.parse_unary_expr()?;
-                self.count_node()?;
-                Ok(Expr::FunctionCall {
-                    name: "negate".to_string(),
-                    args: vec![operand],
-                })
-            }
-            Token::Not => {
-                self.advance();
-                let operand = self.parse_unary_expr()?;
-                self.count_node()?;
-                Ok(Expr::FunctionCall {
-                    name: "not".to_string(),
-                    args: vec![operand],
-                })
-            }
-            Token::Tilde => {
-                self.advance();
-                let operand = self.parse_unary_expr()?;
-                self.count_node()?;
-                Ok(Expr::FunctionCall {
-                    name: "bitNot".to_string(),
-                    args: vec![operand],
-                })
-            }
-            _ => self.parse_call_expr(),
-        }
+        let operator_name = match self.peek() {
+            Token::Minus => "negate",
+            Token::Not => "not",
+            Token::Tilde => "bitNot",
+            _ => return self.parse_call_expr(),
+        };
+
+        self.advance();
+        // Guard the recursion so a long prefix chain (`~~~…x`) is depth-bounded
+        // like every other nesting, rather than recursing unchecked.
+        self.increment_depth()?;
+        let operand = self.parse_unary_expr();
+        self.decrement_depth();
+        let operand = operand?;
+        self.count_node()?;
+        Ok(Expr::FunctionCall {
+            name: operator_name.to_string(),
+            args: vec![operand],
+        })
     }
 
     fn parse_call_expr(&mut self) -> Result<Expr, ExprError> {
@@ -572,20 +437,59 @@ impl ParseState {
         self.parse_primary()
     }
 
+    /// Parse an `if` and any directly-chained `else if`s **iteratively**,
+    /// desugaring `if(c1, v1, if(c2, v2, …, default))` into a flat `multiIf`. A
+    /// lone `if` (whose else is not another `if(...)`) stays an `if`.
+    ///
+    /// Folding the chain here, instead of recursing through each nested `if`,
+    /// means a long `if/else if` ladder costs no nesting depth and produces a flat
+    /// node that every downstream pass walks iteratively — so thousands of
+    /// branches parse, type-check, and evaluate without deep recursion. The result
+    /// is identical in meaning to the nested form (and to what the optimizer's
+    /// conditional flattening would produce).
     fn parse_if_conditional(&mut self) -> Result<Expr, ExprError> {
         self.advance(); // consume "if"
         self.advance(); // consume "("
-        let condition = self.parse_expr()?;
-        self.expect(&Token::Comma)?;
-        let then_branch = self.parse_expr()?;
-        self.expect(&Token::Comma)?;
-        let else_branch = self.parse_expr()?;
-        self.expect(&Token::RParen)?;
+        let mut branches = Vec::new();
+        // Each `if(` opened owes a closing `)`; the whole chain shares one tail.
+        let mut open_parens = 1usize;
+
+        let default = loop {
+            let condition = self.parse_expr()?;
+            self.expect(&Token::Comma)?;
+            let value = self.parse_expr()?;
+            self.expect(&Token::Comma)?;
+            branches.push((condition, value));
+
+            // An else position of `if(...)` continues the chain — fold it in.
+            let chains = matches!(self.peek(), Token::Ident(name) if name.as_str() == "if")
+                && *self.peek_ahead(1) == Token::LParen;
+            if chains {
+                self.advance(); // consume "if"
+                self.advance(); // consume "("
+                open_parens += 1;
+                continue;
+            }
+
+            break self.parse_expr()?; // the final else branch
+        };
+
+        for _ in 0..open_parens {
+            self.expect(&Token::RParen)?;
+        }
         self.count_node()?;
-        Ok(Expr::Conditional(ConditionalExpr::If {
-            condition: Box::new(condition),
-            then_branch: Box::new(then_branch),
-            else_branch: Box::new(else_branch),
+
+        if branches.len() == 1 {
+            let (condition, then_branch) = branches.pop().expect("one branch present");
+            return Ok(Expr::Conditional(ConditionalExpr::If {
+                condition: Box::new(condition),
+                then_branch: Box::new(then_branch),
+                else_branch: Box::new(default),
+            }));
+        }
+        Ok(Expr::Conditional(ConditionalExpr::MultiIf {
+            branches,
+            default: Box::new(default),
         }))
     }
 
@@ -645,15 +549,31 @@ impl ParseState {
             });
         }
 
-        // Desugar: coalesce(a, b, c) -> IfNull(a, IfNull(b, c))
+        // Desugar `coalesce(a, b, c)` into the right-nested `IfNull(a, IfNull(b, c))`.
+        // Each wrap deepens the tree by one, so charge it to the depth budget like
+        // a binary fold — a huge argument list must not build a chain too deep to
+        // recurse over (evaluate, type-check, or even drop). The held depth units
+        // are released once the chain is built.
         let mut result = args.pop().expect("checked non-empty");
-        while let Some(arg) = args.pop() {
-            self.count_node()?;
+        let mut wraps = 0usize;
+        let outcome = loop {
+            let Some(arg) = args.pop() else { break Ok(()) };
+            if let Err(error) = self.count_node() {
+                break Err(error);
+            }
+            wraps += 1;
+            if let Err(error) = self.increment_depth() {
+                break Err(error);
+            }
             result = Expr::Conditional(ConditionalExpr::IfNull {
                 value: Box::new(arg),
                 alternative: Box::new(result),
             });
+        };
+        for _ in 0..wraps {
+            self.decrement_depth();
         }
+        outcome?;
         Ok(result)
     }
 
@@ -1463,48 +1383,158 @@ mod tests {
     }
 
     #[test]
-    fn depth_limit_produces_error() {
-        // Build a deeply nested expression: (((((...42...)))))
-        let nesting = MAX_EXPR_DEPTH + 2;
-        let mut input = String::new();
-        for _ in 0..nesting {
-            input.push('(');
-        }
-        input.push_str("42");
-        for _ in 0..nesting {
-            input.push(')');
-        }
-
-        let result = std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(move || parse(&input))
-            .expect("failed to spawn thread")
-            .join()
-            .expect("thread panicked");
-
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ExprError::NestingTooDeep { max } => {
-                assert_eq!(max, MAX_EXPR_DEPTH);
+    fn power_is_right_associative() {
+        // `2 ** 3 ** 2` parses as `power(2, power(3, 2))`, not `power(power(2,3),2)`.
+        let inner = Expr::FunctionCall {
+            name: "power".to_string(),
+            args: vec![
+                Expr::Literal(LiteralValue::Int(3)),
+                Expr::Literal(LiteralValue::Int(2)),
+            ],
+        };
+        assert_eq!(
+            parse("2 ** 3 ** 2").unwrap().result,
+            Expr::FunctionCall {
+                name: "power".to_string(),
+                args: vec![Expr::Literal(LiteralValue::Int(2)), inner],
             }
-            other => panic!("expected NestingTooDeep, got {other:?}"),
+        );
+    }
+
+    #[test]
+    fn comparison_binds_tighter_than_bitwise_or() {
+        // A multi-level precedence gap: `1 | 2 == 3` is `1 | (2 == 3)`.
+        let equality = Expr::FunctionCall {
+            name: "equals".to_string(),
+            args: vec![
+                Expr::Literal(LiteralValue::Int(2)),
+                Expr::Literal(LiteralValue::Int(3)),
+            ],
+        };
+        assert_eq!(
+            parse("1 | 2 == 3").unwrap().result,
+            Expr::FunctionCall {
+                name: "bitOr".to_string(),
+                args: vec![Expr::Literal(LiteralValue::Int(1)), equality],
+            }
+        );
+    }
+
+    #[test]
+    fn comparison_operators_do_not_chain() {
+        // Comparisons are non-associative: `a < b < c` must be a parse error, not a
+        // silent left- or right-grouping.
+        for source in ["1 < 2 < 3", "1 == 2 != 3", "1 <= 2 >= 3"] {
+            assert!(
+                matches!(parse(source), Err(ExprError::Parse { .. })),
+                "expected a parse error for non-associative `{source}`"
+            );
+        }
+        // A comparison still composes with looser logical operators, though.
+        assert!(parse("1 < 2 && 3 < 4").is_ok());
+    }
+
+    #[test]
+    fn deep_nesting_errors_cleanly_on_a_small_stack() {
+        // The precedence-climbing parser keeps a nesting level to a handful of
+        // native frames, and EVERY deepening point (parens, nested conditionals,
+        // binary/unary/coalesce chains) is charged to the depth guard — so deeply
+        // nested input of any shape returns `NestingTooDeep` on a 2 MiB stack,
+        // never overflowing it. (Strings are built linearly, not by re-formatting
+        // a growing accumulator.)
+        let parse_on_small_stack = |input: String| {
+            std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(move || parse(&input))
+                .expect("failed to spawn thread")
+                .join()
+                .expect("thread panicked")
+        };
+
+        let depth = 1000;
+
+        let parens = format!("{}42{}", "(".repeat(depth), ")".repeat(depth));
+
+        let mut multi_ifs = String::with_capacity(depth * 18);
+        for _ in 0..depth {
+            multi_ifs.push_str("multiIf(true, 1, ");
+        }
+        multi_ifs.push('1');
+        for _ in 0..depth {
+            multi_ifs.push(')');
+        }
+
+        let power_chain = vec!["2"; depth].join(" ** ");
+
+        let mut additions = String::with_capacity(depth * 4);
+        additions.push('1');
+        for _ in 0..depth {
+            additions.push_str(" + 1");
+        }
+
+        let mut coalesce = String::with_capacity(depth * 3 + 12);
+        coalesce.push_str("coalesce(1");
+        for _ in 0..depth {
+            coalesce.push_str(", 1");
+        }
+        coalesce.push(')');
+
+        for input in [parens, multi_ifs, power_chain, additions, coalesce] {
+            match parse_on_small_stack(input) {
+                Err(ExprError::NestingTooDeep { max }) => assert_eq!(max, MAX_EXPR_DEPTH),
+                other => panic!("expected NestingTooDeep, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn case_ladders_are_not_depth_limited() {
+        // A flat `multiIf(c1, v1, …, default)` is parsed iteratively, so a case
+        // ladder with far more than MAX_EXPR_DEPTH branches parses fine.
+        let mut flat = String::from("multiIf(");
+        for n in 0..500 {
+            if n > 0 {
+                flat.push_str(", ");
+            }
+            flat.push_str(&format!("x == {n}, {n}"));
+        }
+        flat.push_str(", -1)");
+        assert!(parse(&flat).is_ok(), "a 500-branch flat multiIf must parse");
+
+        // An `if/else if` ladder folds into the SAME flat `multiIf`, so it too
+        // parses far past the depth limit — the chain consumes no nesting depth.
+        // Built linearly: the `if(...,` prefixes, the default, then the `)` tail.
+        let cases = 1500;
+        let mut chain = String::with_capacity(cases * 18);
+        for n in 0..cases {
+            chain.push_str(&format!("if(x == {n}, {n}, "));
+        }
+        chain.push('0');
+        for _ in 0..cases {
+            chain.push(')');
+        }
+        match parse(&chain) {
+            Ok(Program {
+                result: Expr::Conditional(ConditionalExpr::MultiIf { branches, .. }),
+                ..
+            }) => assert_eq!(branches.len(), cases, "the chain folds to one multiIf"),
+            other => panic!("expected a flat multiIf from the if/else-if chain, got {other:?}"),
         }
     }
 
     #[test]
     fn node_limit_produces_error() {
-        // Build an expression with many nodes: 1+1+1+1+...
-        let mut input = String::from("1");
-        for _ in 0..10_001 {
-            input.push_str(" + 1");
+        // Exceed the node cap with a flat, shallow structure (a wide `multiIf`).
+        // A long binary chain cannot reach this cap — it trips the depth guard
+        // first (each fold is charged to the depth budget).
+        let mut input = String::from("multiIf(true");
+        for _ in 0..MAX_AST_NODES {
+            input.push_str(", 1");
         }
+        input.push(')');
 
-        let result = parse(&input);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ExprError::TooManyNodes { count: _, max } => {
-                assert_eq!(max, MAX_AST_NODES);
-            }
+        match parse(&input) {
+            Err(ExprError::TooManyNodes { count: _, max }) => assert_eq!(max, MAX_AST_NODES),
             other => panic!("expected TooManyNodes, got {other:?}"),
         }
     }

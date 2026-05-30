@@ -20,15 +20,19 @@
 //! * **annotate** marks each register's last read as a move
 //!   ([`engines::move_annotator`]).
 //!
-//! The standalone whole-program engines (convert / guard propagation / evaluate /
-//! compact / move annotation) live under [`engines`]; the rule-based engines live
-//! with their rules ([`rules`], [`second_pass_rules`], [`check`]); every in-place
+//! The standalone whole-program engines (convert / guard propagation / compact /
+//! move annotation) live under [`engines`]; the rule-based engines live with
+//! their rules ([`rules`], [`second_pass_rules`], [`check`]); every in-place
 //! optimization shares the [`Pass`](pass::Pass) interface; [`optimizer`] is the
-//! orchestrator.
+//! orchestrator. [`ProgramEvaluator`](engines::ProgramEvaluator) is not a
+//! pipeline stage — it is the field-free correctness oracle that runs a
+//! `CompactProgram` so the tests can prove compaction (and the optimizations
+//! feeding it) meaning-preserving.
 //!
-//! Only the entry point ([`Optimizer::compile`]) and the executable output
-//! ([`CompactProgram`] / [`OptNode`]) are public; the heap optimization IR is
-//! an internal detail.
+//! Only the entry point ([`Optimizer::compile`]), the executable output
+//! ([`CompactProgram`] / [`OptNode`]), and the correctness oracle
+//! ([`ProgramEvaluator`]) are public; the heap optimization IR is an internal
+//! detail.
 
 pub(crate) mod check;
 pub(crate) mod engines;
