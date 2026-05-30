@@ -221,6 +221,12 @@ mod tests {
         max_args: Some(1),
     };
 
+    static FIELD_FN: DummyFunc = DummyFunc {
+        name: "field",
+        min_args: 1,
+        max_args: Some(1),
+    };
+
     #[test]
     fn register_and_resolve() {
         let mut registry = FunctionRegistry::new();
@@ -269,6 +275,18 @@ mod tests {
         assert!(
             result.is_err(),
             "expected overlapping-arity registration to panic"
+        );
+    }
+
+    #[test]
+    fn reserved_field_name_cannot_be_registered() {
+        let result = std::panic::catch_unwind(|| {
+            let mut registry = FunctionRegistry::new();
+            registry.register(&FIELD_FN); // "field" is reserved grammar
+        });
+        assert!(
+            result.is_err(),
+            "registering reserved 'field' as a function must panic"
         );
     }
 

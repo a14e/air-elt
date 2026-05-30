@@ -264,6 +264,19 @@ impl ExprFunction for BytesFromHexFunc {
         })?;
         Ok(Value::Bytes(bytes))
     }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        if let Some(Some(Value::Text(s))) = args.first() {
+            hex::decode(s).map_err(|e| FuncError::EncodingError {
+                reason: format!("hex decode failed: {e}"),
+            })?;
+        }
+        Ok(())
+    }
 }
 
 // --- bytesFromBase64 ---
@@ -307,6 +320,21 @@ impl ExprFunction for BytesFromBase64Func {
                 reason: format!("base64 decode failed: {e}"),
             })?;
         Ok(Value::Bytes(bytes))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        if let Some(Some(Value::Text(s))) = args.first() {
+            BASE64_STANDARD
+                .decode(s.as_bytes())
+                .map_err(|e| FuncError::EncodingError {
+                    reason: format!("base64 decode failed: {e}"),
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -788,5 +816,39 @@ mod tests {
             .evaluate(vec![Value::Null, Value::Int64(0)], &ctx())
             .unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn validate_const_from_hex_valid_ok() {
+        let s = Value::Text("deadbeef".into());
+        let result = BytesFromHexFunc.validate_const_args(&[Some(&s)], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_from_hex_dynamic_ok() {
+        let result = BytesFromHexFunc.validate_const_args(&[None], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_from_hex_invalid_errors() {
+        let s = Value::Text("xyz".into());
+        let result = BytesFromHexFunc.validate_const_args(&[Some(&s)], &ctx());
+        assert!(matches!(result, Err(FuncError::EncodingError { .. })));
+    }
+
+    #[test]
+    fn validate_const_from_base64_valid_ok() {
+        let s = Value::Text("AQIDBAU=".into());
+        let result = BytesFromBase64Func.validate_const_args(&[Some(&s)], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_from_base64_invalid_errors() {
+        let s = Value::Text("not valid base64!!!".into());
+        let result = BytesFromBase64Func.validate_const_args(&[Some(&s)], &ctx());
+        assert!(matches!(result, Err(FuncError::EncodingError { .. })));
     }
 }

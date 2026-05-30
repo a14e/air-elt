@@ -30,5 +30,6 @@ pub fn ctx() -> EvalContext {
         now: chrono::Utc::now(),
         base_dir: PathBuf::new(),
         is_compile_time: false,
+        caches: crate::cache::ExprCaches::default(),
     }
 }

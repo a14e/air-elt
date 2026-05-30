@@ -34,6 +34,27 @@ fn to_i64(val: &Value, func_name: &str) -> Result<i64, FuncError> {
     }
 }
 
+/// Rejects a shift amount outside `0..64`, matching the runtime check in both
+/// shift functions' `evaluate`.
+fn validate_shift_amount(func_name: &str, n: i64) -> Result<(), FuncError> {
+    if !(0..64).contains(&n) {
+        return Err(FuncError::InvalidArgument {
+            function: func_name.to_owned(),
+            message: format!("shift amount must be in 0..63, got {n}"),
+        });
+    }
+    Ok(())
+}
+
+/// Validates a constant shift-amount argument (arg index 1) for the shift
+/// functions. Dynamic or non-`Int64` amounts are skipped.
+fn validate_shift_const(func_name: &str, args: &[Option<&Value>]) -> Result<(), FuncError> {
+    if let Some(Some(Value::Int64(n))) = args.get(1) {
+        validate_shift_amount(func_name, *n)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Bitwise Operations
 // ---------------------------------------------------------------------------
@@ -211,13 +232,16 @@ impl ExprFunction for BitShiftLeftFunc {
         }
         let a = to_i64(&a_val, "bitShiftLeft")?;
         let n = to_i64(&n_val, "bitShiftLeft")?;
-        if !(0..64).contains(&n) {
-            return Err(FuncError::InvalidArgument {
-                function: "bitShiftLeft".to_owned(),
-                message: format!("shift amount must be in 0..63, got {n}"),
-            });
-        }
+        validate_shift_amount("bitShiftLeft", n)?;
         Ok(Value::Int64(a << n))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_shift_const("bitShiftLeft", args)
     }
 }
 
@@ -253,14 +277,17 @@ impl ExprFunction for BitShiftRightFunc {
         }
         let a = to_i64(&a_val, "bitShiftRight")?;
         let n = to_i64(&n_val, "bitShiftRight")?;
-        if !(0..64).contains(&n) {
-            return Err(FuncError::InvalidArgument {
-                function: "bitShiftRight".to_owned(),
-                message: format!("shift amount must be in 0..63, got {n}"),
-            });
-        }
+        validate_shift_amount("bitShiftRight", n)?;
         // Arithmetic right shift (preserves sign) — Rust's default for i64
         Ok(Value::Int64(a >> n))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_shift_const("bitShiftRight", args)
     }
 }
 
@@ -388,5 +415,41 @@ mod tests {
     fn bit_count_null_propagation() {
         let result = BIT_COUNT.evaluate(vec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn validate_const_shift_valid_ok() {
+        let n = Value::Int64(8);
+        let result = BIT_SHIFT_LEFT.validate_const_args(&[None, Some(&n)], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_shift_boundaries_ok() {
+        // 0 and 63 are the inclusive in-range edges; 64 (tested separately) is out.
+        for amount in [0_i64, 63] {
+            let n = Value::Int64(amount);
+            let left = BIT_SHIFT_LEFT.validate_const_args(&[None, Some(&n)], &ctx());
+            assert!(left.is_ok(), "bitShiftLeft must accept shift {amount}");
+            let right = BIT_SHIFT_RIGHT.validate_const_args(&[None, Some(&n)], &ctx());
+            assert!(right.is_ok(), "bitShiftRight must accept shift {amount}");
+        }
+    }
+
+    #[test]
+    fn validate_const_shift_dynamic_ok() {
+        let result = BIT_SHIFT_RIGHT.validate_const_args(&[None, None], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_shift_out_of_range_errors() {
+        let n = Value::Int64(64);
+        let result = BIT_SHIFT_LEFT.validate_const_args(&[None, Some(&n)], &ctx());
+        assert!(matches!(result, Err(FuncError::InvalidArgument { .. })));
+
+        let neg = Value::Int64(-1);
+        let result = BIT_SHIFT_RIGHT.validate_const_args(&[None, Some(&neg)], &ctx());
+        assert!(matches!(result, Err(FuncError::InvalidArgument { .. })));
     }
 }

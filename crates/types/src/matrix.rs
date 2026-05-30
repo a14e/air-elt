@@ -195,6 +195,33 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
         // Object → Text (unbounded): serialize as JSON string
         (Object, Text { size: None }) => true,
 
+        // Any scalar / binary / temporal value renders losslessly to an
+        // UNBOUNDED text sink via its canonical string form (Bytes → hex,
+        // Timestamp → RFC 3339, numbers → decimal, Bool → true/false, …). The
+        // sink (database) decides what to do with the resulting string.
+        // Bounded `* → Text(n)` is gated by `is_compatible_with_truncate` (a
+        // rendering may exceed `n`); Uuid / IP / Json / Xml / Object keep their
+        // own rules above.
+        (
+            Bool
+            | Int8
+            | Int16
+            | Int32
+            | Int64
+            | UInt8
+            | UInt16
+            | UInt32
+            | UInt64
+            | Float32
+            | Float64
+            | BigInt { .. }
+            | Decimal { .. }
+            | Date
+            | Timestamp
+            | Bytes { .. },
+            Text { size: None },
+        ) => true,
+
         // Narrowing from BigInt/Decimal back into fixed-width or integer
         // types is *not* supported — every reverse path is potentially
         // lossy. Users adding such pipelines must do an explicit transform.
@@ -311,6 +338,28 @@ pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool
         (Json, Object) => true,
         // Object → Text(n) with truncate: serialize as JSON, may exceed size
         (Object, Text { size: Some(_) }) => true,
+        // Any scalar / binary / temporal → bounded Text(n): the canonical
+        // rendering may exceed `n`, so the cut needs `truncate` consent.
+        // (Unbounded `* → Text(None)` is lossless in `is_compatible` above.)
+        (
+            Bool
+            | Int8
+            | Int16
+            | Int32
+            | Int64
+            | UInt8
+            | UInt16
+            | UInt32
+            | UInt64
+            | Float32
+            | Float64
+            | BigInt { .. }
+            | Decimal { .. }
+            | Date
+            | Timestamp
+            | Bytes { .. },
+            Text { size: Some(_) },
+        ) => true,
         _ => false,
     }
 }
@@ -563,9 +612,45 @@ mod tests {
     }
 
     #[test]
-    fn bytes_text_incompatible_both_directions() {
-        assert!(!is_compatible(BYTES, TEXT));
+    fn bytes_to_text_allowed_text_to_bytes_rejected() {
+        // Bytes → Text renders losslessly as hex into an unbounded sink.
+        assert!(is_compatible(BYTES, TEXT));
+        // Text → Bytes is not modelled (no canonical parse direction).
         assert!(!is_compatible(TEXT, BYTES));
+    }
+
+    #[test]
+    fn scalar_temporal_binary_to_text_lossless_unbounded_truncate_bounded() {
+        // Pins the *truth value* of the expanded `* → Text` arms across a
+        // representative spread (not just Int): unbounded sink is lossless,
+        // bounded sink needs truncate consent.
+        let sources = [
+            DataType::Bool,
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Timestamp,
+            DataType::Date,
+            DataType::BigInt { width: None },
+            DataType::Decimal {
+                precision: None,
+                scale: None,
+            },
+            BYTES,
+        ];
+        for src in sources {
+            assert!(
+                is_compatible(src.clone(), TEXT),
+                "{src:?} → Text(None) must be lossless"
+            );
+            assert!(
+                !is_compatible(src.clone(), text(5)),
+                "{src:?} → Text(5) is not lossless (may overflow)"
+            );
+            assert!(
+                is_compatible_with_truncate(src.clone(), text(5)),
+                "{src:?} → Text(5) must be allowed under truncate"
+            );
+        }
     }
 
     #[test]
@@ -1113,10 +1198,11 @@ mod tests {
 
     #[test]
     fn union_src_with_truncate_rejected_when_any_arm_lacks_truncate_path() {
-        // `Int32 → Text(10)` is not in the truncate matrix, so a union
-        // containing Int32 cannot land in a Text sink even with
-        // truncate=true.
-        let src = DataType::union(vec![DataType::Int32, DataType::Text { size: None }]);
+        // `Uuid → Text(10)` is rejected even under truncate (a truncated UUID
+        // is meaningless, < 36 chars), so a union containing Uuid cannot land
+        // in a Text(10) sink even with truncate=true. (Scalars like Int32 now
+        // *do* have a `→ Text(n)` truncate path, so they no longer block.)
+        let src = DataType::union(vec![DataType::Uuid, DataType::Text { size: None }]);
         assert!(!is_compatible(src.clone(), text(10)));
         assert!(!is_compatible_with_truncate(src, text(10)));
     }

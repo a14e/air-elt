@@ -1,5 +1,23 @@
+//! Comparison builtins (`==`, `!=`, `<`, `>`, `<=`, `>=`).
+//!
+//! All six are **total** — they never return null, so their result type is
+//! non-null `Bool`. Equality treats null as an ordinary value: `null == null` is
+//! `true`, `null == <non-null>` is `false` (matching `values_equal`/`Key`, the
+//! canonical equality the type model already uses). The ordering operators treat
+//! null as **incomparable**: any null operand yields `false` — null is not less,
+//! greater, or order-equal to anything (mirrors SQL filtering, and deliberately
+//! unlike `==`, which is the dedicated null test).
+//!
+//! For non-null operands the ordering operators delegate to the canonical
+//! cross-numeric [`compare_values`], so mixed numeric widths (e.g. `BigInt` vs
+//! `Int64`) compare correctly. An undefined comparison — `NaN`, or types with no
+//! shared order — also yields `false` (matching IEEE `NaN` semantics;
+//! cross-category pairs are additionally rejected at `resolve_type`).
+
+use std::cmp::Ordering;
+
 use air_elt_expr_types::nullable::NullableExprType;
-use air_elt_types::{DataType, Value};
+use air_elt_types::{DataType, Value, compare_values};
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
@@ -21,27 +39,15 @@ pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&LESS_OR_EQUALS);
 }
 
-fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering, FuncError> {
-    match (a, b) {
-        (Value::Int64(x), Value::Int64(y)) => Ok(x.cmp(y)),
-        (Value::Float64(x), Value::Float64(y)) => {
-            Ok(x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
-        }
-        (Value::Text(x), Value::Text(y)) => Ok(x.cmp(y)),
-        (Value::Bool(x), Value::Bool(y)) => Ok(x.cmp(y)),
-        _ => Err(FuncError::TypeMismatch {
-            function: "comparison".to_owned(),
-            expected: "matching comparable types".to_owned(),
-            actual: format!("{:?}, {:?}", a.data_type(), b.data_type()),
-        }),
-    }
-}
-
 struct EqualsFunc;
 
 impl ExprFunction for EqualsFunc {
     fn is_pure(&self) -> bool {
         true
+    }
+
+    fn can_fail(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &str {
@@ -57,18 +63,20 @@ impl ExprFunction for EqualsFunc {
     }
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        let nullable = args.iter().any(|a| a.nullable);
         validate_comparable_args("equals", &args[0].data_type, &args[1].data_type)?;
-        Ok(NullableExprType::new(DataType::Bool, nullable))
+        Ok(NullableExprType::non_null(DataType::Bool))
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
         let b = args.remove(1);
         let a = args.remove(0);
-        if a.is_null() || b.is_null() {
-            return Ok(Value::Null);
-        }
-        Ok(Value::Bool(a == b))
+        // Total equality: `null == null` is true, `null == <non-null>` is false.
+        let equal = match (a.is_null(), b.is_null()) {
+            (true, true) => true,
+            (true, false) | (false, true) => false,
+            (false, false) => a == b,
+        };
+        Ok(Value::Bool(equal))
     }
 }
 
@@ -77,6 +85,10 @@ struct NotEqualsFunc;
 impl ExprFunction for NotEqualsFunc {
     fn is_pure(&self) -> bool {
         true
+    }
+
+    fn can_fail(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &str {
@@ -92,18 +104,20 @@ impl ExprFunction for NotEqualsFunc {
     }
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        let nullable = args.iter().any(|a| a.nullable);
         validate_comparable_args("notEquals", &args[0].data_type, &args[1].data_type)?;
-        Ok(NullableExprType::new(DataType::Bool, nullable))
+        Ok(NullableExprType::non_null(DataType::Bool))
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
         let b = args.remove(1);
         let a = args.remove(0);
-        if a.is_null() || b.is_null() {
-            return Ok(Value::Null);
-        }
-        Ok(Value::Bool(a != b))
+        // Total inequality: the negation of total equality (`null != null` is false).
+        let equal = match (a.is_null(), b.is_null()) {
+            (true, true) => true,
+            (true, false) | (false, true) => false,
+            (false, false) => a == b,
+        };
+        Ok(Value::Bool(!equal))
     }
 }
 
@@ -112,6 +126,10 @@ struct GreaterFunc;
 impl ExprFunction for GreaterFunc {
     fn is_pure(&self) -> bool {
         true
+    }
+
+    fn can_fail(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &str {
@@ -127,19 +145,19 @@ impl ExprFunction for GreaterFunc {
     }
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        let nullable = args.iter().any(|a| a.nullable);
         validate_comparable_args("greater", &args[0].data_type, &args[1].data_type)?;
-        Ok(NullableExprType::new(DataType::Bool, nullable))
+        Ok(NullableExprType::non_null(DataType::Bool))
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
         let b = args.remove(1);
         let a = args.remove(0);
         if a.is_null() || b.is_null() {
-            return Ok(Value::Null);
+            return Ok(Value::Bool(false));
         }
-        let ord = compare_values(&a, &b)?;
-        Ok(Value::Bool(ord == std::cmp::Ordering::Greater))
+        Ok(Value::Bool(
+            compare_values(&a, &b) == Some(Ordering::Greater),
+        ))
     }
 }
 
@@ -148,6 +166,10 @@ struct LessFunc;
 impl ExprFunction for LessFunc {
     fn is_pure(&self) -> bool {
         true
+    }
+
+    fn can_fail(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &str {
@@ -163,19 +185,17 @@ impl ExprFunction for LessFunc {
     }
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        let nullable = args.iter().any(|a| a.nullable);
         validate_comparable_args("less", &args[0].data_type, &args[1].data_type)?;
-        Ok(NullableExprType::new(DataType::Bool, nullable))
+        Ok(NullableExprType::non_null(DataType::Bool))
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
         let b = args.remove(1);
         let a = args.remove(0);
         if a.is_null() || b.is_null() {
-            return Ok(Value::Null);
+            return Ok(Value::Bool(false));
         }
-        let ord = compare_values(&a, &b)?;
-        Ok(Value::Bool(ord == std::cmp::Ordering::Less))
+        Ok(Value::Bool(compare_values(&a, &b) == Some(Ordering::Less)))
     }
 }
 
@@ -184,6 +204,10 @@ struct GreaterOrEqualsFunc;
 impl ExprFunction for GreaterOrEqualsFunc {
     fn is_pure(&self) -> bool {
         true
+    }
+
+    fn can_fail(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &str {
@@ -199,19 +223,20 @@ impl ExprFunction for GreaterOrEqualsFunc {
     }
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        let nullable = args.iter().any(|a| a.nullable);
         validate_comparable_args("greaterOrEquals", &args[0].data_type, &args[1].data_type)?;
-        Ok(NullableExprType::new(DataType::Bool, nullable))
+        Ok(NullableExprType::non_null(DataType::Bool))
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
         let b = args.remove(1);
         let a = args.remove(0);
         if a.is_null() || b.is_null() {
-            return Ok(Value::Null);
+            return Ok(Value::Bool(false));
         }
-        let ord = compare_values(&a, &b)?;
-        Ok(Value::Bool(ord != std::cmp::Ordering::Less))
+        Ok(Value::Bool(matches!(
+            compare_values(&a, &b),
+            Some(Ordering::Greater | Ordering::Equal)
+        )))
     }
 }
 
@@ -220,6 +245,10 @@ struct LessOrEqualsFunc;
 impl ExprFunction for LessOrEqualsFunc {
     fn is_pure(&self) -> bool {
         true
+    }
+
+    fn can_fail(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &str {
@@ -235,19 +264,20 @@ impl ExprFunction for LessOrEqualsFunc {
     }
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        let nullable = args.iter().any(|a| a.nullable);
         validate_comparable_args("lessOrEquals", &args[0].data_type, &args[1].data_type)?;
-        Ok(NullableExprType::new(DataType::Bool, nullable))
+        Ok(NullableExprType::non_null(DataType::Bool))
     }
 
     fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
         let b = args.remove(1);
         let a = args.remove(0);
         if a.is_null() || b.is_null() {
-            return Ok(Value::Null);
+            return Ok(Value::Bool(false));
         }
-        let ord = compare_values(&a, &b)?;
-        Ok(Value::Bool(ord != std::cmp::Ordering::Greater))
+        Ok(Value::Bool(matches!(
+            compare_values(&a, &b),
+            Some(Ordering::Less | Ordering::Equal)
+        )))
     }
 }
 
@@ -271,6 +301,9 @@ fn type_category(dt: &DataType) -> &'static str {
         DataType::Timestamp => "timestamp",
         DataType::Uuid => "uuid",
         DataType::Object => "object",
+        // Bytes/Ipv4/Ipv6/Json/Xml share this catch-all: a same-"other" pair
+        // passes resolve_type and resolves to `false` at runtime (compare_values
+        // returns None); only cross-category pairs are rejected here.
         _ => "other",
     }
 }
@@ -317,12 +350,96 @@ mod tests {
     }
 
     #[test]
-    fn null_propagation() {
-        let f = EqualsFunc;
-        let result = f
-            .evaluate(vec![Value::Null, Value::Int64(5)], &ctx())
+    fn equality_is_total_over_null() {
+        // `==`/`!=` do not propagate null: `null == null` is true, `null ==
+        // <non-null>` is false (the dedicated null test, matching `values_equal`).
+        assert_eq!(
+            EqualsFunc
+                .evaluate(vec![Value::Null, Value::Int64(5)], &ctx())
+                .unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            EqualsFunc
+                .evaluate(vec![Value::Null, Value::Null], &ctx())
+                .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            NotEqualsFunc
+                .evaluate(vec![Value::Null, Value::Null], &ctx())
+                .unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            NotEqualsFunc
+                .evaluate(vec![Value::Null, Value::Int64(5)], &ctx())
+                .unwrap(),
+            Value::Bool(true)
+        );
+        // Null on the RIGHT operand for equals (the other match arm).
+        assert_eq!(
+            EqualsFunc
+                .evaluate(vec![Value::Int64(5), Value::Null], &ctx())
+                .unwrap(),
+            Value::Bool(false)
+        );
+        // Cross-numeric equality of non-null values is by value, not variant.
+        assert_eq!(
+            EqualsFunc
+                .evaluate(vec![Value::Int8(5), Value::Int64(5)], &ctx())
+                .unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn resolve_type_is_non_null_bool_even_for_nullable_args() {
+        // The headline of the totalisation: a comparison never returns null, so
+        // its resolved type is non-null Bool regardless of operand nullability.
+        let nullable = NullableExprType::new(DataType::Int64, true);
+        let equality = EqualsFunc
+            .resolve_type(&[nullable.clone(), nullable.clone()])
             .unwrap();
-        assert_eq!(result, Value::Null);
+        assert_eq!(equality.data_type, DataType::Bool);
+        assert!(!equality.nullable);
+        let ordering = LessFunc
+            .resolve_type(&[nullable.clone(), nullable])
+            .unwrap();
+        assert_eq!(ordering.data_type, DataType::Bool);
+        assert!(!ordering.nullable);
+    }
+
+    #[test]
+    fn ordering_with_null_is_false() {
+        // Any null operand makes an ordering comparison false (null is unordered),
+        // regardless of which side it is on.
+        for other in [Value::Int64(5), Value::Null] {
+            assert_eq!(
+                LessFunc
+                    .evaluate(vec![Value::Null, other.clone()], &ctx())
+                    .unwrap(),
+                Value::Bool(false)
+            );
+            assert_eq!(
+                GreaterFunc
+                    .evaluate(vec![other.clone(), Value::Null], &ctx())
+                    .unwrap(),
+                Value::Bool(false)
+            );
+        }
+        assert_eq!(
+            LessOrEqualsFunc
+                .evaluate(vec![Value::Null, Value::Null], &ctx())
+                .unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            GreaterOrEqualsFunc
+                .evaluate(vec![Value::Int64(5), Value::Null], &ctx())
+                .unwrap(),
+            Value::Bool(false)
+        );
     }
 
     #[test]
@@ -362,5 +479,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
+    fn less_cross_numeric_int_widths() {
+        let f = LessFunc;
+        let result = f
+            .evaluate(vec![Value::Int8(1), Value::Int64(2)], &ctx())
+            .unwrap();
+        assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
+    fn less_bigint_promoted_against_int64() {
+        // `(i64::MAX + 1)` promotes to BigInt; comparing it against an Int64
+        // must work cross-numeric (a huge positive value is not < 0).
+        let f = LessFunc;
+        let big = Value::BigInt(num_bigint::BigInt::from(i64::MAX) + 1);
+        let result = f.evaluate(vec![big, Value::Int64(0)], &ctx()).unwrap();
+        assert_eq!(result, Value::Bool(false));
+    }
+
+    #[test]
+    fn greater_int_vs_float() {
+        let f = GreaterFunc;
+        let result = f
+            .evaluate(vec![Value::Int64(3), Value::Float64(2.5)], &ctx())
+            .unwrap();
+        assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
+    fn nan_comparisons_are_false() {
+        // NaN has no ordering: every comparison against it is false.
+        let nan = Value::Float64(f64::NAN);
+        assert_eq!(
+            LessFunc
+                .evaluate(vec![nan.clone(), Value::Float64(1.0)], &ctx())
+                .unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            LessOrEqualsFunc
+                .evaluate(vec![nan.clone(), nan.clone()], &ctx())
+                .unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            GreaterOrEqualsFunc
+                .evaluate(vec![nan.clone(), Value::Float64(1.0)], &ctx())
+                .unwrap(),
+            Value::Bool(false)
+        );
     }
 }

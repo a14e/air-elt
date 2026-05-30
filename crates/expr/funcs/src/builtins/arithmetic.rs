@@ -1,6 +1,10 @@
-use crate::arithmetic_utils::{ArithmeticOp, arithmetic_result_type, concat_result_type};
+use std::cmp::Ordering;
+
+use crate::arithmetic_utils::{
+    ArithmeticOp, arithmetic_result_type, comparable_join, concat_result_type,
+};
 use air_elt_expr_types::nullable::NullableExprType;
-use air_elt_types::{DataType, Value};
+use air_elt_types::{DataType, Value, compare_values};
 use bigdecimal::BigDecimal;
 use num_bigint::BigInt;
 use num_traits::Zero;
@@ -52,6 +56,10 @@ impl ExprFunction for AddFunc {
 
     fn name(&self) -> &str {
         "add"
+    }
+
+    fn can_fail(&self) -> bool {
+        false
     }
 
     fn min_args(&self) -> usize {
@@ -134,6 +142,10 @@ impl ExprFunction for SubtractFunc {
         "subtract"
     }
 
+    fn can_fail(&self) -> bool {
+        false
+    }
+
     fn min_args(&self) -> usize {
         2
     }
@@ -192,6 +204,10 @@ impl ExprFunction for MultiplyFunc {
 
     fn name(&self) -> &str {
         "multiply"
+    }
+
+    fn can_fail(&self) -> bool {
+        false
     }
 
     fn min_args(&self) -> usize {
@@ -631,6 +647,10 @@ impl ExprFunction for MinFunc {
         "min"
     }
 
+    fn can_fail(&self) -> bool {
+        false
+    }
+
     fn min_args(&self) -> usize {
         1
     }
@@ -640,51 +660,15 @@ impl ExprFunction for MinFunc {
     }
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        Ok(NullableExprType::nullable(args[0].data_type.clone()))
+        comparable_join(args, "min").map_err(|e| FuncError::TypeMismatch {
+            function: "min".to_owned(),
+            expected: "arguments sharing one comparable type".to_owned(),
+            actual: e.to_string(),
+        })
     }
 
     fn evaluate(&self, args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let mut result: Option<Value> = None;
-        for val in args {
-            if val.is_null() {
-                continue;
-            }
-            result = Some(match result {
-                None => val,
-                Some(current) => match (&current, &val) {
-                    (Value::Int64(a), Value::Int64(b)) => {
-                        if b < a {
-                            val
-                        } else {
-                            current
-                        }
-                    }
-                    (Value::BigInt(a), Value::BigInt(b)) => {
-                        if b < a {
-                            val
-                        } else {
-                            current
-                        }
-                    }
-                    (Value::Decimal(a), Value::Decimal(b)) => {
-                        if b < a {
-                            val
-                        } else {
-                            current
-                        }
-                    }
-                    (Value::Float64(a), Value::Float64(b)) => {
-                        if b < a {
-                            val
-                        } else {
-                            current
-                        }
-                    }
-                    _ => current,
-                },
-            });
-        }
-        Ok(result.unwrap_or(Value::Null))
+        fold_extremum(args, "min", Ordering::Less)
     }
 }
 
@@ -699,6 +683,10 @@ impl ExprFunction for MaxFunc {
         "max"
     }
 
+    fn can_fail(&self) -> bool {
+        false
+    }
+
     fn min_args(&self) -> usize {
         1
     }
@@ -708,51 +696,59 @@ impl ExprFunction for MaxFunc {
     }
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        Ok(NullableExprType::nullable(args[0].data_type.clone()))
+        comparable_join(args, "max").map_err(|e| FuncError::TypeMismatch {
+            function: "max".to_owned(),
+            expected: "arguments sharing one comparable type".to_owned(),
+            actual: e.to_string(),
+        })
     }
 
     fn evaluate(&self, args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let mut result: Option<Value> = None;
-        for val in args {
-            if val.is_null() {
-                continue;
-            }
-            result = Some(match result {
-                None => val,
-                Some(current) => match (&current, &val) {
-                    (Value::Int64(a), Value::Int64(b)) => {
-                        if b > a {
-                            val
-                        } else {
-                            current
-                        }
-                    }
-                    (Value::BigInt(a), Value::BigInt(b)) => {
-                        if b > a {
-                            val
-                        } else {
-                            current
-                        }
-                    }
-                    (Value::Decimal(a), Value::Decimal(b)) => {
-                        if b > a {
-                            val
-                        } else {
-                            current
-                        }
-                    }
-                    (Value::Float64(a), Value::Float64(b)) => {
-                        if b > a {
-                            val
-                        } else {
-                            current
-                        }
-                    }
-                    _ => current,
-                },
-            });
+        fold_extremum(args, "max", Ordering::Greater)
+    }
+}
+
+/// Shared `min`/`max` reduction. Skips NULLs (SQL semantics), then keeps the
+/// element that compares `winning` against the running best via the
+/// cross-numeric [`compare_values`] total order. Because that order is
+/// consistent across all numeric widths, the chosen element is the global
+/// extremum regardless of how the arguments are grouped — so the reduction is
+/// associative and the optimizer may freely flatten nested `min`/`max`.
+///
+/// `NaN` has no ordering, so it propagates: any `NaN` argument makes the
+/// result `NaN` (also order-independent, so associativity holds). A
+/// comparison undefined for a non-`NaN` reason (incompatible categories,
+/// which `resolve_type` already rejects) is a defensive type error.
+fn fold_extremum(args: Vec<Value>, op: &str, winning: Ordering) -> Result<Value, FuncError> {
+    let mut best: Option<Value> = None;
+    for value in args {
+        if value.is_null() {
+            continue;
         }
-        Ok(result.unwrap_or(Value::Null))
+        best = Some(match best {
+            None => value,
+            Some(current) => match compare_values(&value, &current) {
+                Some(order) if order == winning => value,
+                Some(_) => current,
+                None if is_nan(&value) || is_nan(&current) => Value::Float64(f64::NAN),
+                None => {
+                    return Err(FuncError::TypeMismatch {
+                        function: op.to_owned(),
+                        expected: "values with a defined ordering".to_owned(),
+                        actual: format!("{:?} vs {:?}", value.data_type(), current.data_type()),
+                    });
+                }
+            },
+        });
+    }
+    Ok(best.unwrap_or(Value::Null))
+}
+
+fn is_nan(value: &Value) -> bool {
+    match value {
+        Value::Float64(f) => f.is_nan(),
+        Value::Float32(f) => f.is_nan(),
+        _ => false,
     }
 }
 
@@ -1256,6 +1252,89 @@ mod tests {
         let b = Value::Decimal("2.7".parse().unwrap());
         let result = f.evaluate(vec![a, b], &ctx()).unwrap();
         assert_eq!(result, Value::Decimal("2.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn min_mixed_int_and_float_picks_true_minimum() {
+        // The float 1.0 is the global minimum across mixed numeric types.
+        let f = MinFunc;
+        let result = f
+            .evaluate(
+                vec![Value::Int64(5), Value::Float64(1.0), Value::Int64(2)],
+                &ctx(),
+            )
+            .unwrap();
+        assert_eq!(result, Value::Float64(1.0));
+    }
+
+    #[test]
+    fn min_is_associative_under_regrouping() {
+        // Regression for the flatten bug: nested and flat grouping must agree.
+        let f = MinFunc;
+        let flat = f
+            .evaluate(
+                vec![Value::Int64(5), Value::Float64(1.0), Value::Int64(2)],
+                &ctx(),
+            )
+            .unwrap();
+        let nested_inner = f
+            .evaluate(vec![Value::Float64(1.0), Value::Int64(2)], &ctx())
+            .unwrap();
+        let nested = f
+            .evaluate(vec![Value::Int64(5), nested_inner], &ctx())
+            .unwrap();
+        assert_eq!(flat, nested);
+    }
+
+    #[test]
+    fn min_propagates_nan() {
+        // NaN has no defined ordering, so it propagates to the result.
+        let f = MinFunc;
+        let result = f
+            .evaluate(vec![Value::Float64(1.0), Value::Float64(f64::NAN)], &ctx())
+            .unwrap();
+        assert!(matches!(result, Value::Float64(n) if n.is_nan()));
+    }
+
+    #[test]
+    fn max_nan_propagates_regardless_of_position() {
+        // NaN anywhere in the arguments wins — order-independent (associative).
+        let f = MaxFunc;
+        let first = f
+            .evaluate(vec![Value::Float64(f64::NAN), Value::Float64(2.0)], &ctx())
+            .unwrap();
+        let last = f
+            .evaluate(vec![Value::Float64(2.0), Value::Float64(f64::NAN)], &ctx())
+            .unwrap();
+        assert!(matches!(first, Value::Float64(n) if n.is_nan()));
+        assert!(matches!(last, Value::Float64(n) if n.is_nan()));
+    }
+
+    #[test]
+    fn max_resolve_type_rejects_mixed_categories() {
+        // max over text and a number is undefined for ordering — reject at
+        // type-resolution time.
+        let f = MaxFunc;
+        let args = [
+            NullableExprType::new(DataType::text(), false),
+            NullableExprType::new(DataType::Float64, false),
+        ];
+        assert!(matches!(
+            f.resolve_type(&args),
+            Err(FuncError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn min_resolve_type_widens_mixed_numerics_to_float() {
+        let f = MinFunc;
+        let args = [
+            NullableExprType::new(DataType::Int64, false),
+            NullableExprType::new(DataType::Float64, false),
+        ];
+        let resolved = f.resolve_type(&args).unwrap();
+        assert_eq!(resolved.data_type, DataType::Float64);
+        assert!(resolved.nullable);
     }
 
     // -----------------------------------------------------------------------

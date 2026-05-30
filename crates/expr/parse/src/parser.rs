@@ -5,24 +5,40 @@ use air_elt_expr_types::limits::{
 use crate::detect;
 use crate::error::ExprError;
 use crate::lexer::Lexer;
-use crate::model::{ConditionalExpr, Expr, InterpolationSegment, LiteralValue, Program, Statement};
+use crate::model::{
+    ConditionalExpr, Expr, FieldsSelector, InterpolationSegment, LiteralValue, Program, Statement,
+};
 use crate::token::{SpannedToken, StringPart, Token};
 
 /// Expression parser. Converts expression source strings into [`Program`] ASTs.
-pub struct Parser;
+///
+/// `comptime` selects the grammar surface: compile-time config expressions
+/// (`create_comptime`) reject the runtime-only `field()` / `fields()` /
+/// backtick forms at parse time, since those reference a source row that does
+/// not exist while patching config. Transform compute scripts use the default
+/// runtime parser (`create`), where that grammar is enabled.
+pub struct Parser {
+    comptime: bool,
+}
 
 impl Parser {
-    /// Create a new parser instance.
+    /// Create a runtime parser — `field()` / `fields()` / backtick are allowed.
     pub fn create() -> Self {
-        Self
+        Self { comptime: false }
+    }
+
+    /// Create a compile-time parser — the runtime-only `field()` / `fields()` /
+    /// backtick grammar is rejected at parse time.
+    pub fn create_comptime() -> Self {
+        Self { comptime: true }
     }
 
     pub fn parse(&self, input: &str) -> Result<Program, ExprError> {
         if detect::is_expression(input) {
-            return parse(input);
+            return parse_inner(input, self.comptime);
         }
         if detect::has_interpolation(input) {
-            return parse_interpolation_template(input);
+            return parse_interpolation_template(input, self.comptime);
         }
         Ok(Program {
             statements: vec![],
@@ -34,7 +50,7 @@ impl Parser {
     /// Use this only when you already know the string is an expression (e.g. when
     /// implementing a new evaluator pathway or in unit tests).
     pub fn parse_expression(&self, input: &str) -> Result<Program, ExprError> {
-        parse(input)
+        parse_inner(input, self.comptime)
     }
 
     pub fn parse_toml(&self, value: &toml::Value) -> Result<Program, ExprError> {
@@ -76,7 +92,7 @@ impl Parser {
     }
 }
 
-fn parse_interpolation_template(input: &str) -> Result<Program, ExprError> {
+fn parse_interpolation_template(input: &str, comptime: bool) -> Result<Program, ExprError> {
     if input.len() > MAX_EXPR_SOURCE_LEN {
         return Err(ExprError::ExpressionTooLong {
             len: input.len(),
@@ -85,14 +101,18 @@ fn parse_interpolation_template(input: &str) -> Result<Program, ExprError> {
     }
     let mut lexer = Lexer::new(input);
     let tokens = lexer.tokenize_as_interpolation()?;
-    let mut state = ParseState::new(tokens);
+    let mut state = ParseState::new(tokens, comptime);
     state.parse_program()
 }
 
-/// Parse an expression source string into a [`Program`] AST.
+/// Parse an expression source string into a [`Program`] AST (runtime grammar).
 ///
-/// Convenience wrapper around `Parser::create().parse(input)`.
+/// Convenience wrapper around `Parser::create().parse_expression(input)`.
 pub fn parse(input: &str) -> Result<Program, ExprError> {
+    parse_inner(input, false)
+}
+
+fn parse_inner(input: &str, comptime: bool) -> Result<Program, ExprError> {
     if input.len() > MAX_EXPR_SOURCE_LEN {
         return Err(ExprError::ExpressionTooLong {
             len: input.len(),
@@ -102,7 +122,7 @@ pub fn parse(input: &str) -> Result<Program, ExprError> {
 
     let mut lexer = Lexer::new(input);
     let spanned_tokens = lexer.tokenize()?;
-    let mut state = ParseState::new(spanned_tokens);
+    let mut state = ParseState::new(spanned_tokens, comptime);
     state.parse_program()
 }
 
@@ -112,17 +132,35 @@ struct ParseState {
     depth: usize,
     node_count: usize,
     variable_count: usize,
+    /// When set, the runtime-only `field()` / `fields()` / backtick grammar is
+    /// rejected (compile-time config context).
+    comptime: bool,
 }
 
 impl ParseState {
-    fn new(tokens: Vec<SpannedToken>) -> Self {
+    fn new(tokens: Vec<SpannedToken>, comptime: bool) -> Self {
         Self {
             tokens,
             pos: 0,
             depth: 0,
             node_count: 0,
             variable_count: 0,
+            comptime,
         }
+    }
+
+    /// Reject the runtime-only field grammar in a compile-time context.
+    fn reject_field_in_comptime(&self, form: &str) -> Result<(), ExprError> {
+        if self.comptime {
+            return Err(ExprError::Parse {
+                position: self.pos,
+                message: format!(
+                    "{form} is only valid in a transform compute script, \
+                     not in a compile-time config expression"
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn peek(&self) -> &Token {
@@ -504,6 +542,8 @@ impl ParseState {
                     "coalesce" => return self.parse_coalesce_conditional(),
                     "ifNull" => return self.parse_if_null_conditional(),
                     "nullIf" => return self.parse_null_if_conditional(),
+                    "field" => return self.parse_field(),
+                    "fields" => return self.parse_fields(),
                     _ => {}
                 }
 
@@ -645,6 +685,73 @@ impl ParseState {
         }))
     }
 
+    fn parse_field(&mut self) -> Result<Expr, ExprError> {
+        self.reject_field_in_comptime("field()")?;
+        self.advance(); // consume "field"
+        self.advance(); // consume "("
+        let arg = self.parse_expr()?;
+        if *self.peek() != Token::RParen {
+            return Err(ExprError::Parse {
+                position: self.pos,
+                message: "field(...) requires exactly one argument".to_string(),
+            });
+        }
+        self.expect(&Token::RParen)?;
+        self.count_node()?;
+        Ok(Expr::Field(Box::new(arg)))
+    }
+
+    fn parse_fields(&mut self) -> Result<Expr, ExprError> {
+        self.reject_field_in_comptime("fields()")?;
+        self.advance(); // consume "fields"
+        self.advance(); // consume "("
+        let selector = self.parse_fields_selector()?;
+        self.expect(&Token::RParen)?;
+        self.count_node()?;
+        Ok(Expr::Fields(selector))
+    }
+
+    fn parse_fields_selector(&mut self) -> Result<FieldsSelector, ExprError> {
+        let raw = match self.peek().clone() {
+            Token::RawStringLit(value) => {
+                self.advance();
+                value
+            }
+            Token::StringLit(parts) => {
+                self.advance();
+                match parts.as_slice() {
+                    [StringPart::Literal(text)] => text.clone(),
+                    _ => return Err(self.fields_selector_error()),
+                }
+            }
+            _ => return Err(self.fields_selector_error()),
+        };
+
+        if raw == "*" {
+            return Ok(FieldsSelector::All);
+        }
+
+        let mut names = Vec::new();
+        for part in raw.split(',') {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                return Err(ExprError::Parse {
+                    position: self.pos,
+                    message: "fields(...) selector contains an empty field name".to_string(),
+                });
+            }
+            names.push(trimmed.to_string());
+        }
+        Ok(FieldsSelector::Named(names))
+    }
+
+    fn fields_selector_error(&self) -> ExprError {
+        ExprError::Parse {
+            position: self.pos,
+            message: "fields(...) requires a string literal selector".to_string(),
+        }
+    }
+
     fn parse_args(&mut self) -> Result<Vec<Expr>, ExprError> {
         if *self.peek() == Token::RParen {
             return Ok(Vec::new());
@@ -686,6 +793,14 @@ impl ParseState {
                 self.advance();
                 self.count_node()?;
                 Ok(Expr::Literal(LiteralValue::String(value)))
+            }
+            Token::FieldLit(name) => {
+                self.reject_field_in_comptime("a `backtick` field literal")?;
+                self.advance();
+                self.count_node()?;
+                Ok(Expr::Field(Box::new(Expr::Literal(LiteralValue::String(
+                    name,
+                )))))
             }
             Token::BoolLit(value) => {
                 self.advance();
@@ -1690,6 +1805,94 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn parse_field_function_call() {
+        let program = parse("field(\"x\")").unwrap();
+        assert_eq!(
+            program.result,
+            Expr::Field(Box::new(Expr::Literal(LiteralValue::String(
+                "x".to_string()
+            ))))
+        );
+    }
+
+    #[test]
+    fn parse_field_backtick_literal() {
+        let program = parse("`x`").unwrap();
+        assert_eq!(
+            program.result,
+            Expr::Field(Box::new(Expr::Literal(LiteralValue::String(
+                "x".to_string()
+            ))))
+        );
+    }
+
+    #[test]
+    fn parse_field_nested() {
+        let program = parse("field(field(\"x\"))").unwrap();
+        assert_eq!(
+            program.result,
+            Expr::Field(Box::new(Expr::Field(Box::new(Expr::Literal(
+                LiteralValue::String("x".to_string())
+            )))))
+        );
+    }
+
+    #[test]
+    fn parse_fields_all() {
+        let program = parse("fields(\"*\")").unwrap();
+        assert_eq!(program.result, Expr::Fields(FieldsSelector::All));
+    }
+
+    #[test]
+    fn parse_fields_named() {
+        let program = parse("fields(\"a,b\")").unwrap();
+        assert_eq!(
+            program.result,
+            Expr::Fields(FieldsSelector::Named(vec![
+                "a".to_string(),
+                "b".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn parse_fields_non_string_errors() {
+        let result = parse("fields(123)");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("fields(...) requires a string literal selector"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_field_without_paren_is_variable() {
+        let program = parse("field").unwrap();
+        assert_eq!(program.result, Expr::Variable("field".to_string()));
+    }
+
+    #[test]
+    fn comptime_parser_rejects_field_grammar() {
+        let comptime = Parser::create_comptime();
+        for src in ["field(\"x\")", "fields(\"*\")", "`x`"] {
+            let err = comptime
+                .parse_expression(src)
+                .expect_err("comptime parser must reject runtime field grammar");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("only valid in a transform compute script"),
+                "unexpected error for {src:?}: {msg}"
+            );
+        }
+        // The runtime parser still accepts them.
+        let runtime = Parser::create();
+        assert!(runtime.parse_expression("field(\"x\")").is_ok());
+        assert!(runtime.parse_expression("`x`").is_ok());
+        assert!(runtime.parse_expression("fields(\"*\")").is_ok());
     }
 
     #[test]

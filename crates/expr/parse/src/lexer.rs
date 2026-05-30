@@ -191,6 +191,7 @@ impl<'a> Lexer<'a> {
             }
             b'"' => self.read_double_quoted_string(),
             b'\'' => self.read_single_quoted_string(),
+            b'`' => self.read_field_literal(),
             b'0' => self.read_number_or_hex(),
             b'1'..=b'9' => self.read_number(),
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.read_ident_or_keyword(),
@@ -376,6 +377,34 @@ impl<'a> Lexer<'a> {
                     };
                     content.push(escaped);
                     self.pos += 1;
+                }
+                b'\n' => {
+                    self.line += 1;
+                    content.push('\n');
+                    self.pos += 1;
+                }
+                _ => {
+                    let ch = self.input[self.pos..].chars().next().unwrap_or('?');
+                    content.push(ch);
+                    self.pos += ch.len_utf8();
+                }
+            }
+        }
+        Err(ExprError::UnterminatedString { position: start })
+    }
+
+    /// Read a backtick-delimited field literal `` `name` ``.
+    /// The inner text is raw: no escapes and no interpolation.
+    fn read_field_literal(&mut self) -> Result<Token, ExprError> {
+        let start = self.pos;
+        self.pos += 1; // skip opening backtick
+        let mut content = String::new();
+        while self.pos < self.input.len() {
+            let b = self.input.as_bytes()[self.pos];
+            match b {
+                b'`' => {
+                    self.pos += 1;
+                    return Ok(Token::FieldLit(content));
                 }
                 b'\n' => {
                     self.line += 1;
@@ -676,6 +705,37 @@ mod tests {
             tokens("2 ** 3"),
             vec![Token::IntLit(2), Token::Power, Token::IntLit(3), Token::Eof,]
         );
+    }
+
+    #[test]
+    fn tokenize_field_literal_simple() {
+        assert_eq!(
+            tokens("`id`"),
+            vec![Token::FieldLit("id".to_string()), Token::Eof,]
+        );
+    }
+
+    #[test]
+    fn tokenize_field_literal_with_surrounding_tokens() {
+        assert_eq!(
+            tokens("`a` + `b`"),
+            vec![
+                Token::FieldLit("a".to_string()),
+                Token::Plus,
+                Token::FieldLit("b".to_string()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_field_literal_unterminated_errors() {
+        let mut lexer = Lexer::new("`id");
+        let result = lexer.tokenize();
+        assert!(matches!(
+            result,
+            Err(ExprError::UnterminatedString { position: 0 })
+        ));
     }
 
     #[test]

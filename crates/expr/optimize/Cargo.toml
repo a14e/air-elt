@@ -1,0 +1,32 @@
+[package]
+name = "air-elt-expr-optimize"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Expression-category crate: may depend only on Foundation
+# (`air-elt-types`, `air-elt-commons-arena`) and other Expression crates
+# (`air-elt-expr-*`). Enforced by the structural dep-graph linter.
+air-elt-expr-parse = { workspace = true }
+air-elt-expr-funcs = { workspace = true }
+air-elt-expr-types = { workspace = true }
+air-elt-types = { workspace = true }
+air-elt-commons-arena = { workspace = true }
+ahash = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+bigdecimal = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

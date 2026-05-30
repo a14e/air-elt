@@ -19,4 +19,7 @@ pub enum ExprError {
 
     #[error("invalid patcher pattern: {0}")]
     InvalidPattern(String),
+
+    #[error("field()/fields() is only valid in a transform compute script")]
+    FieldOutsideTransform,
 }

@@ -76,8 +76,11 @@ pub fn parse_text(input: &str) -> Result<Uuid, ConvertError> {
     Ok(Uuid::from_bytes(bytes))
 }
 
-/// Canonical lower-case form, 36 chars with hyphens.
-pub fn to_text(uuid: Uuid) -> String {
+/// Canonical lower-case form, 36 chars with hyphens. Production `Uuid → Text`
+/// renders through [`value_to_string`](crate::value_to_string); this is a
+/// test-only helper for the round-trip assertions below.
+#[cfg(test)]
+pub(crate) fn to_text(uuid: Uuid) -> String {
     uuid.hyphenated().to_string()
 }
 

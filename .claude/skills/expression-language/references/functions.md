@@ -1,6 +1,6 @@
 # Expression language -- function reference
 
-All functions propagate null (return `Value::Null` if any argument is null) unless noted otherwise.
+All functions propagate null (return `Value::Null` if any argument is null) unless noted otherwise. The comparison operators are the notable exception — they are **total** and never return null (see [Comparison](#comparison)).
 
 ## Conditional
 
@@ -115,7 +115,9 @@ Integer overflow promotes to `BigInt` automatically.
 | `greaterOrEquals` | `(T, T) -> Bool` | Greater than or equal |
 | `lessOrEquals` | `(T, T) -> Bool` | Less than or equal |
 
-Comparable type categories: numeric, text, bool, date, timestamp, uuid.
+Comparable type categories: numeric, text, bool, date, timestamp, uuid. Operands must share a category (checked at type resolution; a mismatch is a `TypeMismatch`).
+
+The six operators are **total** — they never return null, so they resolve to non-null `Bool`. Equality treats null as a value: `null == null` is `true`, `null == <non-null>` is `false` (so `x == null` is a real null test). The ordering operators (`<`, `>`, `<=`, `>=`) return `false` whenever either operand is null — null is unordered, mirroring SQL filtering and deliberately unlike `==`.
 
 ## Logical
 

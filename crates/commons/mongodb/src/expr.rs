@@ -199,6 +199,7 @@ mod tests {
             now: Utc::now(),
             base_dir: PathBuf::from("."),
             is_compile_time: false,
+            caches: air_elt_expr_funcs::ExprCaches::default(),
         }
     }
 

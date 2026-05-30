@@ -57,6 +57,7 @@ impl<'a> TypeCheckerState<'a> {
             Expr::Conditional(conditional) => self.check_conditional(conditional),
             Expr::Interpolation(segments) => self.check_interpolation(segments),
             Expr::Object(entries) => self.check_object(entries),
+            Expr::Field(..) | Expr::Fields(..) => Err(ExprError::FieldOutsideTransform),
         }
     }
 

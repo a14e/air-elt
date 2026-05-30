@@ -13,6 +13,7 @@ doctest = false
 air-elt-expr-types = { workspace = true }
 air-elt-types = { workspace = true }
 air-elt-commons = { workspace = true }
+air-elt-commons-caching = { workspace = true }
 ahash = { workspace = true }
 base64 = { workspace = true }
 ch_cityhash102 = { workspace = true }

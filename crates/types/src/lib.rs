@@ -21,6 +21,7 @@ pub mod union_types;
 pub mod value;
 
 pub use compare::{compare_values, values_equal};
+pub use convert::to_text::value_to_string;
 pub use convert::{ConversionContext, ConvertError, convert};
 pub use data_type::DataType;
 pub use dynamic::{DynType, DynValue};

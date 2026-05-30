@@ -25,7 +25,9 @@ pub const MAX_EXPR_FILE_BYTES: usize = 1_048_576;
 /// Maximum nesting depth for object literals in expressions.
 pub const MAX_OBJECT_DEPTH: usize = 128;
 
-/// Names reserved for control-flow expressions handled at the AST level.
-/// These cannot be registered as regular functions.
-pub const RESERVED_CONTROL_FLOW_NAMES: &[&str] =
-    &["if", "multiIf", "coalesce", "ifNull", "nullIf", "and", "or"];
+/// Names reserved for expressions handled at the AST level (control flow,
+/// plus the `field`/`fields` source-reference grammar). These cannot be
+/// registered as regular functions.
+pub const RESERVED_CONTROL_FLOW_NAMES: &[&str] = &[
+    "if", "multiIf", "coalesce", "ifNull", "nullIf", "and", "or", "field", "fields",
+];

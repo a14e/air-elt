@@ -302,6 +302,18 @@ impl ExprFunction for XxHash32Func {
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
 
+/// Supported HMAC algorithm labels (arg index 0). Shared by `evaluate` and
+/// `validate_const_args` so the accepted set never drifts.
+const HMAC_ALGORITHMS: [&str; 2] = ["sha256", "sha512"];
+
+/// Builds the "unsupported algorithm" error for an unrecognised HMAC label.
+fn unsupported_hmac_algorithm_error(algorithm: &str) -> FuncError {
+    FuncError::EvalFailed {
+        function: "hmac".to_owned(),
+        reason: format!("unsupported algorithm: {algorithm} (supported: sha256, sha512)"),
+    }
+}
+
 struct HmacFunc;
 
 impl ExprFunction for HmacFunc {
@@ -371,15 +383,23 @@ impl ExprFunction for HmacFunc {
                 mac.update(&message_bytes);
                 hex::encode(mac.finalize().into_bytes())
             }
-            other => {
-                return Err(FuncError::EvalFailed {
-                    function: "hmac".to_owned(),
-                    reason: format!("unsupported algorithm: {other} (supported: sha256, sha512)"),
-                });
-            }
+            other => return Err(unsupported_hmac_algorithm_error(other)),
         };
 
         Ok(Value::Text(hex_result))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        if let Some(Some(Value::Text(algorithm))) = args.first() {
+            if !HMAC_ALGORITHMS.contains(&algorithm.as_str()) {
+                return Err(unsupported_hmac_algorithm_error(algorithm));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -698,6 +718,26 @@ mod tests {
             ],
             &ctx(),
         );
+        assert!(matches!(result, Err(FuncError::EvalFailed { .. })));
+    }
+
+    #[test]
+    fn hmac_validate_const_valid_ok() {
+        let algorithm = Value::Text("sha512".to_owned());
+        let result = HmacFunc.validate_const_args(&[Some(&algorithm), None, None], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn hmac_validate_const_dynamic_ok() {
+        let result = HmacFunc.validate_const_args(&[None, None, None], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn hmac_validate_const_invalid_errors() {
+        let algorithm = Value::Text("md5".to_owned());
+        let result = HmacFunc.validate_const_args(&[Some(&algorithm), None, None], &ctx());
         assert!(matches!(result, Err(FuncError::EvalFailed { .. })));
     }
 

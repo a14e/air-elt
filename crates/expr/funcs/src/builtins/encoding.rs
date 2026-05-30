@@ -20,6 +20,42 @@ pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&DECODE_TEXT);
 }
 
+/// Valid binary-to-text algorithm labels for `encode` / `decode`. Shared by
+/// both `evaluate` and `validate_const_args` so the accepted set never drifts.
+const ENCODE_ALGORITHMS: [&str; 3] = ["hex", "base64", "base64url"];
+
+/// Builds the "unknown algorithm" error used wherever an unrecognised
+/// `encode`/`decode` label is rejected.
+fn unknown_algorithm_error(algorithm: &str) -> FuncError {
+    FuncError::EncodingError {
+        reason: format!("unknown algorithm: {algorithm} (expected hex, base64, or base64url)"),
+    }
+}
+
+/// Validates a constant algorithm label (arg index 1) for `encode`/`decode`.
+/// Dynamic or non-`Text` labels are skipped.
+fn validate_encode_algorithm_const(args: &[Option<&Value>]) -> Result<(), FuncError> {
+    if let Some(Some(Value::Text(algorithm))) = args.get(1) {
+        if !ENCODE_ALGORITHMS.contains(&algorithm.as_str()) {
+            return Err(unknown_algorithm_error(algorithm));
+        }
+    }
+    Ok(())
+}
+
+/// Validates a constant `encoding_rs` label (arg index 1) for
+/// `encodeText`/`decodeText`. Dynamic or non-`Text` labels are skipped.
+fn validate_label_const(function: &str, args: &[Option<&Value>]) -> Result<(), FuncError> {
+    if let Some(Some(Value::Text(label))) = args.get(1) {
+        if Encoding::for_label(label.as_bytes()).is_none() {
+            return Err(FuncError::EncodingError {
+                reason: format!("unknown encoding: {label} (in {function})"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn extract_bytes(val: Value, func_name: &str) -> Result<Vec<u8>, FuncError> {
     match val {
         Value::Bytes(b) => Ok(b),
@@ -84,15 +120,17 @@ impl ExprFunction for EncodeFunc {
             "hex" => hex::encode(&bytes),
             "base64" => BASE64_STANDARD.encode(&bytes),
             "base64url" => URL_SAFE_NO_PAD.encode(&bytes),
-            other => {
-                return Err(FuncError::EncodingError {
-                    reason: format!(
-                        "unknown algorithm: {other} (expected hex, base64, or base64url)"
-                    ),
-                });
-            }
+            other => return Err(unknown_algorithm_error(other)),
         };
         Ok(Value::Text(encoded))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_encode_algorithm_const(args)
     }
 }
 
@@ -149,15 +187,17 @@ impl ExprFunction for DecodeFunc {
                         reason: format!("base64url decode failed: {e}"),
                     }
                 })?,
-                other => {
-                    return Err(FuncError::EncodingError {
-                        reason: format!(
-                            "unknown algorithm: {other} (expected hex, base64, or base64url)"
-                        ),
-                    });
-                }
+                other => return Err(unknown_algorithm_error(other)),
             };
         Ok(Value::Bytes(decoded))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_encode_algorithm_const(args)
     }
 }
 
@@ -216,6 +256,14 @@ impl ExprFunction for EncodeTextFunc {
         }
         Ok(Value::Bytes(bytes.into_owned()))
     }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_label_const("encodeText", args)
+    }
 }
 
 // --- decodeText ---
@@ -272,6 +320,14 @@ impl ExprFunction for DecodeTextFunc {
             });
         }
         Ok(Value::Text(text.into_owned()))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_label_const("decodeText", args)
     }
 }
 
@@ -483,5 +539,39 @@ mod tests {
             .evaluate(vec![Value::Null, Value::Text("utf-8".into())], &ctx())
             .unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn validate_const_encode_valid_ok() {
+        let algorithm = Value::Text("base64".into());
+        let result = EncodeFunc.validate_const_args(&[None, Some(&algorithm)], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_encode_dynamic_ok() {
+        let result = DecodeFunc.validate_const_args(&[None, None], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_encode_invalid_errors() {
+        let algorithm = Value::Text("rot13".into());
+        let result = EncodeFunc.validate_const_args(&[None, Some(&algorithm)], &ctx());
+        assert!(matches!(result, Err(FuncError::EncodingError { .. })));
+    }
+
+    #[test]
+    fn validate_const_label_valid_ok() {
+        let label = Value::Text("windows-1251".into());
+        let result = EncodeTextFunc.validate_const_args(&[None, Some(&label)], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_label_invalid_errors() {
+        let label = Value::Text("nonsense-encoding".into());
+        let result = DecodeTextFunc.validate_const_args(&[None, Some(&label)], &ctx());
+        assert!(matches!(result, Err(FuncError::EncodingError { .. })));
     }
 }

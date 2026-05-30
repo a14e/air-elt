@@ -31,11 +31,15 @@ pub fn parse_v6(s: &str) -> Result<Ipv6Addr, ConvertError> {
     })
 }
 
-pub fn to_text_v4(a: Ipv4Addr) -> String {
+// Production `Ipv4/Ipv6 → Text` renders through `value_to_string`; these are
+// test-only helpers for the canonical-form assertions.
+#[cfg(test)]
+pub(crate) fn to_text_v4(a: Ipv4Addr) -> String {
     a.to_string()
 }
 
-pub fn to_text_v6(a: Ipv6Addr) -> String {
+#[cfg(test)]
+pub(crate) fn to_text_v6(a: Ipv6Addr) -> String {
     a.to_string()
 }
 

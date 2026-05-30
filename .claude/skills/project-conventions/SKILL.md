@@ -10,10 +10,14 @@ Before editing Rust code, check this list. If a utility exists for your need, us
 
 ## Commons isolation
 
-Two foundational crates carry the no-internal-dep rule:
+Foundation crates carry the no-internal-dep rule (no dependency on any other `air-elt-*` crate):
 
 - `air-elt-commons` (`crates/commons/lib`) — utility helpers (`tracing_init`, `identifier`, `pool_timeouts`, `pool_settings`, `bool_flag`, `interval`).
 - `air-elt-types` (`crates/types`) — canonical type model (`DataType`, `Value`, `Key`, conversion matrix, value comparison (`compare_values`, `values_equal`), JSON encoder, `DynType` / `DynValue` traits, `JsonEncodeError`).
+- `air-elt-commons-caching` (`crates/commons/caching`) — `FifoCache<K, V>`: thread-safe bounded cache with FIFO eviction, cheap-to-clone (`Arc`-shared store). `new(cap)` (`cap == 0` = pass-through), `get_or_try_insert_with(key, build)`. FIFO, not LRU — hits take only a shared read lock. For caching compiled artifacts keyed by string (regex, JSON-path); store `Arc<T>` values.
+- `air-elt-commons-arena` (`crates/commons/arena`) — `Arena<T>`: append-only `u16`-indexed arena for compact execution-order layout. `alloc -> ArenaRef<T>`, `open_slice` + `ArenaSlice::push` (Go-`append` style, grows only at the tail else errors — never relocates), `get`/`slice`. Type-tagged handles (`ArenaRef<T>` / `ArenaSlice<T>`) so a handle from one arena cannot index another.
+
+Both new crates are generic and dependency-free; classified Foundation in the self-lint `CLASSIFICATION_RULES` so the `expr/*` crates may depend on them.
 
 **All type casts and value comparisons belong in `air-elt-types`**, not in expression or connector code. Expression functions and connectors call `air_elt_types::compare_values` / `air_elt_types::convert` instead of hand-rolling match arms. Connector-local custom types implement `DynValue::partial_cmp` and `DynValue::is_equal` for ordering/equality of opaque values.
 
@@ -107,7 +111,13 @@ Canonical types are the only pivot — connectors map `native → DataType` on r
 
 ## Key newtype (`air_elt_types::Key`)
 
-Hashable, totally-ordered projection of `Value` for switch dispatch, batch dedup, and cursor comparison. `Value` has cross-numeric `PartialEq`/`PartialOrd` but does NOT implement `Hash` or `Eq` — for `HashMap`/`HashSet` usage, project through `Key`. Rejects Null/Json/Object; accepts cursor-compatible Custom. Canonicalises small ints → Int64, Float32 → Float64 on construction so cross-width values hash identically. `KeyBson` stays separate for BSON-layer dedup (raw `bson::Bson`, always `_id`).
+Hashable, totally-ordered projection of `Value` for switch dispatch, batch dedup, and cursor comparison. `Value` has cross-numeric `PartialEq`/`PartialOrd` but does NOT implement `Hash` or `Eq` — for `HashMap`/`HashSet` usage, project through `Key`. Rejects Null/Json/Object; accepts cursor-compatible Custom. Canonicalises small ints → Int64, Float32 → Float64 on construction so cross-width values hash identically. The hash is deliberately **coarse**: cross-numeric-equal values (`Int64(1)` / `Float64(1.0)`, `Int64(n)` / `BigInt(n)`) hash by their `f64` value, and `Ipv4` / mapped-`Ipv6` by the v6 form, so values that `Eq` considers equal always share a bucket. `KeyBson` stays separate for BSON-layer dedup (raw `bson::Bson`, always `_id`).
+
+### Property tests for key types (mandatory)
+Any type used as a `HashMap`/`HashSet`/dispatch key (`Key`, `KeyBson`, and any new one) MUST carry property tests asserting the contracts, because a violation is a *silent* lookup miss, not a crash:
+1. **`Eq` implies `Hash`**: for arbitrary pairs, `a == b` implies `hash(a) == hash(b)`. (The converse is not required — hash collisions are allowed and resolved by `Eq`, so a coarse hash is fine; an `Eq` that calls two values equal while `Hash` separates them is the bug.)
+2. **`Ord` consistent with `Eq`**: `cmp(a, b) == Equal` iff `a == b`; plus reflexivity, antisymmetry, transitivity.
+3. **Corner cases** the random strategy must cover (or add as explicit cases): `NaN`, `±0.0`, cross-numeric equals (`Int64`/`Float64`/`BigInt` of the same value), large integers near `2^53` where `int → f64` is lossy, and any cross-type equality the type allows (e.g. `Ipv4` ↔ IPv4-mapped `Ipv6`). See `crates/types/src/key.rs` tests for the reference set.
 
 ## Schema on context
 

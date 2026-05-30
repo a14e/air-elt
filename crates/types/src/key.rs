@@ -125,24 +125,28 @@ fn normalise_float_bits(f: f64) -> u64 {
 
 fn hash_element<H: Hasher>(value: &Value, state: &mut H) {
     match value {
+        // Numeric family: `Int64`, `BigInt`, and `Float64` share one tag and
+        // hash by their `f64` value, so values that `eq_element`/`compare_values`
+        // treat as equal across these types (e.g. `Int64(1)` and `Float64(1.0)`,
+        // or `Int64(n)` and `BigInt(n)`) land in the same bucket — the Eq/Hash
+        // contract. The coercion is deliberately lossy in the same way the
+        // cross-numeric comparison is, so two distinct large integers may share
+        // a bucket (a harmless collision resolved by `eq_element`).
         Value::Int64(n) => {
             0u8.hash(state);
-            n.hash(state);
+            normalise_float_bits(*n as f64).hash(state);
         }
         Value::BigInt(b) => {
             0u8.hash(state);
-            match b.to_i64() {
-                Some(n) => n.hash(state),
-                None => b.hash(state),
-            }
+            normalise_float_bits(b.to_f64().unwrap_or(f64::NAN)).hash(state);
+        }
+        Value::Float64(f) => {
+            0u8.hash(state);
+            normalise_float_bits(*f).hash(state);
         }
         Value::Bool(b) => {
             1u8.hash(state);
             b.hash(state);
-        }
-        Value::Float64(f) => {
-            2u8.hash(state);
-            normalise_float_bits(*f).hash(state);
         }
         Value::Text(s) => {
             3u8.hash(state);
@@ -168,13 +172,16 @@ fn hash_element<H: Hasher>(value: &Value, state: &mut H) {
             8u8.hash(state);
             d.normalized().to_string().hash(state);
         }
+        // IP family: `Ipv4` and `Ipv6` share one tag and hash by the v6-mapped
+        // form, matching the cross-IP equality in `compare_values` (an IPv4 and
+        // its IPv4-mapped IPv6 compare equal).
         Value::Ipv4(a) => {
             9u8.hash(state);
-            a.hash(state);
+            a.to_ipv6_mapped().octets().hash(state);
         }
         Value::Ipv6(a) => {
-            10u8.hash(state);
-            a.hash(state);
+            9u8.hash(state);
+            a.octets().hash(state);
         }
         Value::Custom(c) => {
             11u8.hash(state);
@@ -340,6 +347,40 @@ mod tests {
         let k64 = Key::single(Value::Float64(1.5)).unwrap();
         assert_eq!(k32, k64);
         assert_eq!(hash_of(&k32), hash_of(&k64));
+    }
+
+    #[test]
+    fn int_and_equal_float_share_hash() {
+        // Cross-numeric equality must imply equal hashes, else a HashMap keyed
+        // by `Key` would miss a float entry on an integer-equal lookup.
+        let k_int = Key::single(Value::Int64(1)).unwrap();
+        let k_float = Key::single(Value::Float64(1.0)).unwrap();
+        assert_eq!(k_int, k_float);
+        assert_eq!(hash_of(&k_int), hash_of(&k_float));
+        // A fractional float is a distinct key.
+        assert_ne!(k_int, Key::single(Value::Float64(1.5)).unwrap());
+    }
+
+    #[test]
+    fn lossy_large_int_and_float_share_hash() {
+        // `2^53 + 1` is not exactly representable in f64 and the cross-numeric
+        // comparison rounds it to `2^53.0`, so these compare equal — the Eq/Hash
+        // contract then requires identical hashes (the corner case a property
+        // test shrank to before the hash was made f64-based).
+        let k_int = Key::single(Value::Int64((1i64 << 53) + 1)).unwrap();
+        let k_float = Key::single(Value::Float64((1u64 << 53) as f64)).unwrap();
+        assert_eq!(k_int, k_float);
+        assert_eq!(hash_of(&k_int), hash_of(&k_float));
+    }
+
+    #[test]
+    fn ipv4_and_mapped_ipv6_share_hash() {
+        // An IPv4 and its IPv4-mapped IPv6 compare equal, so they must hash equal.
+        let v4 = std::net::Ipv4Addr::new(1, 2, 3, 4);
+        let k4 = Key::single(Value::Ipv4(v4)).unwrap();
+        let k6 = Key::single(Value::Ipv6(v4.to_ipv6_mapped())).unwrap();
+        assert_eq!(k4, k6);
+        assert_eq!(hash_of(&k4), hash_of(&k6));
     }
 
     #[test]

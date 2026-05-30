@@ -112,6 +112,9 @@ test *args: fmt
 # Full pipeline: format → lint → test
 test-full: fmt lint test
 
+# Alias for test-full
+test-all: test-full
+
 # ── Check dependencies ────────────────────────────────────────────────
 
 # Minimal prereqs check — Rust only

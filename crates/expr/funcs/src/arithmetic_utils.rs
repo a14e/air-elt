@@ -55,6 +55,74 @@ pub fn arithmetic_result_type(
     })
 }
 
+/// Result type of `min` / `max` over `args`: the single common type every
+/// argument coerces to. Numeric arguments widen to one common numeric type
+/// (a plain widening join — no bit inflation, unlike arithmetic); identical
+/// non-numeric comparable categories pass through (`Text`/`Bytes` widen to
+/// unbounded). Mixing categories whose ordering is undefined against each
+/// other (e.g. a number and text) is rejected — `min`/`max` are not defined
+/// on such a comparison. The result is always nullable: every-argument-NULL
+/// yields NULL.
+pub fn comparable_join(
+    args: &[NullableExprType],
+    op: &str,
+) -> Result<NullableExprType, ExprTypeError> {
+    let mut accumulator = args[0].data_type.clone();
+    for arg in &args[1..] {
+        accumulator = join_comparable(&accumulator, &arg.data_type, op)?;
+    }
+    Ok(NullableExprType::nullable(accumulator))
+}
+
+fn join_comparable(left: &DataType, right: &DataType, op: &str) -> Result<DataType, ExprTypeError> {
+    if left == right {
+        return Ok(left.clone());
+    }
+    if is_numeric(left) && is_numeric(right) {
+        return numeric_join(left, right, op);
+    }
+    match (left, right) {
+        (DataType::Text { .. }, DataType::Text { .. }) => Ok(DataType::text()),
+        (DataType::Bytes { .. }, DataType::Bytes { .. }) => Ok(DataType::bytes()),
+        _ => Err(type_mismatch(op, left, right)),
+    }
+}
+
+/// Widening join of two numeric types (no bit inflation): the narrower type
+/// widens into the wider one. Mirrors the type pairs of [`scalar_arithmetic`]
+/// but keeps the width rather than growing it.
+fn numeric_join(left: &DataType, right: &DataType, op: &str) -> Result<DataType, ExprTypeError> {
+    use DataType::*;
+    match (left, right) {
+        (l, r) if is_integer(l) && is_integer(r) => {
+            bits_to_int_type(integer_bits(l).max(integer_bits(r)))
+        }
+        (Float32, Float32) => Ok(Float32),
+        (l, r) if is_float(l) && is_float(r) => Ok(Float64),
+        (l, r) if (is_integer(l) && is_float(r)) || (is_float(l) && is_integer(r)) => Ok(Float64),
+        (BigInt { .. }, BigInt { .. }) => Ok(BigInt { width: None }),
+        (l, BigInt { .. }) | (BigInt { .. }, l) if is_integer(l) => Ok(BigInt { width: None }),
+        (l, r)
+            if (is_numeric(l) && matches!(r, Decimal { .. }))
+                || (matches!(l, Decimal { .. }) && is_numeric(r)) =>
+        {
+            Ok(Decimal {
+                precision: None,
+                scale: None,
+            })
+        }
+        _ => Err(type_mismatch(op, left, right)),
+    }
+}
+
+fn type_mismatch(op: &str, left: &DataType, right: &DataType) -> ExprTypeError {
+    ExprTypeError::TypeMismatch {
+        operation: op.to_owned(),
+        left: format!("{left}"),
+        right: format!("{right}"),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArithmeticOp {
     Add,

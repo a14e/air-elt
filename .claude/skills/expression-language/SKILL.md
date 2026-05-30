@@ -78,7 +78,7 @@ Unary: `negate`/`abs` preserve the input type. `ceil`/`floor`/`round`/`sign` ret
 
 **String functions:** all return `Text{size:None}` (unbounded). Exception: `length`/`indexOf` return `Int64`; `startsWith`/`endsWith`/`contains` return `Bool`. Size-aware algebra (e.g. `concat(Text(5), Text(5))` returning `Text(10)`) exists in `concat_result_type` but is not wired through `ConcatFunc.resolve_type` yet.
 
-**Comparison functions:** always return `Bool`.
+**Comparison functions:** always return **non-null `Bool`** — all six are total. `==`/`!=` treat null as a value (`null==null` → true, `null==x` → false), so `x==null` is a real null test that matches `values_equal`/`Key`; the ordering operators (`<`/`>`/`<=`/`>=`) return `false` on any null operand (null is unordered, mirroring SQL filtering and deliberately unlike `==`). Because they never produce null, comparisons do not propagate operand nullability into `&&`/`||`/`if`.
 
 **Cast functions:** return the target type (`toInt64` returns `Int64`, `toBigInt` returns `BigInt{width:None}`, `toDecimal` returns `Decimal{precision:None, scale:None}`, etc.).
 

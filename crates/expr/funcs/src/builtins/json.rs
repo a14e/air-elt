@@ -1,7 +1,5 @@
 use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::{DataType, Value};
-use jsonpath_rust::JsonPath;
-use std::str::FromStr;
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
@@ -27,15 +25,27 @@ pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&JSON_LENGTH);
 }
 
+/// Warms / validates a constant path argument (index 1) through the cache.
+/// Surfaces a [`FuncError::JsonPathError`] for an inlined invalid path and
+/// leaves the compiled path resident for evaluation. Dynamic or non-`Text`
+/// paths are skipped.
+fn validate_path_const(args: &[Option<&Value>], context: &EvalContext) -> Result<(), FuncError> {
+    if let Some(Some(Value::Text(path))) = args.get(1) {
+        context.caches.with_json_path_cached(path, |_| ())?;
+    }
+    Ok(())
+}
+
 /// Extracts the first result from a JSONPath query, returning None if empty.
+/// The path is compiled through the per-flow cache.
 fn extract_first_json_path(
     json: &serde_json::Value,
     path_str: &str,
+    context: &EvalContext,
 ) -> Result<Option<serde_json::Value>, FuncError> {
-    let path = JsonPath::from_str(path_str).map_err(|e| FuncError::JsonPathError {
-        reason: e.to_string(),
-    })?;
-    let results = path.find(json);
+    let results = context
+        .caches
+        .with_json_path_cached(path_str, |path| path.find(json))?;
     match results {
         serde_json::Value::Array(arr) => Ok(arr.into_iter().next()),
         serde_json::Value::Null => Ok(None),
@@ -172,7 +182,7 @@ impl ExprFunction for JsPathFunc {
         Ok(NullableExprType::nullable(DataType::Json))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
         let path_val = args.remove(1);
         let json_val = args.remove(0);
         if json_val.is_null() || path_val.is_null() {
@@ -192,10 +202,18 @@ impl ExprFunction for JsPathFunc {
                 });
             }
         };
-        match extract_first_json_path(&json, &path_str)? {
+        match extract_first_json_path(&json, &path_str, context)? {
             Some(v) => Ok(Value::Json(v)),
             None => Ok(Value::Null),
         }
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_path_const(args, context)
     }
 }
 
@@ -222,7 +240,7 @@ impl ExprFunction for JsPathStringFunc {
         Ok(NullableExprType::nullable(DataType::Text { size: None }))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
         let path_val = args.remove(1);
         let json_val = args.remove(0);
         if json_val.is_null() || path_val.is_null() {
@@ -242,10 +260,18 @@ impl ExprFunction for JsPathStringFunc {
                 });
             }
         };
-        match extract_first_json_path(&json, &path_str)? {
+        match extract_first_json_path(&json, &path_str, context)? {
             Some(serde_json::Value::String(s)) => Ok(Value::Text(s)),
             Some(_) | None => Ok(Value::Null),
         }
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_path_const(args, context)
     }
 }
 
@@ -272,7 +298,7 @@ impl ExprFunction for JsPathIntFunc {
         Ok(NullableExprType::nullable(DataType::Int64))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
         let path_val = args.remove(1);
         let json_val = args.remove(0);
         if json_val.is_null() || path_val.is_null() {
@@ -292,13 +318,21 @@ impl ExprFunction for JsPathIntFunc {
                 });
             }
         };
-        match extract_first_json_path(&json, &path_str)? {
+        match extract_first_json_path(&json, &path_str, context)? {
             Some(serde_json::Value::Number(n)) => match n.as_i64() {
                 Some(i) => Ok(Value::Int64(i)),
                 None => Ok(Value::Null),
             },
             Some(_) | None => Ok(Value::Null),
         }
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_path_const(args, context)
     }
 }
 
@@ -325,7 +359,7 @@ impl ExprFunction for JsPathFloatFunc {
         Ok(NullableExprType::nullable(DataType::Float64))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
         let path_val = args.remove(1);
         let json_val = args.remove(0);
         if json_val.is_null() || path_val.is_null() {
@@ -345,13 +379,21 @@ impl ExprFunction for JsPathFloatFunc {
                 });
             }
         };
-        match extract_first_json_path(&json, &path_str)? {
+        match extract_first_json_path(&json, &path_str, context)? {
             Some(serde_json::Value::Number(n)) => match n.as_f64() {
                 Some(f) => Ok(Value::Float64(f)),
                 None => Ok(Value::Null),
             },
             Some(_) | None => Ok(Value::Null),
         }
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_path_const(args, context)
     }
 }
 
@@ -378,7 +420,7 @@ impl ExprFunction for JsPathBoolFunc {
         Ok(NullableExprType::nullable(DataType::Bool))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
         let path_val = args.remove(1);
         let json_val = args.remove(0);
         if json_val.is_null() || path_val.is_null() {
@@ -398,10 +440,18 @@ impl ExprFunction for JsPathBoolFunc {
                 });
             }
         };
-        match extract_first_json_path(&json, &path_str)? {
+        match extract_first_json_path(&json, &path_str, context)? {
             Some(serde_json::Value::Bool(b)) => Ok(Value::Bool(b)),
             Some(_) | None => Ok(Value::Null),
         }
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_path_const(args, context)
     }
 }
 
@@ -619,5 +669,26 @@ mod tests {
         let f = JsonLengthFunc;
         let result = f.evaluate(vec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn validate_const_valid_path_ok() {
+        let path = Value::Text("$.store.book[0].title".to_owned());
+        let result = JsPathFunc.validate_const_args(&[None, Some(&path)], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_dynamic_path_ok() {
+        // Dynamic path (None) must skip the check.
+        let result = JsPathStringFunc.validate_const_args(&[None, None], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_invalid_path_errors() {
+        let path = Value::Text("$[".to_owned());
+        let result = JsPathIntFunc.validate_const_args(&[None, Some(&path)], &ctx());
+        assert!(matches!(result, Err(FuncError::JsonPathError { .. })));
     }
 }

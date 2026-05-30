@@ -21,7 +21,7 @@ impl ConfigExprPatcher {
         table: &mut toml::Table,
         context: &ExpressionContext,
     ) -> Result<(), ExprError> {
-        let parser = Parser::create();
+        let parser = Parser::create_comptime();
         let evaluator = Evaluator::create(context);
         self.trie.root.walk_table(table, &parser, &evaluator)
     }
@@ -31,7 +31,7 @@ impl ConfigExprPatcher {
         table: &mut toml::Table,
         context: &ExpressionContext,
     ) -> Result<(), ExprError> {
-        let parser = Parser::create();
+        let parser = Parser::create_comptime();
         let evaluator = Evaluator::create(context);
         let mut value = toml::Value::Table(std::mem::take(table));
         TrieNode::patch_subtree(&mut value, &parser, &evaluator, 0)?;

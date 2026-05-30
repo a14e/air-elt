@@ -173,6 +173,7 @@ impl std::error::Error for SlicePushError {}
 /// A generic, dependency-free arena addressed by `u16` indices. Items are
 /// stored contiguously so a lowered program lays out compactly and stays
 /// cache-local. The arena holds at most `u16::MAX` slots.
+#[derive(Debug)]
 pub struct Arena<T> {
     items: Vec<T>,
 }
@@ -345,6 +346,15 @@ mod tests {
         *arena.get_mut(r) = 42;
 
         assert_eq!(*arena.get(r), 42);
+    }
+
+    #[test]
+    fn debug_renders_items() {
+        let mut arena: Arena<i32> = Arena::new();
+        arena.alloc(7).unwrap();
+        arena.alloc(8).unwrap();
+        let rendered = format!("{arena:?}");
+        assert!(rendered.contains('7') && rendered.contains('8'));
     }
 
     #[test]

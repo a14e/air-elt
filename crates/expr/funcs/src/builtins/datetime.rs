@@ -1,3 +1,4 @@
+use chrono::format::{Item, StrftimeItems};
 use chrono::{DateTime, Datelike, Duration, Months, Timelike, Utc};
 
 use air_elt_expr_types::nullable::NullableExprType;
@@ -123,6 +124,20 @@ fn extract_string(val: Value, func: &str) -> Result<String, FuncError> {
             actual: format!("{:?}", val.data_type()),
         }),
     }
+}
+
+/// Validates a strftime mask by scanning its parsed items for an error item.
+/// Shared by `formatDateTime`'s `evaluate` and `validate_const_args` so both
+/// reject the same malformed masks.
+fn validate_strftime_mask(mask: &str) -> Result<(), FuncError> {
+    let has_error = StrftimeItems::new(mask).any(|item| matches!(item, Item::Error));
+    if has_error {
+        return Err(FuncError::EvalFailed {
+            function: "formatDateTime".to_owned(),
+            reason: format!("invalid format mask: {mask:?}"),
+        });
+    }
+    Ok(())
 }
 
 /// Resolve type for functions accepting a timestamp/date argument.
@@ -872,7 +887,19 @@ impl ExprFunction for FormatDateTimeFunc {
         }
         let dt = extract_timestamp(dt_val, "formatDateTime")?;
         let mask = extract_string(mask_val, "formatDateTime")?;
+        validate_strftime_mask(&mask)?;
         Ok(Value::Text(dt.format(&mask).to_string()))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        if let Some(Some(Value::Text(mask))) = args.get(1) {
+            validate_strftime_mask(mask)?;
+        }
+        Ok(())
     }
 }
 
@@ -902,6 +929,7 @@ mod tests {
             now: Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 45).unwrap(),
             base_dir: PathBuf::new(),
             is_compile_time: false,
+            caches: crate::cache::ExprCaches::default(),
         }
     }
 
@@ -1255,6 +1283,27 @@ mod tests {
             .evaluate(vec![Value::Null, Value::Text("%Y".into())], &ctx())
             .unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn validate_const_mask_valid_ok() {
+        let mask = Value::Text("%Y-%m-%d %H:%M:%S".into());
+        let result = FormatDateTimeFunc.validate_const_args(&[None, Some(&mask)], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_mask_dynamic_ok() {
+        let result = FormatDateTimeFunc.validate_const_args(&[None, None], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_mask_invalid_errors() {
+        // %Q is not a valid chrono specifier — parses to an error item.
+        let mask = Value::Text("%Q".into());
+        let result = FormatDateTimeFunc.validate_const_args(&[None, Some(&mask)], &ctx());
+        assert!(matches!(result, Err(FuncError::EvalFailed { .. })));
     }
 
     // -----------------------------------------------------------------------

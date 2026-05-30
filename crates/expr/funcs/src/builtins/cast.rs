@@ -125,7 +125,7 @@ impl ExprFunction for CastToStringFunc {
         }
         match a {
             Value::Text(s) => Ok(Value::Text(s)),
-            other => Ok(Value::Text(value_to_string(&other))),
+            other => Ok(Value::Text(air_elt_types::value_to_string(&other))),
         }
     }
 }
@@ -1095,44 +1095,6 @@ fn extract_u32(function: &str, param_name: &str, value: &Value) -> Result<u32, F
     }
 }
 
-fn value_to_string(val: &Value) -> String {
-    match val {
-        Value::Null => "null".to_owned(),
-        Value::Bool(b) => b.to_string(),
-        Value::Int8(n) => n.to_string(),
-        Value::Int16(n) => n.to_string(),
-        Value::Int32(n) => n.to_string(),
-        Value::Int64(n) => n.to_string(),
-        Value::UInt8(n) => n.to_string(),
-        Value::UInt16(n) => n.to_string(),
-        Value::UInt32(n) => n.to_string(),
-        Value::UInt64(n) => n.to_string(),
-        Value::Float32(n) => n.to_string(),
-        Value::Float64(n) => n.to_string(),
-        Value::BigInt(n) => n.to_string(),
-        Value::Decimal(n) => n.to_string(),
-        Value::Text(s) => s.clone(),
-        Value::Bytes(b) => format!("{b:?}"),
-        Value::Date(d) => d.to_string(),
-        Value::Timestamp(t) => t.to_rfc3339(),
-        Value::Uuid(u) => u.to_string(),
-        Value::Ipv4(a) => a.to_string(),
-        Value::Ipv6(a) => a.to_string(),
-        Value::Json(j) => j.to_string(),
-        Value::Object(entries) => {
-            let map: serde_json::Map<String, serde_json::Value> = entries
-                .iter()
-                .map(|(k, v)| {
-                    let json_v = air_elt_types::value_to_json(v).unwrap_or(serde_json::Value::Null);
-                    (k.clone(), json_v)
-                })
-                .collect();
-            serde_json::Value::Object(map).to_string()
-        }
-        Value::Custom(_) => "<custom>".to_owned(),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1568,6 +1530,82 @@ mod tests {
     use chrono::Datelike;
 
     // --- Allocation optimization tests ---
+
+    // A `Value::Custom` must render through the canonical `value_to_string`
+    // form (`DynValue::to_json`), not the old `"<custom>"` placeholder.
+    #[test]
+    fn to_string_cast_custom_renders_canonical_form() {
+        use std::any::Any;
+
+        use air_elt_types::convert::ConvertError;
+        use air_elt_types::convert::context::ConversionContext;
+        use air_elt_types::dynamic::{DynType, DynValue};
+        use air_elt_types::error::JsonEncodeError;
+        use serde_json::json;
+
+        #[derive(Debug, Clone)]
+        struct StubType;
+        impl DynType for StubType {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn kind(&self) -> &str {
+                "stub.objectid"
+            }
+            fn can_convert_to(&self, _: &DataType, _: bool) -> bool {
+                false
+            }
+            fn can_construct_from(&self, _: &DataType, _: bool) -> bool {
+                false
+            }
+            fn convert(
+                &self,
+                _: Value,
+                _: &DataType,
+                _: &ConversionContext,
+            ) -> Result<Value, ConvertError> {
+                unimplemented!()
+            }
+            fn construct(
+                &self,
+                _: Value,
+                _: &DataType,
+                _: &ConversionContext,
+            ) -> Result<Value, ConvertError> {
+                unimplemented!()
+            }
+            fn clone_box(&self) -> Box<dyn DynType> {
+                Box::new(StubType)
+            }
+        }
+
+        #[derive(Debug, Clone)]
+        struct StubVal;
+        impl DynValue for StubVal {
+            fn dyn_type(&self) -> Box<dyn DynType> {
+                Box::new(StubType)
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn into_any(self: Box<Self>) -> Box<dyn Any> {
+                self
+            }
+            fn is_equal(&self, _: &dyn DynValue) -> bool {
+                true
+            }
+            fn clone_box(&self) -> Box<dyn DynValue> {
+                Box::new(self.clone())
+            }
+            fn to_json(&self) -> Result<serde_json::Value, JsonEncodeError> {
+                Ok(json!("507f1f77bcf86cd799439011"))
+            }
+        }
+
+        let input = Value::Custom(Box::new(StubVal));
+        let result = CAST_TO_STRING.evaluate(vec![input], &ctx()).unwrap();
+        assert_eq!(result, Value::Text("507f1f77bcf86cd799439011".into()));
+    }
 
     #[test]
     fn to_string_cast_passthrough() {

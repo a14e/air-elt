@@ -1,6 +1,5 @@
 use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::{DataType, Value};
-use regex::Regex;
 
 use crate::builtins::arg_extract::extract_text;
 use crate::error::FuncError;
@@ -15,13 +14,15 @@ pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&REGEX_REPLACE);
 }
 
-/// Compiles a regex pattern, mapping compilation errors onto
-/// [`FuncError::RegexCompileFailed`]. The pattern is compiled inline on every
-/// call; a per-flow cache is wired in a later phase.
-fn compile_pattern(pattern: &str) -> Result<Regex, FuncError> {
-    Regex::new(pattern).map_err(|err| FuncError::RegexCompileFailed {
-        reason: format!("{pattern:?}: {err}"),
-    })
+/// Warms / validates a constant pattern argument through the cache. Surfaces a
+/// [`FuncError::RegexCompileFailed`] for an inlined invalid pattern and leaves
+/// the compiled regex resident for evaluation. Dynamic or non-`Text` patterns
+/// are skipped.
+fn validate_pattern_const(args: &[Option<&Value>], context: &EvalContext) -> Result<(), FuncError> {
+    if let Some(Some(Value::Text(pattern))) = args.get(1) {
+        context.caches.with_regex_cached(pattern, |_| ())?;
+    }
+    Ok(())
 }
 
 struct RegexMatchFunc;
@@ -48,7 +49,7 @@ impl ExprFunction for RegexMatchFunc {
         Ok(NullableExprType::new(DataType::Bool, nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
         let pattern = args.remove(1);
         let text = args.remove(0);
         if text.is_null() || pattern.is_null() {
@@ -56,8 +57,18 @@ impl ExprFunction for RegexMatchFunc {
         }
         let text = extract_text(text, "regexMatch")?;
         let pattern = extract_text(pattern, "regexMatch")?;
-        let re = compile_pattern(&pattern)?;
-        Ok(Value::Bool(re.is_match(&text)))
+        let matched = context
+            .caches
+            .with_regex_cached(&pattern, |re| re.is_match(&text))?;
+        Ok(Value::Bool(matched))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_pattern_const(args, context)
     }
 }
 
@@ -88,7 +99,7 @@ impl ExprFunction for RegexReplaceFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
         let replacement = args.remove(2);
         let pattern = args.remove(1);
         let text = args.remove(0);
@@ -98,9 +109,18 @@ impl ExprFunction for RegexReplaceFunc {
         let text = extract_text(text, "regexReplace")?;
         let pattern = extract_text(pattern, "regexReplace")?;
         let replacement = extract_text(replacement, "regexReplace")?;
-        let re = compile_pattern(&pattern)?;
-        let replaced = re.replace_all(&text, replacement.as_str()).into_owned();
+        let replaced = context.caches.with_regex_cached(&pattern, |re| {
+            re.replace_all(&text, replacement.as_str()).into_owned()
+        })?;
         Ok(Value::Text(replaced))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_pattern_const(args, context)
     }
 }
 
@@ -215,5 +235,26 @@ mod tests {
             &ctx(),
         );
         assert!(matches!(result, Err(FuncError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn validate_const_valid_pattern_ok() {
+        let pattern = Value::Text(r"\d+".into());
+        let result = REGEX_MATCH.validate_const_args(&[None, Some(&pattern)], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_dynamic_pattern_ok() {
+        // Dynamic pattern (None) must skip the check.
+        let result = REGEX_MATCH.validate_const_args(&[None, None], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_invalid_pattern_errors() {
+        let pattern = Value::Text("(".into());
+        let result = REGEX_REPLACE.validate_const_args(&[None, Some(&pattern), None], &ctx());
+        assert!(matches!(result, Err(FuncError::RegexCompileFailed { .. })));
     }
 }

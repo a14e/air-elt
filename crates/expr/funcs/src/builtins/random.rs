@@ -138,6 +138,90 @@ fn seeded_purity(const_args: &[bool], base_arity: usize) -> bool {
     const_args.len() == base_arity + 1 && const_args[base_arity]
 }
 
+/// Validates the optional trailing `seed` slot of a constant argument list.
+/// The slot is present only when `args.len()` exceeds `base_arity`; if that
+/// argument is a constant that is neither `Int64` nor `Null`, it cannot be a
+/// valid seed — surface the same `TypeMismatch` that [`take_seed`] raises at
+/// runtime. Dynamic seeds (`None`) are skipped.
+fn validate_seed_const(
+    function: &str,
+    args: &[Option<&Value>],
+    base_arity: usize,
+) -> Result<(), FuncError> {
+    if args.len() <= base_arity {
+        return Ok(());
+    }
+    if let Some(seed) = args[base_arity] {
+        if !matches!(seed, Value::Int64(_) | Value::Null) {
+            return Err(FuncError::TypeMismatch {
+                function: function.to_owned(),
+                expected: "Int64 seed".to_owned(),
+                actual: format!("{:?}", seed.data_type()),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a `min`/`max` pair where `min > max`, mirroring the requirement
+/// shared by `randomInt`/`randomFloat`. Comparison goes through the canonical
+/// [`Value`] ordering so a mixed `Int64`/`Float64` pair compares correctly.
+/// Both `evaluate` (on extracted typed bounds re-wrapped as [`Value`]) and the
+/// const validator funnel through this single check.
+fn reject_min_gt_max(function: &str, min: &Value, max: &Value) -> Result<(), FuncError> {
+    if min > max {
+        return Err(FuncError::EvalFailed {
+            function: function.to_owned(),
+            reason: format!("min ({min:?}) must not exceed max ({max:?})"),
+        });
+    }
+    Ok(())
+}
+
+/// Validates a constant `min`/`max` pair for `randomInt`/`randomFloat`. Only
+/// errors when both bounds are constant and `min > max`. Dynamic bounds are
+/// skipped.
+fn validate_min_max_const(function: &str, args: &[Option<&Value>]) -> Result<(), FuncError> {
+    let (Some(Some(min)), Some(Some(max))) = (args.first(), args.get(1)) else {
+        return Ok(());
+    };
+    reject_min_gt_max(function, min, max)
+}
+
+/// Rejects a length outside `0..=max`, mirroring the bound shared by every
+/// length-prefixed random function. Both [`extract_length`] (runtime) and
+/// [`validate_length_const`] (const validator) funnel through this single check.
+fn reject_length_out_of_range(function: &str, n: i64, max: i64) -> Result<(), FuncError> {
+    if n < 0 {
+        return Err(FuncError::EvalFailed {
+            function: function.to_owned(),
+            reason: format!("length must be non-negative, got {n}"),
+        });
+    }
+    if n > max {
+        return Err(FuncError::EvalFailed {
+            function: function.to_owned(),
+            reason: format!("length {n} exceeds maximum {max}"),
+        });
+    }
+    Ok(())
+}
+
+/// Validates a constant length argument (arg index 0) for the length-prefixed
+/// random functions. Dynamic or non-`Int64` lengths are skipped; a constant
+/// length below `0` or above `max` raises the same `EvalFailed` as
+/// [`extract_length`].
+fn validate_length_const(
+    function: &str,
+    args: &[Option<&Value>],
+    max: i64,
+) -> Result<(), FuncError> {
+    if let Some(Some(Value::Int64(n))) = args.first() {
+        reject_length_out_of_range(function, *n, max)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // randomUuid
 // ---------------------------------------------------------------------------
@@ -172,6 +256,14 @@ impl ExprFunction for RandomUuidFunc {
         let mut bytes = [0u8; 16];
         rng.fill_bytes(&mut bytes);
         Ok(Value::Uuid(Builder::from_random_bytes(bytes).into_uuid()))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_seed_const("randomUuid", args, 0)
     }
 }
 
@@ -210,18 +302,22 @@ impl ExprFunction for RandomIntFunc {
         let min = extract_i64("randomInt", "min", &min_val)?;
         let max = extract_i64("randomInt", "max", &max_val)?;
 
-        if min > max {
-            return Err(FuncError::EvalFailed {
-                function: "randomInt".to_owned(),
-                reason: format!("min ({min}) must not exceed max ({max})"),
-            });
-        }
+        reject_min_gt_max("randomInt", &min_val, &max_val)?;
 
         let Some(mut rng) = seed.rng() else {
             return Ok(Value::Null);
         };
         let val = rng.random_range(min..=max);
         Ok(Value::Int64(val))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_min_max_const("randomInt", args)?;
+        validate_seed_const("randomInt", args, 2)
     }
 }
 
@@ -260,18 +356,22 @@ impl ExprFunction for RandomFloatFunc {
         let min = extract_f64("randomFloat", "min", &min_val)?;
         let max = extract_f64("randomFloat", "max", &max_val)?;
 
-        if min > max {
-            return Err(FuncError::EvalFailed {
-                function: "randomFloat".to_owned(),
-                reason: format!("min ({min}) must not exceed max ({max})"),
-            });
-        }
+        reject_min_gt_max("randomFloat", &min_val, &max_val)?;
 
         let Some(mut rng) = seed.rng() else {
             return Ok(Value::Null);
         };
         let val: f64 = rng.random_range(min..max);
         Ok(Value::Float64(val))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_min_max_const("randomFloat", args)?;
+        validate_seed_const("randomFloat", args, 2)
     }
 }
 
@@ -312,6 +412,15 @@ impl ExprFunction for RandomAlphanumericFunc {
         };
         let s = Alphanumeric.sample_string(&mut rng, length as usize);
         Ok(Value::Text(s))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_length_const("randomAlphanumeric", args, MAX_STRING_LENGTH)?;
+        validate_seed_const("randomAlphanumeric", args, 1)
     }
 }
 
@@ -362,6 +471,15 @@ impl ExprFunction for RandomHexFunc {
             .collect();
         Ok(Value::Text(s))
     }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_length_const("randomHex", args, MAX_STRING_LENGTH)?;
+        validate_seed_const("randomHex", args, 1)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +520,15 @@ impl ExprFunction for RandomBytesFunc {
         let mut bytes = vec![0u8; length as usize];
         rng.fill(&mut bytes[..]);
         Ok(Value::Bytes(bytes))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        validate_length_const("randomBytes", args, MAX_BYTES_LENGTH)?;
+        validate_seed_const("randomBytes", args, 1)
     }
 }
 
@@ -491,18 +618,7 @@ fn extract_length(function: &str, value: &Value, max: i64) -> Result<i64, FuncEr
             });
         }
     };
-    if n < 0 {
-        return Err(FuncError::EvalFailed {
-            function: function.to_owned(),
-            reason: format!("length must be non-negative, got {n}"),
-        });
-    }
-    if n > max {
-        return Err(FuncError::EvalFailed {
-            function: function.to_owned(),
-            reason: format!("length {n} exceeds maximum {max}"),
-        });
-    }
+    reject_length_out_of_range(function, n, max)?;
     Ok(n)
 }
 
@@ -735,6 +851,87 @@ mod tests {
             &ctx(),
         );
         assert!(matches!(r, Err(FuncError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn validate_const_seed_int_ok() {
+        let seed = Value::Int64(42);
+        let result = RandomUuidFunc.validate_const_args(&[Some(&seed)], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_seed_absent_ok() {
+        // No seed slot present → skip.
+        let result = RandomUuidFunc.validate_const_args(&[], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_seed_dynamic_ok() {
+        // Seed slot present but dynamic (None) → skip.
+        let result = RandomUuidFunc.validate_const_args(&[None], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_seed_wrong_type_errors() {
+        let seed = Value::Text("x".into());
+        let min = Value::Int64(0);
+        let max = Value::Int64(10);
+        let result =
+            RandomIntFunc.validate_const_args(&[Some(&min), Some(&max), Some(&seed)], &ctx());
+        assert!(matches!(result, Err(FuncError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn validate_const_min_max_ok() {
+        let min = Value::Int64(0);
+        let max = Value::Int64(10);
+        let result = RandomIntFunc.validate_const_args(&[Some(&min), Some(&max)], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_min_equals_max_ok() {
+        // min == max is the inclusive boundary — only min > max is an error.
+        let bound = Value::Int64(5);
+        let int_result = RandomIntFunc.validate_const_args(&[Some(&bound), Some(&bound)], &ctx());
+        assert!(int_result.is_ok());
+
+        let float_bound = Value::Float64(5.0);
+        let float_result =
+            RandomFloatFunc.validate_const_args(&[Some(&float_bound), Some(&float_bound)], &ctx());
+        assert!(float_result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_min_exceeds_max_errors() {
+        let min = Value::Int64(20);
+        let max = Value::Int64(10);
+        let result = RandomIntFunc.validate_const_args(&[Some(&min), Some(&max)], &ctx());
+        assert!(matches!(result, Err(FuncError::EvalFailed { .. })));
+    }
+
+    #[test]
+    fn validate_const_length_ok() {
+        let length = Value::Int64(32);
+        let result = RandomAlphanumericFunc.validate_const_args(&[Some(&length)], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_length_negative_errors() {
+        let length = Value::Int64(-1);
+        let result = RandomHexFunc.validate_const_args(&[Some(&length)], &ctx());
+        assert!(matches!(result, Err(FuncError::EvalFailed { .. })));
+    }
+
+    #[test]
+    fn validate_const_length_exceeds_max_errors() {
+        let length = Value::Int64(2_000_000);
+        let result = RandomBytesFunc.validate_const_args(&[Some(&length)], &ctx());
+        assert!(matches!(result, Err(FuncError::EvalFailed { .. })));
     }
 
     #[test]

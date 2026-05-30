@@ -20,12 +20,11 @@ pub mod error;
 pub mod float_narrow;
 pub mod int_narrow;
 pub mod ip;
-pub mod json_text;
 pub mod saturate;
 pub mod text_bool;
-pub mod text_narrow;
-pub mod text_truncate;
 pub mod timestamp_date;
+pub mod to_text;
+pub mod utils;
 pub mod uuid;
 pub mod xml;
 

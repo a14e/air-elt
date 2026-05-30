@@ -2,7 +2,8 @@
 //!
 //! Becomes a thin router: identity / pure-widening short-circuits stay
 //! here; everything narrowing-or-cross-type is delegated to a per-group
-//! submodule (`int_narrow`, `text_narrow`, `json_text`, `xml`, etc.).
+//! submodule (`int_narrow`, `to_text`, `xml`, etc.). Every `* → Text`
+//! conversion routes through the single generic arm into `to_text`.
 //! Truncate-only paths require `ctx.truncate=true`; explicitly-forbidden
 //! truncate combinations return [`ConvertError::TruncationForbidden`].
 
@@ -10,7 +11,7 @@ use super::ConvertError;
 use super::context::ConversionContext;
 use super::{
     bigint_narrow, bytes_narrow, decimal_narrow, decimal_to_float, float_narrow, int_narrow, ip,
-    json_text, text_bool, text_narrow, timestamp_date, uuid as uuid_conv, xml,
+    text_bool, timestamp_date, to_text, uuid as uuid_conv, xml,
 };
 use crate::{DataType, Value};
 use bigdecimal::BigDecimal;
@@ -72,15 +73,11 @@ pub fn convert(
     // is gated by `ctx.truncate` and goes through the dedicated module.
     if let (DataType::Text { size: a }, DataType::Text { size: b }) = (src, dst) {
         if widens_or_equal(*a, *b) {
-            return Ok(value);
+            return Ok(value); // widening / equal size: zero-copy passthrough
         }
-        if ctx.truncate {
-            return text_narrow::convert(value, src, *b);
-        }
-        return Err(ConvertError::Unsupported {
-            src: src.clone(),
-            dst: dst.clone(),
-        });
+        // Narrowing: the matrix admits `Text → Text(n)` shrink only under
+        // `truncate`, so consent is already given — truncate in place.
+        return Ok(to_text::convert(value, *b));
     }
     if let (DataType::Bytes { size: a }, DataType::Bytes { size: b }) = (src, dst) {
         if widens_or_equal(*a, *b) {
@@ -103,10 +100,7 @@ pub fn convert(
         }
 
         // ---- UUID round-trips (existing semantics) ---------------------
-        (DataType::Uuid, DataType::Text { .. }) => match value {
-            Value::Uuid(u) => Ok(Value::Text(uuid_conv::to_text(u))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
-        },
+        // (`Uuid → Text` is handled by the generic `* → Text` arm below.)
         (DataType::Uuid, DataType::Bytes { .. }) => match value {
             Value::Uuid(u) => Ok(Value::Bytes(uuid_conv::to_bytes(u).to_vec())),
             _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
@@ -141,14 +135,7 @@ pub fn convert(
                 _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
             }
         }
-        (DataType::Ipv4, DataType::Text { .. }) => match value {
-            Value::Ipv4(a) => Ok(Value::Text(ip::to_text_v4(a))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
-        },
-        (DataType::Ipv6, DataType::Text { .. }) => match value {
-            Value::Ipv6(a) => Ok(Value::Text(ip::to_text_v6(a))),
-            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
-        },
+        // (`Ipv4 / Ipv6 → Text` are handled by the generic `* → Text` arm below.)
         (DataType::Text { .. }, DataType::Ipv4) => match value {
             Value::Text(s) => Ok(Value::Ipv4(ip::parse_v4(&s)?)),
             _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
@@ -597,22 +584,9 @@ pub fn convert(
             decimal_narrow::convert(value, src, dst)
         }
 
-        // ---- Json → Text ---------------------------------------------
-        (DataType::Json, DataType::Text { size }) => {
-            // Bounded sink requires consent; unbounded does not.
-            if size.is_some() {
-                require_truncate(ctx, src, dst)?;
-            }
-            json_text::convert(value, src, *size)
-        }
-
-        // ---- Xml → Text / Text → Xml --------------------------------
-        (DataType::Xml, DataType::Text { size }) => {
-            if size.is_some() {
-                require_truncate(ctx, src, dst)?;
-            }
-            xml::xml_to_text(value, src, *size)
-        }
+        // ---- Text → Xml ---------------------------------------------
+        // (`Json → Text` and `Xml → Text` are handled by the generic
+        // `* → Text` arm below.)
         (DataType::Text { .. }, DataType::Xml) => xml::text_to_xml(value, src),
 
         // ---- Timestamp → Date ---------------------------------------
@@ -638,33 +612,16 @@ pub fn convert(
             _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
-        // ---- Object → Text -------------------------------------------
-        (DataType::Object, DataType::Text { size }) => {
-            if size.is_some() {
-                require_truncate(ctx, src, dst)?;
-            }
-            match value {
-                Value::Object(entries) => {
-                    let mut map = serde_json::Map::with_capacity(entries.len());
-                    for (key, val) in entries {
-                        let json_val = crate::json_encode::value_to_json(&val).map_err(|e| {
-                            ConvertError::Custom {
-                                message: format!("object to text: {e}"),
-                            }
-                        })?;
-                        map.insert(key, json_val);
-                    }
-                    let serialized = serde_json::Value::Object(map).to_string();
-                    if let Some(max) = size {
-                        let chars: String = serialized.chars().take(*max as usize).collect();
-                        Ok(Value::Text(chars))
-                    } else {
-                        Ok(Value::Text(serialized))
-                    }
-                }
-                _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
-            }
-        }
+        // ---- * → Text -------------------------------------------------
+        // Every type renders to its canonical text form (Uuid hyphenated, IP
+        // canonical, Json/Object serialized, Bytes hex, scalars natural). The
+        // matrix is the sole gatekeeper for which sources are admitted and
+        // whether a bounded sink needs `truncate`; this arm renders+truncates
+        // unconditionally (a no-op when it already fits), so it is deliberately
+        // MORE permissive than the matrix — never call it on an unvalidated
+        // `(src, Text)` pair. `Object → Text` shares the JSON serialization
+        // with `Object → Json` via `value_to_string`.
+        (_, DataType::Text { size }) => Ok(to_text::convert(value, *size)),
 
         // ---- Json → Object (truncate-only) ---------------------------
         (DataType::Json, DataType::Object) => {
@@ -997,14 +954,18 @@ mod tests {
     // §6.3 Text narrowing (UTF-8 boundary)
 
     #[test]
-    fn text_narrow_rejected_without_truncate() {
-        let res = convert(
+    fn text_narrow_fits_passes_without_truncate() {
+        // Value-aware: "hello" (5 chars) fits Text(10) losslessly, so the
+        // declared Text(20)→Text(10) narrowing needs no truncate consent at the
+        // dispatcher. Type-level narrowing is gated by the matrix at validation.
+        let out = convert(
             Value::Text("hello".into()),
             &dt_text(20),
             &dt_text(10),
             &passthrough(),
-        );
-        assert!(matches!(res, Err(ConvertError::Unsupported { .. })));
+        )
+        .unwrap();
+        assert_eq!(out, Value::Text("hello".into()));
     }
 
     #[test]
@@ -1476,6 +1437,28 @@ mod tests {
     }
 
     #[test]
+    fn xml_to_bounded_text_truncates_through_generic_arm() {
+        // Xml → Text(n) now routes through the generic `* → Text` arm; confirm
+        // the bounded path still truncates in chars (incl. the size-0 edge).
+        let out = convert(
+            Value::Text("<aaa/>".into()),
+            &DataType::Xml,
+            &dt_text(3),
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Text("<aa".into()));
+        let empty = convert(
+            Value::Text("<a/>".into()),
+            &DataType::Xml,
+            &dt_text(0),
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(empty, Value::Text(String::new()));
+    }
+
+    #[test]
     fn text_to_xml_well_formed() {
         let out = convert(
             Value::Text("<a/>".into()),
@@ -1588,8 +1571,9 @@ mod tests {
         };
 
         let cases: Vec<(DataType, DataType, Value)> = vec![
-            // UUID round-trips
-            (DataType::Uuid, dt_text(36), wrong_bool.clone()),
+            // UUID round-trips. (`Uuid → Text` is intentionally absent: the
+            // generic `* → Text` arm renders any value, so it never raises a
+            // shape mismatch — type fidelity there is the matrix's job.)
             (DataType::Uuid, dt_bytes(16), wrong_bool.clone()),
             (dt_text(36), DataType::Uuid, wrong_bool.clone()),
             (dt_bytes(16), DataType::Uuid, wrong_bool.clone()),
@@ -1691,25 +1675,22 @@ mod tests {
     }
 
     #[test]
-    fn json_to_text_value_shape_mismatch() {
-        let res = convert(
-            Value::Int32(1),
-            &DataType::Json,
-            &DataType::Text { size: None },
-            &passthrough(),
-        );
-        assert!(matches!(res, Err(ConvertError::ValueShapeMismatch { .. })));
-    }
-
-    #[test]
-    fn xml_to_text_value_shape_mismatch() {
-        let res = convert(
-            Value::Int32(1),
-            &DataType::Xml,
-            &DataType::Text { size: None },
-            &passthrough(),
-        );
-        assert!(matches!(res, Err(ConvertError::ValueShapeMismatch { .. })));
+    fn scalar_to_unbounded_text_renders_canonically() {
+        // The generic `* → Text` arm renders every type to its canonical form;
+        // an unbounded sink is always lossless.
+        let cases = [
+            (Value::Int32(42), DataType::Int32, "42"),
+            (Value::Bool(true), DataType::Bool, "true"),
+            (
+                Value::Bytes(vec![0xde, 0xad]),
+                DataType::Bytes { size: None },
+                "dead",
+            ),
+        ];
+        for (value, src, expected) in cases {
+            let out = convert(value, &src, &DataType::Text { size: None }, &passthrough()).unwrap();
+            assert_eq!(out, Value::Text(expected.into()));
+        }
     }
 
     #[test]

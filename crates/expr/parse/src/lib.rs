@@ -7,5 +7,7 @@ pub(crate) mod lexer;
 pub(crate) mod token;
 
 pub use error::ExprError;
-pub use model::{ConditionalExpr, Expr, InterpolationSegment, LiteralValue, Program, Statement};
+pub use model::{
+    ConditionalExpr, Expr, FieldsSelector, InterpolationSegment, LiteralValue, Program, Statement,
+};
 pub use parser::Parser;

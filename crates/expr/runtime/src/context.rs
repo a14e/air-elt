@@ -26,6 +26,7 @@ fn build_eval_context(config_dir: &Path) -> EvalContext {
         now: chrono::Utc::now(),
         base_dir: config_dir.to_path_buf(),
         is_compile_time: false,
+        caches: air_elt_expr_funcs::ExprCaches::default(),
     }
 }
 

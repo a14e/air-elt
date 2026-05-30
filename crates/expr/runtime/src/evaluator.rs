@@ -6,6 +6,7 @@ use air_elt_expr_parse::model::{
 };
 use air_elt_expr_types::limits::MAX_EXPR_DEPTH;
 use air_elt_types::Value;
+use air_elt_types::value_to_string;
 
 use crate::context::ExpressionContext;
 use crate::error::ExprError;
@@ -73,6 +74,7 @@ impl<'a> EvaluatorState<'a> {
             Expr::Conditional(conditional) => self.eval_conditional(conditional),
             Expr::Interpolation(segments) => self.eval_interpolation(segments),
             Expr::Object(entries) => self.eval_object(entries),
+            Expr::Field(..) | Expr::Fields(..) => Err(ExprError::FieldOutsideTransform),
         }
     }
 
@@ -323,46 +325,6 @@ fn eval_literal(lit: &LiteralValue) -> Value {
     }
 }
 
-fn value_to_string(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::Bool(b) => b.to_string(),
-        Value::Int8(v) => v.to_string(),
-        Value::Int16(v) => v.to_string(),
-        Value::Int32(v) => v.to_string(),
-        Value::Int64(v) => v.to_string(),
-        Value::UInt8(v) => v.to_string(),
-        Value::UInt16(v) => v.to_string(),
-        Value::UInt32(v) => v.to_string(),
-        Value::UInt64(v) => v.to_string(),
-        Value::Float32(v) => v.to_string(),
-        Value::Float64(v) => v.to_string(),
-        Value::Text(s) => s.clone(),
-        Value::BigInt(v) => v.to_string(),
-        Value::Decimal(v) => v.to_string(),
-        Value::Uuid(v) => v.to_string(),
-        Value::Date(d) => d.to_string(),
-        Value::Timestamp(t) => t.to_rfc3339(),
-        Value::Bytes(b) => format!("{b:?}"),
-        Value::Ipv4(v) => v.to_string(),
-        Value::Ipv6(v) => v.to_string(),
-        Value::Json(v) => v.to_string(),
-        Value::Object(entries) => {
-            let map: serde_json::Map<String, serde_json::Value> = entries
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        air_elt_types::value_to_json(v).unwrap_or(serde_json::Value::Null),
-                    )
-                })
-                .collect();
-            serde_json::Value::Object(map).to_string()
-        }
-        Value::Custom(v) => format!("{v:?}"),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -418,6 +380,7 @@ mod tests {
             now: chrono::Utc::now(),
             base_dir: PathBuf::from("/tmp"),
             is_compile_time: false,
+            caches: air_elt_expr_funcs::ExprCaches::default(),
         }
     }
 
@@ -428,6 +391,7 @@ mod tests {
             now: chrono::Utc::now(),
             base_dir: PathBuf::from("/tmp"),
             is_compile_time: false,
+            caches: air_elt_expr_funcs::ExprCaches::default(),
         }
     }
 
