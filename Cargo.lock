@@ -272,6 +272,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "smallvec",
  "statrs",
  "test-strategy",
  "thiserror",
@@ -316,6 +317,7 @@ version = "0.1.4"
 dependencies = [
  "ahash",
  "air-elt-expr-funcs",
+ "air-elt-expr-optimize",
  "air-elt-expr-parse",
  "air-elt-expr-types",
  "air-elt-types",

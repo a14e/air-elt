@@ -12,14 +12,16 @@
 //! what the optimizer's correctness tests exercise.
 
 use air_elt_expr_funcs::signature::EvalContext;
-use air_elt_expr_funcs::{FuncError, FunctionRegistry};
+use air_elt_expr_funcs::{ArgWindow, FuncError, FuncRef, FunctionRegistry};
+use air_elt_expr_parse::FieldsSelector;
 use air_elt_expr_types::limits::{MAX_EXPR_DEPTH, MAX_EXPR_STRING_BYTES};
 use air_elt_types::value_to_string;
 use air_elt_types::{Key, Value};
 use thiserror::Error;
 
 use crate::model::program::{
-    ArgSlice, CompactProgram, CompactYield, KeySlice, NodeRef, OptNode, SwitchTableId, TypeClass,
+    ArgSlice, CompactProgram, CompactYield, ConstId, KeySlice, NodeRef, OptNode, RegisterId,
+    SwitchTableId, TypeClass,
 };
 
 /// Errors raised while evaluating a [`CompactProgram`].
@@ -57,26 +59,79 @@ pub enum EvalError {
     Function(#[from] FuncError),
 }
 
-/// Evaluates a field-free compacted program against a registry and context.
+/// Supplies source-column values to the evaluator. The field-free correctness
+/// oracle uses [`NoFields`] (every access is a [`EvalError::FieldNotBound`]); the
+/// per-row runtime binds a real row. Treating an access as unbound is always a
+/// well-defined error, so an evaluator over the field-free subset stays correct.
+pub trait FieldSource {
+    /// The value of source column `name`.
+    fn field(&self, name: &str) -> Result<Value, EvalError>;
+
+    /// The object produced by `fields("*")` / `fields("a,b")`.
+    fn fields(&self, selector: &FieldsSelector) -> Result<Value, EvalError>;
+}
+
+/// The field-free source: every source-column access is unbound. Used by the
+/// optimizer's correctness oracle, which only exercises the field-free subset.
+pub struct NoFields;
+
+impl FieldSource for NoFields {
+    fn field(&self, _name: &str) -> Result<Value, EvalError> {
+        Err(EvalError::FieldNotBound)
+    }
+
+    fn fields(&self, _selector: &FieldsSelector) -> Result<Value, EvalError> {
+        Err(EvalError::FieldNotBound)
+    }
+}
+
+static NO_FIELDS: NoFields = NoFields;
+
+/// Evaluates a compacted program against a registry, context, and field source.
+/// With [`NoFields`] it covers the field-free subset (constants, operators,
+/// conditionals, variables); with a row-bound [`FieldSource`] it is the per-row
+/// runtime evaluator.
 pub struct ProgramEvaluator<'a> {
     program: &'a CompactProgram,
     registry: &'a FunctionRegistry,
     context: &'a EvalContext,
+    fields: &'a dyn FieldSource,
     registers: Vec<Value>,
+    /// Reusable argument stack. Each call pushes one [`ArgStackItem`] per
+    /// argument above `base = arg_stack.len()` (constants and registers as a
+    /// tag carrying only an index — no copy; sub-expressions as an owned
+    /// `Value`) and truncates back to `base` once the function returns. One
+    /// allocation is reused across every call within an evaluation, and argument
+    /// `i` of a call is simply `arg_stack[base + i]` — no slot bookkeeping.
+    arg_stack: Vec<ArgStackItem>,
 }
 
 impl<'a> ProgramEvaluator<'a> {
+    /// Field-free evaluator (the correctness oracle): any source-field access is
+    /// a [`EvalError::FieldNotBound`].
     pub fn create(
         program: &'a CompactProgram,
         registry: &'a FunctionRegistry,
         context: &'a EvalContext,
+    ) -> Self {
+        Self::create_with_fields(program, registry, context, &NO_FIELDS)
+    }
+
+    /// Evaluator bound to a row's [`FieldSource`] — the per-row runtime path.
+    pub fn create_with_fields(
+        program: &'a CompactProgram,
+        registry: &'a FunctionRegistry,
+        context: &'a EvalContext,
+        fields: &'a dyn FieldSource,
     ) -> Self {
         let registers = vec![Value::Null; program.register_count() as usize];
         Self {
             program,
             registry,
             context,
+            fields,
             registers,
+            arg_stack: Vec::new(),
         }
     }
 
@@ -102,10 +157,12 @@ impl<'a> ProgramEvaluator<'a> {
         }
         let next = depth + 1;
 
-        // `program` is a copy of the `&'a CompactProgram` reference, so the
-        // borrows it hands out (matched node, arg runs) live for `'a` and do not
-        // borrow `self` — leaving `&mut self` free for the register take below.
+        // `program`/`fields` are copies of the `&'a` references, so the borrows
+        // they hand out (matched node, arg runs, a source-field value) live for
+        // `'a` and do not borrow `self` — leaving `&mut self` free for the
+        // register take below.
         let program = self.program;
+        let fields = self.fields;
         match program.node(node_ref) {
             OptNode::Const(id) => Ok(program.constant(*id).clone()),
             OptNode::Register(register) => Ok(self.registers[*register as usize].clone()),
@@ -119,18 +176,12 @@ impl<'a> ProgramEvaluator<'a> {
                     Value::Null,
                 ))
             }
-            OptNode::SourceField(_) | OptNode::Field(_) | OptNode::Fields(_) => {
-                Err(EvalError::FieldNotBound)
-            }
-            OptNode::Call { func, args } => {
-                let arg_refs = program.args(*args);
-                let mut values = Vec::with_capacity(arg_refs.len());
-                for arg_ref in arg_refs {
-                    values.push(self.eval_node(*arg_ref, next)?);
-                }
-                let function = self.registry.get_by_ref(*func);
-                Ok(function.evaluate(values, self.context)?)
-            }
+            OptNode::SourceField(name) => fields.field(name),
+            OptNode::Fields(selector) => fields.fields(selector),
+            // `field(<dynamic>)` is rejected by the type-check pass; a survivor
+            // has no row binding.
+            OptNode::Field(_) => Err(EvalError::FieldNotBound),
+            OptNode::Call { func, args } => self.eval_call(*func, *args, next),
             OptNode::If {
                 condition,
                 then_branch,
@@ -169,6 +220,53 @@ impl<'a> ProgramEvaluator<'a> {
                 on_present,
             } => self.eval_type_assert(*inner, *expect, *on_present, next),
         }
+    }
+
+    /// Evaluate a function call. Each argument becomes one [`ArgStackItem`] on
+    /// the reusable argument stack: a constant or a register is a tag that reads
+    /// its storage in place with no copy; every other argument is a
+    /// sub-expression evaluated left-to-right onto the stack — preserving the
+    /// eager failure/effect order, since a failing sub-expression aborts before
+    /// later ones run. The function then reaches its arguments through an
+    /// [`ArenaArgWindow`], borrowing the read-only ones ([`read`](ArgWindow::read))
+    /// and moving the ones it consumes ([`take`](ArgWindow::take)). The stack is
+    /// truncated back to its base whether the call succeeds or fails, so an error
+    /// never leaves it dirty.
+    fn eval_call(
+        &mut self,
+        func: FuncRef,
+        args: ArgSlice,
+        depth: usize,
+    ) -> Result<Value, EvalError> {
+        let program = self.program;
+        let arg_refs = program.args(args);
+        let base = self.arg_stack.len();
+        // Push one item per argument, left-to-right. A constant or register is a
+        // tag carrying only its index — read in place from the arena, never
+        // copied. A sub-expression is evaluated now (so eager failure/effect
+        // order is preserved — a failing sub-expression aborts before later ones
+        // run) and stored as an owned `Value`.
+        for arg_ref in arg_refs {
+            let item = match program.node(*arg_ref) {
+                OptNode::Const(id) => ArgStackItem::Const(*id),
+                OptNode::Register(register) => ArgStackItem::Register(*register),
+                OptNode::RegisterTake(register) => ArgStackItem::RegisterTake(*register),
+                _ => ArgStackItem::Value(self.eval_node(*arg_ref, depth)?),
+            };
+            self.arg_stack.push(item);
+        }
+
+        let function = self.registry.get_by_ref(func);
+        let outcome = {
+            let mut window = ArenaArgWindow {
+                items: &mut self.arg_stack[base..],
+                program,
+                registers: &mut self.registers,
+            };
+            function.evaluate(&mut window, self.context)
+        };
+        self.arg_stack.truncate(base);
+        Ok(outcome?)
     }
 
     /// Evaluate `inner`, then reproduce the eliminated operation's null/type
@@ -330,13 +428,12 @@ impl<'a> ProgramEvaluator<'a> {
         let program = self.program;
         let key_ids = program.keys(keys);
         let value_refs = program.args(values);
-        let mut map = serde_json::Map::with_capacity(key_ids.len());
+        let mut fields = Vec::with_capacity(key_ids.len());
         for (key_id, value_ref) in key_ids.iter().zip(value_refs) {
             let evaluated = self.eval_node(*value_ref, depth)?;
-            let json = air_elt_types::value_to_json(&evaluated).unwrap_or(serde_json::Value::Null);
-            map.insert(program.key_name(*key_id).to_string(), json);
+            fields.push((program.key_name(*key_id).to_string(), evaluated));
         }
-        Ok(Value::Json(serde_json::Value::Object(map)))
+        Ok(Value::Object(fields))
     }
 }
 
@@ -353,5 +450,60 @@ fn expected_bool(context: &'static str, value: &Value) -> EvalError {
     EvalError::ExpectedBool {
         context,
         actual: format!("{:?}", value.data_type()),
+    }
+}
+
+/// One argument on the evaluator's reusable argument stack. A constant or a
+/// register carries only its index — read in place from the const pool or the
+/// register file, never copied; a sub-expression carries its computed value
+/// inline. So the descriptor and the value stack are one and the same, and
+/// argument `i` of a call is the `i`-th item of the call's stack region.
+enum ArgStackItem {
+    /// A computed sub-expression result, owned inline (`take` moves it out).
+    Value(Value),
+    /// A constant in the program's interned pool (`take` clones — it is shared).
+    Const(ConstId),
+    /// A register read again later (`take` clones to preserve it).
+    Register(RegisterId),
+    /// A register at its proven last use (`take` moves it out of the register).
+    RegisterTake(RegisterId),
+}
+
+/// The arena evaluator's [`ArgWindow`] over a call's region of the argument
+/// stack. A [`read`](ArgWindow::read) borrows the value in place — from the
+/// const pool, the register file, or the inline slot — copying nothing; a
+/// [`take`](ArgWindow::take) moves the values the window owns (inline
+/// sub-expressions and last-use registers) and clones the ones it only aliases
+/// (constants and non-last-use registers).
+struct ArenaArgWindow<'w> {
+    items: &'w mut [ArgStackItem],
+    program: &'w CompactProgram,
+    registers: &'w mut Vec<Value>,
+}
+
+impl ArgWindow for ArenaArgWindow<'_> {
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn read(&self, index: usize) -> &Value {
+        match &self.items[index] {
+            ArgStackItem::Value(value) => value,
+            ArgStackItem::Const(id) => self.program.constant(*id),
+            ArgStackItem::Register(register) | ArgStackItem::RegisterTake(register) => {
+                &self.registers[*register as usize]
+            }
+        }
+    }
+
+    fn take(&mut self, index: usize) -> Value {
+        match &mut self.items[index] {
+            ArgStackItem::Value(value) => std::mem::replace(value, Value::Null),
+            ArgStackItem::Const(id) => self.program.constant(*id).clone(),
+            ArgStackItem::Register(register) => self.registers[*register as usize].clone(),
+            ArgStackItem::RegisterTake(register) => {
+                std::mem::replace(&mut self.registers[*register as usize], Value::Null)
+            }
+        }
     }
 }

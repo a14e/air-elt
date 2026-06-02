@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::data_type::DataType;
+use crate::DataType;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Field {

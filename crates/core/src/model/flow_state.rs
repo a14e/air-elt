@@ -360,9 +360,10 @@ fn derive_schemaless_sink_schema(src: &Schema, expanded: &ExpandedMapping) -> Sc
     )
 }
 
-/// Resolve a default literal: evaluate via `Evaluator`, then check/convert to
-/// the sink type. All TOML literals, expressions, and interpolations go
-/// through the same path.
+/// Resolve a default literal: optimize + evaluate on the arena evaluator
+/// (via [`ExpressionContext::evaluate_const`]), then check/convert to the sink
+/// type. All TOML literals, expressions, and interpolations go through the same
+/// path.
 fn resolve_default_literal(
     literal: &toml::Value,
     sink_dt: &DataType,
@@ -370,8 +371,9 @@ fn resolve_default_literal(
 ) -> Result<Value, String> {
     let parser = air_elt_expr_parse::Parser::create();
     let program = parser.parse_toml(literal).map_err(|e| e.to_string())?;
-    let evaluator = air_elt_expr_runtime::Evaluator::create(expr_context);
-    let value = evaluator.evaluate(&program).map_err(|e| e.to_string())?;
+    let value = expr_context
+        .evaluate_const(&program)
+        .map_err(|e| e.to_string())?;
 
     air_elt_types::ensure_sink_compatible(value, sink_dt)
 }
@@ -989,7 +991,7 @@ mod tests {
         assert_eq!(*default_val, Value::Text("hello world".to_string()));
     }
 
-    /// Interpolation in `default` is evaluated via `Evaluator`.
+    /// Interpolation in `default` is evaluated via the arena evaluator.
     #[test]
     fn interpolation_default_is_evaluated() {
         use crate::transform::TransformOp;

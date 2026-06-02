@@ -17,6 +17,12 @@ pub enum ExprError {
     #[error("function error: {0}")]
     Function(#[from] FuncError),
 
+    #[error("optimization error: {0}")]
+    Optimize(#[from] air_elt_expr_optimize::OptimizeError),
+
+    #[error("evaluation error: {0}")]
+    Eval(#[from] air_elt_expr_optimize::EvalError),
+
     #[error("invalid patcher pattern: {0}")]
     InvalidPattern(String),
 

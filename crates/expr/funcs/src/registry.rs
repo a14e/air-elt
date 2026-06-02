@@ -167,7 +167,7 @@ mod tests {
     use air_elt_expr_types::nullable::NullableExprType;
     use air_elt_types::{DataType, Value};
 
-    use crate::signature::{EvalContext, ExprFunction};
+    use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
     struct DummyFunc {
         name: &'static str,
@@ -192,7 +192,11 @@ mod tests {
             Ok(NullableExprType::non_null(DataType::Int64))
         }
 
-        fn evaluate(&self, _args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+        fn evaluate(
+            &self,
+            _args: &mut dyn ArgWindow,
+            _context: &EvalContext,
+        ) -> Result<Value, FuncError> {
             Ok(Value::Int64(42))
         }
     }

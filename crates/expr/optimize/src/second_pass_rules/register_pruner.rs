@@ -15,6 +15,7 @@ use ahash::AHashSet;
 use air_elt_expr_funcs::FunctionRegistry;
 
 use super::engine::ProgramPass;
+use crate::fallibility::can_fail;
 use crate::model::opt_expr::OptExpr;
 use crate::model::opt_program::OptProgram;
 
@@ -37,59 +38,6 @@ impl ProgramPass for RegisterPruner {
                 break;
             }
         }
-    }
-}
-
-/// Whether evaluating `expr` may raise an error. Conservative: any fallible
-/// function call anywhere in the subtree, or an interpolation (which can
-/// exceed the string-size cap), makes the whole expression fallible.
-fn can_fail(expr: &OptExpr, registry: &FunctionRegistry) -> bool {
-    match expr {
-        OptExpr::Const(_) | OptExpr::Register(_) | OptExpr::SourceField(_) | OptExpr::Fields(_) => {
-            false
-        }
-        OptExpr::Field(inner) => can_fail(inner, registry),
-        OptExpr::Call { func, args } => {
-            registry.get_by_ref(*func).can_fail() || args.iter().any(|arg| can_fail(arg, registry))
-        }
-        OptExpr::If {
-            condition,
-            then_branch,
-            else_branch,
-        } => {
-            can_fail(condition, registry)
-                || can_fail(then_branch, registry)
-                || can_fail(else_branch, registry)
-        }
-        OptExpr::MultiIf { branches, default } => {
-            branches.iter().any(|(condition, value)| {
-                can_fail(condition, registry) || can_fail(value, registry)
-            }) || can_fail(default, registry)
-        }
-        OptExpr::IfNull { value, alternative } => {
-            can_fail(value, registry) || can_fail(alternative, registry)
-        }
-        OptExpr::NullIf { value, sentinel } => {
-            can_fail(value, registry) || can_fail(sentinel, registry)
-        }
-        OptExpr::And { left, right } | OptExpr::Or { left, right } => {
-            can_fail(left, registry) || can_fail(right, registry)
-        }
-        // Interpolation can raise `StringTooLarge` even with infallible segments.
-        OptExpr::Interpolation(_) => true,
-        OptExpr::Object(entries) => entries.iter().any(|(_, value)| can_fail(value, registry)),
-        OptExpr::Switch {
-            inputs,
-            table,
-            default,
-        } => {
-            inputs.iter().any(|input| can_fail(input, registry))
-                || table.iter().any(|(_, value)| can_fail(value, registry))
-                || can_fail(default, registry)
-        }
-        // A TypeAssert exists precisely to raise the preserved `TypeMismatch` on a
-        // present, wrong-typed operand — so it can always fail.
-        OptExpr::TypeAssert { .. } => true,
     }
 }
 

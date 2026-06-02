@@ -4,7 +4,7 @@ use air_elt_types::{DataType, Value};
 use super::arg_extract::validate_text_arg;
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
-use crate::signature::{EvalContext, ExprFunction};
+use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
 static ENV_ONE_ARG: EnvOneArgFunc = EnvOneArgFunc;
 static ENV_TWO_ARG: EnvTwoArgFunc = EnvTwoArgFunc;
@@ -41,8 +41,12 @@ impl ExprFunction for EnvOneArgFunc {
         Ok(NullableExprType::nullable(DataType::Text { size: None }))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
-        let key = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let key = args.take(0);
         if key.is_null() {
             return Ok(Value::Null);
         }
@@ -89,9 +93,13 @@ impl ExprFunction for EnvTwoArgFunc {
         Ok(NullableExprType::non_null(DataType::Text { size: None }))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
-        let default = args.remove(1);
-        let key = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let default = args.take(1);
+        let key = args.take(0);
         if key.is_null() {
             return Ok(default);
         }
@@ -137,8 +145,12 @@ impl ExprFunction for FileFunc {
         Ok(NullableExprType::non_null(DataType::Text { size: None }))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
-        let path_val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let path_val = args.take(0);
         if path_val.is_null() {
             return Ok(Value::Null);
         }
@@ -164,6 +176,7 @@ mod tests {
 
     use super::*;
     use crate::signature::{EnvResolver, EvalContext};
+    use crate::test_support::eval;
     use std::path::PathBuf;
 
     struct TestEnv;
@@ -191,66 +204,76 @@ mod tests {
     #[test]
     fn env_found() {
         let f = EnvOneArgFunc;
-        let result = f
-            .evaluate(vec![Value::Text("HOME".into())], &ctx_with_env())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("HOME".into())],
+            &ctx_with_env(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Text("/home/user".into()));
     }
 
     #[test]
     fn env_not_found_returns_null() {
         let f = EnvOneArgFunc;
-        let result = f
-            .evaluate(vec![Value::Text("MISSING".into())], &ctx_with_env())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("MISSING".into())],
+            &ctx_with_env(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn env_with_default_found() {
         let f = EnvTwoArgFunc;
-        let result = f
-            .evaluate(
-                vec![Value::Text("HOME".into()), Value::Text("fallback".into())],
-                &ctx_with_env(),
-            )
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("HOME".into()), Value::Text("fallback".into())],
+            &ctx_with_env(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Text("/home/user".into()));
     }
 
     #[test]
     fn env_with_default_not_found() {
         let f = EnvTwoArgFunc;
-        let result = f
-            .evaluate(
-                vec![
-                    Value::Text("MISSING".into()),
-                    Value::Text("fallback".into()),
-                ],
-                &ctx_with_env(),
-            )
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![
+                Value::Text("MISSING".into()),
+                Value::Text("fallback".into()),
+            ],
+            &ctx_with_env(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Text("fallback".into()));
     }
 
     #[test]
     fn env_null_key() {
         let f = EnvOneArgFunc;
-        let result = f.evaluate(vec![Value::Null], &ctx_with_env()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Null], &ctx_with_env()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn file_null_returns_null() {
         let f = FileFunc;
-        let result = f.evaluate(vec![Value::Null], &ctx_with_env()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Null], &ctx_with_env()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn file_calls_resolver() {
         let f = FileFunc;
-        let result = f.evaluate(vec![Value::Text("test.txt".into())], &ctx_with_env());
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("test.txt".into())],
+            &ctx_with_env(),
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("test.txt"));

@@ -3,6 +3,12 @@ use std::sync::Arc;
 
 use air_elt_expr_funcs::signature::{EnvResolver, EvalContext, FileResolver};
 use air_elt_expr_funcs::{FuncError, FunctionRegistry};
+use air_elt_expr_optimize::Optimizer;
+use air_elt_expr_parse::Program;
+use air_elt_types::Value;
+
+use crate::error::ExprError;
+use crate::program::RuntimeProgram;
 
 #[derive(Clone)]
 pub struct ExpressionContext {
@@ -16,6 +22,21 @@ impl ExpressionContext {
             registry,
             eval_context: build_eval_context(config_dir),
         }
+    }
+
+    /// Compile a field-free (comptime) program through the optimizer and
+    /// evaluate it on the arena evaluator. This is the single production path
+    /// for const / default / switch literals and config patching: the optimizer
+    /// folds the pure parts to a constant and the arena evaluator runs whatever
+    /// remains (impure `env`/`file`/`now` calls), exactly as the program means.
+    pub fn evaluate_const(&self, program: &Program) -> Result<Value, ExprError> {
+        // Comptime const evaluation has no source schema and no sink column, so
+        // the type pass is skipped (None, None) — the program's surviving
+        // `TypeAssert`s do any per-row type checking.
+        let compact =
+            Optimizer::create(&self.registry, &self.eval_context).compile(program, None, None)?;
+        let value = RuntimeProgram::create(compact).evaluate(&self.registry, &self.eval_context)?;
+        Ok(value)
     }
 }
 

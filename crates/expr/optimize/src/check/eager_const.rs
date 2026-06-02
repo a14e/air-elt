@@ -1,6 +1,6 @@
 //! Eager constant-evaluation check.
 
-use air_elt_types::Value;
+use air_elt_expr_funcs::{FuncArgVec, OwnedArgWindow};
 
 use super::{Check, CheckCx};
 use crate::error::OptimizeError;
@@ -20,7 +20,7 @@ impl Check for EagerConstEval {
         let OptExpr::Call { func, args } = node else {
             return Ok(());
         };
-        let constants: Option<Vec<Value>> =
+        let constants: Option<FuncArgVec> =
             args.iter().map(|arg| arg.as_const().cloned()).collect();
         let Some(values) = constants else {
             return Ok(());
@@ -30,7 +30,8 @@ impl Check for EagerConstEval {
         if !function.purity(&const_flags) {
             return Ok(());
         }
-        match function.evaluate(values, cx.eval_context) {
+        let mut window = OwnedArgWindow::create(values);
+        match function.evaluate(&mut window, cx.eval_context) {
             Ok(_) => Ok(()),
             Err(error) => Err(OptimizeError::ConstEval {
                 function: function.name().to_owned(),

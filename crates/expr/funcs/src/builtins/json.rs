@@ -1,9 +1,11 @@
+use std::borrow::Cow;
+
 use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::{DataType, Value};
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
-use crate::signature::{EvalContext, ExprFunction};
+use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
 static PARSE_JSON: ParseJsonFunc = ParseJsonFunc;
 static TO_JSON: ToJsonFunc = ToJsonFunc;
@@ -53,6 +55,16 @@ fn extract_first_json_path(
     }
 }
 
+/// Borrows or converts a Value into a `serde_json::Value` for JSONPath
+/// operations. The `Json` variant is borrowed in place (zero copy); other
+/// variants are converted into an owned value.
+fn value_to_serde_json_cow(val: &Value) -> Result<Cow<'_, serde_json::Value>, FuncError> {
+    match val {
+        Value::Json(j) => Ok(Cow::Borrowed(j)),
+        other => value_to_serde_json(other).map(Cow::Owned),
+    }
+}
+
 /// Converts a Value to serde_json::Value for JSONPath operations.
 fn value_to_serde_json(val: &Value) -> Result<serde_json::Value, FuncError> {
     match val {
@@ -97,8 +109,12 @@ impl ExprFunction for ParseJsonFunc {
         Ok(NullableExprType::new(DataType::Json, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let val = args.read(0);
         if val.is_null() {
             return Ok(Value::Null);
         }
@@ -113,7 +129,7 @@ impl ExprFunction for ParseJsonFunc {
             }
         };
         let parsed: serde_json::Value =
-            serde_json::from_str(&s).map_err(|e| FuncError::EvalFailed {
+            serde_json::from_str(s).map_err(|e| FuncError::EvalFailed {
                 function: "parseJson".to_owned(),
                 reason: e.to_string(),
             })?;
@@ -144,8 +160,12 @@ impl ExprFunction for ToJsonFunc {
         Ok(NullableExprType::new(DataType::Json, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let val = args.take(0);
         if val.is_null() {
             return Ok(Value::Null);
         }
@@ -182,16 +202,17 @@ impl ExprFunction for JsPathFunc {
         Ok(NullableExprType::nullable(DataType::Json))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
-        let path_val = args.remove(1);
-        let json_val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let path_val = args.read(1);
+        let json_val = args.read(0);
         if json_val.is_null() || path_val.is_null() {
             return Ok(Value::Null);
         }
-        let json = match json_val {
-            Value::Json(j) => j,
-            other => value_to_serde_json(&other)?,
-        };
+        let json = value_to_serde_json_cow(json_val)?;
         let path_str = match path_val {
             Value::Text(s) => s,
             other => {
@@ -202,7 +223,7 @@ impl ExprFunction for JsPathFunc {
                 });
             }
         };
-        match extract_first_json_path(&json, &path_str, context)? {
+        match extract_first_json_path(json.as_ref(), path_str, context)? {
             Some(v) => Ok(Value::Json(v)),
             None => Ok(Value::Null),
         }
@@ -240,16 +261,17 @@ impl ExprFunction for JsPathStringFunc {
         Ok(NullableExprType::nullable(DataType::Text { size: None }))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
-        let path_val = args.remove(1);
-        let json_val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let path_val = args.read(1);
+        let json_val = args.read(0);
         if json_val.is_null() || path_val.is_null() {
             return Ok(Value::Null);
         }
-        let json = match json_val {
-            Value::Json(j) => j,
-            other => value_to_serde_json(&other)?,
-        };
+        let json = value_to_serde_json_cow(json_val)?;
         let path_str = match path_val {
             Value::Text(s) => s,
             other => {
@@ -260,7 +282,7 @@ impl ExprFunction for JsPathStringFunc {
                 });
             }
         };
-        match extract_first_json_path(&json, &path_str, context)? {
+        match extract_first_json_path(json.as_ref(), path_str, context)? {
             Some(serde_json::Value::String(s)) => Ok(Value::Text(s)),
             Some(_) | None => Ok(Value::Null),
         }
@@ -298,16 +320,17 @@ impl ExprFunction for JsPathIntFunc {
         Ok(NullableExprType::nullable(DataType::Int64))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
-        let path_val = args.remove(1);
-        let json_val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let path_val = args.read(1);
+        let json_val = args.read(0);
         if json_val.is_null() || path_val.is_null() {
             return Ok(Value::Null);
         }
-        let json = match json_val {
-            Value::Json(j) => j,
-            other => value_to_serde_json(&other)?,
-        };
+        let json = value_to_serde_json_cow(json_val)?;
         let path_str = match path_val {
             Value::Text(s) => s,
             other => {
@@ -318,7 +341,7 @@ impl ExprFunction for JsPathIntFunc {
                 });
             }
         };
-        match extract_first_json_path(&json, &path_str, context)? {
+        match extract_first_json_path(json.as_ref(), path_str, context)? {
             Some(serde_json::Value::Number(n)) => match n.as_i64() {
                 Some(i) => Ok(Value::Int64(i)),
                 None => Ok(Value::Null),
@@ -359,16 +382,17 @@ impl ExprFunction for JsPathFloatFunc {
         Ok(NullableExprType::nullable(DataType::Float64))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
-        let path_val = args.remove(1);
-        let json_val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let path_val = args.read(1);
+        let json_val = args.read(0);
         if json_val.is_null() || path_val.is_null() {
             return Ok(Value::Null);
         }
-        let json = match json_val {
-            Value::Json(j) => j,
-            other => value_to_serde_json(&other)?,
-        };
+        let json = value_to_serde_json_cow(json_val)?;
         let path_str = match path_val {
             Value::Text(s) => s,
             other => {
@@ -379,7 +403,7 @@ impl ExprFunction for JsPathFloatFunc {
                 });
             }
         };
-        match extract_first_json_path(&json, &path_str, context)? {
+        match extract_first_json_path(json.as_ref(), path_str, context)? {
             Some(serde_json::Value::Number(n)) => match n.as_f64() {
                 Some(f) => Ok(Value::Float64(f)),
                 None => Ok(Value::Null),
@@ -420,16 +444,17 @@ impl ExprFunction for JsPathBoolFunc {
         Ok(NullableExprType::nullable(DataType::Bool))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
-        let path_val = args.remove(1);
-        let json_val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let path_val = args.read(1);
+        let json_val = args.read(0);
         if json_val.is_null() || path_val.is_null() {
             return Ok(Value::Null);
         }
-        let json = match json_val {
-            Value::Json(j) => j,
-            other => value_to_serde_json(&other)?,
-        };
+        let json = value_to_serde_json_cow(json_val)?;
         let path_str = match path_val {
             Value::Text(s) => s,
             other => {
@@ -440,7 +465,7 @@ impl ExprFunction for JsPathBoolFunc {
                 });
             }
         };
-        match extract_first_json_path(&json, &path_str, context)? {
+        match extract_first_json_path(json.as_ref(), path_str, context)? {
             Some(serde_json::Value::Bool(b)) => Ok(Value::Bool(b)),
             Some(_) | None => Ok(Value::Null),
         }
@@ -478,8 +503,12 @@ impl ExprFunction for JsonLengthFunc {
         Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let val = args.read(0);
         if val.is_null() {
             return Ok(Value::Null);
         }
@@ -493,7 +522,7 @@ impl ExprFunction for JsonLengthFunc {
                 });
             }
         };
-        let len = match &json {
+        let len = match json {
             serde_json::Value::Array(arr) => arr.len() as i64,
             serde_json::Value::Object(map) => map.len() as i64,
             _ => {
@@ -511,17 +540,17 @@ impl ExprFunction for JsonLengthFunc {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::ctx;
+    use crate::test_support::{ctx, eval};
 
     #[test]
     fn parse_json_valid() {
         let f = ParseJsonFunc;
-        let result = f
-            .evaluate(
-                vec![Value::Text(r#"{"name":"alice","age":30}"#.to_owned())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text(r#"{"name":"alice","age":30}"#.to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         match result {
             Value::Json(j) => {
                 assert_eq!(j["name"], serde_json::Value::String("alice".to_owned()));
@@ -534,26 +563,33 @@ mod tests {
     #[test]
     fn parse_json_invalid() {
         let f = ParseJsonFunc;
-        let result = f.evaluate(vec![Value::Text("not json{".to_owned())], &ctx());
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("not json{".to_owned())],
+            &ctx(),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_json_null_propagation() {
         let f = ParseJsonFunc;
-        let result = f.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn to_json_roundtrip() {
         let f = ToJsonFunc;
-        let result = f.evaluate(vec![Value::Int64(42)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(42)], &ctx()).unwrap();
         assert_eq!(result, Value::Json(serde_json::json!(42)));
 
-        let result = f
-            .evaluate(vec![Value::Text("hello".to_owned())], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("hello".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Json(serde_json::json!("hello")));
     }
 
@@ -561,9 +597,7 @@ mod tests {
     fn to_json_passthrough() {
         let f = ToJsonFunc;
         let input = serde_json::json!({"a": 1});
-        let result = f
-            .evaluate(vec![Value::Json(input.clone())], &ctx())
-            .unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Json(input.clone())], &ctx()).unwrap();
         assert_eq!(result, Value::Json(input));
     }
 
@@ -571,12 +605,12 @@ mod tests {
     fn js_path_extraction() {
         let f = JsPathFunc;
         let json = Value::Json(serde_json::json!({"store": {"book": [{"title": "Rust"}]}}));
-        let result = f
-            .evaluate(
-                vec![json, Value::Text("$.store.book[0].title".to_owned())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![json, Value::Text("$.store.book[0].title".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Json(serde_json::json!("Rust")));
     }
 
@@ -584,9 +618,12 @@ mod tests {
     fn js_path_not_found() {
         let f = JsPathFunc;
         let json = Value::Json(serde_json::json!({"a": 1}));
-        let result = f
-            .evaluate(vec![json, Value::Text("$.nonexistent".to_owned())], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![json, Value::Text("$.nonexistent".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -594,9 +631,12 @@ mod tests {
     fn js_path_string_extraction() {
         let f = JsPathStringFunc;
         let json = Value::Json(serde_json::json!({"name": "alice"}));
-        let result = f
-            .evaluate(vec![json, Value::Text("$.name".to_owned())], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![json, Value::Text("$.name".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Text("alice".to_owned()));
     }
 
@@ -604,9 +644,12 @@ mod tests {
     fn js_path_int_extraction() {
         let f = JsPathIntFunc;
         let json = Value::Json(serde_json::json!({"count": 42}));
-        let result = f
-            .evaluate(vec![json, Value::Text("$.count".to_owned())], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![json, Value::Text("$.count".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(42));
     }
 
@@ -614,9 +657,12 @@ mod tests {
     fn js_path_float_extraction() {
         let f = JsPathFloatFunc;
         let json = Value::Json(serde_json::json!({"rate": 9.75}));
-        let result = f
-            .evaluate(vec![json, Value::Text("$.rate".to_owned())], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![json, Value::Text("$.rate".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Float64(9.75));
     }
 
@@ -624,9 +670,12 @@ mod tests {
     fn js_path_bool_extraction() {
         let f = JsPathBoolFunc;
         let json = Value::Json(serde_json::json!({"active": true}));
-        let result = f
-            .evaluate(vec![json, Value::Text("$.active".to_owned())], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![json, Value::Text("$.active".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
@@ -634,9 +683,12 @@ mod tests {
     fn js_path_type_mismatch_returns_null() {
         let f = JsPathIntFunc;
         let json = Value::Json(serde_json::json!({"name": "alice"}));
-        let result = f
-            .evaluate(vec![json, Value::Text("$.name".to_owned())], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![json, Value::Text("$.name".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -644,7 +696,7 @@ mod tests {
     fn json_length_array() {
         let f = JsonLengthFunc;
         let json = Value::Json(serde_json::json!([1, 2, 3]));
-        let result = f.evaluate(vec![json], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![json], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(3));
     }
 
@@ -652,7 +704,7 @@ mod tests {
     fn json_length_object() {
         let f = JsonLengthFunc;
         let json = Value::Json(serde_json::json!({"a": 1, "b": 2}));
-        let result = f.evaluate(vec![json], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![json], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(2));
     }
 
@@ -660,14 +712,14 @@ mod tests {
     fn json_length_scalar_error() {
         let f = JsonLengthFunc;
         let json = Value::Json(serde_json::json!(42));
-        let result = f.evaluate(vec![json], &ctx());
+        let result = eval(&f, smallvec::smallvec![json], &ctx());
         assert!(result.is_err());
     }
 
     #[test]
     fn json_length_null_propagation() {
         let f = JsonLengthFunc;
-        let result = f.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 

@@ -10,7 +10,7 @@ use air_elt_types::{DataType, Value};
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
-use crate::signature::{EvalContext, ExprFunction};
+use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
 /// Maximum length for random string generation (randomAlphanumeric, randomHex).
 const MAX_STRING_LENGTH: i64 = 1024;
@@ -102,13 +102,13 @@ enum SeedArg {
 /// function's base arity.
 fn take_seed(
     function: &str,
-    args: &mut Vec<Value>,
+    args: &mut dyn ArgWindow,
     base_arity: usize,
 ) -> Result<SeedArg, FuncError> {
     if args.len() <= base_arity {
         return Ok(SeedArg::None);
     }
-    match args.remove(base_arity) {
+    match args.take(base_arity) {
         Value::Int64(s) => Ok(SeedArg::Seed(s)),
         Value::Null => Ok(SeedArg::Null),
         other => Err(FuncError::TypeMismatch {
@@ -249,8 +249,12 @@ impl ExprFunction for RandomUuidFunc {
         Ok(NullableExprType::non_null(DataType::Uuid))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let Some(mut rng) = take_seed("randomUuid", &mut args, 0)?.rng() else {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let Some(mut rng) = take_seed("randomUuid", args, 0)?.rng() else {
             return Ok(Value::Null);
         };
         let mut bytes = [0u8; 16];
@@ -294,15 +298,19 @@ impl ExprFunction for RandomIntFunc {
         Ok(NullableExprType::non_null(DataType::Int64))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let seed = take_seed("randomInt", &mut args, 2)?;
-        let max_val = args.remove(1);
-        let min_val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let seed = take_seed("randomInt", args, 2)?;
+        let min_val = args.read(0);
+        let max_val = args.read(1);
 
-        let min = extract_i64("randomInt", "min", &min_val)?;
-        let max = extract_i64("randomInt", "max", &max_val)?;
+        let min = extract_i64("randomInt", "min", min_val)?;
+        let max = extract_i64("randomInt", "max", max_val)?;
 
-        reject_min_gt_max("randomInt", &min_val, &max_val)?;
+        reject_min_gt_max("randomInt", min_val, max_val)?;
 
         let Some(mut rng) = seed.rng() else {
             return Ok(Value::Null);
@@ -348,15 +356,19 @@ impl ExprFunction for RandomFloatFunc {
         Ok(NullableExprType::non_null(DataType::Float64))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let seed = take_seed("randomFloat", &mut args, 2)?;
-        let max_val = args.remove(1);
-        let min_val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let seed = take_seed("randomFloat", args, 2)?;
+        let min_val = args.read(0);
+        let max_val = args.read(1);
 
-        let min = extract_f64("randomFloat", "min", &min_val)?;
-        let max = extract_f64("randomFloat", "max", &max_val)?;
+        let min = extract_f64("randomFloat", "min", min_val)?;
+        let max = extract_f64("randomFloat", "max", max_val)?;
 
-        reject_min_gt_max("randomFloat", &min_val, &max_val)?;
+        reject_min_gt_max("randomFloat", min_val, max_val)?;
 
         let Some(mut rng) = seed.rng() else {
             return Ok(Value::Null);
@@ -402,10 +414,14 @@ impl ExprFunction for RandomAlphanumericFunc {
         Ok(NullableExprType::non_null(DataType::Text { size: None }))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let seed = take_seed("randomAlphanumeric", &mut args, 1)?;
-        let length_val = args.remove(0);
-        let length = extract_length("randomAlphanumeric", &length_val, MAX_STRING_LENGTH)?;
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let seed = take_seed("randomAlphanumeric", args, 1)?;
+        let length_val = args.read(0);
+        let length = extract_length("randomAlphanumeric", length_val, MAX_STRING_LENGTH)?;
 
         let Some(mut rng) = seed.rng() else {
             return Ok(Value::Null);
@@ -451,10 +467,14 @@ impl ExprFunction for RandomHexFunc {
         Ok(NullableExprType::non_null(DataType::Text { size: None }))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let seed = take_seed("randomHex", &mut args, 1)?;
-        let length_val = args.remove(0);
-        let length = extract_length("randomHex", &length_val, MAX_STRING_LENGTH)?;
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let seed = take_seed("randomHex", args, 1)?;
+        let length_val = args.read(0);
+        let length = extract_length("randomHex", length_val, MAX_STRING_LENGTH)?;
 
         let Some(mut rng) = seed.rng() else {
             return Ok(Value::Null);
@@ -509,10 +529,14 @@ impl ExprFunction for RandomBytesFunc {
         Ok(NullableExprType::non_null(DataType::Bytes { size: None }))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let seed = take_seed("randomBytes", &mut args, 1)?;
-        let length_val = args.remove(0);
-        let length = extract_length("randomBytes", &length_val, MAX_BYTES_LENGTH)?;
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let seed = take_seed("randomBytes", args, 1)?;
+        let length_val = args.read(0);
+        let length = extract_length("randomBytes", length_val, MAX_BYTES_LENGTH)?;
 
         let Some(mut rng) = seed.rng() else {
             return Ok(Value::Null);
@@ -566,7 +590,11 @@ impl ExprFunction for RandomChoiceFunc {
         Ok(NullableExprType::new(args[0].data_type.clone(), nullable))
     }
 
-    fn evaluate(&self, args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
         if args.is_empty() {
             return Err(FuncError::ArityMismatch {
                 function: "randomChoice".to_owned(),
@@ -576,7 +604,7 @@ impl ExprFunction for RandomChoiceFunc {
         }
         let mut rng = rand::rng();
         let idx = rng.random_range(0..args.len());
-        Ok(args.into_iter().nth(idx).expect("index within bounds"))
+        Ok(args.take(idx))
     }
 }
 
@@ -626,12 +654,12 @@ fn extract_length(function: &str, value: &Value, max: i64) -> Result<i64, FuncEr
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::ctx;
+    use crate::test_support::{ctx, eval};
 
     #[test]
     fn random_uuid_produces_valid_v4() {
         let f = RandomUuidFunc;
-        let result = f.evaluate(vec![], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![], &ctx()).unwrap();
         match result {
             Value::Uuid(id) => {
                 assert_eq!(id.get_version_num(), 4);
@@ -643,8 +671,8 @@ mod tests {
     #[test]
     fn random_uuid_produces_different_values() {
         let f = RandomUuidFunc;
-        let r1 = f.evaluate(vec![], &ctx()).unwrap();
-        let r2 = f.evaluate(vec![], &ctx()).unwrap();
+        let r1 = eval(&f, smallvec::smallvec![], &ctx()).unwrap();
+        let r2 = eval(&f, smallvec::smallvec![], &ctx()).unwrap();
         assert_ne!(r1, r2);
     }
 
@@ -652,9 +680,12 @@ mod tests {
     fn random_int_in_range() {
         let f = RandomIntFunc;
         for _ in 0..100 {
-            let result = f
-                .evaluate(vec![Value::Int64(10), Value::Int64(20)], &ctx())
-                .unwrap();
+            let result = eval(
+                &f,
+                smallvec::smallvec![Value::Int64(10), Value::Int64(20)],
+                &ctx(),
+            )
+            .unwrap();
             match result {
                 Value::Int64(n) => {
                     assert!((10..=20).contains(&n), "got {n} outside [10, 20]");
@@ -667,16 +698,23 @@ mod tests {
     #[test]
     fn random_int_equal_bounds() {
         let f = RandomIntFunc;
-        let result = f
-            .evaluate(vec![Value::Int64(5), Value::Int64(5)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(5), Value::Int64(5)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(5));
     }
 
     #[test]
     fn random_int_min_exceeds_max() {
         let f = RandomIntFunc;
-        let result = f.evaluate(vec![Value::Int64(20), Value::Int64(10)], &ctx());
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(20), Value::Int64(10)],
+            &ctx(),
+        );
         assert!(result.is_err());
     }
 
@@ -684,9 +722,12 @@ mod tests {
     fn random_float_in_range() {
         let f = RandomFloatFunc;
         for _ in 0..100 {
-            let result = f
-                .evaluate(vec![Value::Float64(1.0), Value::Float64(2.0)], &ctx())
-                .unwrap();
+            let result = eval(
+                &f,
+                smallvec::smallvec![Value::Float64(1.0), Value::Float64(2.0)],
+                &ctx(),
+            )
+            .unwrap();
             match result {
                 Value::Float64(n) => {
                     assert!((1.0..2.0).contains(&n), "got {n} outside [1.0, 2.0)");
@@ -699,7 +740,7 @@ mod tests {
     #[test]
     fn random_alphanumeric_correct_length() {
         let f = RandomAlphanumericFunc;
-        let result = f.evaluate(vec![Value::Int64(32)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(32)], &ctx()).unwrap();
         match result {
             Value::Text(s) => {
                 assert_eq!(s.len(), 32);
@@ -712,21 +753,21 @@ mod tests {
     #[test]
     fn random_alphanumeric_zero_length() {
         let f = RandomAlphanumericFunc;
-        let result = f.evaluate(vec![Value::Int64(0)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(0)], &ctx()).unwrap();
         assert_eq!(result, Value::Text(String::new()));
     }
 
     #[test]
     fn random_alphanumeric_exceeds_max() {
         let f = RandomAlphanumericFunc;
-        let result = f.evaluate(vec![Value::Int64(2000)], &ctx());
+        let result = eval(&f, smallvec::smallvec![Value::Int64(2000)], &ctx());
         assert!(result.is_err());
     }
 
     #[test]
     fn random_hex_correct_length_and_chars() {
         let f = RandomHexFunc;
-        let result = f.evaluate(vec![Value::Int64(16)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(16)], &ctx()).unwrap();
         match result {
             Value::Text(s) => {
                 assert_eq!(s.len(), 16);
@@ -742,7 +783,7 @@ mod tests {
     #[test]
     fn random_bytes_correct_length() {
         let f = RandomBytesFunc;
-        let result = f.evaluate(vec![Value::Int64(64)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(64)], &ctx()).unwrap();
         match result {
             Value::Bytes(b) => assert_eq!(b.len(), 64),
             other => panic!("expected Bytes, got {other:?}"),
@@ -752,7 +793,7 @@ mod tests {
     #[test]
     fn random_bytes_exceeds_max() {
         let f = RandomBytesFunc;
-        let result = f.evaluate(vec![Value::Int64(2_000_000)], &ctx());
+        let result = eval(&f, smallvec::smallvec![Value::Int64(2_000_000)], &ctx());
         assert!(result.is_err());
     }
 
@@ -765,7 +806,7 @@ mod tests {
             Value::Text("c".into()),
         ];
         for _ in 0..50 {
-            let result = f.evaluate(options.clone(), &ctx()).unwrap();
+            let result = eval(&f, options.clone(), &ctx()).unwrap();
             match &result {
                 Value::Text(s) => {
                     assert!(s == "a" || s == "b" || s == "c", "unexpected value: {s}");
@@ -778,7 +819,7 @@ mod tests {
     #[test]
     fn random_choice_single_arg() {
         let f = RandomChoiceFunc;
-        let result = f.evaluate(vec![Value::Int64(42)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(42)], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(42));
     }
 
@@ -786,8 +827,8 @@ mod tests {
     fn random_int_seeded_is_deterministic() {
         let f = RandomIntFunc;
         let args = || vec![Value::Int64(0), Value::Int64(1_000_000), Value::Int64(42)];
-        let a = f.evaluate(args(), &ctx()).unwrap();
-        let b = f.evaluate(args(), &ctx()).unwrap();
+        let a = eval(&f, args(), &ctx()).unwrap();
+        let b = eval(&f, args(), &ctx()).unwrap();
         assert_eq!(a, b, "same seed must yield the same value");
         match a {
             Value::Int64(n) => assert!((0..=1_000_000).contains(&n)),
@@ -798,18 +839,18 @@ mod tests {
     #[test]
     fn random_int_different_seed_differs() {
         let f = RandomIntFunc;
-        let a = f
-            .evaluate(
-                vec![Value::Int64(0), Value::Int64(i64::MAX), Value::Int64(1)],
-                &ctx(),
-            )
-            .unwrap();
-        let b = f
-            .evaluate(
-                vec![Value::Int64(0), Value::Int64(i64::MAX), Value::Int64(2)],
-                &ctx(),
-            )
-            .unwrap();
+        let a = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(0), Value::Int64(i64::MAX), Value::Int64(1)],
+            &ctx(),
+        )
+        .unwrap();
+        let b = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(0), Value::Int64(i64::MAX), Value::Int64(2)],
+            &ctx(),
+        )
+        .unwrap();
         assert_ne!(
             a, b,
             "distinct seeds should produce distinct values over a wide range"
@@ -819,8 +860,8 @@ mod tests {
     #[test]
     fn random_uuid_seeded_is_deterministic() {
         let f = RandomUuidFunc;
-        let a = f.evaluate(vec![Value::Int64(7)], &ctx()).unwrap();
-        let b = f.evaluate(vec![Value::Int64(7)], &ctx()).unwrap();
+        let a = eval(&f, smallvec::smallvec![Value::Int64(7)], &ctx()).unwrap();
+        let b = eval(&f, smallvec::smallvec![Value::Int64(7)], &ctx()).unwrap();
         assert_eq!(a, b);
         match a {
             Value::Uuid(id) => assert_eq!(id.get_version_num(), 4),
@@ -831,14 +872,17 @@ mod tests {
     #[test]
     fn random_null_seed_returns_null() {
         let int_f = RandomIntFunc;
-        let r = int_f
-            .evaluate(vec![Value::Int64(0), Value::Int64(10), Value::Null], &ctx())
-            .unwrap();
+        let r = eval(
+            &int_f,
+            smallvec::smallvec![Value::Int64(0), Value::Int64(10), Value::Null],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(r, Value::Null);
 
         let uuid_f = RandomUuidFunc;
         assert_eq!(
-            uuid_f.evaluate(vec![Value::Null], &ctx()).unwrap(),
+            eval(&uuid_f, smallvec::smallvec![Value::Null], &ctx()).unwrap(),
             Value::Null
         );
     }
@@ -846,8 +890,9 @@ mod tests {
     #[test]
     fn random_non_int_seed_errors() {
         let f = RandomIntFunc;
-        let r = f.evaluate(
-            vec![Value::Int64(0), Value::Int64(10), Value::Text("x".into())],
+        let r = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(0), Value::Int64(10), Value::Text("x".into())],
             &ctx(),
         );
         assert!(matches!(r, Err(FuncError::TypeMismatch { .. })));

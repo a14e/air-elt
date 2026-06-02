@@ -627,12 +627,14 @@ pub fn convert(
         (DataType::Json, DataType::Object) => {
             require_truncate(ctx, src, dst)?;
             match value {
-                Value::Json(serde_json::Value::Object(map)) => {
-                    let entries: Vec<(String, Value)> =
-                        map.into_iter().map(|(k, v)| (k, Value::Json(v))).collect();
-                    Ok(Value::Object(entries))
-                }
-                Value::Json(_) => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+                Value::Json(j) => match j {
+                    serde_json::Value::Object(map) => {
+                        let entries: Vec<(String, Value)> =
+                            map.into_iter().map(|(k, v)| (k, Value::Json(v))).collect();
+                        Ok(Value::Object(entries))
+                    }
+                    _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+                },
                 _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
             }
         }

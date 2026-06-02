@@ -111,7 +111,7 @@ impl MoveAnnotator {
             OptNode::Const(_) | OptNode::SourceField(_) | OptNode::Fields(_) => live,
             OptNode::Field(inner) => self.analyze(program, *inner, live, to_take),
             OptNode::TypeAssert { inner, .. } => self.analyze(program, *inner, live, to_take),
-            OptNode::Call { args, .. } => self.analyze_sequential(program, *args, live, to_take),
+            OptNode::Call { args, .. } => self.analyze_call_args(program, *args, live, to_take),
             OptNode::Interpolation(segments) => {
                 self.analyze_sequential(program, *segments, live, to_take)
             }
@@ -158,6 +158,113 @@ impl MoveAnnotator {
                 table,
                 default,
             } => self.analyze_switch(program, *inputs, *table, *default, live, to_take),
+        }
+    }
+
+    /// Liveness of a function call's arguments, with the lazy-`ArgWindow`
+    /// soundness guard.
+    ///
+    /// Unlike interpolation/object values (which the evaluator materializes
+    /// eagerly, left-to-right), a call's **direct** register arguments are read
+    /// through the [`ArgWindow`] when the function asks for them — in the
+    /// function's own order, possibly *taking* (moving) one slot before reading
+    /// another. A nested sub-expression argument still materializes eagerly
+    /// during argument push. So a register that is read as a **direct** argument
+    /// of this call AND read more than once across the call's arguments must not
+    /// be moved by any of those reads: a move could strand a sibling read of the
+    /// same register (it would clone a value already moved out). Keep such
+    /// registers live across the whole argument run so no occurrence is marked
+    /// takeable — cloning is always sound, so this only forgoes an elision in the
+    /// rare aliased case (a field hoisted into one register and read several
+    /// times inside a single call). The common single-read register argument is
+    /// unaffected and still moves.
+    fn analyze_call_args(
+        &self,
+        program: &CompactProgram,
+        run: crate::model::ArgSlice,
+        mut live: LiveSet,
+        to_take: &mut Vec<NodeRef>,
+    ) -> LiveSet {
+        let children = program.args(run);
+        let mut counts = vec![0u32; program.register_count() as usize];
+        for child in children {
+            Self::count_register_reads(program, *child, &mut counts);
+        }
+        for child in children {
+            if let OptNode::Register(register) | OptNode::RegisterTake(register) =
+                program.node(*child)
+            {
+                if counts[*register as usize] >= 2 {
+                    live.insert(*register);
+                }
+            }
+        }
+        self.analyze_sequential(program, run, live, to_take)
+    }
+
+    /// Tally every register read in `node`'s subtree into `counts` (indexed by
+    /// register). Mutually-exclusive branches are counted together — an
+    /// over-count only makes the aliasing guard more conservative (an extra
+    /// clone), never unsound.
+    fn count_register_reads(program: &CompactProgram, node: NodeRef, counts: &mut [u32]) {
+        match program.node(node) {
+            OptNode::Register(register) | OptNode::RegisterTake(register) => {
+                counts[*register as usize] += 1;
+            }
+            OptNode::Const(_) | OptNode::SourceField(_) | OptNode::Fields(_) => {}
+            OptNode::Field(inner) | OptNode::TypeAssert { inner, .. } => {
+                Self::count_register_reads(program, *inner, counts);
+            }
+            OptNode::Call { args, .. } | OptNode::Interpolation(args) => {
+                for child in program.args(*args) {
+                    Self::count_register_reads(program, *child, counts);
+                }
+            }
+            OptNode::Object { values, .. } => {
+                for child in program.args(*values) {
+                    Self::count_register_reads(program, *child, counts);
+                }
+            }
+            OptNode::NullIf { value, sentinel } => {
+                Self::count_register_reads(program, *value, counts);
+                Self::count_register_reads(program, *sentinel, counts);
+            }
+            OptNode::And { left, right } | OptNode::Or { left, right } => {
+                Self::count_register_reads(program, *left, counts);
+                Self::count_register_reads(program, *right, counts);
+            }
+            OptNode::IfNull { value, alternative } => {
+                Self::count_register_reads(program, *value, counts);
+                Self::count_register_reads(program, *alternative, counts);
+            }
+            OptNode::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                Self::count_register_reads(program, *condition, counts);
+                Self::count_register_reads(program, *then_branch, counts);
+                Self::count_register_reads(program, *else_branch, counts);
+            }
+            OptNode::MultiIf { branches, default } => {
+                for child in program.args(*branches) {
+                    Self::count_register_reads(program, *child, counts);
+                }
+                Self::count_register_reads(program, *default, counts);
+            }
+            OptNode::Switch {
+                inputs,
+                table,
+                default,
+            } => {
+                for child in program.args(*inputs) {
+                    Self::count_register_reads(program, *child, counts);
+                }
+                for branch in program.switch_table(*table).branches() {
+                    Self::count_register_reads(program, branch, counts);
+                }
+                Self::count_register_reads(program, *default, counts);
+            }
         }
     }
 

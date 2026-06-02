@@ -21,8 +21,8 @@ use air_elt_expr_funcs::signature::EvalContext;
 
 use super::{
     concat_collapse, const_fold, dce, de_morgan, empty_needle, encode_round_trip, field_collapse,
-    flatten, flatten_conditionals, idempotent, multi_if_collapse, or_membership, round_trip,
-    switch_collapse, switch_lower, type_assert_collapse,
+    flatten, flatten_conditionals, idempotent, multi_if_collapse, object_access, or_membership,
+    round_trip, switch_collapse, switch_lower, type_assert_collapse,
 };
 use crate::model::opt_expr::OptExpr;
 
@@ -73,6 +73,7 @@ impl RuleSet {
             Box::new(const_fold::ConstFold),
             Box::new(const_fold::InterpolationFold),
             Box::new(const_fold::ObjectFold),
+            Box::new(object_access::ObjectAccessFold),
             Box::new(flatten_conditionals::FlattenConditionals),
             Box::new(dce::BranchPrune),
             Box::new(switch_lower::SwitchLower::create(registry)),

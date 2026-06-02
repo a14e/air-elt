@@ -10,4 +10,4 @@ pub(crate) mod test_support;
 pub use cache::ExprCaches;
 pub use error::FuncError;
 pub use registry::{FuncRef, FunctionRegistry};
-pub use signature::ExprFunction;
+pub use signature::{ArgWindow, ExprFunction, FuncArgVec, OwnedArgWindow, SliceArgWindow};

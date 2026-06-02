@@ -7,7 +7,7 @@
 //! per binding, so the IR is single-assignment and earlier reads see the
 //! earlier value.
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use air_elt_commons_arena::ArenaOverflow;
 use air_elt_expr_funcs::FunctionRegistry;
 use air_elt_expr_parse::model::{
@@ -132,6 +132,12 @@ impl<'a> OptProgramConverter<'a> {
     }
 
     fn lower_object(&mut self, entries: &[(String, Expr)]) -> Result<OptExpr, OptimizeError> {
+        let mut seen: AHashSet<&str> = AHashSet::with_capacity(entries.len());
+        for (key, _) in entries {
+            if !seen.insert(key.as_str()) {
+                return Err(OptimizeError::DuplicateObjectKey { key: key.clone() });
+            }
+        }
         let lowered = entries
             .iter()
             .map(|(key, value)| Ok((key.clone(), self.lower_expr(value)?)))

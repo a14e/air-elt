@@ -37,6 +37,7 @@
 pub(crate) mod check;
 pub(crate) mod engines;
 pub mod error;
+pub(crate) mod fallibility;
 pub mod model;
 pub mod optimizer;
 pub(crate) mod pass;
@@ -46,7 +47,7 @@ pub(crate) mod second_pass_rules;
 #[cfg(test)]
 mod test_utils;
 
-pub use engines::{EvalError, ProgramEvaluator};
+pub use engines::{EvalError, ExpectedOutput, FieldSource, ProgramEvaluator};
 pub use error::OptimizeError;
 pub use model::{
     ArgSlice, CompactProgram, CompactStatement, CompactYield, ConstId, KeyId, KeySlice, NodeRef,

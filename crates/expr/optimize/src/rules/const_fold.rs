@@ -16,6 +16,7 @@
 //! constant call that sits in an always-reached position and turns its failure
 //! into a compile-time [`OptimizeError::ConstEval`].
 
+use air_elt_expr_funcs::{FuncArgVec, OwnedArgWindow};
 use air_elt_expr_types::limits::MAX_EXPR_STRING_BYTES;
 use air_elt_types::Value;
 use air_elt_types::value_to_string;
@@ -48,11 +49,12 @@ impl Rule for ConstFold {
         // compile time. A successful result folds to a constant; a failure
         // leaves the call untouched for the static `check` pass (its
         // `EagerConstEval`) to judge once dead branches are gone.
-        let values: Vec<Value> = args
+        let values: FuncArgVec = args
             .iter()
             .map(|arg| arg.as_const().expect("pre-scanned as constant").clone())
             .collect();
-        match function.evaluate(values, cx.eval_context) {
+        let mut window = OwnedArgWindow::create(values);
+        match function.evaluate(&mut window, cx.eval_context) {
             Ok(value) => Rewrite::Changed(OptExpr::Const(value)),
             Err(_) => Rewrite::Same(OptExpr::Call { func, args }),
         }
@@ -104,15 +106,14 @@ impl Rule for ObjectFold {
             return Rewrite::Same(OptExpr::Object(entries));
         }
 
-        let mut map = serde_json::Map::with_capacity(entries.len());
+        let mut fields = Vec::with_capacity(entries.len());
         for (key, value) in &entries {
             let OptExpr::Const(constant) = value else {
                 continue; // pre-scanned: every value is constant
             };
-            let json = air_elt_types::value_to_json(constant).unwrap_or(serde_json::Value::Null);
-            map.insert(key.clone(), json);
+            fields.push((key.clone(), constant.clone()));
         }
 
-        Rewrite::Changed(OptExpr::Const(Value::Json(serde_json::Value::Object(map))))
+        Rewrite::Changed(OptExpr::Const(Value::Object(fields)))
     }
 }

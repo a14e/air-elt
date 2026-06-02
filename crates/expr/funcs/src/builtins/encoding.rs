@@ -6,7 +6,7 @@ use encoding_rs::Encoding;
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
-use crate::signature::{EvalContext, ExprFunction};
+use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
 static ENCODE: EncodeFunc = EncodeFunc;
 static DECODE: DecodeFunc = DecodeFunc;
@@ -56,7 +56,7 @@ fn validate_label_const(function: &str, args: &[Option<&Value>]) -> Result<(), F
     Ok(())
 }
 
-fn extract_bytes(val: Value, func_name: &str) -> Result<Vec<u8>, FuncError> {
+fn extract_bytes_ref<'a>(val: &'a Value, func_name: &str) -> Result<&'a [u8], FuncError> {
     match val {
         Value::Bytes(b) => Ok(b),
         other => Err(FuncError::TypeMismatch {
@@ -67,7 +67,7 @@ fn extract_bytes(val: Value, func_name: &str) -> Result<Vec<u8>, FuncError> {
     }
 }
 
-fn extract_text(val: Value, func_name: &str) -> Result<String, FuncError> {
+fn extract_text_ref<'a>(val: &'a Value, func_name: &str) -> Result<&'a str, FuncError> {
     match val {
         Value::Text(s) => Ok(s),
         other => Err(FuncError::TypeMismatch {
@@ -108,18 +108,20 @@ impl ExprFunction for EncodeFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let algorithm_val = args.remove(1);
-        let bytes_val = args.remove(0);
-        if bytes_val.is_null() || algorithm_val.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() || args.read(1).is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(bytes_val, "encode")?;
-        let algorithm = extract_text(algorithm_val, "encode")?;
-        let encoded = match algorithm.as_str() {
-            "hex" => hex::encode(&bytes),
-            "base64" => BASE64_STANDARD.encode(&bytes),
-            "base64url" => URL_SAFE_NO_PAD.encode(&bytes),
+        let bytes = extract_bytes_ref(args.read(0), "encode")?;
+        let algorithm = extract_text_ref(args.read(1), "encode")?;
+        let encoded = match algorithm {
+            "hex" => hex::encode(bytes),
+            "base64" => BASE64_STANDARD.encode(bytes),
+            "base64url" => URL_SAFE_NO_PAD.encode(bytes),
             other => return Err(unknown_algorithm_error(other)),
         };
         Ok(Value::Text(encoded))
@@ -164,17 +166,19 @@ impl ExprFunction for DecodeFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let algorithm_val = args.remove(1);
-        let text_val = args.remove(0);
-        if text_val.is_null() || algorithm_val.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() || args.read(1).is_null() {
             return Ok(Value::Null);
         }
-        let text = extract_text(text_val, "decode")?;
-        let algorithm = extract_text(algorithm_val, "decode")?;
+        let text = extract_text_ref(args.read(0), "decode")?;
+        let algorithm = extract_text_ref(args.read(1), "decode")?;
         let decoded =
-            match algorithm.as_str() {
-                "hex" => hex::decode(&text).map_err(|e| FuncError::EncodingError {
+            match algorithm {
+                "hex" => hex::decode(text).map_err(|e| FuncError::EncodingError {
                     reason: format!("hex decode failed: {e}"),
                 })?,
                 "base64" => BASE64_STANDARD.decode(text.as_bytes()).map_err(|e| {
@@ -231,14 +235,16 @@ impl ExprFunction for EncodeTextFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let encoding_val = args.remove(1);
-        let text_val = args.remove(0);
-        if text_val.is_null() || encoding_val.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() || args.read(1).is_null() {
             return Ok(Value::Null);
         }
-        let text = extract_text(text_val, "encodeText")?;
-        let encoding_name = extract_text(encoding_val, "encodeText")?;
+        let text = extract_text_ref(args.read(0), "encodeText")?;
+        let encoding_name = extract_text_ref(args.read(1), "encodeText")?;
 
         let enc = Encoding::for_label(encoding_name.as_bytes()).ok_or_else(|| {
             FuncError::EncodingError {
@@ -246,7 +252,7 @@ impl ExprFunction for EncodeTextFunc {
             }
         })?;
 
-        let (bytes, _, had_errors) = enc.encode(&text);
+        let (bytes, _, had_errors) = enc.encode(text);
         if had_errors {
             return Err(FuncError::EncodingError {
                 reason: format!(
@@ -296,14 +302,16 @@ impl ExprFunction for DecodeTextFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let encoding_val = args.remove(1);
-        let bytes_val = args.remove(0);
-        if bytes_val.is_null() || encoding_val.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() || args.read(1).is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(bytes_val, "decodeText")?;
-        let encoding_name = extract_text(encoding_val, "decodeText")?;
+        let bytes = extract_bytes_ref(args.read(0), "decodeText")?;
+        let encoding_name = extract_text_ref(args.read(1), "decodeText")?;
 
         let enc = Encoding::for_label(encoding_name.as_bytes()).ok_or_else(|| {
             FuncError::EncodingError {
@@ -311,7 +319,7 @@ impl ExprFunction for DecodeTextFunc {
             }
         })?;
 
-        let (text, _, had_errors) = enc.decode(&bytes);
+        let (text, _, had_errors) = enc.decode(bytes);
         if had_errors {
             return Err(FuncError::EncodingError {
                 reason: format!(
@@ -357,64 +365,64 @@ fn validate_text_arg(function: &str, dt: &DataType) -> Result<(), FuncError> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::ctx;
+    use crate::test_support::{ctx, eval};
 
     #[test]
     fn encode_hex() {
-        let result = EncodeFunc
-            .evaluate(
-                vec![Value::Bytes(vec![0xCA, 0xFE]), Value::Text("hex".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &EncodeFunc,
+            smallvec::smallvec![Value::Bytes(vec![0xCA, 0xFE]), Value::Text("hex".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Text("cafe".into()));
     }
 
     #[test]
     fn decode_hex() {
-        let result = DecodeFunc
-            .evaluate(
-                vec![Value::Text("cafe".into()), Value::Text("hex".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &DecodeFunc,
+            smallvec::smallvec![Value::Text("cafe".into()), Value::Text("hex".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bytes(vec![0xCA, 0xFE]));
     }
 
     #[test]
     fn encode_base64() {
-        let result = EncodeFunc
-            .evaluate(
-                vec![Value::Bytes(vec![1, 2, 3]), Value::Text("base64".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &EncodeFunc,
+            smallvec::smallvec![Value::Bytes(vec![1, 2, 3]), Value::Text("base64".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Text("AQID".into()));
     }
 
     #[test]
     fn decode_base64() {
-        let result = DecodeFunc
-            .evaluate(
-                vec![Value::Text("AQID".into()), Value::Text("base64".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &DecodeFunc,
+            smallvec::smallvec![Value::Text("AQID".into()), Value::Text("base64".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bytes(vec![1, 2, 3]));
     }
 
     #[test]
     fn encode_base64url() {
         // Bytes that produce different output for standard vs URL-safe base64
-        let result = EncodeFunc
-            .evaluate(
-                vec![
-                    Value::Bytes(vec![0xFB, 0xFF, 0xFE]),
-                    Value::Text("base64url".into()),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &EncodeFunc,
+            smallvec::smallvec![
+                Value::Bytes(vec![0xFB, 0xFF, 0xFE]),
+                Value::Text("base64url".into()),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         // URL-safe uses - and _ instead of + and /, no padding
         let text = match result {
             Value::Text(s) => s,
@@ -429,32 +437,33 @@ mod tests {
     fn decode_base64url() {
         // Encode then decode roundtrip
         let original = vec![0xFB, 0xFF, 0xFE];
-        let encoded = EncodeFunc
-            .evaluate(
-                vec![
-                    Value::Bytes(original.clone()),
-                    Value::Text("base64url".into()),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let encoded = eval(
+            &EncodeFunc,
+            smallvec::smallvec![
+                Value::Bytes(original.clone()),
+                Value::Text("base64url".into()),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         let encoded_text = match encoded {
             Value::Text(s) => s,
             _ => panic!("expected Text"),
         };
-        let decoded = DecodeFunc
-            .evaluate(
-                vec![Value::Text(encoded_text), Value::Text("base64url".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let decoded = eval(
+            &DecodeFunc,
+            smallvec::smallvec![Value::Text(encoded_text), Value::Text("base64url".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(decoded, Value::Bytes(original));
     }
 
     #[test]
     fn encode_unknown_algorithm() {
-        let result = EncodeFunc.evaluate(
-            vec![Value::Bytes(vec![1, 2, 3]), Value::Text("rot13".into())],
+        let result = eval(
+            &EncodeFunc,
+            smallvec::smallvec![Value::Bytes(vec![1, 2, 3]), Value::Text("rot13".into())],
             &ctx(),
         );
         assert!(result.is_err());
@@ -464,57 +473,58 @@ mod tests {
 
     #[test]
     fn encode_text_utf8() {
-        let result = EncodeTextFunc
-            .evaluate(
-                vec![Value::Text("hello".into()), Value::Text("utf-8".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &EncodeTextFunc,
+            smallvec::smallvec![Value::Text("hello".into()), Value::Text("utf-8".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bytes(b"hello".to_vec()));
     }
 
     #[test]
     fn encode_text_windows_1251() {
         // Russian letter "A" (U+0410) in windows-1251 is 0xC0
-        let result = EncodeTextFunc
-            .evaluate(
-                vec![
-                    Value::Text("\u{0410}".into()),
-                    Value::Text("windows-1251".into()),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &EncodeTextFunc,
+            smallvec::smallvec![
+                Value::Text("\u{0410}".into()),
+                Value::Text("windows-1251".into()),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bytes(vec![0xC0]));
     }
 
     #[test]
     fn decode_text_utf8() {
-        let result = DecodeTextFunc
-            .evaluate(
-                vec![Value::Bytes(b"hello".to_vec()), Value::Text("utf-8".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &DecodeTextFunc,
+            smallvec::smallvec![Value::Bytes(b"hello".to_vec()), Value::Text("utf-8".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Text("hello".into()));
     }
 
     #[test]
     fn decode_text_windows_1251() {
         // 0xC0 in windows-1251 is Russian letter "A" (U+0410)
-        let result = DecodeTextFunc
-            .evaluate(
-                vec![Value::Bytes(vec![0xC0]), Value::Text("windows-1251".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &DecodeTextFunc,
+            smallvec::smallvec![Value::Bytes(vec![0xC0]), Value::Text("windows-1251".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Text("\u{0410}".into()));
     }
 
     #[test]
     fn unknown_encoding_error() {
-        let result = EncodeTextFunc.evaluate(
-            vec![
+        let result = eval(
+            &EncodeTextFunc,
+            smallvec::smallvec![
                 Value::Text("test".into()),
                 Value::Text("nonsense-encoding".into()),
             ],
@@ -527,17 +537,23 @@ mod tests {
 
     #[test]
     fn null_propagation_encode() {
-        let result = EncodeFunc
-            .evaluate(vec![Value::Null, Value::Text("hex".into())], &ctx())
-            .unwrap();
+        let result = eval(
+            &EncodeFunc,
+            smallvec::smallvec![Value::Null, Value::Text("hex".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn null_propagation_decode_text() {
-        let result = DecodeTextFunc
-            .evaluate(vec![Value::Null, Value::Text("utf-8".into())], &ctx())
-            .unwrap();
+        let result = eval(
+            &DecodeTextFunc,
+            smallvec::smallvec![Value::Null, Value::Text("utf-8".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 

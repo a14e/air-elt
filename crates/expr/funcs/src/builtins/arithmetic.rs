@@ -11,7 +11,7 @@ use num_traits::Zero;
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
-use crate::signature::{EvalContext, ExprFunction};
+use crate::signature::{ArgWindow, EvalContext, ExprFunction, FuncArgVec};
 
 static ADD: AddFunc = AddFunc;
 static SUBTRACT: SubtractFunc = SubtractFunc;
@@ -100,28 +100,51 @@ impl ExprFunction for AddFunc {
         }
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
+        let b = args.read(1);
         if a.is_null() || b.is_null() {
             return Ok(Value::Null);
         }
+        // Inline fast path: borrow the operands, no `Null` write-back on the hot
+        // integer/float path.
         match (a, b) {
-            (Value::Text(mut s), Value::Text(t)) => {
-                s.push_str(&t);
-                Ok(Value::Text(s))
-            }
-            (Value::Int64(x), Value::Int64(y)) => match x.checked_add(y) {
-                Some(result) => Ok(Value::Int64(result)),
-                None => Ok(Value::BigInt(BigInt::from(x) + BigInt::from(y))),
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_add(*y) {
+                Some(result) => return Ok(Value::Int64(result)),
+                None => return Ok(Value::BigInt(BigInt::from(*x) + BigInt::from(*y))),
             },
+            (Value::Float64(x), Value::Float64(y)) => return Ok(Value::Float64(*x + *y)),
+            _ => {}
+        }
+        // Heap / mixed operands: take ownership of arg 0 (its buffer is reused
+        // for Text concat / BigInt / Decimal). For the Text case arg 1 is only
+        // READ — `push_str` borrows it, so taking would clone a const separator
+        // (`' '`, `'-'`) on every row.
+        let left = args.take(0);
+        if let Value::Text(mut s) = left {
+            return match args.read(1) {
+                Value::Text(t) => {
+                    s.push_str(t);
+                    Ok(Value::Text(s))
+                }
+                other => Err(FuncError::TypeMismatch {
+                    function: "add".to_owned(),
+                    expected: "matching numeric or text types".to_owned(),
+                    actual: format!("Text, {:?}", other.data_type()),
+                }),
+            };
+        }
+        match (left, args.take(1)) {
             (Value::BigInt(x), Value::BigInt(y)) => Ok(Value::BigInt(x + y)),
             (Value::BigInt(x), Value::Int64(y)) => Ok(Value::BigInt(x + BigInt::from(y))),
             (Value::Int64(x), Value::BigInt(y)) => Ok(Value::BigInt(BigInt::from(x) + y)),
             (Value::Decimal(x), Value::Decimal(y)) => Ok(Value::Decimal(x + y)),
             (Value::Decimal(x), Value::Int64(y)) => Ok(Value::Decimal(x + BigDecimal::from(y))),
             (Value::Int64(x), Value::Decimal(y)) => Ok(Value::Decimal(BigDecimal::from(x) + y)),
-            (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x + y)),
             (a, b) => Err(FuncError::TypeMismatch {
                 function: "add".to_owned(),
                 expected: "matching numeric or text types".to_owned(),
@@ -168,24 +191,31 @@ impl ExprFunction for SubtractFunc {
         Ok(NullableExprType { nullable, ..result })
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
+        let b = args.read(1);
         if a.is_null() || b.is_null() {
             return Ok(Value::Null);
         }
         match (a, b) {
-            (Value::Int64(x), Value::Int64(y)) => match x.checked_sub(y) {
-                Some(result) => Ok(Value::Int64(result)),
-                None => Ok(Value::BigInt(BigInt::from(x) - BigInt::from(y))),
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_sub(*y) {
+                Some(result) => return Ok(Value::Int64(result)),
+                None => return Ok(Value::BigInt(BigInt::from(*x) - BigInt::from(*y))),
             },
+            (Value::Float64(x), Value::Float64(y)) => return Ok(Value::Float64(*x - *y)),
+            _ => {}
+        }
+        match (args.take(0), args.take(1)) {
             (Value::BigInt(x), Value::BigInt(y)) => Ok(Value::BigInt(x - y)),
             (Value::BigInt(x), Value::Int64(y)) => Ok(Value::BigInt(x - BigInt::from(y))),
             (Value::Int64(x), Value::BigInt(y)) => Ok(Value::BigInt(BigInt::from(x) - y)),
             (Value::Decimal(x), Value::Decimal(y)) => Ok(Value::Decimal(x - y)),
             (Value::Decimal(x), Value::Int64(y)) => Ok(Value::Decimal(x - BigDecimal::from(y))),
             (Value::Int64(x), Value::Decimal(y)) => Ok(Value::Decimal(BigDecimal::from(x) - y)),
-            (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x - y)),
             (a, b) => Err(FuncError::TypeMismatch {
                 function: "subtract".to_owned(),
                 expected: "matching numeric types".to_owned(),
@@ -232,24 +262,31 @@ impl ExprFunction for MultiplyFunc {
         Ok(NullableExprType { nullable, ..result })
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
+        let b = args.read(1);
         if a.is_null() || b.is_null() {
             return Ok(Value::Null);
         }
         match (a, b) {
-            (Value::Int64(x), Value::Int64(y)) => match x.checked_mul(y) {
-                Some(result) => Ok(Value::Int64(result)),
-                None => Ok(Value::BigInt(BigInt::from(x) * BigInt::from(y))),
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_mul(*y) {
+                Some(result) => return Ok(Value::Int64(result)),
+                None => return Ok(Value::BigInt(BigInt::from(*x) * BigInt::from(*y))),
             },
+            (Value::Float64(x), Value::Float64(y)) => return Ok(Value::Float64(*x * *y)),
+            _ => {}
+        }
+        match (args.take(0), args.take(1)) {
             (Value::BigInt(x), Value::BigInt(y)) => Ok(Value::BigInt(x * y)),
             (Value::BigInt(x), Value::Int64(y)) => Ok(Value::BigInt(x * BigInt::from(y))),
             (Value::Int64(x), Value::BigInt(y)) => Ok(Value::BigInt(BigInt::from(x) * y)),
             (Value::Decimal(x), Value::Decimal(y)) => Ok(Value::Decimal(x * y)),
             (Value::Decimal(x), Value::Int64(y)) => Ok(Value::Decimal(x * BigDecimal::from(y))),
             (Value::Int64(x), Value::Decimal(y)) => Ok(Value::Decimal(BigDecimal::from(x) * y)),
-            (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x * y)),
             (a, b) => Err(FuncError::TypeMismatch {
                 function: "multiply".to_owned(),
                 expected: "matching numeric types".to_owned(),
@@ -292,18 +329,31 @@ impl ExprFunction for DivideFunc {
         Ok(NullableExprType { nullable, ..result })
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
+        let b = args.read(1);
         if a.is_null() || b.is_null() {
             return Ok(Value::Null);
         }
         match (a, b) {
-            (Value::Int64(_), Value::Int64(0)) => Err(FuncError::DivisionByZero),
-            (Value::Int64(x), Value::Int64(y)) => match x.checked_div(y) {
-                Some(result) => Ok(Value::Int64(result)),
-                None => Ok(Value::BigInt(BigInt::from(x) / BigInt::from(y))),
+            (Value::Int64(_), Value::Int64(0)) => return Err(FuncError::DivisionByZero),
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_div(*y) {
+                Some(result) => return Ok(Value::Int64(result)),
+                None => return Ok(Value::BigInt(BigInt::from(*x) / BigInt::from(*y))),
             },
+            (Value::Float64(x), Value::Float64(y)) => {
+                if *y == 0.0 {
+                    return Err(FuncError::DivisionByZero);
+                }
+                return Ok(Value::Float64(*x / *y));
+            }
+            _ => {}
+        }
+        match (args.take(0), args.take(1)) {
             (Value::BigInt(_), Value::BigInt(ref y)) if y.is_zero() => {
                 Err(FuncError::DivisionByZero)
             }
@@ -324,12 +374,6 @@ impl ExprFunction for DivideFunc {
                 Err(FuncError::DivisionByZero)
             }
             (Value::Int64(x), Value::Decimal(y)) => Ok(Value::Decimal(BigDecimal::from(x) / y)),
-            (Value::Float64(x), Value::Float64(y)) => {
-                if y == 0.0 {
-                    return Err(FuncError::DivisionByZero);
-                }
-                Ok(Value::Float64(x / y))
-            }
             (a, b) => Err(FuncError::TypeMismatch {
                 function: "divide".to_owned(),
                 expected: "matching numeric types".to_owned(),
@@ -372,19 +416,32 @@ impl ExprFunction for ModuloFunc {
         Ok(NullableExprType { nullable, ..result })
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
+        let b = args.read(1);
         if a.is_null() || b.is_null() {
             return Ok(Value::Null);
         }
         match (a, b) {
-            (Value::Int64(_), Value::Int64(0)) => Err(FuncError::DivisionByZero),
-            (Value::Int64(x), Value::Int64(y)) => match x.checked_rem(y) {
-                Some(result) => Ok(Value::Int64(result)),
+            (Value::Int64(_), Value::Int64(0)) => return Err(FuncError::DivisionByZero),
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_rem(*y) {
+                Some(result) => return Ok(Value::Int64(result)),
                 // i64::MIN % -1 overflows; promote to BigInt (result is 0).
-                None => Ok(Value::BigInt(BigInt::from(x) % BigInt::from(y))),
+                None => return Ok(Value::BigInt(BigInt::from(*x) % BigInt::from(*y))),
             },
+            (Value::Float64(x), Value::Float64(y)) => {
+                if *y == 0.0 {
+                    return Err(FuncError::DivisionByZero);
+                }
+                return Ok(Value::Float64(*x % *y));
+            }
+            _ => {}
+        }
+        match (args.take(0), args.take(1)) {
             (Value::BigInt(_), Value::BigInt(ref y)) if y.is_zero() => {
                 Err(FuncError::DivisionByZero)
             }
@@ -405,12 +462,6 @@ impl ExprFunction for ModuloFunc {
                 Err(FuncError::DivisionByZero)
             }
             (Value::Int64(x), Value::Decimal(y)) => Ok(Value::Decimal(BigDecimal::from(x) % y)),
-            (Value::Float64(x), Value::Float64(y)) => {
-                if y == 0.0 {
-                    return Err(FuncError::DivisionByZero);
-                }
-                Ok(Value::Float64(x % y))
-            }
             (a, b) => Err(FuncError::TypeMismatch {
                 function: "modulo".to_owned(),
                 expected: "matching numeric types".to_owned(),
@@ -443,19 +494,26 @@ impl ExprFunction for NegateFunc {
         Ok(args[0].clone())
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
         match a {
             Value::Int64(x) => match x.checked_neg() {
-                Some(result) => Ok(Value::Int64(result)),
-                None => Ok(Value::BigInt(-BigInt::from(x))),
+                Some(result) => return Ok(Value::Int64(result)),
+                None => return Ok(Value::BigInt(-BigInt::from(*x))),
             },
+            Value::Float64(x) => return Ok(Value::Float64(-*x)),
+            _ => {}
+        }
+        match args.take(0) {
             Value::BigInt(x) => Ok(Value::BigInt(-x)),
             Value::Decimal(x) => Ok(Value::Decimal(-x)),
-            Value::Float64(x) => Ok(Value::Float64(-x)),
             other => Err(FuncError::TypeMismatch {
                 function: "negate".to_owned(),
                 expected: "numeric".to_owned(),
@@ -488,16 +546,24 @@ impl ExprFunction for AbsFunc {
         Ok(args[0].clone())
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
         match a {
             Value::Int64(x) => match x.checked_abs() {
-                Some(result) => Ok(Value::Int64(result)),
-                None => Ok(Value::BigInt(BigInt::from(x).magnitude().clone().into())),
+                Some(result) => return Ok(Value::Int64(result)),
+                None => return Ok(Value::BigInt(BigInt::from(*x).magnitude().clone().into())),
             },
+            Value::Float64(x) => return Ok(Value::Float64(x.abs())),
+            _ => {}
+        }
+        match args.take(0) {
             Value::BigInt(x) => {
                 if x < BigInt::zero() {
                     Ok(Value::BigInt(-x))
@@ -506,7 +572,6 @@ impl ExprFunction for AbsFunc {
                 }
             }
             Value::Decimal(x) => Ok(Value::Decimal(x.abs())),
-            Value::Float64(x) => Ok(Value::Float64(x.abs())),
             other => Err(FuncError::TypeMismatch {
                 function: "abs".to_owned(),
                 expected: "numeric".to_owned(),
@@ -539,13 +604,17 @@ impl ExprFunction for CeilFunc {
         Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
         match a {
-            Value::Int64(x) => Ok(Value::Int64(x)),
+            Value::Int64(x) => Ok(Value::Int64(*x)),
             Value::Float64(x) => Ok(Value::Int64(x.ceil() as i64)),
             other => Err(FuncError::TypeMismatch {
                 function: "ceil".to_owned(),
@@ -579,13 +648,17 @@ impl ExprFunction for FloorFunc {
         Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
         match a {
-            Value::Int64(x) => Ok(Value::Int64(x)),
+            Value::Int64(x) => Ok(Value::Int64(*x)),
             Value::Float64(x) => Ok(Value::Int64(x.floor() as i64)),
             other => Err(FuncError::TypeMismatch {
                 function: "floor".to_owned(),
@@ -619,13 +692,17 @@ impl ExprFunction for RoundFunc {
         Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
         match a {
-            Value::Int64(x) => Ok(Value::Int64(x)),
+            Value::Int64(x) => Ok(Value::Int64(*x)),
             Value::Float64(x) => Ok(Value::Int64(x.round() as i64)),
             other => Err(FuncError::TypeMismatch {
                 function: "round".to_owned(),
@@ -667,8 +744,13 @@ impl ExprFunction for MinFunc {
         })
     }
 
-    fn evaluate(&self, args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        fold_extremum(args, "min", Ordering::Less)
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let collected: FuncArgVec = (0..args.len()).map(|i| args.take(i)).collect();
+        fold_extremum(collected, "min", Ordering::Less)
     }
 }
 
@@ -703,8 +785,13 @@ impl ExprFunction for MaxFunc {
         })
     }
 
-    fn evaluate(&self, args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        fold_extremum(args, "max", Ordering::Greater)
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let collected: FuncArgVec = (0..args.len()).map(|i| args.take(i)).collect();
+        fold_extremum(collected, "max", Ordering::Greater)
     }
 }
 
@@ -719,7 +806,7 @@ impl ExprFunction for MaxFunc {
 /// result `NaN` (also order-independent, so associativity holds). A
 /// comparison undefined for a non-`NaN` reason (incompatible categories,
 /// which `resolve_type` already rejects) is a defensive type error.
-fn fold_extremum(args: Vec<Value>, op: &str, winning: Ordering) -> Result<Value, FuncError> {
+fn fold_extremum(args: FuncArgVec, op: &str, winning: Ordering) -> Result<Value, FuncError> {
     let mut best: Option<Value> = None;
     for value in args {
         if value.is_null() {
@@ -775,14 +862,18 @@ impl ExprFunction for SignFunc {
         Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
         match a {
             Value::Int64(x) => Ok(Value::Int64(x.signum())),
-            Value::BigInt(ref x) => {
+            Value::BigInt(x) => {
                 use num_bigint::Sign;
                 let s = match x.sign() {
                     Sign::Plus => 1i64,
@@ -791,7 +882,7 @@ impl ExprFunction for SignFunc {
                 };
                 Ok(Value::Int64(s))
             }
-            Value::Decimal(ref x) => {
+            Value::Decimal(x) => {
                 use num_traits::Signed;
                 let s = x.signum();
                 if s.is_zero() {
@@ -803,9 +894,9 @@ impl ExprFunction for SignFunc {
                 }
             }
             Value::Float64(x) => {
-                if x > 0.0 {
+                if *x > 0.0 {
                     Ok(Value::Int64(1))
-                } else if x < 0.0 {
+                } else if *x < 0.0 {
                     Ok(Value::Int64(-1))
                 } else {
                     Ok(Value::Int64(0))
@@ -844,14 +935,18 @@ impl ExprFunction for PowerFunc {
         Ok(NullableExprType::new(DataType::Float64, nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
+        let b = args.read(1);
         if a.is_null() || b.is_null() {
             return Ok(Value::Null);
         }
         // Integer power: both Int64 -> compute as integer
-        if let (Value::Int64(base), Value::Int64(exp)) = (&a, &b) {
+        if let (Value::Int64(base), Value::Int64(exp)) = (a, b) {
             if *exp >= 0 {
                 let exp_u32 = (*exp).min(63) as u32;
                 match base.checked_pow(exp_u32) {
@@ -866,8 +961,8 @@ impl ExprFunction for PowerFunc {
             let exp_f = *exp as f64;
             return Ok(Value::Float64(base_f.powf(exp_f)));
         }
-        let base = to_f64(&a, "power")?;
-        let exp = to_f64(&b, "power")?;
+        let base = to_f64(a, "power")?;
+        let exp = to_f64(b, "power")?;
         Ok(Value::Float64(base.powf(exp)))
     }
 }
@@ -895,12 +990,16 @@ impl ExprFunction for SqrtFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "sqrt")?;
+        let x = to_f64(a, "sqrt")?;
         Ok(Value::Float64(x.sqrt()))
     }
 }
@@ -961,23 +1060,29 @@ fn validate_numeric_args(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::ctx;
+    use crate::test_support::{ctx, eval};
 
     #[test]
     fn add_int() {
         let f = AddFunc;
-        let result = f
-            .evaluate(vec![Value::Int64(2), Value::Int64(3)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(2), Value::Int64(3)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(5));
     }
 
     #[test]
     fn add_int_overflow_promotes_to_bigint() {
         let f = AddFunc;
-        let result = f
-            .evaluate(vec![Value::Int64(i64::MAX), Value::Int64(1)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(i64::MAX), Value::Int64(1)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(
             result,
             Value::BigInt(BigInt::from(i64::MAX) + BigInt::from(1))
@@ -987,138 +1092,185 @@ mod tests {
     #[test]
     fn add_text_concat() {
         let f = AddFunc;
-        let result = f
-            .evaluate(
-                vec![Value::Text("hello".into()), Value::Text(" world".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("hello".into()), Value::Text(" world".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Text("hello world".into()));
     }
 
     #[test]
     fn add_null_propagation() {
         let f = AddFunc;
-        let result = f
-            .evaluate(vec![Value::Null, Value::Int64(3)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Null, Value::Int64(3)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn divide_by_zero() {
         let f = DivideFunc;
-        let result = f.evaluate(vec![Value::Int64(5), Value::Int64(0)], &ctx());
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(5), Value::Int64(0)],
+            &ctx(),
+        );
         assert!(matches!(result, Err(FuncError::DivisionByZero)));
     }
 
     #[test]
     fn modulo_basic() {
         let f = ModuloFunc;
-        let result = f
-            .evaluate(vec![Value::Int64(7), Value::Int64(3)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(7), Value::Int64(3)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(1));
     }
 
     #[test]
     fn negate_int() {
         let f = NegateFunc;
-        let result = f.evaluate(vec![Value::Int64(5)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(5)], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(-5));
     }
 
     #[test]
     fn abs_negative() {
         let f = AbsFunc;
-        let result = f.evaluate(vec![Value::Int64(-7)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(-7)], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(7));
     }
 
     #[test]
     fn ceil_float() {
         let f = CeilFunc;
-        let result = f.evaluate(vec![Value::Float64(2.3)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Float64(2.3)], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(3));
     }
 
     #[test]
     fn floor_float() {
         let f = FloorFunc;
-        let result = f.evaluate(vec![Value::Float64(2.7)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Float64(2.7)], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(2));
     }
 
     #[test]
     fn round_float() {
         let f = RoundFunc;
-        let result = f.evaluate(vec![Value::Float64(2.5)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Float64(2.5)], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(3));
     }
 
     #[test]
     fn min_ignores_null() {
         let f = MinFunc;
-        let result = f
-            .evaluate(vec![Value::Int64(5), Value::Null, Value::Int64(2)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(5), Value::Null, Value::Int64(2)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(2));
     }
 
     #[test]
     fn max_all_null() {
         let f = MaxFunc;
-        let result = f.evaluate(vec![Value::Null, Value::Null], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Null, Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn min_spills_past_inline_capacity() {
+        // Six arguments exceed `FuncArgVec`'s inline capacity of four, forcing
+        // the heap spill: the n-ary `fold_extremum` consumer must return the
+        // same result on the spilled buffer as it would inline.
+        let f = MinFunc;
+        let result = eval(
+            &f,
+            smallvec::smallvec![
+                Value::Int64(9),
+                Value::Int64(7),
+                Value::Int64(5),
+                Value::Int64(3),
+                Value::Int64(1),
+                Value::Int64(8),
+            ],
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(result, Value::Int64(1));
     }
 
     #[test]
     fn sign_positive() {
         let f = SignFunc;
-        let result = f.evaluate(vec![Value::Int64(42)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(42)], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(1));
     }
 
     #[test]
     fn power_basic() {
         let f = PowerFunc;
-        let result = f
-            .evaluate(vec![Value::Float64(2.0), Value::Float64(3.0)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Float64(2.0), Value::Float64(3.0)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Float64(8.0));
     }
 
     #[test]
     fn power_integer_both_int64() {
         let f = PowerFunc;
-        let result = f
-            .evaluate(vec![Value::Int64(2), Value::Int64(10)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(2), Value::Int64(10)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(1024));
     }
 
     #[test]
     fn power_integer_overflow_to_bigint() {
         let f = PowerFunc;
-        let result = f
-            .evaluate(vec![Value::Int64(2), Value::Int64(63)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(2), Value::Int64(63)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::BigInt(BigInt::from(2).pow(63)));
     }
 
     #[test]
     fn power_integer_negative_exponent() {
         let f = PowerFunc;
-        let result = f
-            .evaluate(vec![Value::Int64(2), Value::Int64(-1)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(2), Value::Int64(-1)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Float64(0.5));
     }
 
     #[test]
     fn sqrt_basic() {
         let f = SqrtFunc;
-        let result = f.evaluate(vec![Value::Float64(9.0)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Float64(9.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(3.0));
     }
 
@@ -1129,7 +1281,7 @@ mod tests {
         let f = AddFunc;
         let a = Value::BigInt(BigInt::from(1_000_000_000_000i64));
         let b = Value::BigInt(BigInt::from(2_000_000_000_000i64));
-        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![a, b], &ctx()).unwrap();
         assert_eq!(result, Value::BigInt(BigInt::from(3_000_000_000_000i64)));
     }
 
@@ -1138,7 +1290,7 @@ mod tests {
         let f = AddFunc;
         let a = Value::BigInt(BigInt::from(100));
         let b = Value::Int64(50);
-        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![a, b], &ctx()).unwrap();
         assert_eq!(result, Value::BigInt(BigInt::from(150)));
     }
 
@@ -1147,7 +1299,7 @@ mod tests {
         let f = AddFunc;
         let a = Value::Decimal("1.5".parse().unwrap());
         let b = Value::Decimal("2.5".parse().unwrap());
-        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![a, b], &ctx()).unwrap();
         assert_eq!(result, Value::Decimal("4.0".parse().unwrap()));
     }
 
@@ -1156,7 +1308,7 @@ mod tests {
         let f = SubtractFunc;
         let a = Value::BigInt(BigInt::from(100));
         let b = Value::BigInt(BigInt::from(30));
-        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![a, b], &ctx()).unwrap();
         assert_eq!(result, Value::BigInt(BigInt::from(70)));
     }
 
@@ -1165,7 +1317,7 @@ mod tests {
         let f = MultiplyFunc;
         let a = Value::BigInt(BigInt::from(100));
         let b = Value::BigInt(BigInt::from(200));
-        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![a, b], &ctx()).unwrap();
         assert_eq!(result, Value::BigInt(BigInt::from(20_000)));
     }
 
@@ -1174,7 +1326,7 @@ mod tests {
         let f = DivideFunc;
         let a = Value::BigInt(BigInt::from(100));
         let b = Value::BigInt(BigInt::from(4));
-        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![a, b], &ctx()).unwrap();
         assert_eq!(result, Value::BigInt(BigInt::from(25)));
     }
 
@@ -1183,7 +1335,7 @@ mod tests {
         let f = DivideFunc;
         let a = Value::BigInt(BigInt::from(100));
         let b = Value::BigInt(BigInt::from(0));
-        let result = f.evaluate(vec![a, b], &ctx());
+        let result = eval(&f, smallvec::smallvec![a, b], &ctx());
         assert!(matches!(result, Err(FuncError::DivisionByZero)));
     }
 
@@ -1192,7 +1344,7 @@ mod tests {
         let f = ModuloFunc;
         let a = Value::BigInt(BigInt::from(17));
         let b = Value::BigInt(BigInt::from(5));
-        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![a, b], &ctx()).unwrap();
         assert_eq!(result, Value::BigInt(BigInt::from(2)));
     }
 
@@ -1200,7 +1352,7 @@ mod tests {
     fn negate_bigint() {
         let f = NegateFunc;
         let a = Value::BigInt(BigInt::from(42));
-        let result = f.evaluate(vec![a], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![a], &ctx()).unwrap();
         assert_eq!(result, Value::BigInt(BigInt::from(-42)));
     }
 
@@ -1208,7 +1360,7 @@ mod tests {
     fn abs_bigint_negative() {
         let f = AbsFunc;
         let a = Value::BigInt(BigInt::from(-99));
-        let result = f.evaluate(vec![a], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![a], &ctx()).unwrap();
         assert_eq!(result, Value::BigInt(BigInt::from(99)));
     }
 
@@ -1216,7 +1368,7 @@ mod tests {
     fn abs_decimal_negative() {
         let f = AbsFunc;
         let a = Value::Decimal("-3.14".parse().unwrap());
-        let result = f.evaluate(vec![a], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![a], &ctx()).unwrap();
         assert_eq!(result, Value::Decimal("3.14".parse().unwrap()));
     }
 
@@ -1224,7 +1376,7 @@ mod tests {
     fn sign_bigint_negative() {
         let f = SignFunc;
         let a = Value::BigInt(BigInt::from(-42));
-        let result = f.evaluate(vec![a], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![a], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(-1));
     }
 
@@ -1232,7 +1384,7 @@ mod tests {
     fn sign_decimal_positive() {
         let f = SignFunc;
         let a = Value::Decimal("7.5".parse().unwrap());
-        let result = f.evaluate(vec![a], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![a], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(1));
     }
 
@@ -1241,7 +1393,7 @@ mod tests {
         let f = MinFunc;
         let a = Value::BigInt(BigInt::from(100));
         let b = Value::BigInt(BigInt::from(50));
-        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![a, b], &ctx()).unwrap();
         assert_eq!(result, Value::BigInt(BigInt::from(50)));
     }
 
@@ -1250,7 +1402,7 @@ mod tests {
         let f = MaxFunc;
         let a = Value::Decimal("1.5".parse().unwrap());
         let b = Value::Decimal("2.7".parse().unwrap());
-        let result = f.evaluate(vec![a, b], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![a, b], &ctx()).unwrap();
         assert_eq!(result, Value::Decimal("2.7".parse().unwrap()));
     }
 
@@ -1258,12 +1410,12 @@ mod tests {
     fn min_mixed_int_and_float_picks_true_minimum() {
         // The float 1.0 is the global minimum across mixed numeric types.
         let f = MinFunc;
-        let result = f
-            .evaluate(
-                vec![Value::Int64(5), Value::Float64(1.0), Value::Int64(2)],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(5), Value::Float64(1.0), Value::Int64(2)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Float64(1.0));
     }
 
@@ -1271,18 +1423,24 @@ mod tests {
     fn min_is_associative_under_regrouping() {
         // Regression for the flatten bug: nested and flat grouping must agree.
         let f = MinFunc;
-        let flat = f
-            .evaluate(
-                vec![Value::Int64(5), Value::Float64(1.0), Value::Int64(2)],
-                &ctx(),
-            )
-            .unwrap();
-        let nested_inner = f
-            .evaluate(vec![Value::Float64(1.0), Value::Int64(2)], &ctx())
-            .unwrap();
-        let nested = f
-            .evaluate(vec![Value::Int64(5), nested_inner], &ctx())
-            .unwrap();
+        let flat = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(5), Value::Float64(1.0), Value::Int64(2)],
+            &ctx(),
+        )
+        .unwrap();
+        let nested_inner = eval(
+            &f,
+            smallvec::smallvec![Value::Float64(1.0), Value::Int64(2)],
+            &ctx(),
+        )
+        .unwrap();
+        let nested = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(5), nested_inner],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(flat, nested);
     }
 
@@ -1290,9 +1448,12 @@ mod tests {
     fn min_propagates_nan() {
         // NaN has no defined ordering, so it propagates to the result.
         let f = MinFunc;
-        let result = f
-            .evaluate(vec![Value::Float64(1.0), Value::Float64(f64::NAN)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Float64(1.0), Value::Float64(f64::NAN)],
+            &ctx(),
+        )
+        .unwrap();
         assert!(matches!(result, Value::Float64(n) if n.is_nan()));
     }
 
@@ -1300,12 +1461,18 @@ mod tests {
     fn max_nan_propagates_regardless_of_position() {
         // NaN anywhere in the arguments wins — order-independent (associative).
         let f = MaxFunc;
-        let first = f
-            .evaluate(vec![Value::Float64(f64::NAN), Value::Float64(2.0)], &ctx())
-            .unwrap();
-        let last = f
-            .evaluate(vec![Value::Float64(2.0), Value::Float64(f64::NAN)], &ctx())
-            .unwrap();
+        let first = eval(
+            &f,
+            smallvec::smallvec![Value::Float64(f64::NAN), Value::Float64(2.0)],
+            &ctx(),
+        )
+        .unwrap();
+        let last = eval(
+            &f,
+            smallvec::smallvec![Value::Float64(2.0), Value::Float64(f64::NAN)],
+            &ctx(),
+        )
+        .unwrap();
         assert!(matches!(first, Value::Float64(n) if n.is_nan()));
         assert!(matches!(last, Value::Float64(n) if n.is_nan()));
     }
@@ -1345,7 +1512,7 @@ mod tests {
         use super::*;
         use crate::registry::FunctionRegistry;
         use crate::signature::ExprFunction;
-        use crate::test_support::ctx;
+        use crate::test_support::{ctx, eval};
         use proptest::prelude::*;
 
         fn arb_numeric_value() -> impl Strategy<Value = Value> {
@@ -1405,11 +1572,11 @@ mod tests {
         }
 
         fn eval_binary(func: &dyn ExprFunction, a: Value, b: Value) -> Result<Value, FuncError> {
-            func.evaluate(vec![a, b], &ctx())
+            eval(func, smallvec::smallvec![a, b], &ctx())
         }
 
         fn eval_unary(func: &dyn ExprFunction, a: Value) -> Result<Value, FuncError> {
-            func.evaluate(vec![a], &ctx())
+            eval(func, smallvec::smallvec![a], &ctx())
         }
 
         // --- Property 1: Eval crash-freedom for binary arithmetic ---
@@ -1729,8 +1896,9 @@ mod tests {
             #[test]
             fn cast_to_decimal_never_panics(a in arb_any_value()) {
                 let f = cast_func("toDecimal", 3);
-                let _ = f.evaluate(
-                    vec![a, Value::Int64(38), Value::Int64(10)],
+                let _ = eval(
+                    f,
+                    smallvec::smallvec![a, Value::Int64(38), Value::Int64(10)],
                     &ctx(),
                 );
             }

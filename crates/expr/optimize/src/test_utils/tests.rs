@@ -12,7 +12,9 @@ use air_elt_expr_funcs::signature::{EnvResolver, EvalContext, FileResolver};
 use air_elt_expr_parse::model::{Expr, LiteralValue};
 use air_elt_expr_parse::{Parser, Program};
 use air_elt_expr_types::limits::MAX_EXPR_DEPTH;
-use air_elt_types::{Key, Value};
+use air_elt_types::{DataType, Field, Key, Schema, Value};
+
+use crate::ExpectedOutput;
 use proptest::prelude::*;
 
 use crate::engines::{Compactor, EvalError, ProgramEvaluator};
@@ -93,7 +95,7 @@ fn optimized_result(source: &str) -> OptExpr {
 
 fn compile_optimized(source: &str) -> CompactProgram {
     Optimizer::create(&registry(), &context())
-        .compile(&parse(source))
+        .compile(&parse(source), None, None)
         .unwrap()
 }
 
@@ -152,6 +154,23 @@ fn eval_with_register0(result: OptExpr, seed: Value) -> Value {
     };
     let compiled = compact(program).unwrap();
     eval_const_program(&compiled, &registry(), &context()).unwrap()
+}
+
+/// Borrow an object literal's fields, panicking if `value` is not a `Value::Object`.
+fn object_entries(value: &Value) -> &[(String, Value)] {
+    match value {
+        Value::Object(entries) => entries,
+        other => panic!("expected Value::Object, got {other:?}"),
+    }
+}
+
+/// The first value bound to `key` in an object literal.
+fn object_field<'a>(value: &'a Value, key: &str) -> &'a Value {
+    object_entries(value)
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, val)| val)
+        .unwrap_or_else(|| panic!("key {key:?} not found in {value:?}"))
 }
 
 // ---- Golden structural rewrites -------------------------------------------
@@ -362,10 +381,10 @@ fn folds_interpolation_and_object() {
         .result;
     assert_eq!(folded, OptExpr::Const(Value::Text("a2b".to_string())));
 
-    assert!(matches!(
+    assert_eq!(
         optimized_result("{\"k\" = 1 + 1}"),
-        OptExpr::Const(Value::Json(_))
-    ));
+        OptExpr::Const(Value::Object(vec![("k".to_string(), Value::Int64(2))])),
+    );
 }
 
 #[test]
@@ -438,7 +457,7 @@ fn rejects_constant_evaluation_error_at_compile_time() {
     let registry = registry();
     let context = context();
     let program = parse("x = 1 / 0; 5");
-    let result = Optimizer::create(&registry, &context).compile(&program);
+    let result = Optimizer::create(&registry, &context).compile(&program, None, None);
     assert!(matches!(result, Err(OptimizeError::ConstEval { .. })));
 }
 
@@ -449,7 +468,7 @@ fn keeps_constant_error_in_a_dead_branch() {
     let registry = registry();
     let context = context();
     let program = parse("if(1 < 0, 1 / 0, 7)");
-    let compiled = Optimizer::create(&registry, &context).compile(&program);
+    let compiled = Optimizer::create(&registry, &context).compile(&program, None, None);
     assert!(compiled.is_ok());
 }
 
@@ -478,7 +497,7 @@ fn rejects_invalid_constant_regex_in_eager_position() {
     let registry = registry();
     let context = context();
     let program = parse("regexMatch(\"abc\", \"[\")");
-    let result = Optimizer::create(&registry, &context).compile(&program);
+    let result = Optimizer::create(&registry, &context).compile(&program, None, None);
     assert!(matches!(result, Err(OptimizeError::ConstEval { .. })));
 }
 
@@ -489,7 +508,7 @@ fn keeps_invalid_constant_regex_in_a_dead_branch() {
     let registry = registry();
     let context = context();
     let program = parse("if(1 < 0, regexMatch(\"abc\", \"[\"), false)");
-    let compiled = Optimizer::create(&registry, &context).compile(&program);
+    let compiled = Optimizer::create(&registry, &context).compile(&program, None, None);
     assert!(compiled.is_ok());
 }
 
@@ -500,7 +519,7 @@ fn defers_division_by_zero_with_dynamic_operand_to_runtime() {
     let registry = registry();
     let context = context();
     let program = parse("x = field(\"a\") / 0; x");
-    let compiled = Optimizer::create(&registry, &context).compile(&program);
+    let compiled = Optimizer::create(&registry, &context).compile(&program, None, None);
     assert!(compiled.is_ok());
 }
 
@@ -512,7 +531,7 @@ fn rejects_invalid_const_regex_with_dynamic_text() {
     let registry = registry();
     let context = context();
     let program = parse("regexMatch(field(\"x\"), \"(\")");
-    let result = Optimizer::create(&registry, &context).compile(&program);
+    let result = Optimizer::create(&registry, &context).compile(&program, None, None);
     assert!(matches!(result, Err(OptimizeError::InvalidConstArg { .. })));
 }
 
@@ -521,7 +540,7 @@ fn rejects_invalid_const_jspath_with_dynamic_json() {
     let registry = registry();
     let context = context();
     let program = parse("jsPath(field(\"doc\"), \"$[\")");
-    let result = Optimizer::create(&registry, &context).compile(&program);
+    let result = Optimizer::create(&registry, &context).compile(&program, None, None);
     assert!(matches!(result, Err(OptimizeError::InvalidConstArg { .. })));
 }
 
@@ -533,7 +552,7 @@ fn rejects_invalid_const_regex_even_in_a_lazy_branch() {
     let registry = registry();
     let context = context();
     let program = parse("if(field(\"c\"), regexMatch(field(\"x\"), \"(\"), false)");
-    let result = Optimizer::create(&registry, &context).compile(&program);
+    let result = Optimizer::create(&registry, &context).compile(&program, None, None);
     assert!(matches!(result, Err(OptimizeError::InvalidConstArg { .. })));
 }
 
@@ -545,7 +564,7 @@ fn rejects_non_const_field_argument() {
     let registry = registry();
     let context = context();
     let program = parse("field(upper(field(\"x\")))");
-    let result = Optimizer::create(&registry, &context).compile(&program);
+    let result = Optimizer::create(&registry, &context).compile(&program, None, None);
     assert!(matches!(result, Err(OptimizeError::NonConstFieldArg)));
 }
 
@@ -556,7 +575,7 @@ fn defers_value_failure_in_lazy_and_right_operand() {
     let registry = registry();
     let context = context();
     let program = parse("field(\"c\") && ((1 / 0) == 0)");
-    let compiled = Optimizer::create(&registry, &context).compile(&program);
+    let compiled = Optimizer::create(&registry, &context).compile(&program, None, None);
     assert!(compiled.is_ok());
 }
 
@@ -566,7 +585,7 @@ fn rejects_value_failure_in_eager_and_left_operand() {
     let registry = registry();
     let context = context();
     let program = parse("((1 / 0) == 0) && field(\"c\")");
-    let result = Optimizer::create(&registry, &context).compile(&program);
+    let result = Optimizer::create(&registry, &context).compile(&program, None, None);
     assert!(matches!(result, Err(OptimizeError::ConstEval { .. })));
 }
 
@@ -576,7 +595,7 @@ fn defers_value_failure_in_if_null_alternative() {
     let registry = registry();
     let context = context();
     let program = parse("ifNull(field(\"x\"), 1 / 0)");
-    let compiled = Optimizer::create(&registry, &context).compile(&program);
+    let compiled = Optimizer::create(&registry, &context).compile(&program, None, None);
     assert!(compiled.is_ok());
 }
 
@@ -586,7 +605,7 @@ fn rejects_value_failure_in_null_if_operand() {
     let registry = registry();
     let context = context();
     let program = parse("nullIf(field(\"x\"), 1 / 0)");
-    let result = Optimizer::create(&registry, &context).compile(&program);
+    let result = Optimizer::create(&registry, &context).compile(&program, None, None);
     assert!(matches!(result, Err(OptimizeError::ConstEval { .. })));
 }
 
@@ -1673,13 +1692,119 @@ fn evaluates_object_via_arena() {
     // Unoptimized keeps the Object node, exercising the key-table + value-run
     // arena path in the evaluator.
     let value = eval_unoptimized("{\"a\" = 1, \"b\" = 1 + 1}");
-    match value {
-        Value::Json(json) => {
-            assert_eq!(json.get("a"), Some(&serde_json::json!(1)));
-            assert_eq!(json.get("b"), Some(&serde_json::json!(2)));
-        }
-        other => panic!("expected Json, got {other:?}"),
-    }
+    assert_eq!(object_field(&value, "a"), &Value::Int64(1));
+    assert_eq!(object_field(&value, "b"), &Value::Int64(2));
+}
+
+#[test]
+fn object_literal_is_consumable_by_object_builtins() {
+    // An object literal evaluates to `Value::Object` (matching its resolved
+    // `DataType::Object`), so the object builtins — which require `Value::Object`
+    // — accept it. Before the literal lowered to `Value::Json`, this round-trip
+    // raised a runtime `TypeMismatch` despite type-checking cleanly.
+    assert_eq!(
+        eval_unoptimized("objectGet({\"a\" = 1, \"b\" = 2}, \"b\")"),
+        Value::Int64(2)
+    );
+    assert_eq!(
+        eval_unoptimized("objectLength({\"a\" = 1, \"b\" = 2})"),
+        Value::Int64(2)
+    );
+}
+
+#[test]
+fn object_get_hit_folds_to_the_matched_value() {
+    // Dynamic-valued object → ObjectFold leaves it, ObjectAccessFold extracts
+    // the matched value. (`field("x")` collapses to `SourceField`.)
+    assert_eq!(
+        optimized_result("objectGet({\"k\" = field(\"x\")}, \"k\")"),
+        OptExpr::SourceField("x".to_string())
+    );
+}
+
+#[test]
+fn object_get_hit_drops_infallible_siblings() {
+    // The matched value is returned; the other entry (`field("y")`, infallible)
+    // is dropped.
+    assert_eq!(
+        optimized_result("objectGet({\"k\" = field(\"x\"), \"j\" = field(\"y\")}, \"k\")"),
+        OptExpr::SourceField("x".to_string())
+    );
+}
+
+#[test]
+fn object_get_miss_folds_to_null() {
+    assert_eq!(
+        optimized_result("objectGet({\"k\" = field(\"x\")}, \"absent\")"),
+        OptExpr::Const(Value::Null)
+    );
+}
+
+#[test]
+fn object_length_folds_to_count() {
+    assert_eq!(
+        optimized_result("objectLength({\"k\" = field(\"x\"), \"j\" = field(\"y\")})"),
+        OptExpr::Const(Value::Int64(2))
+    );
+}
+
+#[test]
+fn object_has_key_folds_to_bool() {
+    assert_eq!(
+        optimized_result("objectHasKey({\"k\" = field(\"x\")}, \"k\")"),
+        OptExpr::Const(Value::Bool(true))
+    );
+    assert_eq!(
+        optimized_result("objectHasKey({\"k\" = field(\"x\")}, \"absent\")"),
+        OptExpr::Const(Value::Bool(false))
+    );
+}
+
+#[test]
+fn object_get_keeps_call_when_a_dropped_sibling_can_fail() {
+    // The matched key is "k", but sibling "j" = `field("y") / field("z")` is
+    // fallible (divide). Dropping it would discard its potential error, so the
+    // rewrite must NOT fire — the call stays.
+    let result = optimized_result(
+        "objectGet({\"k\" = field(\"x\"), \"j\" = field(\"y\") / field(\"z\")}, \"k\")",
+    );
+    assert!(
+        matches!(result, OptExpr::Call { .. }),
+        "fallible sibling must block the fold, got {result:?}"
+    );
+}
+
+#[test]
+fn object_length_keeps_call_when_a_value_can_fail() {
+    // A fallible value must still be evaluated; folding to the static count would
+    // discard its potential error, so the call stays.
+    let result = optimized_result("objectLength({\"k\" = field(\"y\") / field(\"z\")})");
+    assert!(
+        matches!(result, OptExpr::Call { .. }),
+        "fallible value must block the length fold, got {result:?}"
+    );
+}
+
+#[test]
+fn object_has_key_keeps_call_when_a_value_can_fail() {
+    let result = optimized_result("objectHasKey({\"k\" = field(\"y\") / field(\"z\")}, \"k\")");
+    assert!(
+        matches!(result, OptExpr::Call { .. }),
+        "fallible value must block the hasKey fold, got {result:?}"
+    );
+}
+
+#[test]
+fn rejects_duplicate_object_keys_at_compile_time() {
+    // The converter catches a repeated key before const-folding can collapse the
+    // literal into an opaque constant — a static, compile-time failure.
+    let err = Optimizer::create(&registry(), &context())
+        .compile(&parse("{\"a\" = 1, \"a\" = 2}"), None, None)
+        .unwrap_err();
+    assert!(
+        matches!(&err, OptimizeError::DuplicateObjectKey { key } if key == "a"),
+        "expected DuplicateObjectKey, got {err:?}"
+    );
 }
 
 // ---- Compaction: constant interning ---------------------------------------
@@ -1894,20 +2019,21 @@ fn compaction_interns_object_keys_shared_across_objects() {
     );
 
     let value = eval_const_program(&compiled, &registry(), &context()).unwrap();
-    let Value::Json(json) = value else {
-        panic!("expected a Json object");
-    };
-    assert_eq!(json.pointer("/first/id"), Some(&serde_json::json!(1)));
-    assert_eq!(json.pointer("/first/name"), Some(&serde_json::json!("a")));
-    assert_eq!(json.pointer("/second/id"), Some(&serde_json::json!(2)));
-    assert_eq!(json.pointer("/second/name"), Some(&serde_json::json!("b")));
+    let first = object_field(&value, "first");
+    let second = object_field(&value, "second");
+    assert_eq!(object_field(first, "id"), &Value::Int64(1));
+    assert_eq!(object_field(first, "name"), &Value::Text("a".to_string()));
+    assert_eq!(object_field(second, "id"), &Value::Int64(2));
+    assert_eq!(object_field(second, "name"), &Value::Text("b".to_string()));
 }
 
 #[test]
 fn compaction_interns_duplicate_keys_within_one_object() {
     // A name repeated inside a single object interns to one pool entry; the run
-    // still holds both occurrences (same id twice) and eval applies last-wins, as
-    // `serde_json::Map::insert` overwrites.
+    // still holds both occurrences (same id twice). This OptProgram is built
+    // directly, bypassing the converter that rejects duplicate keys at compile
+    // time — so eval still runs, and `Value::Object` (an ordered list) preserves
+    // BOTH entries rather than de-duplicating.
     let program = OptProgram {
         statements: vec![],
         result: OptExpr::Object(vec![
@@ -1929,13 +2055,13 @@ fn compaction_interns_duplicate_keys_within_one_object() {
     );
 
     let value = eval_const_program(&compiled, &registry(), &context()).unwrap();
-    let Value::Json(json) = value else {
-        panic!("expected a Json object");
-    };
     assert_eq!(
-        json.get("dup"),
-        Some(&serde_json::json!(2)),
-        "last write wins"
+        object_entries(&value),
+        &[
+            ("dup".to_string(), Value::Int64(1)),
+            ("dup".to_string(), Value::Int64(2)),
+        ],
+        "the ordered object keeps both occurrences in order"
     );
 }
 
@@ -1969,12 +2095,9 @@ fn compaction_preserves_object_key_run_order() {
 
     // And the key→value pairing survives interning.
     let value = eval_const_program(&compiled, &registry(), &context()).unwrap();
-    let Value::Json(json) = value else {
-        panic!("expected a Json object");
-    };
-    assert_eq!(json.get("b"), Some(&serde_json::json!(1)));
-    assert_eq!(json.get("a"), Some(&serde_json::json!(2)));
-    assert_eq!(json.get("c"), Some(&serde_json::json!(3)));
+    assert_eq!(object_field(&value, "b"), &Value::Int64(1));
+    assert_eq!(object_field(&value, "a"), &Value::Int64(2));
+    assert_eq!(object_field(&value, "c"), &Value::Int64(3));
 }
 
 // ---- Depth guard ----------------------------------------------------------
@@ -2229,10 +2352,12 @@ fn register_of(node: &OptNode) -> RegisterId {
 }
 
 #[test]
-fn move_marks_last_read_of_a_hoisted_register() {
-    // `field("c")` read twice → field hoist binds it to a register; the two
-    // reads become `[Register(r), Register(r)]`. The annotator turns the LAST
-    // read into a move and leaves the earlier one a clone.
+fn aliased_hoisted_register_in_one_call_is_not_moved() {
+    // `field("c")` read twice in ONE call → field hoist binds it to a register;
+    // both reads become `Register(r)`. Under the lazy `ArgWindow` a function may
+    // take one argument before reading another, so a register read by two
+    // arguments of the same call must NOT be moved — both stay clones (moving
+    // either could strand the sibling read). See the move-annotator's call guard.
     let compiled = compile_optimized(r#"concat(field("c"), field("c"))"#);
     let register = compiled.statements()[0].register;
     let OptNode::Call { args, .. } = compiled.node(compiled.result()) else {
@@ -2249,8 +2374,8 @@ fn move_marks_last_read_of_a_hoisted_register() {
         reads[0]
     );
     assert!(
-        matches!(reads[1], OptNode::RegisterTake(r) if *r == register),
-        "the last read moves: {:?}",
+        matches!(reads[1], OptNode::Register(r) if *r == register),
+        "the aliased second read also clones (not moved): {:?}",
         reads[1]
     );
 }
@@ -2321,10 +2446,10 @@ fn keeps_register_read_in_controlling_condition_as_clone() {
 }
 
 #[test]
-fn move_does_not_corrupt_an_earlier_register_read() {
-    // The last read of an impure register moves the value out (leaving the slot
-    // null); the earlier read cloned it first, so both halves must be equal — the
-    // move must not corrupt the value the earlier read observed.
+fn aliased_register_reads_in_one_call_both_clone_and_agree() {
+    // `concat(x, x)` reuses one impure register in two arguments of one call.
+    // The aliasing guard forbids moving either read, so both clone; the two
+    // halves of the result must then be equal (neither read corrupts the other).
     let compiled = compile_optimized(r#"x = randomHex(4); concat(x, x)"#);
     let OptNode::Call { args, .. } = compiled.node(compiled.result()) else {
         panic!("expected a concat call result");
@@ -2336,8 +2461,8 @@ fn move_does_not_corrupt_an_earlier_register_read() {
         .collect();
     assert!(matches!(reads[0], OptNode::Register(_)), "{:?}", reads[0]);
     assert!(
-        matches!(reads[1], OptNode::RegisterTake(_)),
-        "{:?}",
+        matches!(reads[1], OptNode::Register(_)),
+        "the aliased second read also clones: {:?}",
         reads[1]
     );
 
@@ -2519,7 +2644,7 @@ proptest! {
         let program = Parser::create().parse_expression(&source).unwrap();
 
         let unoptimized = compact(optimize(&program, &registry, &context, false).unwrap()).unwrap();
-        let optimized = match Optimizer::create(&registry, &context).compile(&program) {
+        let optimized = match Optimizer::create(&registry, &context).compile(&program, None, None) {
             Ok(program) => program,
             // The optimizer evaluates constants while folding; a constant in an
             // always-reached (eager) position that fails to evaluate stops the
@@ -2550,4 +2675,181 @@ proptest! {
             ),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3b — static type pass: schema-driven field typing + output validation.
+// Exercised end-to-end through `compile(program, schema, expected)`.
+// ---------------------------------------------------------------------------
+
+fn make_schema(fields: &[(&str, DataType, bool)]) -> Schema {
+    let fields = fields
+        .iter()
+        .map(|(name, data_type, nullable)| Field {
+            name: (*name).to_owned(),
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        })
+        .collect();
+    Schema::new(fields)
+}
+
+fn compile_typed(
+    source: &str,
+    schema: Option<&Schema>,
+    expected: Option<&ExpectedOutput>,
+) -> Result<CompactProgram, OptimizeError> {
+    Optimizer::create(&registry(), &context()).compile(&parse(source), schema, expected)
+}
+
+#[test]
+fn typed_field_arithmetic_compiles_with_schema() {
+    let schema = make_schema(&[("x", DataType::Int64, false)]);
+    let result = compile_typed("field(\"x\") + 1", Some(&schema), None);
+    assert!(result.is_ok(), "expected ok, got {result:?}");
+}
+
+#[test]
+fn field_absent_from_fixed_schema_is_an_error() {
+    let schema = make_schema(&[("a", DataType::Int64, false)]);
+    let err = compile_typed("field(\"b\")", Some(&schema), None).unwrap_err();
+    assert!(
+        matches!(err, OptimizeError::FieldNotInSchema { ref name } if name == "b"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn output_type_text_into_int_column_fails() {
+    let expected = ExpectedOutput {
+        data_type: DataType::Int64,
+        truncate: false,
+    };
+    let err = compile_typed("'hello'", None, Some(&expected)).unwrap_err();
+    assert!(
+        matches!(err, OptimizeError::OutputTypeMismatch { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn output_type_widening_is_compatible() {
+    // `1 + 1` folds to a small constant (bound 2 → materializes to Int8), so
+    // widening to an Int64 column is compatible.
+    let expected = ExpectedOutput {
+        data_type: DataType::Int64,
+        truncate: false,
+    };
+    assert!(compile_typed("1 + 1", None, Some(&expected)).is_ok());
+}
+
+#[test]
+fn output_type_narrowing_requires_truncate() {
+    let schema = make_schema(&[("x", DataType::Int64, false)]);
+    let into_int8 = |truncate| ExpectedOutput {
+        data_type: DataType::Int8,
+        truncate,
+    };
+    // Int64 field → Int8 sink: rejected without truncate, accepted with it.
+    let strict = compile_typed("field(\"x\")", Some(&schema), Some(&into_int8(false)));
+    assert!(
+        matches!(strict, Err(OptimizeError::OutputTypeMismatch { .. })),
+        "got {strict:?}"
+    );
+    let truncating = compile_typed("field(\"x\")", Some(&schema), Some(&into_int8(true)));
+    assert!(truncating.is_ok(), "got {truncating:?}");
+}
+
+#[test]
+fn small_int_literal_materializes_into_narrow_column() {
+    // `5` carries bound 3 → materializes to Int8, so it fits an Int8 column with
+    // no truncate. Without the int-bound path this would be Int64 → Int8 and fail.
+    let expected = ExpectedOutput {
+        data_type: DataType::Int8,
+        truncate: false,
+    };
+    assert!(compile_typed("5", None, Some(&expected)).is_ok());
+}
+
+#[test]
+fn schemaless_field_does_not_error_and_skips_output_check() {
+    // No schema: `field("x")` is unknown, so the result type is unknown and the
+    // output-compat check is deferred to the runtime asserts — compiles clean
+    // even against a concrete expected type.
+    let expected = ExpectedOutput {
+        data_type: DataType::Int64,
+        truncate: false,
+    };
+    let result = compile_typed("field(\"x\") + 1", None, Some(&expected));
+    assert!(result.is_ok(), "got {result:?}");
+}
+
+#[test]
+fn register_binding_is_typed_from_its_definition() {
+    // `x` read twice keeps a register; typing flows from the field through the
+    // register into the arithmetic and the output check.
+    let schema = make_schema(&[("a", DataType::Int32, false)]);
+    let expected = ExpectedOutput {
+        data_type: DataType::Int64,
+        truncate: false,
+    };
+    let result = compile_typed("x = field(\"a\"); x + x", Some(&schema), Some(&expected));
+    assert!(result.is_ok(), "got {result:?}");
+}
+
+#[test]
+fn untyped_path_skips_the_type_pass() {
+    // No schema and no expected output → the type pass does not run, so a
+    // would-be output mismatch (`'hello'` into nothing) compiles, preserving the
+    // untyped/comptime behaviour.
+    assert!(compile_typed("'hello'", None, None).is_ok());
+}
+
+#[test]
+fn function_type_mismatch_surfaces_as_a_compile_error() {
+    // The headline of the pass: a `Call` whose args are all known is fed to the
+    // function's `resolve_type`, and a `TypeMismatch` (here `add` over a Text
+    // field + an int) must surface as a compile error — not be swallowed into an
+    // unknown/Ok result. `resolve_type`'s `FuncError` maps to `OptimizeError`
+    // via `#[from]`, so it lands as the `Function` variant.
+    let schema = make_schema(&[("s", DataType::Text { size: None }, false)]);
+    let err = compile_typed("field(\"s\") + 1", Some(&schema), None).unwrap_err();
+    assert!(matches!(err, OptimizeError::Function(_)), "got {err:?}");
+}
+
+#[test]
+fn conditional_result_type_flows_to_the_output_check() {
+    // An `if` synthesizes its result type from the branches (merge_branches):
+    // both branches are the Int64 field, so the result is Int64 and a narrowing
+    // Int8 sink is rejected without truncate — proving the branch type actually
+    // flowed through the conditional into the output-compat check.
+    let schema = make_schema(&[("c", DataType::Bool, false), ("x", DataType::Int64, false)]);
+    let expected = ExpectedOutput {
+        data_type: DataType::Int8,
+        truncate: false,
+    };
+    let err = compile_typed(
+        "if(field(\"c\"), field(\"x\"), field(\"x\"))",
+        Some(&schema),
+        Some(&expected),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, OptimizeError::OutputTypeMismatch { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn schemaless_with_sample_absent_field_is_unknown_not_an_error() {
+    // A sample-derived schema is not authoritative: a field absent from the
+    // sample may still exist on a row, so it types as unknown (no
+    // FieldNotInSchema) — unlike the fixed-schema case.
+    let sampled = Schema::schemaless_with_sample(vec![Field {
+        name: "seen".to_owned(),
+        data_type: DataType::Int64,
+        nullable: false,
+    }]);
+    let result = compile_typed("field(\"absent\")", Some(&sampled), None);
+    assert!(result.is_ok(), "got {result:?}");
 }

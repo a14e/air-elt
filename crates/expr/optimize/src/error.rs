@@ -55,6 +55,29 @@ pub enum OptimizeError {
         second: &'static str,
     },
 
+    /// An object literal repeats a key. The parser preserves every entry, so a
+    /// duplicate is caught here at conversion (before const-folding can collapse
+    /// the literal into an opaque constant) and rejected — a repeated key is
+    /// almost always a mistake, and `Value::Object` is an ordered list that would
+    /// otherwise silently carry both entries.
+    #[error("duplicate key in object literal: {key:?}")]
+    DuplicateObjectKey { key: String },
+
+    /// A `field("name")` (or backtick shorthand) references a column absent from
+    /// a fixed source schema. Raised only against a
+    /// [`Fixed`](air_elt_types::SchemaKind::Fixed) schema — a schemaless source
+    /// cannot prove a field absent, so the read stays dynamic there.
+    #[error("source field `{name}` is not in the schema")]
+    FieldNotInSchema { name: String },
+
+    /// The compiled program's result type cannot produce the expected sink
+    /// column type (and `truncate` does not bridge the gap). Caught at compile
+    /// time so a mis-typed compute column fails validation before any data moves.
+    #[error(
+        "output type mismatch: result `{resolved}` is not compatible with expected `{expected}`"
+    )]
+    OutputTypeMismatch { resolved: String, expected: String },
+
     /// The compacted program needed more than `u16::MAX` arena slots.
     #[error("program too large to compact: {0}")]
     Overflow(#[from] ArenaOverflow),

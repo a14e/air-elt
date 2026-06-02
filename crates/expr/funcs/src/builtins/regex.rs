@@ -1,10 +1,10 @@
 use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::{DataType, Value};
 
-use crate::builtins::arg_extract::extract_text;
+use crate::builtins::arg_extract::extract_text_ref;
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
-use crate::signature::{EvalContext, ExprFunction};
+use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
 static REGEX_MATCH: RegexMatchFunc = RegexMatchFunc;
 static REGEX_REPLACE: RegexReplaceFunc = RegexReplaceFunc;
@@ -49,17 +49,21 @@ impl ExprFunction for RegexMatchFunc {
         Ok(NullableExprType::new(DataType::Bool, nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
-        let pattern = args.remove(1);
-        let text = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let pattern = args.read(1);
+        let text = args.read(0);
         if text.is_null() || pattern.is_null() {
             return Ok(Value::Null);
         }
-        let text = extract_text(text, "regexMatch")?;
-        let pattern = extract_text(pattern, "regexMatch")?;
+        let text = extract_text_ref(text, "regexMatch")?;
+        let pattern = extract_text_ref(pattern, "regexMatch")?;
         let matched = context
             .caches
-            .with_regex_cached(&pattern, |re| re.is_match(&text))?;
+            .with_regex_cached(pattern, |re| re.is_match(text))?;
         Ok(Value::Bool(matched))
     }
 
@@ -99,19 +103,23 @@ impl ExprFunction for RegexReplaceFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
-        let replacement = args.remove(2);
-        let pattern = args.remove(1);
-        let text = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let replacement = args.read(2);
+        let pattern = args.read(1);
+        let text = args.read(0);
         if text.is_null() || pattern.is_null() || replacement.is_null() {
             return Ok(Value::Null);
         }
-        let text = extract_text(text, "regexReplace")?;
-        let pattern = extract_text(pattern, "regexReplace")?;
-        let replacement = extract_text(replacement, "regexReplace")?;
-        let replaced = context.caches.with_regex_cached(&pattern, |re| {
-            re.replace_all(&text, replacement.as_str()).into_owned()
-        })?;
+        let text = extract_text_ref(text, "regexReplace")?;
+        let pattern = extract_text_ref(pattern, "regexReplace")?;
+        let replacement = extract_text_ref(replacement, "regexReplace")?;
+        let replaced = context
+            .caches
+            .with_regex_cached(pattern, |re| re.replace_all(text, replacement).into_owned())?;
         Ok(Value::Text(replaced))
     }
 
@@ -128,49 +136,50 @@ impl ExprFunction for RegexReplaceFunc {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::ctx;
+    use crate::test_support::{ctx, eval};
 
     #[test]
     fn regex_match_true() {
-        let result = REGEX_MATCH
-            .evaluate(
-                vec![Value::Text("hello123".into()), Value::Text(r"\d+".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &REGEX_MATCH,
+            smallvec::smallvec![Value::Text("hello123".into()), Value::Text(r"\d+".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
     #[test]
     fn regex_match_false() {
-        let result = REGEX_MATCH
-            .evaluate(
-                vec![Value::Text("hello".into()), Value::Text(r"\d+".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &REGEX_MATCH,
+            smallvec::smallvec![Value::Text("hello".into()), Value::Text(r"\d+".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(false));
     }
 
     #[test]
     fn regex_replace_all() {
-        let result = REGEX_REPLACE
-            .evaluate(
-                vec![
-                    Value::Text("a1b2c3".into()),
-                    Value::Text(r"\d".into()),
-                    Value::Text("X".into()),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &REGEX_REPLACE,
+            smallvec::smallvec![
+                Value::Text("a1b2c3".into()),
+                Value::Text(r"\d".into()),
+                Value::Text("X".into()),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Text("aXbXcX".into()));
     }
 
     #[test]
     fn regex_match_invalid_pattern() {
-        let result = REGEX_MATCH.evaluate(
-            vec![Value::Text("hello".into()), Value::Text("(".into())],
+        let result = eval(
+            &REGEX_MATCH,
+            smallvec::smallvec![Value::Text("hello".into()), Value::Text("(".into())],
             &ctx(),
         );
         assert!(matches!(result, Err(FuncError::RegexCompileFailed { .. })));
@@ -178,8 +187,9 @@ mod tests {
 
     #[test]
     fn regex_replace_invalid_pattern() {
-        let result = REGEX_REPLACE.evaluate(
-            vec![
+        let result = eval(
+            &REGEX_REPLACE,
+            smallvec::smallvec![
                 Value::Text("hello".into()),
                 Value::Text("(".into()),
                 Value::Text("x".into()),
@@ -191,43 +201,53 @@ mod tests {
 
     #[test]
     fn regex_match_null_propagation() {
-        let from_text = REGEX_MATCH
-            .evaluate(vec![Value::Null, Value::Text(r"\d".into())], &ctx())
-            .unwrap();
+        let from_text = eval(
+            &REGEX_MATCH,
+            smallvec::smallvec![Value::Null, Value::Text(r"\d".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(from_text, Value::Null);
 
-        let from_pattern = REGEX_MATCH
-            .evaluate(vec![Value::Text("abc".into()), Value::Null], &ctx())
-            .unwrap();
+        let from_pattern = eval(
+            &REGEX_MATCH,
+            smallvec::smallvec![Value::Text("abc".into()), Value::Null],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(from_pattern, Value::Null);
     }
 
     #[test]
     fn regex_replace_null_propagation() {
-        let result = REGEX_REPLACE
-            .evaluate(
-                vec![
-                    Value::Text("abc".into()),
-                    Value::Text(r"\d".into()),
-                    Value::Null,
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &REGEX_REPLACE,
+            smallvec::smallvec![
+                Value::Text("abc".into()),
+                Value::Text(r"\d".into()),
+                Value::Null,
+            ],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn regex_match_non_text_arg() {
-        let result =
-            REGEX_MATCH.evaluate(vec![Value::Int64(42), Value::Text(r"\d".into())], &ctx());
+        let result = eval(
+            &REGEX_MATCH,
+            smallvec::smallvec![Value::Int64(42), Value::Text(r"\d".into())],
+            &ctx(),
+        );
         assert!(matches!(result, Err(FuncError::TypeMismatch { .. })));
     }
 
     #[test]
     fn regex_replace_non_text_arg() {
-        let result = REGEX_REPLACE.evaluate(
-            vec![
+        let result = eval(
+            &REGEX_REPLACE,
+            smallvec::smallvec![
                 Value::Text("abc".into()),
                 Value::Text(r"\d".into()),
                 Value::Int64(1),

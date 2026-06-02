@@ -4,7 +4,6 @@ use air_elt_expr_types::limits::MAX_EXPR_DEPTH;
 
 use crate::context::ExpressionContext;
 use crate::error::ExprError;
-use crate::evaluator::Evaluator;
 
 pub struct ConfigExprPatcher {
     trie: PatternTrie,
@@ -22,8 +21,7 @@ impl ConfigExprPatcher {
         context: &ExpressionContext,
     ) -> Result<(), ExprError> {
         let parser = Parser::create_comptime();
-        let evaluator = Evaluator::create(context);
-        self.trie.root.walk_table(table, &parser, &evaluator)
+        self.trie.root.walk_table(table, &parser, context)
     }
 
     pub fn patch_table(
@@ -32,9 +30,8 @@ impl ConfigExprPatcher {
         context: &ExpressionContext,
     ) -> Result<(), ExprError> {
         let parser = Parser::create_comptime();
-        let evaluator = Evaluator::create(context);
         let mut value = toml::Value::Table(std::mem::take(table));
-        TrieNode::patch_subtree(&mut value, &parser, &evaluator, 0)?;
+        TrieNode::patch_subtree(&mut value, &parser, context, 0)?;
         if let toml::Value::Table(patched) = value {
             *table = patched;
         }
@@ -130,7 +127,7 @@ impl TrieNode {
         &self,
         table: &mut toml::Table,
         parser: &Parser,
-        evaluator: &Evaluator<'_>,
+        context: &ExpressionContext,
     ) -> Result<(), ExprError> {
         let keys: Vec<String> = table.keys().cloned().collect();
         for key in keys {
@@ -142,10 +139,10 @@ impl TrieNode {
             if let Some(child) = child_node {
                 if child.is_subtree_terminal {
                     if let Some(value) = table.get_mut(&key) {
-                        Self::patch_subtree(value, parser, evaluator, 0)?;
+                        Self::patch_subtree(value, parser, context, 0)?;
                     }
                 } else if let Some(value) = table.get_mut(&key) {
-                    child.walk_value(value, parser, evaluator)?;
+                    child.walk_value(value, parser, context)?;
                 }
             }
         }
@@ -156,17 +153,17 @@ impl TrieNode {
         &self,
         value: &mut toml::Value,
         parser: &Parser,
-        evaluator: &Evaluator<'_>,
+        context: &ExpressionContext,
     ) -> Result<(), ExprError> {
         match value {
-            toml::Value::Table(t) => self.walk_table(t, parser, evaluator),
+            toml::Value::Table(t) => self.walk_table(t, parser, context),
             toml::Value::Array(arr) => {
                 if let Some(array_child) = self.array_wildcard_child.as_deref() {
                     for element in arr.iter_mut() {
                         if array_child.is_subtree_terminal {
-                            Self::patch_subtree(element, parser, evaluator, 0)?;
+                            Self::patch_subtree(element, parser, context, 0)?;
                         } else if let toml::Value::Table(t) = element {
-                            array_child.walk_table(t, parser, evaluator)?;
+                            array_child.walk_table(t, parser, context)?;
                         }
                     }
                 }
@@ -179,7 +176,7 @@ impl TrieNode {
     fn patch_subtree(
         value: &mut toml::Value,
         parser: &Parser,
-        evaluator: &Evaluator<'_>,
+        context: &ExpressionContext,
         depth: usize,
     ) -> Result<(), ExprError> {
         if depth > MAX_EXPR_DEPTH {
@@ -191,7 +188,7 @@ impl TrieNode {
             toml::Value::String(s) => {
                 if parser.is_expr(s) {
                     let program = parser.parse(s)?;
-                    let result = evaluator.evaluate(&program)?;
+                    let result = context.evaluate_const(&program)?;
                     *value = result
                         .to_toml()
                         .unwrap_or_else(|| toml::Value::String(format!("{result:?}")));
@@ -201,13 +198,13 @@ impl TrieNode {
                 let keys: Vec<String> = t.keys().cloned().collect();
                 for k in keys {
                     if let Some(v) = t.get_mut(&k) {
-                        Self::patch_subtree(v, parser, evaluator, depth + 1)?;
+                        Self::patch_subtree(v, parser, context, depth + 1)?;
                     }
                 }
             }
             toml::Value::Array(arr) => {
                 for v in arr.iter_mut() {
-                    Self::patch_subtree(v, parser, evaluator, depth + 1)?;
+                    Self::patch_subtree(v, parser, context, depth + 1)?;
                 }
             }
             _ => {}

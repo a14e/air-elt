@@ -18,9 +18,12 @@
 use air_elt_expr_funcs::FunctionRegistry;
 use air_elt_expr_funcs::signature::EvalContext;
 use air_elt_expr_parse::model::Program;
+use air_elt_types::Schema;
 
 use crate::check::StaticCheckEngine;
-use crate::engines::{Compactor, GuardPropagation, MoveAnnotator, OptProgramConverter};
+use crate::engines::{
+    Compactor, ExpectedOutput, GuardPropagation, MoveAnnotator, OptProgramConverter, TypeChecker,
+};
 use crate::error::OptimizeError;
 use crate::model::CompactProgram;
 use crate::model::opt_program::OptProgram;
@@ -47,8 +50,26 @@ impl<'a> Optimizer<'a> {
 
     /// Lower, optimize, and compact a parsed program into its executable form,
     /// then annotate register last-uses as moves.
-    pub fn compile(&self, program: &Program) -> Result<CompactProgram, OptimizeError> {
+    ///
+    /// `schema` and `expected` drive the static **type** pass (Phase 3b): when
+    /// either is present, the optimized program is type-checked before
+    /// compaction — `SourceField`s are typed from `schema` (a field absent from a
+    /// *fixed* schema is an error), and when `expected` is set the result type is
+    /// validated against the sink column's type (honouring `truncate`). With both
+    /// `None` (the schemaless / comptime `ConfigExprPatcher` path) the type pass
+    /// is skipped and the program's surviving `TypeAssert`s do the per-row
+    /// checking, exactly as before.
+    pub fn compile(
+        &self,
+        program: &Program,
+        schema: Option<&Schema>,
+        expected: Option<&ExpectedOutput>,
+    ) -> Result<CompactProgram, OptimizeError> {
         let optimized = self.optimize(program, true)?;
+        if schema.is_some() || expected.is_some() {
+            TypeChecker::create(self.registry, schema, optimized.register_count)
+                .check(&optimized, expected)?;
+        }
         let mut compact = Compactor::create().compact(optimized)?;
         MoveAnnotator::create().annotate(&mut compact);
         Ok(compact)

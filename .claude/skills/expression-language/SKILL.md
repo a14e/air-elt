@@ -30,7 +30,7 @@ Operators (in precedence order, low to high; binary operators are left-associati
 The parser is precedence-climbing (one `PrattOperator` table in `pratt_operator.rs`), so deeply nested expressions stay shallow on the native stack and the depth guard (`MAX_EXPR_DEPTH`) returns a clean error instead of overflowing.
 
 Function calls: `name(arg1, arg2, ...)`.
-Object literals: `{ "key" = expr, "other" = expr }`.
+Object literals: `{ "key" = expr, "other" = expr }`. An object literal evaluates to a `Value::Object` (ordered key/value list, type `DataType::Object`) — the only producer of `Value::Object` in the language, and what the `object*` functions consume. Values keep their canonical types (an `Int64` field stays `Int64`, not a JSON number). A repeated key is a **compile-time error** (rejected in the optimizer's converter, before const-folding can collapse the literal). Arrays have no `Value` variant — a nested array value is carried as `Value::Json(Array)`.
 String interpolation: `"prefix {expr} suffix"`.
 
 Comments: `#` starts a line comment that runs to the end of the line (a trailing comment on a statement or a whole comment line). The newline is preserved, so a comment never merges two statements. A `#` inside a string literal (`'a # b'`, `"#fff"`) is a literal character, not a comment — only top-level expression source (and `{...}` interpolation segments) treats `#` as a comment.

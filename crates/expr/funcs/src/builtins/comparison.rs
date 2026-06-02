@@ -21,7 +21,7 @@ use air_elt_types::{DataType, Value, compare_values};
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
-use crate::signature::{EvalContext, ExprFunction};
+use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
 static EQUALS: EqualsFunc = EqualsFunc;
 static NOT_EQUALS: NotEqualsFunc = NotEqualsFunc;
@@ -67,9 +67,13 @@ impl ExprFunction for EqualsFunc {
         Ok(NullableExprType::non_null(DataType::Bool))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
+        let b = args.read(1);
         // Total equality: `null == null` is true, `null == <non-null>` is false.
         let equal = match (a.is_null(), b.is_null()) {
             (true, true) => true,
@@ -108,9 +112,13 @@ impl ExprFunction for NotEqualsFunc {
         Ok(NullableExprType::non_null(DataType::Bool))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
+        let b = args.read(1);
         // Total inequality: the negation of total equality (`null != null` is false).
         let equal = match (a.is_null(), b.is_null()) {
             (true, true) => true,
@@ -149,15 +157,17 @@ impl ExprFunction for GreaterFunc {
         Ok(NullableExprType::non_null(DataType::Bool))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
+        let b = args.read(1);
         if a.is_null() || b.is_null() {
             return Ok(Value::Bool(false));
         }
-        Ok(Value::Bool(
-            compare_values(&a, &b) == Some(Ordering::Greater),
-        ))
+        Ok(Value::Bool(compare_values(a, b) == Some(Ordering::Greater)))
     }
 }
 
@@ -189,13 +199,17 @@ impl ExprFunction for LessFunc {
         Ok(NullableExprType::non_null(DataType::Bool))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
+        let b = args.read(1);
         if a.is_null() || b.is_null() {
             return Ok(Value::Bool(false));
         }
-        Ok(Value::Bool(compare_values(&a, &b) == Some(Ordering::Less)))
+        Ok(Value::Bool(compare_values(a, b) == Some(Ordering::Less)))
     }
 }
 
@@ -227,14 +241,18 @@ impl ExprFunction for GreaterOrEqualsFunc {
         Ok(NullableExprType::non_null(DataType::Bool))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
+        let b = args.read(1);
         if a.is_null() || b.is_null() {
             return Ok(Value::Bool(false));
         }
         Ok(Value::Bool(matches!(
-            compare_values(&a, &b),
+            compare_values(a, b),
             Some(Ordering::Greater | Ordering::Equal)
         )))
     }
@@ -268,14 +286,18 @@ impl ExprFunction for LessOrEqualsFunc {
         Ok(NullableExprType::non_null(DataType::Bool))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
+        let b = args.read(1);
         if a.is_null() || b.is_null() {
             return Ok(Value::Bool(false));
         }
         Ok(Value::Bool(matches!(
-            compare_values(&a, &b),
+            compare_values(a, b),
             Some(Ordering::Less | Ordering::Equal)
         )))
     }
@@ -329,23 +351,29 @@ fn validate_comparable_args(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::ctx;
+    use crate::test_support::{ctx, eval};
 
     #[test]
     fn equals_same() {
         let f = EqualsFunc;
-        let result = f
-            .evaluate(vec![Value::Int64(5), Value::Int64(5)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(5), Value::Int64(5)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
     #[test]
     fn equals_different() {
         let f = EqualsFunc;
-        let result = f
-            .evaluate(vec![Value::Int64(5), Value::Int64(3)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(5), Value::Int64(3)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(false));
     }
 
@@ -354,41 +382,59 @@ mod tests {
         // `==`/`!=` do not propagate null: `null == null` is true, `null ==
         // <non-null>` is false (the dedicated null test, matching `values_equal`).
         assert_eq!(
-            EqualsFunc
-                .evaluate(vec![Value::Null, Value::Int64(5)], &ctx())
-                .unwrap(),
+            eval(
+                &EqualsFunc,
+                smallvec::smallvec![Value::Null, Value::Int64(5)],
+                &ctx()
+            )
+            .unwrap(),
             Value::Bool(false)
         );
         assert_eq!(
-            EqualsFunc
-                .evaluate(vec![Value::Null, Value::Null], &ctx())
-                .unwrap(),
+            eval(
+                &EqualsFunc,
+                smallvec::smallvec![Value::Null, Value::Null],
+                &ctx()
+            )
+            .unwrap(),
             Value::Bool(true)
         );
         assert_eq!(
-            NotEqualsFunc
-                .evaluate(vec![Value::Null, Value::Null], &ctx())
-                .unwrap(),
+            eval(
+                &NotEqualsFunc,
+                smallvec::smallvec![Value::Null, Value::Null],
+                &ctx()
+            )
+            .unwrap(),
             Value::Bool(false)
         );
         assert_eq!(
-            NotEqualsFunc
-                .evaluate(vec![Value::Null, Value::Int64(5)], &ctx())
-                .unwrap(),
+            eval(
+                &NotEqualsFunc,
+                smallvec::smallvec![Value::Null, Value::Int64(5)],
+                &ctx()
+            )
+            .unwrap(),
             Value::Bool(true)
         );
         // Null on the RIGHT operand for equals (the other match arm).
         assert_eq!(
-            EqualsFunc
-                .evaluate(vec![Value::Int64(5), Value::Null], &ctx())
-                .unwrap(),
+            eval(
+                &EqualsFunc,
+                smallvec::smallvec![Value::Int64(5), Value::Null],
+                &ctx()
+            )
+            .unwrap(),
             Value::Bool(false)
         );
         // Cross-numeric equality of non-null values is by value, not variant.
         assert_eq!(
-            EqualsFunc
-                .evaluate(vec![Value::Int8(5), Value::Int64(5)], &ctx())
-                .unwrap(),
+            eval(
+                &EqualsFunc,
+                smallvec::smallvec![Value::Int8(5), Value::Int64(5)],
+                &ctx()
+            )
+            .unwrap(),
             Value::Bool(true)
         );
     }
@@ -416,28 +462,40 @@ mod tests {
         // regardless of which side it is on.
         for other in [Value::Int64(5), Value::Null] {
             assert_eq!(
-                LessFunc
-                    .evaluate(vec![Value::Null, other.clone()], &ctx())
-                    .unwrap(),
+                eval(
+                    &LessFunc,
+                    smallvec::smallvec![Value::Null, other.clone()],
+                    &ctx()
+                )
+                .unwrap(),
                 Value::Bool(false)
             );
             assert_eq!(
-                GreaterFunc
-                    .evaluate(vec![other.clone(), Value::Null], &ctx())
-                    .unwrap(),
+                eval(
+                    &GreaterFunc,
+                    smallvec::smallvec![other.clone(), Value::Null],
+                    &ctx()
+                )
+                .unwrap(),
                 Value::Bool(false)
             );
         }
         assert_eq!(
-            LessOrEqualsFunc
-                .evaluate(vec![Value::Null, Value::Null], &ctx())
-                .unwrap(),
+            eval(
+                &LessOrEqualsFunc,
+                smallvec::smallvec![Value::Null, Value::Null],
+                &ctx()
+            )
+            .unwrap(),
             Value::Bool(false)
         );
         assert_eq!(
-            GreaterOrEqualsFunc
-                .evaluate(vec![Value::Int64(5), Value::Null], &ctx())
-                .unwrap(),
+            eval(
+                &GreaterOrEqualsFunc,
+                smallvec::smallvec![Value::Int64(5), Value::Null],
+                &ctx()
+            )
+            .unwrap(),
             Value::Bool(false)
         );
     }
@@ -445,48 +503,60 @@ mod tests {
     #[test]
     fn greater_int() {
         let f = GreaterFunc;
-        let result = f
-            .evaluate(vec![Value::Int64(5), Value::Int64(3)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(5), Value::Int64(3)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
     #[test]
     fn less_float() {
         let f = LessFunc;
-        let result = f
-            .evaluate(vec![Value::Float64(1.0), Value::Float64(2.0)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Float64(1.0), Value::Float64(2.0)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
     #[test]
     fn greater_or_equals_equal() {
         let f = GreaterOrEqualsFunc;
-        let result = f
-            .evaluate(vec![Value::Int64(5), Value::Int64(5)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(5), Value::Int64(5)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
     #[test]
     fn less_or_equals_text() {
         let f = LessOrEqualsFunc;
-        let result = f
-            .evaluate(
-                vec![Value::Text("abc".into()), Value::Text("abd".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("abc".into()), Value::Text("abd".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
     #[test]
     fn less_cross_numeric_int_widths() {
         let f = LessFunc;
-        let result = f
-            .evaluate(vec![Value::Int8(1), Value::Int64(2)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int8(1), Value::Int64(2)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
@@ -496,16 +566,19 @@ mod tests {
         // must work cross-numeric (a huge positive value is not < 0).
         let f = LessFunc;
         let big = Value::BigInt(num_bigint::BigInt::from(i64::MAX) + 1);
-        let result = f.evaluate(vec![big, Value::Int64(0)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![big, Value::Int64(0)], &ctx()).unwrap();
         assert_eq!(result, Value::Bool(false));
     }
 
     #[test]
     fn greater_int_vs_float() {
         let f = GreaterFunc;
-        let result = f
-            .evaluate(vec![Value::Int64(3), Value::Float64(2.5)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(3), Value::Float64(2.5)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
@@ -514,21 +587,30 @@ mod tests {
         // NaN has no ordering: every comparison against it is false.
         let nan = Value::Float64(f64::NAN);
         assert_eq!(
-            LessFunc
-                .evaluate(vec![nan.clone(), Value::Float64(1.0)], &ctx())
-                .unwrap(),
+            eval(
+                &LessFunc,
+                smallvec::smallvec![nan.clone(), Value::Float64(1.0)],
+                &ctx()
+            )
+            .unwrap(),
             Value::Bool(false)
         );
         assert_eq!(
-            LessOrEqualsFunc
-                .evaluate(vec![nan.clone(), nan.clone()], &ctx())
-                .unwrap(),
+            eval(
+                &LessOrEqualsFunc,
+                smallvec::smallvec![nan.clone(), nan.clone()],
+                &ctx()
+            )
+            .unwrap(),
             Value::Bool(false)
         );
         assert_eq!(
-            GreaterOrEqualsFunc
-                .evaluate(vec![nan.clone(), Value::Float64(1.0)], &ctx())
-                .unwrap(),
+            eval(
+                &GreaterOrEqualsFunc,
+                smallvec::smallvec![nan.clone(), Value::Float64(1.0)],
+                &ctx()
+            )
+            .unwrap(),
             Value::Bool(false)
         );
     }

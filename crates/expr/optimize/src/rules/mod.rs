@@ -16,6 +16,7 @@ mod flatten;
 mod flatten_conditionals;
 mod idempotent;
 mod multi_if_collapse;
+mod object_access;
 mod or_membership;
 mod rewrite_driver;
 mod round_trip;
