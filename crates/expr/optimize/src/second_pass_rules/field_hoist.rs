@@ -22,6 +22,7 @@ use ahash::AHashMap;
 use air_elt_expr_funcs::FunctionRegistry;
 
 use super::engine::ProgramPass;
+use crate::model::node_id::NodeCounter;
 use crate::model::opt_expr::OptExpr;
 use crate::model::opt_program::{OptProgram, OptStatement};
 
@@ -31,7 +32,12 @@ impl ProgramPass for FieldHoister {
     /// Hoist every source field read more than once into a fresh register
     /// binding, rewriting the reads to register references. Size-increasing, so
     /// it runs as a one-shot finalization pass — never inside the fixpoint.
-    fn run(&self, program: &mut OptProgram, _registry: &FunctionRegistry) {
+    fn run(
+        &self,
+        program: &mut OptProgram,
+        _registry: &FunctionRegistry,
+        node_counter: &NodeCounter,
+    ) {
         let mut counts: AHashMap<String, usize> = AHashMap::new();
         let mut order: Vec<String> = Vec::new();
         for statement in &program.statements {
@@ -60,16 +66,16 @@ impl ProgramPass for FieldHoister {
         }
 
         for statement in &mut program.statements {
-            rewrite_fields(&mut statement.value, &registers);
+            rewrite_fields(&mut statement.value, &registers, node_counter);
         }
-        rewrite_fields(&mut program.result, &registers);
+        rewrite_fields(&mut program.result, &registers, node_counter);
 
         // Prepend one binding per hoisted field; the reads now reference them.
         let mut statements = Vec::with_capacity(targets.len() + program.statements.len());
         for name in &targets {
             statements.push(OptStatement {
                 register: registers[name],
-                value: OptExpr::SourceField(name.clone()),
+                value: OptExpr::SourceField(node_counter.fresh_id(), name.clone()),
             });
         }
         statements.append(&mut program.statements);
@@ -81,15 +87,15 @@ impl ProgramPass for FieldHoister {
 /// Tally each [`OptExpr::SourceField`] read, recording first-appearance order.
 fn count_fields(expr: &OptExpr, counts: &mut AHashMap<String, usize>, order: &mut Vec<String>) {
     match expr {
-        OptExpr::SourceField(name) => {
+        OptExpr::SourceField(_, name) => {
             let entry = counts.entry(name.clone()).or_insert(0);
             if *entry == 0 {
                 order.push(name.clone());
             }
             *entry += 1;
         }
-        OptExpr::Const(_) | OptExpr::Register(_) | OptExpr::Fields(_) => {}
-        OptExpr::Field(inner) => count_fields(inner, counts, order),
+        OptExpr::Const(..) | OptExpr::Register(..) | OptExpr::Fields(..) => {}
+        OptExpr::Field(_, inner) => count_fields(inner, counts, order),
         OptExpr::Call { args, .. } => {
             for arg in args {
                 count_fields(arg, counts, order);
@@ -99,36 +105,43 @@ fn count_fields(expr: &OptExpr, counts: &mut AHashMap<String, usize>, order: &mu
             condition,
             then_branch,
             else_branch,
+            ..
         } => {
             count_fields(condition, counts, order);
             count_fields(then_branch, counts, order);
             count_fields(else_branch, counts, order);
         }
-        OptExpr::MultiIf { branches, default } => {
+        OptExpr::MultiIf {
+            branches, default, ..
+        } => {
             for (condition, value) in branches {
                 count_fields(condition, counts, order);
                 count_fields(value, counts, order);
             }
             count_fields(default, counts, order);
         }
-        OptExpr::IfNull { value, alternative } => {
+        OptExpr::IfNull {
+            value, alternative, ..
+        } => {
             count_fields(value, counts, order);
             count_fields(alternative, counts, order);
         }
-        OptExpr::NullIf { value, sentinel } => {
+        OptExpr::NullIf {
+            value, sentinel, ..
+        } => {
             count_fields(value, counts, order);
             count_fields(sentinel, counts, order);
         }
-        OptExpr::And { left, right } | OptExpr::Or { left, right } => {
+        OptExpr::And { left, right, .. } | OptExpr::Or { left, right, .. } => {
             count_fields(left, counts, order);
             count_fields(right, counts, order);
         }
-        OptExpr::Interpolation(segments) => {
+        OptExpr::Interpolation(_, segments) => {
             for segment in segments {
                 count_fields(segment, counts, order);
             }
         }
-        OptExpr::Object(entries) => {
+        OptExpr::Object(_, entries) => {
             for (_, value) in entries {
                 count_fields(value, counts, order);
             }
@@ -137,6 +150,7 @@ fn count_fields(expr: &OptExpr, counts: &mut AHashMap<String, usize>, order: &mu
             inputs,
             table,
             default,
+            ..
         } => {
             for input in inputs {
                 count_fields(input, counts, order);
@@ -147,75 +161,103 @@ fn count_fields(expr: &OptExpr, counts: &mut AHashMap<String, usize>, order: &mu
             count_fields(default, counts, order);
         }
         OptExpr::TypeAssert { inner, .. } => count_fields(inner, counts, order),
+        OptExpr::Block {
+            statements, result, ..
+        } => {
+            for statement in statements {
+                count_fields(&statement.value, counts, order);
+            }
+            count_fields(result, counts, order);
+        }
     }
 }
 
 /// Replace every hoisted [`OptExpr::SourceField`] with its register reference.
-fn rewrite_fields(expr: &mut OptExpr, registers: &AHashMap<String, u16>) {
+fn rewrite_fields(
+    expr: &mut OptExpr,
+    registers: &AHashMap<String, u16>,
+    node_counter: &NodeCounter,
+) {
     match expr {
-        OptExpr::SourceField(name) => {
+        OptExpr::SourceField(_, name) => {
             if let Some(register) = registers.get(name) {
-                *expr = OptExpr::Register(*register);
+                *expr = OptExpr::Register(node_counter.fresh_id(), *register);
             }
         }
-        OptExpr::Const(_) | OptExpr::Register(_) | OptExpr::Fields(_) => {}
-        OptExpr::Field(inner) => rewrite_fields(inner, registers),
+        OptExpr::Const(..) | OptExpr::Register(..) | OptExpr::Fields(..) => {}
+        OptExpr::Field(_, inner) => rewrite_fields(inner, registers, node_counter),
         OptExpr::Call { args, .. } => {
             for arg in args {
-                rewrite_fields(arg, registers);
+                rewrite_fields(arg, registers, node_counter);
             }
         }
         OptExpr::If {
             condition,
             then_branch,
             else_branch,
+            ..
         } => {
-            rewrite_fields(condition, registers);
-            rewrite_fields(then_branch, registers);
-            rewrite_fields(else_branch, registers);
+            rewrite_fields(condition, registers, node_counter);
+            rewrite_fields(then_branch, registers, node_counter);
+            rewrite_fields(else_branch, registers, node_counter);
         }
-        OptExpr::MultiIf { branches, default } => {
+        OptExpr::MultiIf {
+            branches, default, ..
+        } => {
             for (condition, value) in branches {
-                rewrite_fields(condition, registers);
-                rewrite_fields(value, registers);
+                rewrite_fields(condition, registers, node_counter);
+                rewrite_fields(value, registers, node_counter);
             }
-            rewrite_fields(default, registers);
+            rewrite_fields(default, registers, node_counter);
         }
-        OptExpr::IfNull { value, alternative } => {
-            rewrite_fields(value, registers);
-            rewrite_fields(alternative, registers);
+        OptExpr::IfNull {
+            value, alternative, ..
+        } => {
+            rewrite_fields(value, registers, node_counter);
+            rewrite_fields(alternative, registers, node_counter);
         }
-        OptExpr::NullIf { value, sentinel } => {
-            rewrite_fields(value, registers);
-            rewrite_fields(sentinel, registers);
+        OptExpr::NullIf {
+            value, sentinel, ..
+        } => {
+            rewrite_fields(value, registers, node_counter);
+            rewrite_fields(sentinel, registers, node_counter);
         }
-        OptExpr::And { left, right } | OptExpr::Or { left, right } => {
-            rewrite_fields(left, registers);
-            rewrite_fields(right, registers);
+        OptExpr::And { left, right, .. } | OptExpr::Or { left, right, .. } => {
+            rewrite_fields(left, registers, node_counter);
+            rewrite_fields(right, registers, node_counter);
         }
-        OptExpr::Interpolation(segments) => {
+        OptExpr::Interpolation(_, segments) => {
             for segment in segments {
-                rewrite_fields(segment, registers);
+                rewrite_fields(segment, registers, node_counter);
             }
         }
-        OptExpr::Object(entries) => {
+        OptExpr::Object(_, entries) => {
             for (_, value) in entries {
-                rewrite_fields(value, registers);
+                rewrite_fields(value, registers, node_counter);
             }
         }
         OptExpr::Switch {
             inputs,
             table,
             default,
+            ..
         } => {
             for input in inputs {
-                rewrite_fields(input, registers);
+                rewrite_fields(input, registers, node_counter);
             }
             for (_, value) in table {
-                rewrite_fields(value, registers);
+                rewrite_fields(value, registers, node_counter);
             }
-            rewrite_fields(default, registers);
+            rewrite_fields(default, registers, node_counter);
         }
-        OptExpr::TypeAssert { inner, .. } => rewrite_fields(inner, registers),
+        OptExpr::TypeAssert { inner, .. } => rewrite_fields(inner, registers, node_counter),
+        OptExpr::Block {
+            statements, result, ..
+        } => {
+            for statement in statements {
+                rewrite_fields(&mut statement.value, registers, node_counter);
+            }
+            rewrite_fields(result, registers, node_counter);
+        }
     }
 }

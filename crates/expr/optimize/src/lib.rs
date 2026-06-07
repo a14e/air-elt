@@ -2,7 +2,9 @@
 //! IR ready for fast per-row execution.
 //!
 //! The pipeline is
-//! `convert → fixpoint → finalize → check → compact → annotate`:
+//! `convert → fixpoint → finalize → check → [type-check → discharge] → compact →
+//! annotate` (the bracketed typed steps run only when a schema or expected output
+//! is supplied):
 //! * **convert** resolves function names/arities to registry references and
 //!   variables to register slots ([`engines::opt_program_converter`]).
 //! * **fixpoint** rewrites the heap IR to a fixpoint — downward guard
@@ -15,6 +17,12 @@
 //!   whole-program steps (field-read hoisting) that cannot join the monotone loop.
 //! * **check** runs the static-analysis pass over the optimized program
 //!   ([`check`]).
+//! * **type-check** (typed path only) derives the static type map
+//!   (`AHashMap<NodeId, Type>`) over the heap IR ([`engines::type_check`]).
+//! * **typed rewrites** (typed path only, interleaved into the fixpoint) apply
+//!   the simplifications a known type makes sound — stripping redundant
+//!   `TypeAssert`s and casts, `min`/`max`/`concat` flatten, string `+` → `concat`,
+//!   identity/annihilation peepholes, and power reduction ([`typed`]).
 //! * **compact** lays the result into arenas in execution order with an interned
 //!   constant pool ([`engines::compact`]).
 //! * **annotate** marks each register's last read as a move
@@ -37,12 +45,13 @@
 pub(crate) mod check;
 pub(crate) mod engines;
 pub mod error;
-pub(crate) mod fallibility;
 pub mod model;
 pub mod optimizer;
 pub(crate) mod pass;
 pub(crate) mod rules;
 pub(crate) mod second_pass_rules;
+pub(crate) mod typed;
+pub(crate) mod util;
 
 #[cfg(test)]
 mod test_utils;

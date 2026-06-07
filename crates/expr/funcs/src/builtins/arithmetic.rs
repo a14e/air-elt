@@ -945,22 +945,12 @@ impl ExprFunction for PowerFunc {
         if a.is_null() || b.is_null() {
             return Ok(Value::Null);
         }
-        // Integer power: both Int64 -> compute as integer
-        if let (Value::Int64(base), Value::Int64(exp)) = (a, b) {
-            if *exp >= 0 {
-                let exp_u32 = (*exp).min(63) as u32;
-                match base.checked_pow(exp_u32) {
-                    Some(result) => return Ok(Value::Int64(result)),
-                    None => {
-                        return Ok(Value::BigInt(BigInt::from(*base).pow(exp_u32)));
-                    }
-                }
-            }
-            // Negative exponent for integers -> float
-            let base_f = *base as f64;
-            let exp_f = *exp as f64;
-            return Ok(Value::Float64(base_f.powf(exp_f)));
-        }
+        // `power` always resolves to `Float64`, so it evaluates as float
+        // exponentiation for every input — type and value agree. Integer-base,
+        // constant-non-negative-exponent powers are lowered to exact integer
+        // multiplication by the optimizer before they reach here; what survives as
+        // a `power` call (dynamic, negative, or fractional exponents, or a float
+        // base) is genuinely `Float64`.
         let base = to_f64(a, "power")?;
         let exp = to_f64(b, "power")?;
         Ok(Value::Float64(base.powf(exp)))
@@ -1191,6 +1181,42 @@ mod tests {
     }
 
     #[test]
+    fn min_of_non_null_args_resolves_non_null() {
+        // `min`/`max` skip NULLs, so with no nullable argument the extremum can
+        // never be NULL — the resolved type must be non-nullable.
+        let args = [
+            NullableExprType::non_null(DataType::Int64),
+            NullableExprType::non_null(DataType::Int32),
+        ];
+        let resolved = MinFunc.resolve_type(&args).unwrap();
+        assert!(!resolved.nullable, "min of non-null args is non-null");
+        assert_eq!(resolved.data_type, DataType::Int64);
+    }
+
+    #[test]
+    fn max_with_one_non_null_arg_resolves_non_null() {
+        // One non-null argument guarantees a non-null extremum even alongside a
+        // nullable one (the nullable arg, if NULL, is skipped).
+        let args = [
+            NullableExprType::nullable(DataType::Int64),
+            NullableExprType::non_null(DataType::Int64),
+        ];
+        let resolved = MaxFunc.resolve_type(&args).unwrap();
+        assert!(!resolved.nullable, "one non-null arg makes max non-null");
+    }
+
+    #[test]
+    fn min_of_all_nullable_args_resolves_nullable() {
+        // Every argument nullable → every-arg-NULL is possible → NULL result.
+        let args = [
+            NullableExprType::nullable(DataType::Int64),
+            NullableExprType::nullable(DataType::Int64),
+        ];
+        let resolved = MinFunc.resolve_type(&args).unwrap();
+        assert!(resolved.nullable, "min of all-nullable args is nullable");
+    }
+
+    #[test]
     fn min_spills_past_inline_capacity() {
         // Six arguments exceed `FuncArgVec`'s inline capacity of four, forcing
         // the heap spill: the n-ary `fold_extremum` consumer must return the
@@ -1232,7 +1258,10 @@ mod tests {
     }
 
     #[test]
-    fn power_integer_both_int64() {
+    fn power_of_integer_args_evaluates_as_float() {
+        // The runtime `power` is Float64-only — it always resolves to Float64, so
+        // type and value agree. Exact integer powers are produced by the
+        // optimizer's lowering to multiplication, never here.
         let f = PowerFunc;
         let result = eval(
             &f,
@@ -1240,23 +1269,17 @@ mod tests {
             &ctx(),
         )
         .unwrap();
-        assert_eq!(result, Value::Int64(1024));
+        // Assert the VARIANT, not just the value: `Value` equality is
+        // cross-numeric (`Int64(1024) == Float64(1024.0)`), so `assert_eq!` alone
+        // would not catch a regression back to an integer result.
+        assert!(
+            matches!(result, Value::Float64(f) if f == 1024.0),
+            "got {result:?}"
+        );
     }
 
     #[test]
-    fn power_integer_overflow_to_bigint() {
-        let f = PowerFunc;
-        let result = eval(
-            &f,
-            smallvec::smallvec![Value::Int64(2), Value::Int64(63)],
-            &ctx(),
-        )
-        .unwrap();
-        assert_eq!(result, Value::BigInt(BigInt::from(2).pow(63)));
-    }
-
-    #[test]
-    fn power_integer_negative_exponent() {
+    fn power_negative_exponent_is_float() {
         let f = PowerFunc;
         let result = eval(
             &f,
@@ -1501,7 +1524,9 @@ mod tests {
         ];
         let resolved = f.resolve_type(&args).unwrap();
         assert_eq!(resolved.data_type, DataType::Float64);
-        assert!(resolved.nullable);
+        // Both arguments are non-null, so the extremum is non-null (NULLs are
+        // skipped, and there are none to skip here).
+        assert!(!resolved.nullable);
     }
 
     // -----------------------------------------------------------------------

@@ -21,6 +21,7 @@ pub(crate) struct SwitchCollapse;
 impl Rule for SwitchCollapse {
     fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
         let OptExpr::Switch {
+            id,
             inputs,
             table,
             default,
@@ -40,6 +41,7 @@ impl Rule for SwitchCollapse {
             default_is_same_key_switch && inputs.iter().all(|expr| is_pure(expr, cx.registry));
         if !collapsible {
             return Rewrite::Same(OptExpr::Switch {
+                id,
                 inputs,
                 table,
                 default,
@@ -61,6 +63,7 @@ impl Rule for SwitchCollapse {
                     }
                 }
                 Rewrite::Changed(OptExpr::Switch {
+                    id,
                     inputs,
                     table: merged,
                     default: inner_default,
@@ -68,6 +71,7 @@ impl Rule for SwitchCollapse {
             }
             // `collapsible` already proved the default is a switch.
             other => Rewrite::Same(OptExpr::Switch {
+                id,
                 inputs,
                 table,
                 default: Box::new(other),

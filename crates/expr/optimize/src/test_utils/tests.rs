@@ -17,8 +17,10 @@ use air_elt_types::{DataType, Field, Key, Schema, Value};
 use crate::ExpectedOutput;
 use proptest::prelude::*;
 
-use crate::engines::{Compactor, EvalError, ProgramEvaluator};
+use crate::engines::type_check::{TypeChecker, TypeMap};
+use crate::engines::{Compactor, EvalError, FieldSource, ProgramEvaluator};
 use crate::error::OptimizeError;
+use crate::model::node_id::{NodeCounter, NodeId};
 use crate::model::opt_expr::{AssertYield, OptExpr};
 use crate::model::opt_program::{OptProgram, OptStatement};
 use crate::model::{CompactProgram, NodeRef, OptNode, RegisterId, TypeClass};
@@ -34,7 +36,7 @@ fn optimize(
     context: &EvalContext,
     apply_rules: bool,
 ) -> Result<OptProgram, OptimizeError> {
-    Optimizer::create(registry, context).optimize(program, apply_rules)
+    Optimizer::create(registry, context).optimize(program, apply_rules, None)
 }
 
 fn compact(lowered: OptProgram) -> Result<CompactProgram, OptimizeError> {
@@ -122,7 +124,8 @@ fn rewrite_result(result: OptExpr, register_count: RegisterId) -> OptExpr {
     let registry = registry();
     let context = context();
     let rule_set = RuleSet::create(&registry);
-    let driver = RewriteDriver::create(&rule_set, &registry, &context);
+    let node_counter = NodeCounter::create();
+    let driver = RewriteDriver::create(&rule_set, &registry, &context, &node_counter);
     let mut program = OptProgram {
         statements: vec![],
         result,
@@ -137,8 +140,12 @@ fn rewrite_result(result: OptExpr, register_count: RegisterId) -> OptExpr {
 fn register_equals(register: RegisterId, constant: Value) -> OptExpr {
     let equals = registry().get_ref("equals", Some(2)).unwrap();
     OptExpr::Call {
+        id: NodeId::PLACEHOLDER,
         func: equals,
-        args: vec![OptExpr::Register(register), OptExpr::Const(constant)],
+        args: vec![
+            OptExpr::Register(NodeId::PLACEHOLDER, register),
+            OptExpr::Const(NodeId::PLACEHOLDER, constant),
+        ],
     }
 }
 
@@ -147,7 +154,7 @@ fn eval_with_register0(result: OptExpr, seed: Value) -> Value {
     let program = OptProgram {
         statements: vec![OptStatement {
             register: 0,
-            value: OptExpr::Const(seed),
+            value: OptExpr::Const(NodeId::PLACEHOLDER, seed),
         }],
         result,
         register_count: 1,
@@ -190,11 +197,17 @@ fn substitutes_null_operand_in_is_null_branch() {
     else {
         panic!("expected if, got {result:?}");
     };
-    assert_eq!(*then_branch, OptExpr::Const(Value::Null));
+    assert_eq!(
+        *then_branch,
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Null)
+    );
     // The else only knows `x` is non-null (no value), so the read survives —
     // here a hoisted register, since the field is read several times.
     assert!(
-        matches!(*else_branch, OptExpr::Register(_) | OptExpr::SourceField(_)),
+        matches!(
+            *else_branch,
+            OptExpr::Register(..) | OptExpr::SourceField(..)
+        ),
         "expected the operand read to survive, got {else_branch:?}"
     );
 }
@@ -206,7 +219,7 @@ fn if_null_alternative_folds_through_null_to_the_value() {
     // `ifNull(c, null)` then collapses to `c`.
     assert_eq!(
         optimized_result(r#"ifNull(field("c"), upper(field("c")))"#),
-        OptExpr::SourceField("c".to_string())
+        OptExpr::SourceField(NodeId::PLACEHOLDER, "c".to_string())
     );
 }
 
@@ -215,7 +228,7 @@ fn if_null_with_null_alternative_folds_to_value() {
     // `ifNull(value, null)` ≡ `value` — the redundant wrapper is dropped.
     assert_eq!(
         optimized_result(r#"ifNull(field("c"), null)"#),
-        OptExpr::SourceField("c".to_string())
+        OptExpr::SourceField(NodeId::PLACEHOLDER, "c".to_string())
     );
 }
 
@@ -226,7 +239,10 @@ fn substitutes_string_equality_operand_in_then_branch() {
     let OptExpr::If { then_branch, .. } = result else {
         panic!("expected if, got {result:?}");
     };
-    assert_eq!(*then_branch, OptExpr::Const(Value::Text("YES".to_string())));
+    assert_eq!(
+        *then_branch,
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("YES".to_string()))
+    );
 }
 
 #[test]
@@ -252,7 +268,10 @@ fn threads_equality_fact_into_and_right_operand() {
     let OptExpr::And { right, .. } = result else {
         panic!("expected and, got {result:?}");
     };
-    assert_eq!(*right, OptExpr::Const(Value::Bool(false)));
+    assert_eq!(
+        *right,
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Bool(false))
+    );
 }
 
 #[test]
@@ -263,7 +282,10 @@ fn substitutes_null_in_is_not_null_else_branch() {
     let OptExpr::If { else_branch, .. } = result else {
         panic!("expected if, got {result:?}");
     };
-    assert_eq!(*else_branch, OptExpr::Const(Value::Null));
+    assert_eq!(
+        *else_branch,
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Null)
+    );
 }
 
 #[test]
@@ -274,7 +296,10 @@ fn folds_not_equals_fact_in_else_branch() {
     let OptExpr::If { else_branch, .. } = result else {
         panic!("expected if, got {result:?}");
     };
-    assert_eq!(*else_branch, OptExpr::Const(Value::Text("YES".to_string())));
+    assert_eq!(
+        *else_branch,
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("YES".to_string()))
+    );
 }
 
 #[test]
@@ -306,10 +331,13 @@ fn accepts_feasible_conjunctions() {
 
 #[test]
 fn folds_arithmetic_to_constant() {
-    assert_eq!(optimized_result("1 + 2"), OptExpr::Const(Value::Int64(3)));
+    assert_eq!(
+        optimized_result("1 + 2"),
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(3))
+    );
     assert_eq!(
         optimized_result("2 * 3 + 4"),
-        OptExpr::Const(Value::Int64(10))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(10))
     );
 }
 
@@ -317,13 +345,13 @@ fn folds_arithmetic_to_constant() {
 fn folds_nested_pure_calls() {
     assert_eq!(
         optimized_result("concat(toString(1 + 2), '!')"),
-        OptExpr::Const(Value::Text("3!".to_string()))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("3!".to_string()))
     );
 }
 
 #[test]
 fn collapses_field_forms_to_source_field() {
-    let expected = OptExpr::SourceField("x".to_string());
+    let expected = OptExpr::SourceField(NodeId::PLACEHOLDER, "x".to_string());
     assert_eq!(optimized_result("field(\"x\")"), expected);
     assert_eq!(optimized_result("field(`x`)"), expected);
     assert_eq!(optimized_result("field(field(\"x\"))"), expected);
@@ -338,8 +366,9 @@ fn double_negation_collapses_to_bool_type_assert() {
             inner,
             expect,
             on_present,
+            ..
         } => {
-            assert!(matches!(*inner, OptExpr::SourceField(name) if name == "flag"));
+            assert!(matches!(*inner, OptExpr::SourceField(_, name) if name == "flag"));
             assert_eq!(expect, TypeClass::Bool);
             assert_eq!(on_present, AssertYield::Identity);
         }
@@ -351,7 +380,7 @@ fn double_negation_collapses_to_bool_type_assert() {
 fn prunes_multi_if_with_constant_conditions() {
     assert_eq!(
         optimized_result("multiIf(false, 1, true, 2, 3)"),
-        OptExpr::Const(Value::Int64(2))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(2))
     );
 }
 
@@ -359,15 +388,15 @@ fn prunes_multi_if_with_constant_conditions() {
 fn prunes_constant_and_or() {
     assert_eq!(
         optimized_result("true && field(\"b\")"),
-        OptExpr::SourceField("b".to_string())
+        OptExpr::SourceField(NodeId::PLACEHOLDER, "b".to_string())
     );
     assert_eq!(
         optimized_result("false && field(\"b\")"),
-        OptExpr::Const(Value::Bool(false))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Bool(false))
     );
     assert_eq!(
         optimized_result("true || field(\"b\")"),
-        OptExpr::Const(Value::Bool(true))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Bool(true))
     );
 }
 
@@ -379,11 +408,17 @@ fn folds_interpolation_and_object() {
     let folded = optimize(&interpolation, &registry, &context, true)
         .unwrap()
         .result;
-    assert_eq!(folded, OptExpr::Const(Value::Text("a2b".to_string())));
+    assert_eq!(
+        folded,
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("a2b".to_string()))
+    );
 
     assert_eq!(
         optimized_result("{\"k\" = 1 + 1}"),
-        OptExpr::Const(Value::Object(vec![("k".to_string(), Value::Int64(2))])),
+        OptExpr::Const(
+            NodeId::PLACEHOLDER,
+            Value::Object(vec![("k".to_string(), Value::Int64(2))])
+        ),
     );
 }
 
@@ -631,7 +666,7 @@ fn equals_field_name(condition: &OptExpr) -> Option<&str> {
         return None;
     };
     match args.first() {
-        Some(OptExpr::SourceField(name)) => Some(name.as_str()),
+        Some(OptExpr::SourceField(_, name)) => Some(name.as_str()),
         _ => None,
     }
 }
@@ -645,16 +680,17 @@ fn collapses_single_branch_multi_if_to_if() {
             condition,
             then_branch,
             else_branch,
+            ..
         } => {
             assert_eq!(equals_field_name(&condition), Some("a"));
             assert_eq!(
                 *then_branch,
-                OptExpr::Const(Value::Int64(10)),
+                OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(10)),
                 "branch value"
             );
             assert_eq!(
                 *else_branch,
-                OptExpr::Const(Value::Int64(0)),
+                OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(0)),
                 "default → else"
             );
         }
@@ -671,11 +707,12 @@ fn collapses_two_branch_multi_if_to_nested_if() {
             condition,
             then_branch,
             else_branch,
+            ..
         } => {
             assert_eq!(equals_field_name(&condition), Some("a"));
             assert_eq!(
                 *then_branch,
-                OptExpr::Const(Value::Int64(10)),
+                OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(10)),
                 "first value"
             );
             match *else_branch {
@@ -683,16 +720,17 @@ fn collapses_two_branch_multi_if_to_nested_if() {
                     condition: inner_condition,
                     then_branch: inner_then,
                     else_branch: inner_else,
+                    ..
                 } => {
                     assert_eq!(equals_field_name(&inner_condition), Some("b"));
                     assert_eq!(
                         *inner_then,
-                        OptExpr::Const(Value::Int64(20)),
+                        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(20)),
                         "second value"
                     );
                     assert_eq!(
                         *inner_else,
-                        OptExpr::Const(Value::Int64(0)),
+                        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(0)),
                         "default → innermost else"
                     );
                 }
@@ -759,10 +797,12 @@ fn factors_conjunction_of_negations() {
     // not(a) && not(b) → not(a || b): the two `not`s merge into one.
     let not = registry().get_ref("not", Some(1)).unwrap();
     let expected = OptExpr::Call {
+        id: NodeId::PLACEHOLDER,
         func: not,
         args: vec![OptExpr::Or {
-            left: Box::new(OptExpr::SourceField("a".to_string())),
-            right: Box::new(OptExpr::SourceField("b".to_string())),
+            id: NodeId::PLACEHOLDER,
+            left: Box::new(OptExpr::SourceField(NodeId::PLACEHOLDER, "a".to_string())),
+            right: Box::new(OptExpr::SourceField(NodeId::PLACEHOLDER, "b".to_string())),
         }],
     };
     assert_eq!(optimized_result("!field(\"a\") && !field(\"b\")"), expected);
@@ -773,10 +813,12 @@ fn factors_disjunction_of_negations() {
     // not(a) || not(b) → not(a && b).
     let not = registry().get_ref("not", Some(1)).unwrap();
     let expected = OptExpr::Call {
+        id: NodeId::PLACEHOLDER,
         func: not,
         args: vec![OptExpr::And {
-            left: Box::new(OptExpr::SourceField("a".to_string())),
-            right: Box::new(OptExpr::SourceField("b".to_string())),
+            id: NodeId::PLACEHOLDER,
+            left: Box::new(OptExpr::SourceField(NodeId::PLACEHOLDER, "a".to_string())),
+            right: Box::new(OptExpr::SourceField(NodeId::PLACEHOLDER, "b".to_string())),
         }],
     };
     assert_eq!(optimized_result("!field(\"a\") || !field(\"b\")"), expected);
@@ -792,6 +834,7 @@ fn de_morgan_composes_with_double_negation_collapse() {
             inner,
             expect,
             on_present,
+            ..
         } => {
             assert!(matches!(*inner, OptExpr::And { .. }));
             assert_eq!(expect, TypeClass::Bool);
@@ -806,7 +849,7 @@ fn keeps_mixed_negation_unfactored() {
     // Only the left operand is negated → De Morgan does not apply; the `&&` stays.
     match optimized_result("!field(\"a\") && field(\"b\")") {
         OptExpr::And { right, .. } => {
-            assert!(matches!(*right, OptExpr::SourceField(name) if name == "b"));
+            assert!(matches!(*right, OptExpr::SourceField(_, name) if name == "b"));
         }
         other => panic!("expected a kept And, got {other:?}"),
     }
@@ -818,7 +861,7 @@ fn keeps_single_negation_in_disjunction_unfactored() {
     // Morgan does not apply and the `||` is kept intact.
     match optimized_result("field(\"a\") || !field(\"b\")") {
         OptExpr::Or { left, .. } => {
-            assert!(matches!(*left, OptExpr::SourceField(name) if name == "a"));
+            assert!(matches!(*left, OptExpr::SourceField(_, name) if name == "a"));
         }
         other => panic!("expected a kept Or, got {other:?}"),
     }
@@ -836,8 +879,9 @@ fn collapses_empty_needle_predicates_to_type_assert() {
                 inner,
                 expect,
                 on_present,
+                ..
             } => {
-                assert!(matches!(*inner, OptExpr::SourceField(name) if name == "x"));
+                assert!(matches!(*inner, OptExpr::SourceField(_, name) if name == "x"));
                 assert_eq!(expect, TypeClass::String);
                 assert_eq!(on_present, AssertYield::Const(Value::Bool(true)));
             }
@@ -855,8 +899,9 @@ fn collapses_double_reverse_to_identity_type_assert() {
             inner,
             expect,
             on_present,
+            ..
         } => {
-            assert!(matches!(*inner, OptExpr::SourceField(name) if name == "x"));
+            assert!(matches!(*inner, OptExpr::SourceField(_, name) if name == "x"));
             assert_eq!(expect, TypeClass::String);
             assert_eq!(on_present, AssertYield::Identity);
         }
@@ -901,8 +946,9 @@ fn concat_with_empty_string_becomes_string_assert() {
                 inner,
                 expect,
                 on_present,
+                ..
             } => {
-                assert!(matches!(*inner, OptExpr::SourceField(name) if name == "x"));
+                assert!(matches!(*inner, OptExpr::SourceField(_, name) if name == "x"));
                 assert_eq!(expect, TypeClass::String);
                 assert_eq!(on_present, AssertYield::Identity);
             }
@@ -919,8 +965,9 @@ fn single_argument_concat_becomes_string_assert() {
             inner,
             expect,
             on_present,
+            ..
         } => {
-            assert!(matches!(*inner, OptExpr::SourceField(name) if name == "x"));
+            assert!(matches!(*inner, OptExpr::SourceField(_, name) if name == "x"));
             assert_eq!(expect, TypeClass::String);
             assert_eq!(on_present, AssertYield::Identity);
         }
@@ -934,8 +981,8 @@ fn concat_drops_empty_string_arguments() {
     match optimized_result(r#"concat(field("a"), "", field("b"))"#) {
         OptExpr::Call { args, .. } => {
             assert_eq!(args.len(), 2);
-            assert!(matches!(&args[0], OptExpr::SourceField(name) if name == "a"));
-            assert!(matches!(&args[1], OptExpr::SourceField(name) if name == "b"));
+            assert!(matches!(&args[0], OptExpr::SourceField(_, name) if name == "a"));
+            assert!(matches!(&args[1], OptExpr::SourceField(_, name) if name == "b"));
         }
         other => panic!("expected a two-arg concat, got {other:?}"),
     }
@@ -945,7 +992,7 @@ fn concat_drops_empty_string_arguments() {
 fn concat_of_only_empty_strings_folds_to_empty() {
     assert_eq!(
         optimized_result(r#"concat("", "")"#),
-        OptExpr::Const(Value::Text(String::new()))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Text(String::new()))
     );
 }
 
@@ -958,7 +1005,7 @@ fn trim_of_concat_strips_whitespace_constant_edges() {
             assert_eq!(args.len(), 1);
             match &args[0] {
                 OptExpr::TypeAssert { inner, expect, .. } => {
-                    assert!(matches!(&**inner, OptExpr::SourceField(name) if name == "x"));
+                    assert!(matches!(&**inner, OptExpr::SourceField(_, name) if name == "x"));
                     assert_eq!(*expect, TypeClass::String);
                 }
                 other => panic!("expected a string assert under trim, got {other:?}"),
@@ -979,8 +1026,13 @@ fn trim_of_concat_left_trims_partial_whitespace_edge() {
                     args: concat_args, ..
                 } => {
                     assert_eq!(concat_args.len(), 2);
-                    assert_eq!(concat_args[0], OptExpr::Const(Value::Text("hi".into())));
-                    assert!(matches!(&concat_args[1], OptExpr::SourceField(name) if name == "x"));
+                    assert_eq!(
+                        concat_args[0],
+                        OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("hi".into()))
+                    );
+                    assert!(
+                        matches!(&concat_args[1], OptExpr::SourceField(_, name) if name == "x")
+                    );
                 }
                 other => panic!("expected inner concat, got {other:?}"),
             }
@@ -1000,8 +1052,9 @@ fn decode_of_encode_same_label_collapses_to_bytes_assert() {
                 inner,
                 expect,
                 on_present,
+                ..
             } => {
-                assert!(matches!(*inner, OptExpr::SourceField(name) if name == "x"));
+                assert!(matches!(*inner, OptExpr::SourceField(_, name) if name == "x"));
                 assert_eq!(expect, TypeClass::Bytes);
                 assert_eq!(on_present, AssertYield::Identity);
             }
@@ -1036,8 +1089,9 @@ fn nested_type_asserts_collapse_to_one() {
             inner,
             expect,
             on_present,
+            ..
         } => {
-            assert!(matches!(*inner, OptExpr::SourceField(name) if name == "x"));
+            assert!(matches!(*inner, OptExpr::SourceField(_, name) if name == "x"));
             assert_eq!(expect, TypeClass::String);
             assert_eq!(on_present, AssertYield::Identity);
         }
@@ -1050,11 +1104,13 @@ fn type_assert_with_const_inner_yield_does_not_collapse() {
     // A `Const` inner yield is not provably of the outer class, so the outer
     // assert over it is NOT redundant — the nesting is kept.
     let inner = OptExpr::TypeAssert {
-        inner: Box::new(OptExpr::Register(0)),
+        id: NodeId::PLACEHOLDER,
+        inner: Box::new(OptExpr::Register(NodeId::PLACEHOLDER, 0)),
         expect: TypeClass::String,
         on_present: AssertYield::Const(Value::Bool(true)),
     };
     let outer = OptExpr::TypeAssert {
+        id: NodeId::PLACEHOLDER,
         inner: Box::new(inner),
         expect: TypeClass::String,
         on_present: AssertYield::Identity,
@@ -1079,16 +1135,21 @@ fn long_or_of_equals_lowers_to_membership_switch() {
             inputs,
             table,
             default,
+            ..
         } => {
             assert_eq!(inputs.len(), 1);
-            assert!(matches!(&inputs[0], OptExpr::SourceField(name) if name == "k"));
+            assert!(matches!(&inputs[0], OptExpr::SourceField(_, name) if name == "k"));
             assert_eq!(table.len(), 6);
             assert!(
                 table
                     .iter()
-                    .all(|(_, value)| *value == OptExpr::Const(Value::Bool(true)))
+                    .all(|(_, value)| *value
+                        == OptExpr::Const(NodeId::PLACEHOLDER, Value::Bool(true)))
             );
-            assert_eq!(*default, OptExpr::Const(Value::Bool(false)));
+            assert_eq!(
+                *default,
+                OptExpr::Const(NodeId::PLACEHOLDER, Value::Bool(false))
+            );
         }
         other => panic!("expected a membership Switch, got {other:?}"),
     }
@@ -1119,6 +1180,7 @@ fn membership_switch_evaluates_like_the_disjunction() {
     let mut chain = register_equals(0, Value::Int64(1));
     for index in 2..=6i64 {
         chain = OptExpr::Or {
+            id: NodeId::PLACEHOLDER,
             left: Box::new(chain),
             right: Box::new(register_equals(0, Value::Int64(index))),
         };
@@ -1140,17 +1202,21 @@ fn membership_switch_evaluates_like_the_disjunction() {
 /// A `Switch` over `Register(0)` keyed on `Int64` constants.
 fn int_switch(entries: Vec<(i64, &str)>, default: &str) -> OptExpr {
     OptExpr::Switch {
-        inputs: vec![OptExpr::Register(0)],
+        id: NodeId::PLACEHOLDER,
+        inputs: vec![OptExpr::Register(NodeId::PLACEHOLDER, 0)],
         table: entries
             .into_iter()
             .map(|(key, value)| {
                 (
                     Key::from_value(&Value::Int64(key)).unwrap(),
-                    OptExpr::Const(Value::Text(value.to_owned())),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Text(value.to_owned())),
                 )
             })
             .collect(),
-        default: Box::new(OptExpr::Const(Value::Text(default.to_owned()))),
+        default: Box::new(OptExpr::Const(
+            NodeId::PLACEHOLDER,
+            Value::Text(default.to_owned()),
+        )),
     }
 }
 
@@ -1160,10 +1226,11 @@ fn nested_switch_over_same_key_collapses() {
     //   → Switch{k, {1→a, 2→b}, default d}   (outer wins on key 1).
     let inner = int_switch(vec![(1, "x"), (2, "b")], "d");
     let outer = OptExpr::Switch {
-        inputs: vec![OptExpr::Register(0)],
+        id: NodeId::PLACEHOLDER,
+        inputs: vec![OptExpr::Register(NodeId::PLACEHOLDER, 0)],
         table: vec![(
             Key::from_value(&Value::Int64(1)).unwrap(),
-            OptExpr::Const(Value::Text("a".into())),
+            OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("a".into())),
         )],
         default: Box::new(inner),
     };
@@ -1172,17 +1239,27 @@ fn nested_switch_over_same_key_collapses() {
             inputs,
             table,
             default,
+            ..
         } => {
-            assert_eq!(inputs, vec![OptExpr::Register(0)]);
+            assert_eq!(inputs, vec![OptExpr::Register(NodeId::PLACEHOLDER, 0)]);
             assert_eq!(table.len(), 2);
             let one = Key::from_value(&Value::Int64(1)).unwrap();
             let entry = table.iter().find(|(key, _)| *key == one).unwrap();
             // Outer wins on the shared key 1; the inner-only key 2 carries over.
-            assert_eq!(entry.1, OptExpr::Const(Value::Text("a".into())));
+            assert_eq!(
+                entry.1,
+                OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("a".into()))
+            );
             let two = Key::from_value(&Value::Int64(2)).unwrap();
             let entry_two = table.iter().find(|(key, _)| *key == two).unwrap();
-            assert_eq!(entry_two.1, OptExpr::Const(Value::Text("b".into())));
-            assert_eq!(*default, OptExpr::Const(Value::Text("d".into())));
+            assert_eq!(
+                entry_two.1,
+                OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("b".into()))
+            );
+            assert_eq!(
+                *default,
+                OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("d".into()))
+            );
         }
         other => panic!("expected a merged Switch, got {other:?}"),
     }
@@ -1191,18 +1268,20 @@ fn nested_switch_over_same_key_collapses() {
 #[test]
 fn nested_switch_over_different_key_is_kept() {
     let inner = OptExpr::Switch {
-        inputs: vec![OptExpr::Register(1)],
+        id: NodeId::PLACEHOLDER,
+        inputs: vec![OptExpr::Register(NodeId::PLACEHOLDER, 1)],
         table: vec![(
             Key::from_value(&Value::Int64(2)).unwrap(),
-            OptExpr::Const(Value::Text("b".into())),
+            OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("b".into())),
         )],
-        default: Box::new(OptExpr::Const(Value::Text("d".into()))),
+        default: Box::new(OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("d".into()))),
     };
     let outer = OptExpr::Switch {
-        inputs: vec![OptExpr::Register(0)],
+        id: NodeId::PLACEHOLDER,
+        inputs: vec![OptExpr::Register(NodeId::PLACEHOLDER, 0)],
         table: vec![(
             Key::from_value(&Value::Int64(1)).unwrap(),
-            OptExpr::Const(Value::Text("a".into())),
+            OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("a".into())),
         )],
         default: Box::new(inner),
     };
@@ -1219,26 +1298,29 @@ fn nested_switch_over_impure_key_is_kept() {
     let random_key = || {
         let random_int = registry().get_ref("randomInt", Some(2)).unwrap();
         OptExpr::Call {
+            id: NodeId::PLACEHOLDER,
             func: random_int,
             args: vec![
-                OptExpr::Const(Value::Int64(0)),
-                OptExpr::Const(Value::Int64(10)),
+                OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(0)),
+                OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(10)),
             ],
         }
     };
     let inner = OptExpr::Switch {
+        id: NodeId::PLACEHOLDER,
         inputs: vec![random_key()],
         table: vec![(
             Key::from_value(&Value::Int64(2)).unwrap(),
-            OptExpr::Const(Value::Text("b".into())),
+            OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("b".into())),
         )],
-        default: Box::new(OptExpr::Const(Value::Text("d".into()))),
+        default: Box::new(OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("d".into()))),
     };
     let outer = OptExpr::Switch {
+        id: NodeId::PLACEHOLDER,
         inputs: vec![random_key()],
         table: vec![(
             Key::from_value(&Value::Int64(1)).unwrap(),
-            OptExpr::Const(Value::Text("a".into())),
+            OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("a".into())),
         )],
         default: Box::new(inner),
     };
@@ -1251,42 +1333,44 @@ fn nested_switch_over_impure_key_is_kept() {
 #[test]
 fn switch_with_constant_key_folds_to_matched_branch() {
     let switch = OptExpr::Switch {
-        inputs: vec![OptExpr::Const(Value::Int64(2))],
+        id: NodeId::PLACEHOLDER,
+        inputs: vec![OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(2))],
         table: vec![
             (
                 Key::from_value(&Value::Int64(1)).unwrap(),
-                OptExpr::Const(Value::Text("a".into())),
+                OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("a".into())),
             ),
             (
                 Key::from_value(&Value::Int64(2)).unwrap(),
-                OptExpr::Const(Value::Text("b".into())),
+                OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("b".into())),
             ),
             (
                 Key::from_value(&Value::Int64(3)).unwrap(),
-                OptExpr::Const(Value::Text("c".into())),
+                OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("c".into())),
             ),
         ],
-        default: Box::new(OptExpr::Const(Value::Text("z".into()))),
+        default: Box::new(OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("z".into()))),
     };
     assert_eq!(
         rewrite_result(switch, 0),
-        OptExpr::Const(Value::Text("b".into()))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("b".into()))
     );
 }
 
 #[test]
 fn switch_with_constant_key_miss_folds_to_default() {
     let switch = OptExpr::Switch {
-        inputs: vec![OptExpr::Const(Value::Int64(9))],
+        id: NodeId::PLACEHOLDER,
+        inputs: vec![OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(9))],
         table: vec![(
             Key::from_value(&Value::Int64(1)).unwrap(),
-            OptExpr::Const(Value::Text("a".into())),
+            OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("a".into())),
         )],
-        default: Box::new(OptExpr::Const(Value::Text("z".into()))),
+        default: Box::new(OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("z".into()))),
     };
     assert_eq!(
         rewrite_result(switch, 0),
-        OptExpr::Const(Value::Text("z".into()))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("z".into()))
     );
 }
 
@@ -1302,7 +1386,7 @@ fn switch_on_inlined_constant_key_folds_through_the_pipeline() {
     source.push_str(r#""default")"#);
     assert_eq!(
         optimized_result(&source),
-        OptExpr::Const(Value::Text("v3".into()))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("v3".into()))
     );
 }
 
@@ -1310,10 +1394,11 @@ fn switch_on_inlined_constant_key_folds_through_the_pipeline() {
 fn collapsed_switch_evaluates_correctly() {
     let inner = int_switch(vec![(2, "b")], "d");
     let outer = OptExpr::Switch {
-        inputs: vec![OptExpr::Register(0)],
+        id: NodeId::PLACEHOLDER,
+        inputs: vec![OptExpr::Register(NodeId::PLACEHOLDER, 0)],
         table: vec![(
             Key::from_value(&Value::Int64(1)).unwrap(),
-            OptExpr::Const(Value::Text("a".into())),
+            OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("a".into())),
         )],
         default: Box::new(inner),
     };
@@ -1343,7 +1428,8 @@ fn eval_type_assert(
     let program = OptProgram {
         statements: vec![],
         result: OptExpr::TypeAssert {
-            inner: Box::new(OptExpr::Const(operand)),
+            id: NodeId::PLACEHOLDER,
+            inner: Box::new(OptExpr::Const(NodeId::PLACEHOLDER, operand)),
             expect,
             on_present,
         },
@@ -1413,8 +1499,9 @@ fn collapses_encoding_round_trips_to_bytes_type_assert() {
                 inner,
                 expect,
                 on_present,
+                ..
             } => {
-                assert!(matches!(*inner, OptExpr::SourceField(name) if name == "x"));
+                assert!(matches!(*inner, OptExpr::SourceField(_, name) if name == "x"));
                 assert_eq!(expect, TypeClass::Bytes);
                 assert_eq!(on_present, AssertYield::Identity);
             }
@@ -1430,7 +1517,7 @@ fn keeps_bitnot_involution_untyped() {
     match optimized_result("~(~field(\"x\"))") {
         OptExpr::Call { args, .. } => match &args[0] {
             OptExpr::Call { args: inner, .. } => {
-                assert!(matches!(&inner[0], OptExpr::SourceField(name) if name == "x"));
+                assert!(matches!(&inner[0], OptExpr::SourceField(_, name) if name == "x"));
             }
             other => panic!("expected the inner bitNot to survive, got {other:?}"),
         },
@@ -1463,7 +1550,7 @@ fn collapses_idempotent_string_ops() {
             OptExpr::Call { args, .. } => {
                 assert_eq!(args.len(), 1, "{op}: single call kept");
                 assert!(
-                    matches!(&args[0], OptExpr::SourceField(name) if name == "x"),
+                    matches!(&args[0], OptExpr::SourceField(_, name) if name == "x"),
                     "{op}: inner duplicate dropped"
                 );
             }
@@ -1515,7 +1602,7 @@ fn hoists_repeated_field_read_into_register() {
     .unwrap();
     assert_eq!(program.statements.len(), 1);
     assert!(
-        matches!(&program.statements[0].value, OptExpr::SourceField(name) if name == "a"),
+        matches!(&program.statements[0].value, OptExpr::SourceField(_, name) if name == "a"),
         "expected a hoisted source-field binding"
     );
     let register = program.statements[0].register;
@@ -1524,7 +1611,7 @@ fn hoists_repeated_field_read_into_register() {
             assert_eq!(args.len(), 2);
             assert!(
                 args.iter()
-                    .all(|arg| matches!(arg, OptExpr::Register(reg) if *reg == register)),
+                    .all(|arg| matches!(arg, OptExpr::Register(_, reg) if *reg == register)),
                 "both reads must reference the hoisted register"
             );
         }
@@ -1633,19 +1720,19 @@ fn optimized_and_unoptimized_agree_on_examples() {
 fn folds_null_boolean_three_valued() {
     assert_eq!(
         optimized_result("null && false"),
-        OptExpr::Const(Value::Bool(false))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Bool(false))
     );
     assert_eq!(
         optimized_result("null && true"),
-        OptExpr::Const(Value::Null)
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Null)
     );
     assert_eq!(
         optimized_result("null || true"),
-        OptExpr::Const(Value::Bool(true))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Bool(true))
     );
     assert_eq!(
         optimized_result("null || false"),
-        OptExpr::Const(Value::Null)
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Null)
     );
 }
 
@@ -1661,19 +1748,19 @@ fn evaluates_null_boolean_three_valued() {
 fn prunes_if_null_and_null_if() {
     assert_eq!(
         optimized_result("ifNull(null, 42)"),
-        OptExpr::Const(Value::Int64(42))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(42))
     );
     assert_eq!(
         optimized_result("ifNull(7, field(\"x\"))"),
-        OptExpr::Const(Value::Int64(7))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(7))
     );
     assert_eq!(
         optimized_result("nullIf(5, 5)"),
-        OptExpr::Const(Value::Null)
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Null)
     );
     assert_eq!(
         optimized_result("nullIf(5, 6)"),
-        OptExpr::Const(Value::Int64(5))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(5))
     );
 }
 
@@ -1681,7 +1768,7 @@ fn prunes_if_null_and_null_if() {
 fn prunes_multi_if_all_false_to_default() {
     assert_eq!(
         optimized_result("multiIf(false, 1, false, 2, 3)"),
-        OptExpr::Const(Value::Int64(3))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(3))
     );
 }
 
@@ -1718,7 +1805,7 @@ fn object_get_hit_folds_to_the_matched_value() {
     // the matched value. (`field("x")` collapses to `SourceField`.)
     assert_eq!(
         optimized_result("objectGet({\"k\" = field(\"x\")}, \"k\")"),
-        OptExpr::SourceField("x".to_string())
+        OptExpr::SourceField(NodeId::PLACEHOLDER, "x".to_string())
     );
 }
 
@@ -1728,7 +1815,7 @@ fn object_get_hit_drops_infallible_siblings() {
     // is dropped.
     assert_eq!(
         optimized_result("objectGet({\"k\" = field(\"x\"), \"j\" = field(\"y\")}, \"k\")"),
-        OptExpr::SourceField("x".to_string())
+        OptExpr::SourceField(NodeId::PLACEHOLDER, "x".to_string())
     );
 }
 
@@ -1736,7 +1823,7 @@ fn object_get_hit_drops_infallible_siblings() {
 fn object_get_miss_folds_to_null() {
     assert_eq!(
         optimized_result("objectGet({\"k\" = field(\"x\")}, \"absent\")"),
-        OptExpr::Const(Value::Null)
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Null)
     );
 }
 
@@ -1744,7 +1831,7 @@ fn object_get_miss_folds_to_null() {
 fn object_length_folds_to_count() {
     assert_eq!(
         optimized_result("objectLength({\"k\" = field(\"x\"), \"j\" = field(\"y\")})"),
-        OptExpr::Const(Value::Int64(2))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(2))
     );
 }
 
@@ -1752,11 +1839,11 @@ fn object_length_folds_to_count() {
 fn object_has_key_folds_to_bool() {
     assert_eq!(
         optimized_result("objectHasKey({\"k\" = field(\"x\")}, \"k\")"),
-        OptExpr::Const(Value::Bool(true))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Bool(true))
     );
     assert_eq!(
         optimized_result("objectHasKey({\"k\" = field(\"x\")}, \"absent\")"),
-        OptExpr::Const(Value::Bool(false))
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Bool(false))
     );
 }
 
@@ -1813,10 +1900,19 @@ fn rejects_duplicate_object_keys_at_compile_time() {
 fn compaction_dedups_type_exact_constants() {
     let program = OptProgram {
         statements: vec![],
-        result: OptExpr::Object(vec![
-            ("a".to_string(), OptExpr::Const(Value::Int64(5))),
-            ("b".to_string(), OptExpr::Const(Value::Int64(5))),
-        ]),
+        result: OptExpr::Object(
+            NodeId::PLACEHOLDER,
+            vec![
+                (
+                    "a".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(5)),
+                ),
+                (
+                    "b".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(5)),
+                ),
+            ],
+        ),
         register_count: 0,
     };
     let compiled = Compactor::create().compact(program).unwrap();
@@ -1833,10 +1929,19 @@ fn compaction_keeps_cross_width_constants_distinct() {
     // a slot would silently change the second node's resolved type.
     let program = OptProgram {
         statements: vec![],
-        result: OptExpr::Object(vec![
-            ("a".to_string(), OptExpr::Const(Value::Int8(5))),
-            ("b".to_string(), OptExpr::Const(Value::Int64(5))),
-        ]),
+        result: OptExpr::Object(
+            NodeId::PLACEHOLDER,
+            vec![
+                (
+                    "a".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Int8(5)),
+                ),
+                (
+                    "b".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(5)),
+                ),
+            ],
+        ),
         register_count: 0,
     };
     let compiled = Compactor::create().compact(program).unwrap();
@@ -1854,11 +1959,23 @@ fn compaction_keeps_float_constants_distinct() {
     // take separate slots (they are excluded before the dedup key is computed).
     let program = OptProgram {
         statements: vec![],
-        result: OptExpr::Object(vec![
-            ("a".to_string(), OptExpr::Const(Value::Float64(0.0))),
-            ("b".to_string(), OptExpr::Const(Value::Float64(-0.0))),
-            ("c".to_string(), OptExpr::Const(Value::Float64(0.0))),
-        ]),
+        result: OptExpr::Object(
+            NodeId::PLACEHOLDER,
+            vec![
+                (
+                    "a".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Float64(0.0)),
+                ),
+                (
+                    "b".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Float64(-0.0)),
+                ),
+                (
+                    "c".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Float64(0.0)),
+                ),
+            ],
+        ),
         register_count: 0,
     };
     let compiled = Compactor::create().compact(program).unwrap();
@@ -1878,16 +1995,25 @@ fn compaction_keeps_decimal_scale_distinct() {
     // would conflate them, so decimals are excluded from dedup to preserve scale.
     let program = OptProgram {
         statements: vec![],
-        result: OptExpr::Object(vec![
-            (
-                "a".to_string(),
-                OptExpr::Const(Value::Decimal(BigDecimal::from_str("1.0").unwrap())),
-            ),
-            (
-                "b".to_string(),
-                OptExpr::Const(Value::Decimal(BigDecimal::from_str("1.00").unwrap())),
-            ),
-        ]),
+        result: OptExpr::Object(
+            NodeId::PLACEHOLDER,
+            vec![
+                (
+                    "a".to_string(),
+                    OptExpr::Const(
+                        NodeId::PLACEHOLDER,
+                        Value::Decimal(BigDecimal::from_str("1.0").unwrap()),
+                    ),
+                ),
+                (
+                    "b".to_string(),
+                    OptExpr::Const(
+                        NodeId::PLACEHOLDER,
+                        Value::Decimal(BigDecimal::from_str("1.00").unwrap()),
+                    ),
+                ),
+            ],
+        ),
         register_count: 0,
     };
     let compiled = Compactor::create().compact(program).unwrap();
@@ -1904,12 +2030,20 @@ fn compaction_dedups_across_the_whole_pool() {
     // duplicate far past any old window still collapses. 130 distinct constants
     // then a repeat of the first → 130 slots, not 131.
     let mut entries: Vec<(String, OptExpr)> = (0..130)
-        .map(|n| (format!("k{n}"), OptExpr::Const(Value::Int64(n))))
+        .map(|n| {
+            (
+                format!("k{n}"),
+                OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(n)),
+            )
+        })
         .collect();
-    entries.push(("dup".to_string(), OptExpr::Const(Value::Int64(0))));
+    entries.push((
+        "dup".to_string(),
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(0)),
+    ));
     let program = OptProgram {
         statements: vec![],
-        result: OptExpr::Object(entries),
+        result: OptExpr::Object(NodeId::PLACEHOLDER, entries),
         register_count: 0,
     };
     let compiled = Compactor::create().compact(program).unwrap();
@@ -1926,10 +2060,19 @@ fn compaction_keeps_distinct_same_typed_constants() {
     // of the same type must NOT collapse (a too-coarse key would merge them).
     let program = OptProgram {
         statements: vec![],
-        result: OptExpr::Object(vec![
-            ("a".to_string(), OptExpr::Const(Value::Int64(5))),
-            ("b".to_string(), OptExpr::Const(Value::Int64(6))),
-        ]),
+        result: OptExpr::Object(
+            NodeId::PLACEHOLDER,
+            vec![
+                (
+                    "a".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(5)),
+                ),
+                (
+                    "b".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(6)),
+                ),
+            ],
+        ),
         register_count: 0,
     };
     let compiled = Compactor::create().compact(program).unwrap();
@@ -1951,10 +2094,19 @@ fn compaction_keeps_ipv4_and_mapped_ipv6_distinct() {
     let mapped: Ipv6Addr = v4.to_ipv6_mapped();
     let program = OptProgram {
         statements: vec![],
-        result: OptExpr::Object(vec![
-            ("a".to_string(), OptExpr::Const(Value::Ipv4(v4))),
-            ("b".to_string(), OptExpr::Const(Value::Ipv6(mapped))),
-        ]),
+        result: OptExpr::Object(
+            NodeId::PLACEHOLDER,
+            vec![
+                (
+                    "a".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Ipv4(v4)),
+                ),
+                (
+                    "b".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Ipv6(mapped)),
+                ),
+            ],
+        ),
         register_count: 0,
     };
     let compiled = Compactor::create().compact(program).unwrap();
@@ -1972,10 +2124,19 @@ fn compaction_never_dedups_json_constants() {
     let json = serde_json::json!({"k": 1});
     let program = OptProgram {
         statements: vec![],
-        result: OptExpr::Object(vec![
-            ("a".to_string(), OptExpr::Const(Value::Json(json.clone()))),
-            ("b".to_string(), OptExpr::Const(Value::Json(json))),
-        ]),
+        result: OptExpr::Object(
+            NodeId::PLACEHOLDER,
+            vec![
+                (
+                    "a".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Json(json.clone())),
+                ),
+                (
+                    "b".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Json(json)),
+                ),
+            ],
+        ),
         register_count: 0,
     };
     let compiled = Compactor::create().compact(program).unwrap();
@@ -1992,23 +2153,35 @@ fn compaction_interns_object_keys_shared_across_objects() {
     // eval then proves a shared `KeyId` still renders EACH object's own values —
     // i.e. the dedup does not bleed one object's value into the other.
     let inner = |id: i64, name: &str| {
-        OptExpr::Object(vec![
-            ("id".to_string(), OptExpr::Const(Value::Int64(id))),
-            (
-                "name".to_string(),
-                OptExpr::Const(Value::Text(name.to_string())),
-            ),
-        ])
+        OptExpr::Object(
+            NodeId::PLACEHOLDER,
+            vec![
+                (
+                    "id".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(id)),
+                ),
+                (
+                    "name".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Text(name.to_string())),
+                ),
+            ],
+        )
     };
     let program = OptProgram {
         statements: vec![OptStatement {
             register: 0,
             value: inner(1, "a"),
         }],
-        result: OptExpr::Object(vec![
-            ("first".to_string(), OptExpr::Register(0)),
-            ("second".to_string(), inner(2, "b")),
-        ]),
+        result: OptExpr::Object(
+            NodeId::PLACEHOLDER,
+            vec![
+                (
+                    "first".to_string(),
+                    OptExpr::Register(NodeId::PLACEHOLDER, 0),
+                ),
+                ("second".to_string(), inner(2, "b")),
+            ],
+        ),
         register_count: 1,
     };
     let compiled = compact(program).unwrap();
@@ -2036,10 +2209,19 @@ fn compaction_interns_duplicate_keys_within_one_object() {
     // BOTH entries rather than de-duplicating.
     let program = OptProgram {
         statements: vec![],
-        result: OptExpr::Object(vec![
-            ("dup".to_string(), OptExpr::Const(Value::Int64(1))),
-            ("dup".to_string(), OptExpr::Const(Value::Int64(2))),
-        ]),
+        result: OptExpr::Object(
+            NodeId::PLACEHOLDER,
+            vec![
+                (
+                    "dup".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(1)),
+                ),
+                (
+                    "dup".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(2)),
+                ),
+            ],
+        ),
         register_count: 0,
     };
     let compiled = compact(program).unwrap();
@@ -2071,11 +2253,23 @@ fn compaction_preserves_object_key_run_order() {
     // its original order and stay paired with the right value.
     let program = OptProgram {
         statements: vec![],
-        result: OptExpr::Object(vec![
-            ("b".to_string(), OptExpr::Const(Value::Int64(1))),
-            ("a".to_string(), OptExpr::Const(Value::Int64(2))),
-            ("c".to_string(), OptExpr::Const(Value::Int64(3))),
-        ]),
+        result: OptExpr::Object(
+            NodeId::PLACEHOLDER,
+            vec![
+                (
+                    "b".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(1)),
+                ),
+                (
+                    "a".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(2)),
+                ),
+                (
+                    "c".to_string(),
+                    OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(3)),
+                ),
+            ],
+        ),
         register_count: 0,
     };
     let compiled = compact(program).unwrap();
@@ -2117,7 +2311,7 @@ fn rejects_program_nested_past_the_depth_limit() {
         statements: vec![],
         result: expr,
     };
-    let result = Optimizer::create(&registry(), &context()).optimize(&program, false);
+    let result = Optimizer::create(&registry(), &context()).optimize(&program, false, None);
     assert!(matches!(result, Err(OptimizeError::NestingTooDeep { .. })));
 }
 
@@ -2228,7 +2422,7 @@ fn switch_lowering_keeps_first_branch_on_duplicate_key() {
     assert_eq!(matches.len(), 1, "the duplicate key collapses to one entry");
     assert_eq!(
         *matches[0],
-        OptExpr::Const(Value::Int64(10)),
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(10)),
         "first branch wins"
     );
 }
@@ -2240,15 +2434,15 @@ fn evaluates_switch_dispatch() {
     let table = vec![
         (
             Key::single(Value::Int64(1)).unwrap(),
-            OptExpr::Const(Value::Int64(10)),
+            OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(10)),
         ),
         (
             Key::single(Value::Int64(2)).unwrap(),
-            OptExpr::Const(Value::Int64(20)),
+            OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(20)),
         ),
         (
             Key::single(Value::Int64(3)).unwrap(),
-            OptExpr::Const(Value::Int64(30)),
+            OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(30)),
         ),
     ];
     let registry = registry();
@@ -2257,9 +2451,10 @@ fn evaluates_switch_dispatch() {
         let program = OptProgram {
             statements: vec![],
             result: OptExpr::Switch {
-                inputs: vec![OptExpr::Const(input)],
+                id: NodeId::PLACEHOLDER,
+                inputs: vec![OptExpr::Const(NodeId::PLACEHOLDER, input)],
                 table: table.clone(),
-                default: Box::new(OptExpr::Const(Value::Int64(0))),
+                default: Box::new(OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(0))),
             },
             register_count: 0,
         };
@@ -2702,6 +2897,29 @@ fn compile_typed(
     Optimizer::create(&registry(), &context()).compile(&parse(source), schema, expected)
 }
 
+/// Optimize a program and derive its static type map against a schema. Returns
+/// the optimized heap program alongside the map so a test can assert per-node
+/// coverage.
+fn type_map_of(source: &str, schema: &Schema) -> (OptProgram, TypeMap) {
+    let registry = registry();
+    let context = context();
+    let optimized = optimize(&parse(source), &registry, &context, true).unwrap();
+    let map = TypeChecker::create(&registry, Some(schema), optimized.register_count, false)
+        .check(&optimized, None)
+        .unwrap();
+    (optimized, map)
+}
+
+/// Total node count of a program (every statement value plus the result).
+fn program_node_count(program: &OptProgram) -> usize {
+    let statement_nodes: usize = program
+        .statements
+        .iter()
+        .map(|statement| statement.value.node_count())
+        .sum();
+    statement_nodes + program.result.node_count()
+}
+
 #[test]
 fn typed_field_arithmetic_compiles_with_schema() {
     let schema = make_schema(&[("x", DataType::Int64, false)]);
@@ -2803,6 +3021,699 @@ fn untyped_path_skips_the_type_pass() {
     // would-be output mismatch (`'hello'` into nothing) compiles, preserving the
     // untyped/comptime behaviour.
     assert!(compile_typed("'hello'", None, None).is_ok());
+}
+
+// ---- The static type map (sole-author derivation) -------------------------
+
+#[test]
+fn type_map_covers_every_node_under_a_fixed_schema() {
+    // With a fixed schema every node is statically known, so the type-check pass
+    // records a type for each one — the map is total. The keys are unique
+    // per-compile ids, so its size equals the program's node count.
+    let schema = make_schema(&[("x", DataType::Int64, false)]);
+    let (program, map) = type_map_of("field(\"x\") + 1", &schema);
+    assert_eq!(
+        map.len(),
+        program_node_count(&program),
+        "every node should have exactly one type entry under a fixed schema"
+    );
+}
+
+#[test]
+fn type_map_roots_at_the_result_type() {
+    // The map entry for the result node's id is the program's output type: a bare
+    // `field("x")` pass-through carries the schema field's type straight through.
+    let schema = make_schema(&[("x", DataType::Text { size: None }, false)]);
+    let (program, map) = type_map_of("field(\"x\")", &schema);
+    let root_type = map
+        .get(&program.result.id())
+        .expect("the result node is typed under a fixed schema");
+    assert_eq!(root_type.data_type, DataType::Text { size: None });
+}
+
+#[test]
+fn type_map_covers_register_bindings() {
+    // A register binding is typed once and every node — the binding value and the
+    // result — is mapped.
+    let schema = make_schema(&[("a", DataType::Int32, false)]);
+    let (program, map) = type_map_of("x = field(\"a\"); x + x", &schema);
+    assert_eq!(map.len(), program_node_count(&program));
+    assert_eq!(map[&program.result.id()].data_type, DataType::Int64);
+}
+
+// ---- Typed discharge (the map's consumer) ---------------------------------
+
+#[test]
+fn typed_path_strips_a_redundant_string_assert() {
+    // `concat(x, "")` parks a `TypeAssert{String}` over `x`. With `x` typed as
+    // `Text`, the assert is statically satisfied, so discharge collapses it to the
+    // bare field read.
+    let schema = make_schema(&[("x", DataType::Text { size: None }, false)]);
+    let program = compile_typed("concat(field(\"x\"), \"\")", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::SourceField(_)),
+        "expected the assert discharged to a field read, got {:?}",
+        program.node(program.result())
+    );
+}
+
+#[test]
+fn untyped_path_keeps_the_string_assert() {
+    // Without a schema the operand type is unknown, so the runtime `TypeAssert`
+    // survives to do the per-row check — discharge never runs.
+    let program = compile_typed("concat(field(\"x\"), \"\")", None, None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::TypeAssert { .. }),
+        "the untyped path keeps the runtime assert, got {:?}",
+        program.node(program.result())
+    );
+}
+
+#[test]
+fn typed_path_strips_redundant_to_string() {
+    // `toString(x)` where `x` is already `Text` is the identity, so discharge
+    // collapses it to the field read.
+    let schema = make_schema(&[("x", DataType::Text { size: None }, false)]);
+    let program = compile_typed("toString(field(\"x\"))", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::SourceField(_)),
+        "toString of a Text field is the identity, got {:?}",
+        program.node(program.result())
+    );
+}
+
+#[test]
+fn typed_path_keeps_to_string_of_a_non_text_field() {
+    // `toString(x)` where `x` is Int64 is a real conversion — it must NOT be
+    // stripped.
+    let schema = make_schema(&[("x", DataType::Int64, false)]);
+    let program = compile_typed("toString(field(\"x\"))", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Call { .. }),
+        "a real toString conversion must survive, got {:?}",
+        program.node(program.result())
+    );
+}
+
+// ---- Const-yield discharge + value equivalence ----------------------------
+
+/// A field source binding exactly one column, for the discharge differential.
+struct OneField {
+    name: String,
+    value: Value,
+}
+
+impl FieldSource for OneField {
+    fn field(&self, name: &str) -> Result<Value, EvalError> {
+        if name == self.name {
+            Ok(self.value.clone())
+        } else {
+            Err(EvalError::FieldNotBound)
+        }
+    }
+
+    fn fields(&self, _selector: &air_elt_expr_parse::FieldsSelector) -> Result<Value, EvalError> {
+        Err(EvalError::FieldNotBound)
+    }
+}
+
+fn eval_with_field(program: &CompactProgram, name: &str, value: Value) -> Result<Value, EvalError> {
+    let registry = registry();
+    let context = context();
+    let fields = OneField {
+        name: name.to_owned(),
+        value,
+    };
+    ProgramEvaluator::create_with_fields(program, &registry, &context, &fields).evaluate()
+}
+
+#[test]
+fn typed_path_strips_const_yield_assert_for_a_non_null_operand() {
+    // `contains(x, "")` parks a `TypeAssert{String, Const(true)}`. With `x` a
+    // NON-null Text field the operand is always present and of class, so the
+    // assert yields the constant unconditionally — discharge folds it to `true`.
+    let schema = make_schema(&[("x", DataType::Text { size: None }, false)]);
+    let program = compile_typed("contains(field(\"x\"), \"\")", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Const(_)),
+        "non-null operand: the Const-yield assert folds to the constant, got {:?}",
+        program.node(program.result())
+    );
+}
+
+#[test]
+fn typed_path_keeps_const_yield_assert_for_a_nullable_operand() {
+    // With `x` a NULLABLE Text field the assert still distinguishes present
+    // (`true`) from null (`null`), so it must NOT collapse to a bare constant.
+    let schema = make_schema(&[("x", DataType::Text { size: None }, true)]);
+    let program = compile_typed("contains(field(\"x\"), \"\")", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::TypeAssert { .. }),
+        "nullable operand keeps the Const-yield assert, got {:?}",
+        program.node(program.result())
+    );
+}
+
+#[test]
+fn discharge_preserves_value_on_schema_consistent_rows() {
+    // The discharge differential: on schema-consistent rows the typed (discharged)
+    // and untyped (assert kept) programs evaluate to the same value. A non-null
+    // Text schema admits only non-null Text rows; a nullable schema admits null
+    // too, where the kept assert and the (non-stripped) typed program both yield
+    // null.
+    let cases: &[(bool, &[Value])] = &[
+        (
+            false,
+            &[Value::Text("abc".to_owned()), Value::Text(String::new())],
+        ),
+        (true, &[Value::Text("hi".to_owned()), Value::Null]),
+    ];
+    for (nullable, rows) in cases {
+        let schema = make_schema(&[("x", DataType::Text { size: None }, *nullable)]);
+        let typed = compile_typed("contains(field(\"x\"), \"\")", Some(&schema), None).unwrap();
+        let untyped = compile_typed("contains(field(\"x\"), \"\")", None, None).unwrap();
+        for row in *rows {
+            let from_typed = eval_with_field(&typed, "x", row.clone()).unwrap();
+            let from_untyped = eval_with_field(&untyped, "x", row.clone()).unwrap();
+            assert_eq!(
+                from_typed, from_untyped,
+                "discharge changed the value for nullable={nullable} row {row:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn type_map_covers_a_lowered_switch_with_reided_clones() {
+    // An `||`-clause branch lowers to several `Switch` keys pointing at clones of
+    // one branch value; `switch_lower` re-ids each clone, so every surviving node
+    // keeps a unique id and the map stays total (`len == node_count`).
+    let schema = make_schema(&[("k", DataType::Int64, false)]);
+    let source = "multiIf(\
+        field(\"k\") == 1 || field(\"k\") == 2, 100, \
+        field(\"k\") == 3, 30, \
+        field(\"k\") == 4, 40, \
+        field(\"k\") == 5, 50, \
+        field(\"k\") == 6, 60, \
+        field(\"k\") == 7, 70, 0)";
+    let (program, map) = type_map_of(source, &schema);
+    assert!(
+        matches!(program.result, OptExpr::Switch { .. }),
+        "expected the multiIf to lower to a Switch, got {:?}",
+        program.result
+    );
+    assert_eq!(
+        map.len(),
+        program_node_count(&program),
+        "re-ided switch-branch clones keep every node id unique"
+    );
+}
+
+// ---- Typed casts -----------------------------------------------------------
+
+#[test]
+fn typed_strips_a_redundant_int_cast() {
+    // `toInt64(x)` where `x` is already `Int64` is the identity.
+    let schema = make_schema(&[("x", DataType::Int64, false)]);
+    let program = compile_typed("toInt64(field(\"x\"))", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::SourceField(_)),
+        "got {:?}",
+        program.node(program.result())
+    );
+}
+
+#[test]
+fn typed_keeps_a_widening_int_cast() {
+    // `toInt64(x)` where `x` is `Int32` is a real widening (resolved type would
+    // change from Int64 to Int32) — it must NOT be stripped.
+    let schema = make_schema(&[("x", DataType::Int32, false)]);
+    let program = compile_typed("toInt64(field(\"x\"))", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Call { .. }),
+        "a widening cast must survive, got {:?}",
+        program.node(program.result())
+    );
+}
+
+#[test]
+fn typed_strips_redundant_float_and_bool_casts() {
+    for (source, data_type) in [
+        ("toFloat64(field(\"x\"))", DataType::Float64),
+        ("toBool(field(\"x\"))", DataType::Bool),
+        ("toUuid(field(\"x\"))", DataType::Uuid),
+    ] {
+        let schema = make_schema(&[("x", data_type.clone(), false)]);
+        let program = compile_typed(source, Some(&schema), None).unwrap();
+        assert!(
+            matches!(program.node(program.result()), OptNode::SourceField(_)),
+            "{source} over {data_type:?}: got {:?}",
+            program.node(program.result())
+        );
+    }
+}
+
+// ---- Typed min/max flatten -------------------------------------------------
+
+#[test]
+fn typed_flattens_same_type_min_max() {
+    // `max(max(a,b),c)` over uniform Int64 flattens to one 3-ary `max`.
+    let schema = make_schema(&[
+        ("a", DataType::Int64, false),
+        ("b", DataType::Int64, false),
+        ("c", DataType::Int64, false),
+    ]);
+    let program = compile_typed(
+        "max(max(field(\"a\"), field(\"b\")), field(\"c\"))",
+        Some(&schema),
+        None,
+    )
+    .unwrap();
+    let OptNode::Call { args, .. } = program.node(program.result()) else {
+        panic!(
+            "expected a max call, got {:?}",
+            program.node(program.result())
+        );
+    };
+    assert_eq!(
+        program.args(*args).len(),
+        3,
+        "the nested max should flatten to 3 args"
+    );
+}
+
+#[test]
+fn typed_keeps_mixed_int_float_min_max_nested() {
+    // A `Float64` operand mixed with integers triggers the lossy compare arm, so
+    // the flatten must NOT fire — the result stays a 2-ary `max`.
+    let schema = make_schema(&[
+        ("a", DataType::Int64, false),
+        ("b", DataType::Int64, false),
+        ("c", DataType::Float64, false),
+    ]);
+    let program = compile_typed(
+        "max(max(field(\"a\"), field(\"b\")), field(\"c\"))",
+        Some(&schema),
+        None,
+    )
+    .unwrap();
+    let OptNode::Call { args, .. } = program.node(program.result()) else {
+        panic!(
+            "expected a max call, got {:?}",
+            program.node(program.result())
+        );
+    };
+    assert_eq!(
+        program.args(*args).len(),
+        2,
+        "mixed int/float max must not flatten"
+    );
+}
+
+// ---- Untyped min/max NULL-literal drop -------------------------------------
+
+#[test]
+fn drops_null_literal_from_max_to_single_operand() {
+    // `max(x, null)` drops the null literal; the one-argument extremum that
+    // remains is just `x`. Untyped (no schema) — the rule needs no type map.
+    let program = compile_typed("max(field(\"x\"), null)", None, None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::SourceField(_)),
+        "max(x, null) collapses to x, got {:?}",
+        program.node(program.result())
+    );
+    assert_eq!(
+        eval_with_field(&program, "x", Value::Int64(7)).unwrap(),
+        Value::Int64(7)
+    );
+}
+
+#[test]
+fn drops_only_null_literal_from_min() {
+    // `min(a, null, b)` drops only the null literal, leaving a 2-ary `min`.
+    let program = compile_typed("min(field(\"a\"), null, field(\"b\"))", None, None).unwrap();
+    let OptNode::Call { args, .. } = program.node(program.result()) else {
+        panic!(
+            "expected a min call, got {:?}",
+            program.node(program.result())
+        );
+    };
+    assert_eq!(
+        program.args(*args).len(),
+        2,
+        "only the null literal is dropped"
+    );
+}
+
+#[test]
+fn all_null_max_folds_to_null_constant() {
+    let program = compile_typed("max(null, null)", None, None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Const(_)),
+        "max(null, null) folds to a null constant, got {:?}",
+        program.node(program.result())
+    );
+    assert_eq!(
+        eval_const_program(&program, &registry(), &context()).unwrap(),
+        Value::Null
+    );
+}
+
+#[test]
+fn null_drop_lets_mixed_extremum_type_check() {
+    // The null literal resolves to `Bool`, so without the drop `max(int_field,
+    // null)` would fail `comparable_join` (Int64 vs Bool). Dropping the null first
+    // leaves a well-typed extremum (here, just the field), so the typed path
+    // compiles cleanly against a schema.
+    let schema = make_schema(&[("x", DataType::Int64, false)]);
+    let program = compile_typed("max(field(\"x\"), null)", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::SourceField(_)),
+        "got {:?}",
+        program.node(program.result())
+    );
+}
+
+// ---- Typed min/max saturation ----------------------------------------------
+
+#[test]
+fn typed_saturates_max_at_type_maximum() {
+    // `max(int8, 127)`: 127 is `Int8::MAX`, so the field can never exceed it — the
+    // max collapses to the constant, value-exact against the unreduced form.
+    let schema = make_schema(&[("x", DataType::Int8, false)]);
+    let program = compile_typed("max(field(\"x\"), 127)", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Const(_)),
+        "max(int8, 127) saturates to 127, got {:?}",
+        program.node(program.result())
+    );
+    let untyped = compile_typed("max(field(\"x\"), 127)", None, None).unwrap();
+    assert_eq!(
+        eval_with_field(&program, "x", Value::Int8(5)).unwrap(),
+        eval_with_field(&untyped, "x", Value::Int8(5)).unwrap(),
+    );
+}
+
+#[test]
+fn typed_saturates_min_at_unsigned_zero() {
+    // `min(uint8, 0)`: 0 is `UInt8::MIN`, so the field is always ≥ 0 — the min
+    // collapses to 0.
+    let schema = make_schema(&[("x", DataType::UInt8, false)]);
+    let program = compile_typed("min(field(\"x\"), 0)", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Const(_)),
+        "min(uint8, 0) saturates to 0, got {:?}",
+        program.node(program.result())
+    );
+    let untyped = compile_typed("min(field(\"x\"), 0)", None, None).unwrap();
+    assert_eq!(
+        eval_with_field(&program, "x", Value::UInt8(200)).unwrap(),
+        eval_with_field(&untyped, "x", Value::UInt8(200)).unwrap(),
+    );
+}
+
+#[test]
+fn typed_saturates_over_nullable_operand() {
+    // min/max skip NULLs, so saturation fires even for a NULLABLE operand: the
+    // result is the bound whether `x` is present (≤ bound) or NULL (skipped).
+    // This is the case the weaker `!can_fail` gate admits where `is_droppable`
+    // (which requires non-null) would not.
+    let schema = make_schema(&[("x", DataType::Int8, true)]);
+    let program = compile_typed("max(field(\"x\"), 127)", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Const(_)),
+        "saturation fires over a nullable operand, got {:?}",
+        program.node(program.result())
+    );
+    let untyped = compile_typed("max(field(\"x\"), 127)", None, None).unwrap();
+    assert_eq!(
+        eval_with_field(&program, "x", Value::Null).unwrap(),
+        eval_with_field(&untyped, "x", Value::Null).unwrap(),
+    );
+}
+
+#[test]
+fn typed_does_not_saturate_below_bound() {
+    // `max(int8, 100)`: 100 is NOT `Int8::MAX` (127), so the field can exceed it —
+    // the max must survive.
+    let schema = make_schema(&[("x", DataType::Int8, false)]);
+    let program = compile_typed("max(field(\"x\"), 100)", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Call { .. }),
+        "100 < Int8::MAX must not saturate, got {:?}",
+        program.node(program.result())
+    );
+}
+
+#[test]
+fn typed_does_not_saturate_wider_operand() {
+    // `max(int32, 127)`: 127 is `Int8::MAX` but not `Int32::MAX`, and the data
+    // types differ — both the bound and the type-match gates reject it.
+    let schema = make_schema(&[("x", DataType::Int32, false)]);
+    let program = compile_typed("max(field(\"x\"), 127)", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Call { .. }),
+        "got {:?}",
+        program.node(program.result())
+    );
+}
+
+#[test]
+fn typed_does_not_saturate_float_operand() {
+    // Floats carry `NaN`, which min/max propagate rather than saturate, so a float
+    // operand is never collapsed regardless of the constant.
+    let schema = make_schema(&[("x", DataType::Float64, false)]);
+    let program = compile_typed("max(field(\"x\"), 1.0)", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Call { .. }),
+        "got {:?}",
+        program.node(program.result())
+    );
+}
+
+#[test]
+fn typed_keeps_saturation_when_operand_can_fail() {
+    // `max(toInt8(x), 127)`: `toInt8` can fail (out-of-range), so dropping it would
+    // discard a potential error — the saturation must NOT fire even though 127 is
+    // `Int8::MAX` and the types match.
+    let schema = make_schema(&[("x", DataType::Int64, false)]);
+    let program = compile_typed("max(toInt8(field(\"x\")), 127)", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Call { .. }),
+        "a fallible operand keeps the max, got {:?}",
+        program.node(program.result())
+    );
+}
+
+#[test]
+fn typed_string_add_flattens_to_concat() {
+    // Each `+` over Text fields is `add`, which the typed pass swaps to `concat`,
+    // splicing the chain into one variadic concat.
+    let schema = make_schema(&[
+        ("a", DataType::Text { size: None }, false),
+        ("b", DataType::Text { size: None }, false),
+        ("c", DataType::Text { size: None }, false),
+    ]);
+    let program = compile_typed(
+        "field(\"a\") + field(\"b\") + field(\"c\")",
+        Some(&schema),
+        None,
+    )
+    .unwrap();
+    let OptNode::Call { args, .. } = program.node(program.result()) else {
+        panic!(
+            "expected a concat call, got {:?}",
+            program.node(program.result())
+        );
+    };
+    assert_eq!(
+        program.args(*args).len(),
+        3,
+        "the string + chain flattens to one concat"
+    );
+}
+
+#[test]
+fn typed_string_add_preserves_value() {
+    // `x + x` over a NULLABLE Text field becomes `concat(x, x)`, value-equal to the
+    // add on both a present string AND null (both propagate null identically).
+    let schema = make_schema(&[("x", DataType::Text { size: None }, true)]);
+    let typed = compile_typed("field(\"x\") + field(\"x\")", Some(&schema), None).unwrap();
+    let untyped = compile_typed("field(\"x\") + field(\"x\")", None, None).unwrap();
+    for value in [Value::Text("hi".to_owned()), Value::Null] {
+        assert_eq!(
+            eval_with_field(&typed, "x", value.clone()).unwrap(),
+            eval_with_field(&untyped, "x", value).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn typed_dead_branch_with_absent_field_compiles() {
+    // A typed rewrite (`x * 0 → 0`) makes the condition constant; the untyped
+    // const-fold + DCE then prune the dead `field("absent")` branch. The per-round
+    // type-check is tolerant (only the converged tree is strictly checked), so this
+    // VALID program must compile despite the not-yet-pruned absent field.
+    let schema = make_schema(&[("x", DataType::Int64, false), ("a", DataType::Int64, false)]);
+    let result = compile_typed(
+        "if(field(\"x\") * 0 == 0, field(\"a\"), field(\"absent\"))",
+        Some(&schema),
+        None,
+    );
+    assert!(result.is_ok(), "expected ok, got {result:?}");
+}
+
+// ---- Typed algebraic identities / annihilation -----------------------------
+
+#[test]
+fn typed_strips_bitwise_identities() {
+    let schema = make_schema(&[("x", DataType::Int64, false)]);
+    for source in ["field(\"x\") | 0", "field(\"x\") ^ 0", "field(\"x\") << 0"] {
+        let program = compile_typed(source, Some(&schema), None).unwrap();
+        assert!(
+            matches!(program.node(program.result()), OptNode::SourceField(_)),
+            "{source}: got {:?}",
+            program.node(program.result())
+        );
+    }
+}
+
+#[test]
+fn typed_annihilates_bitand_zero() {
+    // `x & 0` over a non-null, infallible Int64 folds to the constant 0.
+    let schema = make_schema(&[("x", DataType::Int64, false)]);
+    let program = compile_typed("field(\"x\") & 0", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Const(_)),
+        "got {:?}",
+        program.node(program.result())
+    );
+    assert_eq!(
+        eval_with_field(&program, "x", Value::Int64(123)).unwrap(),
+        Value::Int64(0)
+    );
+}
+
+#[test]
+fn typed_boolean_absorption() {
+    let schema = make_schema(&[("x", DataType::Bool, false)]);
+    // `x || false → x` (unit kept), `x || true → true` (absorbing).
+    let unit = compile_typed("field(\"x\") || false", Some(&schema), None).unwrap();
+    assert!(matches!(unit.node(unit.result()), OptNode::SourceField(_)));
+    let absorb = compile_typed("field(\"x\") || true", Some(&schema), None).unwrap();
+    assert!(matches!(absorb.node(absorb.result()), OptNode::Const(_)));
+    assert_eq!(
+        eval_with_field(&absorb, "x", Value::Bool(false)).unwrap(),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn typed_identity_preserves_value() {
+    // The bitwise identity `x | 0 → x` is value-exact: typed and untyped agree on
+    // every row.
+    let schema = make_schema(&[("x", DataType::Int64, false)]);
+    let typed = compile_typed("field(\"x\") | 0", Some(&schema), None).unwrap();
+    let untyped = compile_typed("field(\"x\") | 0", None, None).unwrap();
+    for value in [Value::Int64(0), Value::Int64(42), Value::Int64(-7)] {
+        assert_eq!(
+            eval_with_field(&typed, "x", value.clone()).unwrap(),
+            eval_with_field(&untyped, "x", value.clone()).unwrap(),
+        );
+    }
+}
+
+// ---- Typed power reduction -------------------------------------------------
+
+#[test]
+fn typed_reduces_unit_power_on_float() {
+    let schema = make_schema(&[("x", DataType::Float64, false)]);
+    // `x ** 1 → x`, value-exact on a sample row.
+    let one = compile_typed("field(\"x\") ** 1", Some(&schema), None).unwrap();
+    assert!(matches!(one.node(one.result()), OptNode::SourceField(_)));
+    let untyped_one = compile_typed("field(\"x\") ** 1", None, None).unwrap();
+    assert_eq!(
+        eval_with_field(&one, "x", Value::Float64(2.5)).unwrap(),
+        eval_with_field(&untyped_one, "x", Value::Float64(2.5)).unwrap(),
+    );
+    // `x ** 0 → 1.0`.
+    let zero = compile_typed("field(\"x\") ** 0", Some(&schema), None).unwrap();
+    assert!(matches!(zero.node(zero.result()), OptNode::Const(_)));
+    assert_eq!(
+        eval_with_field(&zero, "x", Value::Float64(7.0)).unwrap(),
+        Value::Float64(1.0)
+    );
+}
+
+#[test]
+fn typed_does_not_reduce_square_power() {
+    // `x ** 2` is NOT reduced to `x * x`: `powf(x, 2.0)` is not portably bit-equal
+    // to `x * x` (powf is not correctly-rounded on every libm), so the rewrite
+    // would silently change per-row values. It stays a `power` call.
+    let schema = make_schema(&[("x", DataType::Float64, false)]);
+    let program = compile_typed("field(\"x\") ** 2", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Call { .. }),
+        "x**2 must survive as a power call, got {:?}",
+        program.node(program.result())
+    );
+}
+
+#[test]
+fn typed_keeps_pow_zero_on_nullable_base() {
+    // `pow(x, 0)` drops `x`; for a NULLABLE base that is unsound (`pow(null,0)` is
+    // null, not 1.0), so the call must survive.
+    let schema = make_schema(&[("x", DataType::Float64, true)]);
+    let program = compile_typed("field(\"x\") ** 0", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Call { .. }),
+        "nullable base keeps pow(x,0), got {:?}",
+        program.node(program.result())
+    );
+    // and it still yields null on a null row, matching the unreduced semantics.
+    assert_eq!(
+        eval_with_field(&program, "x", Value::Null).unwrap(),
+        Value::Null
+    );
+}
+
+#[test]
+fn typed_keeps_annihilation_on_nullable_operand() {
+    // `x & 0` drops `x`; for a NULLABLE operand that is unsound (`null & 0` is
+    // null, not 0), so the annihilation must NOT fire.
+    let schema = make_schema(&[("x", DataType::Int64, true)]);
+    let program = compile_typed("field(\"x\") & 0", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Call { .. }),
+        "nullable operand keeps x & 0, got {:?}",
+        program.node(program.result())
+    );
+    assert_eq!(
+        eval_with_field(&program, "x", Value::Null).unwrap(),
+        Value::Null
+    );
+}
+
+#[test]
+fn typed_self_inverse_folds_to_zero() {
+    // `x - x → 0` and `x ^ x → 0` over a non-null, infallible, pure Int64; the
+    // folded constant matches the unreduced value on every row.
+    let schema = make_schema(&[("x", DataType::Int64, false)]);
+    for source in ["field(\"x\") - field(\"x\")", "field(\"x\") ^ field(\"x\")"] {
+        let typed = compile_typed(source, Some(&schema), None).unwrap();
+        assert!(
+            matches!(typed.node(typed.result()), OptNode::Const(_)),
+            "{source}: got {:?}",
+            typed.node(typed.result())
+        );
+        let untyped = compile_typed(source, None, None).unwrap();
+        for sample in [Value::Int64(0), Value::Int64(99), Value::Int64(-5)] {
+            assert_eq!(
+                eval_with_field(&typed, "x", sample.clone()).unwrap(),
+                eval_with_field(&untyped, "x", sample.clone()).unwrap(),
+            );
+        }
+    }
 }
 
 #[test]

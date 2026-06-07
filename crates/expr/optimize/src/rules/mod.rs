@@ -11,6 +11,7 @@ mod de_morgan;
 mod empty_needle;
 mod encode_round_trip;
 mod engine;
+mod extremum_null_drop;
 mod field_collapse;
 mod flatten;
 mod flatten_conditionals;

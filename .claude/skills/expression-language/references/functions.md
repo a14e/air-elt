@@ -151,10 +151,12 @@ The six operators are **total** — they never return null, so they resolve to n
 
 ## Datetime
 
+`now`/`today` are pinned to the batch clock (`EvalContext.now`) at program initialization, so **every call within one batch returns the same value** — the SQL `NOW()` / `CURRENT_TIMESTAMP` semantics an ELT engine needs (one timestamp per inserted batch). They are therefore **referentially transparent** (`is_pure() == true`) and the optimizer may share/dedup/drop them, but **not compile-time-foldable** (`purity() == false`): the batch clock is unknown at compile time, so const folding never freezes a compile-time clock into the program.
+
 | Function | Signature | Description |
 |---|---|---|
-| `now` | `() -> Timestamp` | Current UTC timestamp (from EvalContext) |
-| `today` | `() -> Date` | Current UTC date |
+| `now` | `() -> Timestamp` | Current UTC timestamp (batch clock; stable within a batch) |
+| `today` | `() -> Date` | Current UTC date (batch clock; stable within a batch) |
 | `second` | `(Timestamp) -> Int64` | Extract second (0-59) |
 | `minute` | `(Timestamp) -> Int64` | Extract minute (0-59) |
 | `hour` | `(Timestamp) -> Int64` | Extract hour (0-23) |

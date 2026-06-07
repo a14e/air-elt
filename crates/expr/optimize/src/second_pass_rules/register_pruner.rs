@@ -15,14 +15,20 @@ use ahash::AHashSet;
 use air_elt_expr_funcs::FunctionRegistry;
 
 use super::engine::ProgramPass;
-use crate::fallibility::can_fail;
+use crate::model::node_id::NodeCounter;
 use crate::model::opt_expr::OptExpr;
 use crate::model::opt_program::OptProgram;
+use crate::util::fallibility::can_fail;
 
 pub(crate) struct RegisterPruner;
 
 impl ProgramPass for RegisterPruner {
-    fn run(&self, program: &mut OptProgram, registry: &FunctionRegistry) {
+    fn run(
+        &self,
+        program: &mut OptProgram,
+        registry: &FunctionRegistry,
+        _node_counter: &NodeCounter,
+    ) {
         loop {
             let mut used: AHashSet<u16> = AHashSet::new();
             collect(&program.result, &mut used);
@@ -43,11 +49,11 @@ impl ProgramPass for RegisterPruner {
 
 fn collect(expr: &OptExpr, used: &mut AHashSet<u16>) {
     match expr {
-        OptExpr::Register(register) => {
+        OptExpr::Register(_, register) => {
             used.insert(*register);
         }
-        OptExpr::Const(_) | OptExpr::SourceField(_) | OptExpr::Fields(_) => {}
-        OptExpr::Field(inner) => collect(inner, used),
+        OptExpr::Const(..) | OptExpr::SourceField(..) | OptExpr::Fields(..) => {}
+        OptExpr::Field(_, inner) => collect(inner, used),
         OptExpr::Call { args, .. } => {
             for arg in args {
                 collect(arg, used);
@@ -57,36 +63,43 @@ fn collect(expr: &OptExpr, used: &mut AHashSet<u16>) {
             condition,
             then_branch,
             else_branch,
+            ..
         } => {
             collect(condition, used);
             collect(then_branch, used);
             collect(else_branch, used);
         }
-        OptExpr::MultiIf { branches, default } => {
+        OptExpr::MultiIf {
+            branches, default, ..
+        } => {
             for (condition, value) in branches {
                 collect(condition, used);
                 collect(value, used);
             }
             collect(default, used);
         }
-        OptExpr::IfNull { value, alternative } => {
+        OptExpr::IfNull {
+            value, alternative, ..
+        } => {
             collect(value, used);
             collect(alternative, used);
         }
-        OptExpr::NullIf { value, sentinel } => {
+        OptExpr::NullIf {
+            value, sentinel, ..
+        } => {
             collect(value, used);
             collect(sentinel, used);
         }
-        OptExpr::And { left, right } | OptExpr::Or { left, right } => {
+        OptExpr::And { left, right, .. } | OptExpr::Or { left, right, .. } => {
             collect(left, used);
             collect(right, used);
         }
-        OptExpr::Interpolation(segments) => {
+        OptExpr::Interpolation(_, segments) => {
             for segment in segments {
                 collect(segment, used);
             }
         }
-        OptExpr::Object(entries) => {
+        OptExpr::Object(_, entries) => {
             for (_, value) in entries {
                 collect(value, used);
             }
@@ -95,6 +108,7 @@ fn collect(expr: &OptExpr, used: &mut AHashSet<u16>) {
             inputs,
             table,
             default,
+            ..
         } => {
             for input in inputs {
                 collect(input, used);
@@ -105,5 +119,13 @@ fn collect(expr: &OptExpr, used: &mut AHashSet<u16>) {
             collect(default, used);
         }
         OptExpr::TypeAssert { inner, .. } => collect(inner, used),
+        OptExpr::Block {
+            statements, result, ..
+        } => {
+            for statement in statements {
+                collect(&statement.value, used);
+            }
+            collect(result, used);
+        }
     }
 }

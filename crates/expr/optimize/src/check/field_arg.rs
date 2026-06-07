@@ -13,7 +13,7 @@ pub(crate) struct FieldArgCheck;
 impl Check for FieldArgCheck {
     fn check(&self, node: &OptExpr, _eager: bool, _cx: &CheckCx) -> Result<(), OptimizeError> {
         match node {
-            OptExpr::Field(_) => Err(OptimizeError::NonConstFieldArg),
+            OptExpr::Field(..) => Err(OptimizeError::NonConstFieldArg),
             _ => Ok(()),
         }
     }

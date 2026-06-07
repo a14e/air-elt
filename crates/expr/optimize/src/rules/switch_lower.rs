@@ -25,6 +25,7 @@ use air_elt_types::Key;
 
 use super::switch_build::{KeyExprs, SwitchEntries, clause_to_key, is_pure, parse_condition};
 use super::{Rewrite, Rule, RuleCx};
+use crate::model::node_id::NodeCounter;
 use crate::model::opt_expr::OptExpr;
 
 /// Minimum branch count for the lookup table to pay off (strictly `> 5`).
@@ -44,23 +45,41 @@ impl SwitchLower {
 
 impl Rule for SwitchLower {
     fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
-        let OptExpr::MultiIf { branches, default } = node else {
+        let OptExpr::MultiIf {
+            id,
+            branches,
+            default,
+        } = node
+        else {
             return Rewrite::Same(node);
         };
         let Some(equals) = self.equals else {
-            return Rewrite::Same(OptExpr::MultiIf { branches, default });
+            return Rewrite::Same(OptExpr::MultiIf {
+                id,
+                branches,
+                default,
+            });
         };
         if branches.len() < MIN_SWITCH_BRANCHES {
-            return Rewrite::Same(OptExpr::MultiIf { branches, default });
+            return Rewrite::Same(OptExpr::MultiIf {
+                id,
+                branches,
+                default,
+            });
         }
 
-        match try_lower(&branches, equals, cx.registry) {
+        match try_lower(&branches, equals, cx.registry, cx.node_counter) {
             Some((inputs, table)) => Rewrite::Changed(OptExpr::Switch {
+                id: cx.node_counter.fresh_id(),
                 inputs,
                 table,
                 default,
             }),
-            None => Rewrite::Same(OptExpr::MultiIf { branches, default }),
+            None => Rewrite::Same(OptExpr::MultiIf {
+                id,
+                branches,
+                default,
+            }),
         }
     }
 }
@@ -71,6 +90,7 @@ fn try_lower(
     branches: &[(OptExpr, OptExpr)],
     equals: FuncRef,
     registry: &FunctionRegistry,
+    node_counter: &NodeCounter,
 ) -> Option<(KeyExprs, SwitchEntries)> {
     let mut key_exprs: Option<KeyExprs> = None;
     let mut table: SwitchEntries = Vec::new();
@@ -90,7 +110,12 @@ fn try_lower(
             if !seen.insert(key.clone()) {
                 continue;
             }
-            table.push((key, value.clone()));
+            // One source branch value is cloned into a table entry per key it
+            // matches; re-id each clone so the surviving copies keep distinct
+            // node ids (the source branches are dropped, so this stays unique).
+            let mut branch_value = value.clone();
+            branch_value.reassign_ids(node_counter);
+            table.push((key, branch_value));
         }
     }
 

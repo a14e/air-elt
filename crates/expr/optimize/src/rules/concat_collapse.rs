@@ -29,7 +29,7 @@ use crate::model::program::TypeClass;
 
 /// Whether a node is the constant empty string `""`.
 fn is_empty_text(expr: &OptExpr) -> bool {
-    matches!(expr, OptExpr::Const(Value::Text(text)) if text.is_empty())
+    matches!(expr, OptExpr::Const(_, Value::Text(text)) if text.is_empty())
 }
 
 pub(crate) struct ConcatCollapse {
@@ -45,12 +45,12 @@ impl ConcatCollapse {
 }
 
 impl Rule for ConcatCollapse {
-    fn apply(&self, node: OptExpr, _cx: &RuleCx) -> Rewrite {
-        let OptExpr::Call { func, args } = node else {
+    fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
+        let OptExpr::Call { id, func, args } = node else {
             return Rewrite::Same(node);
         };
         if Some(func) != self.concat {
-            return Rewrite::Same(OptExpr::Call { func, args });
+            return Rewrite::Same(OptExpr::Call { id, func, args });
         }
 
         let original_len = args.len();
@@ -59,13 +59,17 @@ impl Rule for ConcatCollapse {
 
         match kept.len() {
             // Every argument was an empty string ⇒ the concatenation is "".
-            0 => Rewrite::Changed(OptExpr::Const(Value::Text(String::new()))),
+            0 => Rewrite::Changed(OptExpr::Const(
+                cx.node_counter.fresh_id(),
+                Value::Text(String::new()),
+            )),
             1 => {
                 let only = kept.pop().expect("len checked");
                 if only.as_const().is_some() {
                     // A single constant folds via const_fold; only report a change
                     // if an empty argument was actually dropped here.
                     let node = OptExpr::Call {
+                        id,
                         func,
                         args: vec![only],
                     };
@@ -77,6 +81,7 @@ impl Rule for ConcatCollapse {
                 } else {
                     // Strict concat of a single dynamic operand is a string assert.
                     Rewrite::Changed(OptExpr::TypeAssert {
+                        id: cx.node_counter.fresh_id(),
                         inner: Box::new(only),
                         expect: TypeClass::String,
                         on_present: AssertYield::Identity,
@@ -84,7 +89,11 @@ impl Rule for ConcatCollapse {
                 }
             }
             _ => {
-                let node = OptExpr::Call { func, args: kept };
+                let node = OptExpr::Call {
+                    id,
+                    func,
+                    args: kept,
+                };
                 if dropped {
                     Rewrite::Changed(node)
                 } else {
@@ -110,35 +119,38 @@ impl TrimConcat {
 }
 
 impl Rule for TrimConcat {
-    fn apply(&self, node: OptExpr, _cx: &RuleCx) -> Rewrite {
-        let OptExpr::Call { func, args } = node else {
+    fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
+        let OptExpr::Call { id, func, args } = node else {
             return Rewrite::Same(node);
         };
         let is_trim = Some(func) == self.trim && args.len() == 1;
         let wraps_concat = is_trim
             && matches!(&args[0], OptExpr::Call { func: inner, .. } if Some(*inner) == self.concat);
         if !wraps_concat {
-            return Rewrite::Same(OptExpr::Call { func, args });
+            return Rewrite::Same(OptExpr::Call { id, func, args });
         }
 
         let mut args = args;
         let inner = args.pop().expect("len checked");
         let OptExpr::Call {
+            id: concat_id,
             func: concat,
             args: concat_args,
         } = inner
         else {
             // `wraps_concat` already proved the inner shape.
-            return Rewrite::Same(OptExpr::Call { func, args });
+            return Rewrite::Same(OptExpr::Call { id, func, args });
         };
 
-        let (trimmed_args, changed) = strip_whitespace_edges(concat_args);
+        let (trimmed_args, changed) = strip_whitespace_edges(concat_args, cx);
         if !changed {
             let inner = OptExpr::Call {
+                id: concat_id,
                 func: concat,
                 args: trimmed_args,
             };
             return Rewrite::Same(OptExpr::Call {
+                id,
                 func,
                 args: vec![inner],
             });
@@ -146,13 +158,18 @@ impl Rule for TrimConcat {
 
         // Every segment was a whitespace-only constant ⇒ `trim` yields "".
         if trimmed_args.is_empty() {
-            return Rewrite::Changed(OptExpr::Const(Value::Text(String::new())));
+            return Rewrite::Changed(OptExpr::Const(
+                cx.node_counter.fresh_id(),
+                Value::Text(String::new()),
+            ));
         }
         let inner = OptExpr::Call {
+            id: concat_id,
             func: concat,
             args: trimmed_args,
         };
         Rewrite::Changed(OptExpr::Call {
+            id,
             func,
             args: vec![inner],
         })
@@ -162,11 +179,11 @@ impl Rule for TrimConcat {
 /// Drop whitespace-only constant segments at the edges of a soon-to-be-trimmed
 /// concatenation, and left/right-trim a partially-whitespace constant edge.
 /// Returns the rewritten segments and whether anything changed.
-fn strip_whitespace_edges(args: Vec<OptExpr>) -> (Vec<OptExpr>, bool) {
+fn strip_whitespace_edges(args: Vec<OptExpr>, cx: &RuleCx) -> (Vec<OptExpr>, bool) {
     let mut args: VecDeque<OptExpr> = args.into();
     let mut changed = false;
 
-    while let Some(OptExpr::Const(Value::Text(text))) = args.front() {
+    while let Some(OptExpr::Const(_, Value::Text(text))) = args.front() {
         let trimmed = text.trim_start();
         if trimmed.is_empty() {
             args.pop_front();
@@ -174,7 +191,10 @@ fn strip_whitespace_edges(args: Vec<OptExpr>) -> (Vec<OptExpr>, bool) {
         } else if trimmed.len() != text.len() {
             let trimmed = trimmed.to_owned();
             args.pop_front();
-            args.push_front(OptExpr::Const(Value::Text(trimmed)));
+            args.push_front(OptExpr::Const(
+                cx.node_counter.fresh_id(),
+                Value::Text(trimmed),
+            ));
             changed = true;
             break;
         } else {
@@ -182,7 +202,7 @@ fn strip_whitespace_edges(args: Vec<OptExpr>) -> (Vec<OptExpr>, bool) {
         }
     }
 
-    while let Some(OptExpr::Const(Value::Text(text))) = args.back() {
+    while let Some(OptExpr::Const(_, Value::Text(text))) = args.back() {
         let trimmed = text.trim_end();
         if trimmed.is_empty() {
             args.pop_back();
@@ -190,7 +210,10 @@ fn strip_whitespace_edges(args: Vec<OptExpr>) -> (Vec<OptExpr>, bool) {
         } else if trimmed.len() != text.len() {
             let trimmed = trimmed.to_owned();
             args.pop_back();
-            args.push_back(OptExpr::Const(Value::Text(trimmed)));
+            args.push_back(OptExpr::Const(
+                cx.node_counter.fresh_id(),
+                Value::Text(trimmed),
+            ));
             changed = true;
             break;
         } else {

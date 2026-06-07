@@ -28,7 +28,7 @@ impl IdempotentCollapse {
 
 impl Rule for IdempotentCollapse {
     fn apply(&self, node: OptExpr, _cx: &RuleCx) -> Rewrite {
-        let OptExpr::Call { func, args } = node else {
+        let OptExpr::Call { id, func, args } = node else {
             return Rewrite::Same(node);
         };
 
@@ -36,11 +36,11 @@ impl Rule for IdempotentCollapse {
             && self.operators.contains(&func)
             && matches!(
                 &args[0],
-                OptExpr::Call { func: inner, args: inner_args }
+                OptExpr::Call { func: inner, args: inner_args, .. }
                     if *inner == func && inner_args.len() == 1
             );
         if !nested {
-            return Rewrite::Same(OptExpr::Call { func, args });
+            return Rewrite::Same(OptExpr::Call { id, func, args });
         }
 
         // `f(f(x))` → `f(x)`: keep the outer `func`, take the inner call's operand.
@@ -51,11 +51,13 @@ impl Rule for IdempotentCollapse {
         } = inner_call
         else {
             return Rewrite::Same(OptExpr::Call {
+                id,
                 func,
                 args: vec![inner_call],
             });
         };
         Rewrite::Changed(OptExpr::Call {
+            id,
             func,
             args: inner_args,
         })

@@ -36,22 +36,23 @@ impl EmptyNeedle {
 }
 
 impl Rule for EmptyNeedle {
-    fn apply(&self, node: OptExpr, _cx: &RuleCx) -> Rewrite {
-        let OptExpr::Call { func, args } = node else {
+    fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
+        let OptExpr::Call { id, func, args } = node else {
             return Rewrite::Same(node);
         };
 
         let needle_is_empty = args.len() == 2
             && self.predicates.contains(&func)
-            && matches!(&args[1], OptExpr::Const(Value::Text(text)) if text.is_empty());
+            && matches!(&args[1], OptExpr::Const(_, Value::Text(text)) if text.is_empty());
         if !needle_is_empty {
-            return Rewrite::Same(OptExpr::Call { func, args });
+            return Rewrite::Same(OptExpr::Call { id, func, args });
         }
 
         // Keep arg 0 (haystack), drop the constant empty needle.
         let mut args = args;
         let haystack = args.swap_remove(0);
         Rewrite::Changed(OptExpr::TypeAssert {
+            id: cx.node_counter.fresh_id(),
             inner: Box::new(haystack),
             expect: TypeClass::String,
             on_present: AssertYield::Const(Value::Bool(true)),

@@ -9,7 +9,7 @@
 //! reach.
 //!
 //! Soundness rests on eager evaluation: building an object evaluates every value,
-//! so a value that [`can_fail`](crate::fallibility) must still be evaluated even
+//! so a value that [`can_fail`](crate::util::fallibility) must still be evaluated even
 //! when its key is not the one read. Each rewrite therefore fires only when the
 //! values it would drop are infallible. The matched value of an `objectGet` hit
 //! is returned (and thus still evaluated), so only the *other* entries gate that
@@ -21,25 +21,26 @@ use air_elt_expr_funcs::FuncRef;
 use air_elt_types::Value;
 
 use super::{Rewrite, Rule, RuleCx};
-use crate::fallibility::can_fail;
+use crate::model::node_id::NodeId;
 use crate::model::opt_expr::OptExpr;
+use crate::util::fallibility::can_fail;
 
 pub(crate) struct ObjectAccessFold;
 
 impl Rule for ObjectAccessFold {
     fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
-        let OptExpr::Call { func, args } = node else {
+        let OptExpr::Call { id, func, args } = node else {
             return Rewrite::Same(node);
         };
         // Only an object-access call over a literal object first argument.
-        if !matches!(args.first(), Some(OptExpr::Object(_))) {
-            return Rewrite::Same(OptExpr::Call { func, args });
+        if !matches!(args.first(), Some(OptExpr::Object(_, _))) {
+            return Rewrite::Same(OptExpr::Call { id, func, args });
         }
         match cx.registry.get_by_ref(func).name() {
-            "objectGet" => fold_object_get(func, args, cx),
-            "objectHasKey" => fold_object_has_key(func, args, cx),
-            "objectLength" => fold_object_length(func, args, cx),
-            _ => Rewrite::Same(OptExpr::Call { func, args }),
+            "objectGet" => fold_object_get(id, func, args, cx),
+            "objectHasKey" => fold_object_has_key(id, func, args, cx),
+            "objectLength" => fold_object_length(id, func, args, cx),
+            _ => Rewrite::Same(OptExpr::Call { id, func, args }),
         }
     }
 }
@@ -60,14 +61,14 @@ fn const_text_key(args: &[OptExpr]) -> Option<String> {
 /// confirmed the first argument is an `Object`).
 fn object_entries(args: &[OptExpr]) -> &[(String, OptExpr)] {
     match args.first() {
-        Some(OptExpr::Object(entries)) => entries,
+        Some(OptExpr::Object(_, entries)) => entries,
         _ => &[],
     }
 }
 
-fn fold_object_get(func: FuncRef, args: Vec<OptExpr>, cx: &RuleCx) -> Rewrite {
+fn fold_object_get(id: NodeId, func: FuncRef, args: Vec<OptExpr>, cx: &RuleCx) -> Rewrite {
     let Some(key) = const_text_key(&args) else {
-        return Rewrite::Same(OptExpr::Call { func, args });
+        return Rewrite::Same(OptExpr::Call { id, func, args });
     };
 
     let entries = object_entries(&args);
@@ -85,14 +86,14 @@ fn fold_object_get(func: FuncRef, args: Vec<OptExpr>, cx: &RuleCx) -> Rewrite {
             .all(|(_, value)| !can_fail(value, cx.registry)),
     };
     if !sound {
-        return Rewrite::Same(OptExpr::Call { func, args });
+        return Rewrite::Same(OptExpr::Call { id, func, args });
     }
 
     match matched {
-        None => Rewrite::Changed(OptExpr::Const(Value::Null)),
+        None => Rewrite::Changed(OptExpr::Const(cx.node_counter.fresh_id(), Value::Null)),
         Some(index) => {
             let mut args = args;
-            let OptExpr::Object(mut entries) = args.swap_remove(0) else {
+            let OptExpr::Object(_, mut entries) = args.swap_remove(0) else {
                 unreachable!("first argument confirmed Object")
             };
             Rewrite::Changed(entries.swap_remove(index).1)
@@ -100,9 +101,9 @@ fn fold_object_get(func: FuncRef, args: Vec<OptExpr>, cx: &RuleCx) -> Rewrite {
     }
 }
 
-fn fold_object_has_key(func: FuncRef, args: Vec<OptExpr>, cx: &RuleCx) -> Rewrite {
+fn fold_object_has_key(id: NodeId, func: FuncRef, args: Vec<OptExpr>, cx: &RuleCx) -> Rewrite {
     let Some(key) = const_text_key(&args) else {
-        return Rewrite::Same(OptExpr::Call { func, args });
+        return Rewrite::Same(OptExpr::Call { id, func, args });
     };
     let entries = object_entries(&args);
     // The answer is static, but every value is still dropped — keep the call
@@ -111,20 +112,26 @@ fn fold_object_has_key(func: FuncRef, args: Vec<OptExpr>, cx: &RuleCx) -> Rewrit
         .iter()
         .any(|(_, value)| can_fail(value, cx.registry))
     {
-        return Rewrite::Same(OptExpr::Call { func, args });
+        return Rewrite::Same(OptExpr::Call { id, func, args });
     }
     let present = entries.iter().any(|(name, _)| name == &key);
-    Rewrite::Changed(OptExpr::Const(Value::Bool(present)))
+    Rewrite::Changed(OptExpr::Const(
+        cx.node_counter.fresh_id(),
+        Value::Bool(present),
+    ))
 }
 
-fn fold_object_length(func: FuncRef, args: Vec<OptExpr>, cx: &RuleCx) -> Rewrite {
+fn fold_object_length(id: NodeId, func: FuncRef, args: Vec<OptExpr>, cx: &RuleCx) -> Rewrite {
     let entries = object_entries(&args);
     if entries
         .iter()
         .any(|(_, value)| can_fail(value, cx.registry))
     {
-        return Rewrite::Same(OptExpr::Call { func, args });
+        return Rewrite::Same(OptExpr::Call { id, func, args });
     }
     let length = entries.len() as i64;
-    Rewrite::Changed(OptExpr::Const(Value::Int64(length)))
+    Rewrite::Changed(OptExpr::Const(
+        cx.node_counter.fresh_id(),
+        Value::Int64(length),
+    ))
 }

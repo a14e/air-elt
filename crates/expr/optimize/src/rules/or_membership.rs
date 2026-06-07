@@ -54,11 +54,15 @@ impl Rule for OrMembership {
             return Rewrite::Same(node);
         };
 
-        match try_lower(&node, equals, cx.registry) {
+        match try_lower(&node, equals, cx) {
             Some((inputs, table)) => Rewrite::Changed(OptExpr::Switch {
+                id: cx.node_counter.fresh_id(),
                 inputs,
                 table,
-                default: Box::new(OptExpr::Const(Value::Bool(false))),
+                default: Box::new(OptExpr::Const(
+                    cx.node_counter.fresh_id(),
+                    Value::Bool(false),
+                )),
             }),
             None => Rewrite::Same(node),
         }
@@ -68,8 +72,9 @@ impl Rule for OrMembership {
 fn try_lower(
     condition: &OptExpr,
     equals: FuncRef,
-    registry: &FunctionRegistry,
+    cx: &RuleCx,
 ) -> Option<(KeyExprs, SwitchEntries)> {
+    let registry = cx.registry;
     let clauses = parse_condition(condition, equals)?;
     if clauses.len() < MIN_MEMBERSHIP_ENTRIES {
         // A short chain is cheaper left as `||`; only a long membership test pays
@@ -86,7 +91,10 @@ fn try_lower(
         if !seen.insert(key.clone()) {
             continue;
         }
-        table.push((key, OptExpr::Const(Value::Bool(true))));
+        table.push((
+            key,
+            OptExpr::Const(cx.node_counter.fresh_id(), Value::Bool(true)),
+        ));
     }
 
     let key_exprs = key_exprs?;

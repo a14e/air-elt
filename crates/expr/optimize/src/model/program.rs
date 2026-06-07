@@ -165,6 +165,25 @@ pub enum OptNode {
         expect: TypeClass,
         on_present: CompactYield,
     },
+    /// A scoped binding: evaluate `value` into `register`, then evaluate `body`
+    /// (the result). The flattened form of a heap
+    /// [`Block`](crate::model::opt_expr::OptExpr::Block) — a multi-binding block
+    /// lowers to nested `Bind` nodes. Because it is reached only when control
+    /// descends to it, the binding is evaluated lazily/branch-locally (a binding
+    /// introduced inside one `if` arm is written only when that arm runs),
+    /// enabling branch-local CSE and computation push-down. The register is a
+    /// slot in the program-wide register file.
+    ///
+    /// Reached only once a producer of the heap `Block` exists (the planned
+    /// CSE / push-down passes). Until then no `Block` is built, so compaction
+    /// never emits a `Bind` and the variant is `dead_code` — kept wired so the
+    /// evaluator and arena layout are ready when the passes land.
+    #[allow(dead_code)]
+    Bind {
+        register: RegisterId,
+        value: NodeRef,
+        body: NodeRef,
+    },
 }
 
 /// A compacted switch dispatch table: an O(1) map from constant [`Key`] to the

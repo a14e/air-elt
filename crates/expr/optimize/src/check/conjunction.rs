@@ -58,7 +58,7 @@ impl Check for ConjunctionInfeasibility {
 /// `&&` nodes and treating everything else as a leaf conjunct.
 fn flatten_and<'a>(node: &'a OptExpr, out: &mut Vec<&'a OptExpr>) {
     match node {
-        OptExpr::And { left, right } => {
+        OptExpr::And { left, right, .. } => {
             flatten_and(left, out);
             flatten_and(right, out);
         }

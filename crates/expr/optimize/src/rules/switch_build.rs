@@ -25,7 +25,7 @@ pub(super) type SwitchEntries = Vec<(Key, OptExpr)>;
 /// A condition is a disjunction (`||`) of conjunctive clauses.
 pub(super) fn parse_condition(condition: &OptExpr, equals: FuncRef) -> Option<Vec<Clause>> {
     match condition {
-        OptExpr::Or { left, right } => {
+        OptExpr::Or { left, right, .. } => {
             let mut clauses = parse_condition(left, equals)?;
             clauses.extend(parse_condition(right, equals)?);
             Some(clauses)
@@ -37,12 +37,12 @@ pub(super) fn parse_condition(condition: &OptExpr, equals: FuncRef) -> Option<Ve
 /// A clause is a conjunction (`&&`) of `equals(K, const)` tests.
 fn parse_clause(condition: &OptExpr, equals: FuncRef) -> Option<Clause> {
     match condition {
-        OptExpr::And { left, right } => {
+        OptExpr::And { left, right, .. } => {
             let mut clause = parse_clause(left, equals)?;
             clause.extend(parse_clause(right, equals)?);
             Some(clause)
         }
-        OptExpr::Call { func, args } if *func == equals && args.len() == 2 => {
+        OptExpr::Call { func, args, .. } if *func == equals && args.len() == 2 => {
             match (args[0].as_const(), args[1].as_const()) {
                 (Some(constant), None) if is_switchable_const(constant) => {
                     Some(vec![(args[1].clone(), constant.clone())])
@@ -123,45 +123,50 @@ pub(super) fn is_switchable_const(value: &Value) -> bool {
 /// evaluate it once instead of per branch.
 pub(super) fn is_pure(expr: &OptExpr, registry: &FunctionRegistry) -> bool {
     match expr {
-        OptExpr::Const(_) | OptExpr::Register(_) | OptExpr::SourceField(_) | OptExpr::Fields(_) => {
-            true
-        }
-        OptExpr::Field(inner) => is_pure(inner, registry),
-        OptExpr::Call { func, args } => {
+        OptExpr::Const(..)
+        | OptExpr::Register(..)
+        | OptExpr::SourceField(..)
+        | OptExpr::Fields(..) => true,
+        OptExpr::Field(_, inner) => is_pure(inner, registry),
+        OptExpr::Call { func, args, .. } => {
             registry.get_by_ref(*func).is_pure() && args.iter().all(|arg| is_pure(arg, registry))
         }
         OptExpr::If {
             condition,
             then_branch,
             else_branch,
+            ..
         } => {
             is_pure(condition, registry)
                 && is_pure(then_branch, registry)
                 && is_pure(else_branch, registry)
         }
-        OptExpr::MultiIf { branches, default } => {
+        OptExpr::MultiIf {
+            branches, default, ..
+        } => {
             branches
                 .iter()
                 .all(|(condition, value)| is_pure(condition, registry) && is_pure(value, registry))
                 && is_pure(default, registry)
         }
-        OptExpr::IfNull { value, alternative } => {
-            is_pure(value, registry) && is_pure(alternative, registry)
-        }
-        OptExpr::NullIf { value, sentinel } => {
-            is_pure(value, registry) && is_pure(sentinel, registry)
-        }
-        OptExpr::And { left, right } | OptExpr::Or { left, right } => {
+        OptExpr::IfNull {
+            value, alternative, ..
+        } => is_pure(value, registry) && is_pure(alternative, registry),
+        OptExpr::NullIf {
+            value, sentinel, ..
+        } => is_pure(value, registry) && is_pure(sentinel, registry),
+        OptExpr::And { left, right, .. } | OptExpr::Or { left, right, .. } => {
             is_pure(left, registry) && is_pure(right, registry)
         }
-        OptExpr::Interpolation(segments) => {
+        OptExpr::Interpolation(_, segments) => {
             segments.iter().all(|segment| is_pure(segment, registry))
         }
-        OptExpr::Object(entries) => entries.iter().all(|(_, value)| is_pure(value, registry)),
+        OptExpr::Object(_, entries) => entries.iter().all(|(_, value)| is_pure(value, registry)),
         OptExpr::Switch {
             inputs,
             table,
             default,
+            ..
         } => {
             inputs.iter().all(|input| is_pure(input, registry))
                 && table.iter().all(|(_, value)| is_pure(value, registry))
@@ -169,5 +174,13 @@ pub(super) fn is_pure(expr: &OptExpr, registry: &FunctionRegistry) -> bool {
         }
         // The assert itself is a pure type/null check; purity follows the operand.
         OptExpr::TypeAssert { inner, .. } => is_pure(inner, registry),
+        OptExpr::Block {
+            statements, result, ..
+        } => {
+            statements
+                .iter()
+                .all(|statement| is_pure(&statement.value, registry))
+                && is_pure(result, registry)
+        }
     }
 }

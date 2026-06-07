@@ -20,6 +20,7 @@ use air_elt_expr_funcs::{FuncRef, FunctionRegistry};
 use air_elt_types::Value;
 
 use super::{Rewrite, Rule, RuleCx};
+use crate::model::node_id::{NodeCounter, NodeId};
 use crate::model::opt_expr::{AssertYield, OptExpr};
 use crate::model::program::TypeClass;
 
@@ -46,22 +47,25 @@ impl EncodeRoundTrip {
 }
 
 impl Rule for EncodeRoundTrip {
-    fn apply(&self, node: OptExpr, _cx: &RuleCx) -> Rewrite {
+    fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
         let (encode, decode) = match (self.encode, self.decode) {
             (Some(encode), Some(decode)) => (encode, decode),
             _ => return Rewrite::Same(node),
         };
-        let OptExpr::Call { func, args } = node else {
+        let counter = cx.node_counter;
+        let OptExpr::Call { id, func, args } = node else {
             return Rewrite::Same(node);
         };
         if func != decode || args.len() != 2 {
-            return Rewrite::Same(OptExpr::Call { func, args });
+            return Rewrite::Same(OptExpr::Call { id, func, args });
         }
 
         // The outer label `B` must be a constant round-trip algorithm.
         let outer_label = match &args[1] {
-            OptExpr::Const(Value::Text(label)) if is_round_trip_algorithm(label) => label.clone(),
-            _ => return Rewrite::Same(OptExpr::Call { func, args }),
+            OptExpr::Const(_, Value::Text(label)) if is_round_trip_algorithm(label) => {
+                label.clone()
+            }
+            _ => return Rewrite::Same(OptExpr::Call { id, func, args }),
         };
 
         let mut args = args;
@@ -70,25 +74,31 @@ impl Rule for EncodeRoundTrip {
             OptExpr::Call {
                 func: inner_func,
                 args: inner_args,
+                ..
             } if inner_func == encode && inner_args.len() == 2 => {
                 let labels_match = matches!(
                     &inner_args[1],
-                    OptExpr::Const(Value::Text(inner_label)) if *inner_label == outer_label
+                    OptExpr::Const(_, Value::Text(inner_label)) if *inner_label == outer_label
                 );
                 if !labels_match {
-                    return restore(func, inner_func, inner_args, outer_label);
+                    return restore(id, func, inner_func, inner_args, outer_label, counter);
                 }
                 let mut inner_args = inner_args;
                 let operand = inner_args.swap_remove(0);
                 Rewrite::Changed(OptExpr::TypeAssert {
+                    id: counter.fresh_id(),
                     inner: Box::new(operand),
                     expect: TypeClass::Bytes,
                     on_present: AssertYield::Identity,
                 })
             }
             other => Rewrite::Same(OptExpr::Call {
+                id,
                 func,
-                args: vec![other, OptExpr::Const(Value::Text(outer_label))],
+                args: vec![
+                    other,
+                    OptExpr::Const(counter.fresh_id(), Value::Text(outer_label)),
+                ],
             }),
         }
     }
@@ -96,17 +106,24 @@ impl Rule for EncodeRoundTrip {
 
 /// Rebuild `decode(encode(x, A), B)` unchanged when the labels did not match.
 fn restore(
+    decode_id: NodeId,
     decode: FuncRef,
     encode: FuncRef,
     inner_args: Vec<OptExpr>,
     outer_label: String,
+    counter: &NodeCounter,
 ) -> Rewrite {
     let inner = OptExpr::Call {
+        id: counter.fresh_id(),
         func: encode,
         args: inner_args,
     };
     Rewrite::Same(OptExpr::Call {
+        id: decode_id,
         func: decode,
-        args: vec![inner, OptExpr::Const(Value::Text(outer_label))],
+        args: vec![
+            inner,
+            OptExpr::Const(counter.fresh_id(), Value::Text(outer_label)),
+        ],
     })
 }

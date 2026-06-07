@@ -159,8 +159,16 @@ fn timestamp_input_type(args: &[NullableExprType], func: &str) -> Result<(), Fun
 struct NowFunc;
 
 impl ExprFunction for NowFunc {
-    /// Impure: depends on the runtime clock — never const-foldable.
+    /// Referentially transparent: `now` is pinned to the batch clock
+    /// (`context.now`) at program initialization, so every call in one run
+    /// returns the same value — safe to share (CSE/dedup) or drop when unused.
     fn is_pure(&self) -> bool {
+        true
+    }
+
+    /// NOT const-foldable: the batch clock is unknown at compile time, so const
+    /// folding must never freeze a compile-time `now` into the program.
+    fn purity(&self, _const_args: &[bool]) -> bool {
         false
     }
 
@@ -192,8 +200,15 @@ impl ExprFunction for NowFunc {
 struct TodayFunc;
 
 impl ExprFunction for TodayFunc {
-    /// Impure: depends on the runtime clock — never const-foldable.
+    /// Referentially transparent: `today` is derived from the batch clock
+    /// (`context.now`) pinned at program initialization, so every call in one
+    /// run returns the same value — safe to share (CSE/dedup) or drop when unused.
     fn is_pure(&self) -> bool {
+        true
+    }
+
+    /// NOT const-foldable: the batch clock is unknown at compile time.
+    fn purity(&self, _const_args: &[bool]) -> bool {
         false
     }
 
@@ -1008,6 +1023,29 @@ mod tests {
         assert_eq!(
             result,
             Value::Date(NaiveDate::from_ymd_opt(2024, 6, 15).unwrap())
+        );
+    }
+
+    #[test]
+    fn now_and_today_are_pure_but_not_const_foldable() {
+        // Referentially transparent (pinned to the batch clock at init, so
+        // repeated calls in one run agree) — safe to CSE/dedup/drop.
+        assert!(NowFunc.is_pure(), "now must be referentially transparent");
+        assert!(
+            TodayFunc.is_pure(),
+            "today must be referentially transparent"
+        );
+        // ...but NOT const-foldable: the batch clock is unknown at compile time,
+        // so const folding must never freeze a compile-time clock into the
+        // program. `purity` is the gate const folding consults, and it stays
+        // false regardless of (the empty set of) argument constness.
+        assert!(
+            !NowFunc.purity(&[]),
+            "now must not be const-folded (reads the batch clock)"
+        );
+        assert!(
+            !TodayFunc.purity(&[]),
+            "today must not be const-folded (reads the batch clock)"
         );
     }
 

@@ -28,7 +28,7 @@ pub(crate) struct ConstFold;
 
 impl Rule for ConstFold {
     fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
-        let OptExpr::Call { func, args } = node else {
+        let OptExpr::Call { id, func, args } = node else {
             return Rewrite::Same(node);
         };
 
@@ -36,13 +36,13 @@ impl Rule for ConstFold {
         // non-constant, or if the call is not compile-time pure. Only once the
         // whole call is known foldable do we clone the argument values.
         if !args.iter().all(|arg| arg.as_const().is_some()) {
-            return Rewrite::Same(OptExpr::Call { func, args });
+            return Rewrite::Same(OptExpr::Call { id, func, args });
         }
 
         let function = cx.registry.get_by_ref(func);
         let const_flags = vec![true; args.len()];
         if !function.purity(&const_flags) {
-            return Rewrite::Same(OptExpr::Call { func, args });
+            return Rewrite::Same(OptExpr::Call { id, func, args });
         }
 
         // Every argument is constant and the call is pure: it is fully known at
@@ -55,8 +55,8 @@ impl Rule for ConstFold {
             .collect();
         let mut window = OwnedArgWindow::create(values);
         match function.evaluate(&mut window, cx.eval_context) {
-            Ok(value) => Rewrite::Changed(OptExpr::Const(value)),
-            Err(_) => Rewrite::Same(OptExpr::Call { func, args }),
+            Ok(value) => Rewrite::Changed(OptExpr::Const(cx.node_counter.fresh_id(), value)),
+            Err(_) => Rewrite::Same(OptExpr::Call { id, func, args }),
         }
     }
 }
@@ -64,15 +64,15 @@ impl Rule for ConstFold {
 pub(crate) struct InterpolationFold;
 
 impl Rule for InterpolationFold {
-    fn apply(&self, node: OptExpr, _cx: &RuleCx) -> Rewrite {
-        let OptExpr::Interpolation(segments) = node else {
+    fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
+        let OptExpr::Interpolation(id, segments) = node else {
             return Rewrite::Same(node);
         };
 
         // Pre-scan: bail without building any string if a segment is
         // non-constant. Only an all-constant interpolation is rendered.
         if !segments.iter().all(|segment| segment.as_const().is_some()) {
-            return Rewrite::Same(OptExpr::Interpolation(segments));
+            return Rewrite::Same(OptExpr::Interpolation(id, segments));
         }
 
         let mut rendered = String::new();
@@ -82,38 +82,44 @@ impl Rule for InterpolationFold {
             // Preserve the runtime size cap: an oversized fold would mask the
             // error the runtime must raise, so leave it for evaluation.
             if rendered.len() > MAX_EXPR_STRING_BYTES {
-                return Rewrite::Same(OptExpr::Interpolation(segments));
+                return Rewrite::Same(OptExpr::Interpolation(id, segments));
             }
         }
 
-        Rewrite::Changed(OptExpr::Const(Value::Text(rendered)))
+        Rewrite::Changed(OptExpr::Const(
+            cx.node_counter.fresh_id(),
+            Value::Text(rendered),
+        ))
     }
 }
 
 pub(crate) struct ObjectFold;
 
 impl Rule for ObjectFold {
-    fn apply(&self, node: OptExpr, _cx: &RuleCx) -> Rewrite {
-        let OptExpr::Object(entries) = node else {
+    fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
+        let OptExpr::Object(id, entries) = node else {
             return Rewrite::Same(node);
         };
 
         // Pre-scan: bail without building the map if any value is non-constant.
         if !entries
             .iter()
-            .all(|(_, value)| matches!(value, OptExpr::Const(_)))
+            .all(|(_, value)| matches!(value, OptExpr::Const(..)))
         {
-            return Rewrite::Same(OptExpr::Object(entries));
+            return Rewrite::Same(OptExpr::Object(id, entries));
         }
 
         let mut fields = Vec::with_capacity(entries.len());
         for (key, value) in &entries {
-            let OptExpr::Const(constant) = value else {
+            let OptExpr::Const(_, constant) = value else {
                 continue; // pre-scanned: every value is constant
             };
             fields.push((key.clone(), constant.clone()));
         }
 
-        Rewrite::Changed(OptExpr::Const(Value::Object(fields)))
+        Rewrite::Changed(OptExpr::Const(
+            cx.node_counter.fresh_id(),
+            Value::Object(fields),
+        ))
     }
 }

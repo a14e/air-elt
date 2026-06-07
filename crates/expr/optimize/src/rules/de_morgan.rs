@@ -23,6 +23,7 @@
 use air_elt_expr_funcs::{FuncRef, FunctionRegistry};
 
 use super::{Rewrite, Rule, RuleCx};
+use crate::model::node_id::NodeCounter;
 use crate::model::opt_expr::OptExpr;
 
 pub(crate) struct DeMorgan {
@@ -38,38 +39,49 @@ impl DeMorgan {
 }
 
 impl Rule for DeMorgan {
-    fn apply(&self, node: OptExpr, _cx: &RuleCx) -> Rewrite {
+    fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
         let Some(not) = self.not else {
             return Rewrite::Same(node);
         };
+        let counter = cx.node_counter;
 
         match node {
-            OptExpr::And { left, right } => match (peel_not(not, *left), peel_not(not, *right)) {
-                (Ok(a), Ok(b)) => Rewrite::Changed(wrap_not(
-                    not,
-                    OptExpr::Or {
-                        left: Box::new(a),
-                        right: Box::new(b),
-                    },
-                )),
-                (left, right) => Rewrite::Same(OptExpr::And {
-                    left: Box::new(restore_not(not, left)),
-                    right: Box::new(restore_not(not, right)),
-                }),
-            },
-            OptExpr::Or { left, right } => match (peel_not(not, *left), peel_not(not, *right)) {
-                (Ok(a), Ok(b)) => Rewrite::Changed(wrap_not(
-                    not,
-                    OptExpr::And {
-                        left: Box::new(a),
-                        right: Box::new(b),
-                    },
-                )),
-                (left, right) => Rewrite::Same(OptExpr::Or {
-                    left: Box::new(restore_not(not, left)),
-                    right: Box::new(restore_not(not, right)),
-                }),
-            },
+            OptExpr::And { id, left, right } => {
+                match (peel_not(not, *left), peel_not(not, *right)) {
+                    (Ok(a), Ok(b)) => Rewrite::Changed(wrap_not(
+                        not,
+                        counter,
+                        OptExpr::Or {
+                            id,
+                            left: Box::new(a),
+                            right: Box::new(b),
+                        },
+                    )),
+                    (left, right) => Rewrite::Same(OptExpr::And {
+                        id,
+                        left: Box::new(restore_not(not, counter, left)),
+                        right: Box::new(restore_not(not, counter, right)),
+                    }),
+                }
+            }
+            OptExpr::Or { id, left, right } => {
+                match (peel_not(not, *left), peel_not(not, *right)) {
+                    (Ok(a), Ok(b)) => Rewrite::Changed(wrap_not(
+                        not,
+                        counter,
+                        OptExpr::And {
+                            id,
+                            left: Box::new(a),
+                            right: Box::new(b),
+                        },
+                    )),
+                    (left, right) => Rewrite::Same(OptExpr::Or {
+                        id,
+                        left: Box::new(restore_not(not, counter, left)),
+                        right: Box::new(restore_not(not, counter, right)),
+                    }),
+                }
+            }
             other => Rewrite::Same(other),
         }
     }
@@ -78,7 +90,7 @@ impl Rule for DeMorgan {
 /// `Ok(operand)` if `expr` is `not(operand)`, else `Err(expr)` returned intact.
 fn peel_not(not: FuncRef, expr: OptExpr) -> Result<OptExpr, OptExpr> {
     match expr {
-        OptExpr::Call { func, mut args } if func == not && args.len() == 1 => {
+        OptExpr::Call { func, mut args, .. } if func == not && args.len() == 1 => {
             Ok(args.swap_remove(0))
         }
         other => Err(other),
@@ -86,15 +98,16 @@ fn peel_not(not: FuncRef, expr: OptExpr) -> Result<OptExpr, OptExpr> {
 }
 
 /// Inverse of [`peel_not`]: rewrap a peeled operand, or pass through the original.
-fn restore_not(not: FuncRef, peeled: Result<OptExpr, OptExpr>) -> OptExpr {
+fn restore_not(not: FuncRef, counter: &NodeCounter, peeled: Result<OptExpr, OptExpr>) -> OptExpr {
     match peeled {
-        Ok(operand) => wrap_not(not, operand),
+        Ok(operand) => wrap_not(not, counter, operand),
         Err(original) => original,
     }
 }
 
-fn wrap_not(not: FuncRef, operand: OptExpr) -> OptExpr {
+fn wrap_not(not: FuncRef, counter: &NodeCounter, operand: OptExpr) -> OptExpr {
     OptExpr::Call {
+        id: counter.fresh_id(),
         func: not,
         args: vec![operand],
     }

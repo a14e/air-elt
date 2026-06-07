@@ -61,8 +61,11 @@ pub fn arithmetic_result_type(
 /// non-numeric comparable categories pass through (`Text`/`Bytes` widen to
 /// unbounded). Mixing categories whose ordering is undefined against each
 /// other (e.g. a number and text) is rejected — `min`/`max` are not defined
-/// on such a comparison. The result is always nullable: every-argument-NULL
-/// yields NULL.
+/// on such a comparison.
+///
+/// `min`/`max` skip NULL arguments and yield NULL only when EVERY argument is
+/// NULL, so the result is nullable exactly when every argument is nullable: a
+/// single non-null argument guarantees a non-null extremum.
 pub fn comparable_join(
     args: &[NullableExprType],
     op: &str,
@@ -71,7 +74,8 @@ pub fn comparable_join(
     for arg in &args[1..] {
         accumulator = join_comparable(&accumulator, &arg.data_type, op)?;
     }
-    Ok(NullableExprType::nullable(accumulator))
+    let nullable = args.iter().all(|arg| arg.nullable);
+    Ok(NullableExprType::new(accumulator, nullable))
 }
 
 fn join_comparable(left: &DataType, right: &DataType, op: &str) -> Result<DataType, ExprTypeError> {

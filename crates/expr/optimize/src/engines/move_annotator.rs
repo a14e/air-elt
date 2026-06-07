@@ -158,6 +158,20 @@ impl MoveAnnotator {
                 table,
                 default,
             } => self.analyze_switch(program, *inputs, *table, *default, live, to_take),
+            // Let-binding liveness: the body runs after the store, the value
+            // before it. The register is defined by this binding (its store), so
+            // it is dead before the binding — drop it from the body's live-before,
+            // then analyze the value with that set. The register is block-local
+            // (SSA), so it never escapes to the surrounding context.
+            OptNode::Bind {
+                register,
+                value,
+                body,
+            } => {
+                let mut after_value = self.analyze(program, *body, live, to_take);
+                after_value.remove(*register);
+                self.analyze(program, *value, after_value, to_take)
+            }
         }
     }
 
@@ -264,6 +278,10 @@ impl MoveAnnotator {
                     Self::count_register_reads(program, branch, counts);
                 }
                 Self::count_register_reads(program, *default, counts);
+            }
+            OptNode::Bind { value, body, .. } => {
+                Self::count_register_reads(program, *value, counts);
+                Self::count_register_reads(program, *body, counts);
             }
         }
     }

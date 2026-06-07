@@ -112,18 +112,18 @@ impl Compactor {
 
     fn compact_expr(&mut self, expr: OptExpr) -> Result<NodeRef, OptimizeError> {
         match expr {
-            OptExpr::Const(value) => {
+            OptExpr::Const(_, value) => {
                 let id = self.intern_const(value)?;
                 Ok(self.nodes.alloc(OptNode::Const(id))?)
             }
-            OptExpr::Register(register) => Ok(self.nodes.alloc(OptNode::Register(register))?),
-            OptExpr::SourceField(name) => Ok(self.nodes.alloc(OptNode::SourceField(name))?),
-            OptExpr::Field(inner) => {
+            OptExpr::Register(_, register) => Ok(self.nodes.alloc(OptNode::Register(register))?),
+            OptExpr::SourceField(_, name) => Ok(self.nodes.alloc(OptNode::SourceField(name))?),
+            OptExpr::Field(_, inner) => {
                 let inner = self.compact_expr(*inner)?;
                 Ok(self.nodes.alloc(OptNode::Field(inner))?)
             }
-            OptExpr::Fields(selector) => Ok(self.nodes.alloc(OptNode::Fields(selector))?),
-            OptExpr::Call { func, args } => {
+            OptExpr::Fields(_, selector) => Ok(self.nodes.alloc(OptNode::Fields(selector))?),
+            OptExpr::Call { func, args, .. } => {
                 let args = self.compact_run(args)?;
                 Ok(self.nodes.alloc(OptNode::Call { func, args })?)
             }
@@ -131,6 +131,7 @@ impl Compactor {
                 condition,
                 then_branch,
                 else_branch,
+                ..
             } => {
                 let condition = self.compact_expr(*condition)?;
                 let then_branch = self.compact_expr(*then_branch)?;
@@ -141,7 +142,9 @@ impl Compactor {
                     else_branch,
                 })?)
             }
-            OptExpr::MultiIf { branches, default } => {
+            OptExpr::MultiIf {
+                branches, default, ..
+            } => {
                 // Flatten `(cond, val)` pairs into one alternating run.
                 let mut flattened = Vec::with_capacity(branches.len() * 2);
                 for (condition, value) in branches {
@@ -152,31 +155,35 @@ impl Compactor {
                 let default = self.compact_expr(*default)?;
                 Ok(self.nodes.alloc(OptNode::MultiIf { branches, default })?)
             }
-            OptExpr::IfNull { value, alternative } => {
+            OptExpr::IfNull {
+                value, alternative, ..
+            } => {
                 let value = self.compact_expr(*value)?;
                 let alternative = self.compact_expr(*alternative)?;
                 Ok(self.nodes.alloc(OptNode::IfNull { value, alternative })?)
             }
-            OptExpr::NullIf { value, sentinel } => {
+            OptExpr::NullIf {
+                value, sentinel, ..
+            } => {
                 let value = self.compact_expr(*value)?;
                 let sentinel = self.compact_expr(*sentinel)?;
                 Ok(self.nodes.alloc(OptNode::NullIf { value, sentinel })?)
             }
-            OptExpr::And { left, right } => {
+            OptExpr::And { left, right, .. } => {
                 let left = self.compact_expr(*left)?;
                 let right = self.compact_expr(*right)?;
                 Ok(self.nodes.alloc(OptNode::And { left, right })?)
             }
-            OptExpr::Or { left, right } => {
+            OptExpr::Or { left, right, .. } => {
                 let left = self.compact_expr(*left)?;
                 let right = self.compact_expr(*right)?;
                 Ok(self.nodes.alloc(OptNode::Or { left, right })?)
             }
-            OptExpr::Interpolation(segments) => {
+            OptExpr::Interpolation(_, segments) => {
                 let segments = self.compact_run(segments)?;
                 Ok(self.nodes.alloc(OptNode::Interpolation(segments))?)
             }
-            OptExpr::Object(entries) => {
+            OptExpr::Object(_, entries) => {
                 let mut keys = Vec::with_capacity(entries.len());
                 let mut values = Vec::with_capacity(entries.len());
                 for (key, value) in entries {
@@ -191,6 +198,7 @@ impl Compactor {
                 inputs,
                 table,
                 default,
+                ..
             } => {
                 let key_arity = inputs.len() as u8;
                 // Branch nodes first (the table maps keys to their refs); keys
@@ -225,6 +233,7 @@ impl Compactor {
                 inner,
                 expect,
                 on_present,
+                ..
             } => {
                 let inner = self.compact_expr(*inner)?;
                 let on_present = match on_present {
@@ -236,6 +245,25 @@ impl Compactor {
                     expect,
                     on_present,
                 })?)
+            }
+            OptExpr::Block {
+                statements, result, ..
+            } => {
+                // Fold the block's bindings into nested `Bind` nodes around the
+                // result: `Block{ s1; s2; result }` → `Bind{s1, Bind{s2, result}}`.
+                // Compact the result first (the innermost body), then wrap each
+                // binding from last to first so every child is allocated before
+                // the `Bind` that references it.
+                let mut body = self.compact_expr(*result)?;
+                for statement in statements.into_iter().rev() {
+                    let value = self.compact_expr(statement.value)?;
+                    body = self.nodes.alloc(OptNode::Bind {
+                        register: statement.register,
+                        value,
+                        body,
+                    })?;
+                }
+                Ok(body)
             }
         }
     }

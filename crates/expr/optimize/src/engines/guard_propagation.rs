@@ -42,6 +42,7 @@
 use air_elt_expr_funcs::{FuncRef, FunctionRegistry};
 use air_elt_types::Value;
 
+use crate::model::node_id::NodeCounter;
 use crate::model::opt_expr::{FrozenOperand, OptExpr};
 use crate::model::opt_program::{OptProgram, OptStatement};
 use crate::pass::Pass;
@@ -80,14 +81,15 @@ fn is_substitutable(value: &Value) -> bool {
     matches!(value, Value::Null | Value::Text(_) | Value::Bool(_))
 }
 
-pub(crate) struct GuardPropagation {
+pub(crate) struct GuardPropagation<'a> {
     is_null: Option<FuncRef>,
     is_not_null: Option<FuncRef>,
     equals: Option<FuncRef>,
     not_equals: Option<FuncRef>,
+    node_counter: &'a NodeCounter,
 }
 
-impl Pass for GuardPropagation {
+impl Pass for GuardPropagation<'_> {
     /// Substitute through every statement value and the program result, in place,
     /// starting from an empty environment.
     fn optimize(&self, program: &mut OptProgram) {
@@ -100,32 +102,38 @@ impl Pass for GuardPropagation {
             })
             .collect();
 
-        let result = std::mem::replace(&mut program.result, OptExpr::Const(Value::Null));
+        let placeholder = OptExpr::Const(self.node_counter.fresh_id(), Value::Null);
+        let result = std::mem::replace(&mut program.result, placeholder);
         program.result = self.propagate(result, &FactEnv::default());
     }
 }
 
-impl GuardPropagation {
-    pub(crate) fn create(registry: &FunctionRegistry) -> Self {
+impl<'a> GuardPropagation<'a> {
+    pub(crate) fn create(registry: &FunctionRegistry, node_counter: &'a NodeCounter) -> Self {
         Self {
             is_null: registry.get_ref("isNull", Some(1)).ok(),
             is_not_null: registry.get_ref("isNotNull", Some(1)).ok(),
             equals: registry.get_ref("equals", Some(2)).ok(),
             not_equals: registry.get_ref("notEquals", Some(2)).ok(),
+            node_counter,
         }
     }
 
     fn propagate(&self, expr: OptExpr, env: &FactEnv) -> OptExpr {
-        // A frozen operand the environment pins to a value folds to that value.
+        // A frozen operand the environment pins to a value folds to that value —
+        // a genuinely new `Const` node, so it gets a fresh id.
         if let Some(operand) = expr.frozen_operand() {
             if let Some(value) = env.value_of(&operand) {
-                return OptExpr::Const(value.clone());
+                return OptExpr::Const(self.node_counter.fresh_id(), value.clone());
             }
             return expr;
         }
 
+        // Substitution preserves a node's identity, so every structural arm
+        // carries `id` forward.
         match expr {
             OptExpr::If {
+                id,
                 condition,
                 then_branch,
                 else_branch,
@@ -134,12 +142,17 @@ impl GuardPropagation {
                 let then_env = self.extend(env, &condition, true);
                 let else_env = self.extend(env, &condition, false);
                 OptExpr::If {
+                    id,
                     condition: Box::new(condition),
                     then_branch: Box::new(self.propagate(*then_branch, &then_env)),
                     else_branch: Box::new(self.propagate(*else_branch, &else_env)),
                 }
             }
-            OptExpr::MultiIf { branches, default } => {
+            OptExpr::MultiIf {
+                id,
+                branches,
+                default,
+            } => {
                 let mut reached = env.clone();
                 let mut rewritten = Vec::with_capacity(branches.len());
                 for (condition, value) in branches {
@@ -151,11 +164,12 @@ impl GuardPropagation {
                     rewritten.push((condition, value));
                 }
                 OptExpr::MultiIf {
+                    id,
                     branches: rewritten,
                     default: Box::new(self.propagate(*default, &reached)),
                 }
             }
-            OptExpr::And { left, right } => {
+            OptExpr::And { id, left, right } => {
                 let left = self.propagate(*left, env);
                 // The fact-bearing guards are all total, so the left is never
                 // null; the right runs only when the left is true, where its
@@ -163,23 +177,30 @@ impl GuardPropagation {
                 let right_env = self.extend(env, &left, true);
                 let right = self.propagate(*right, &right_env);
                 OptExpr::And {
+                    id,
                     left: Box::new(left),
                     right: Box::new(right),
                 }
             }
-            OptExpr::Or { left, right } => OptExpr::Or {
+            OptExpr::Or { id, left, right } => OptExpr::Or {
+                id,
                 left: Box::new(self.propagate(*left, env)),
                 right: Box::new(self.propagate(*right, env)),
             },
-            OptExpr::Field(inner) => OptExpr::Field(Box::new(self.propagate(*inner, env))),
-            OptExpr::Call { func, args } => OptExpr::Call {
+            OptExpr::Field(id, inner) => OptExpr::Field(id, Box::new(self.propagate(*inner, env))),
+            OptExpr::Call { id, func, args } => OptExpr::Call {
+                id,
                 func,
                 args: args
                     .into_iter()
                     .map(|arg| self.propagate(arg, env))
                     .collect(),
             },
-            OptExpr::IfNull { value, alternative } => {
+            OptExpr::IfNull {
+                id,
+                value,
+                alternative,
+            } => {
                 let value = self.propagate(*value, env);
                 // `ifNull` evaluates `value` once; the alternative runs only on the
                 // null path. So if `value` is a frozen operand, it is null
@@ -190,31 +211,41 @@ impl GuardPropagation {
                     None => env.clone(),
                 };
                 OptExpr::IfNull {
+                    id,
                     value: Box::new(value),
                     alternative: Box::new(self.propagate(*alternative, &alternative_env)),
                 }
             }
-            OptExpr::NullIf { value, sentinel } => OptExpr::NullIf {
+            OptExpr::NullIf {
+                id,
+                value,
+                sentinel,
+            } => OptExpr::NullIf {
+                id,
                 value: Box::new(self.propagate(*value, env)),
                 sentinel: Box::new(self.propagate(*sentinel, env)),
             },
-            OptExpr::Interpolation(segments) => OptExpr::Interpolation(
+            OptExpr::Interpolation(id, segments) => OptExpr::Interpolation(
+                id,
                 segments
                     .into_iter()
                     .map(|segment| self.propagate(segment, env))
                     .collect(),
             ),
-            OptExpr::Object(entries) => OptExpr::Object(
+            OptExpr::Object(id, entries) => OptExpr::Object(
+                id,
                 entries
                     .into_iter()
                     .map(|(key, value)| (key, self.propagate(value, env)))
                     .collect(),
             ),
             OptExpr::Switch {
+                id,
                 inputs,
                 table,
                 default,
             } => OptExpr::Switch {
+                id,
                 inputs: inputs
                     .into_iter()
                     .map(|input| self.propagate(input, env))
@@ -226,18 +257,39 @@ impl GuardPropagation {
                 default: Box::new(self.propagate(*default, env)),
             },
             OptExpr::TypeAssert {
+                id,
                 inner,
                 expect,
                 on_present,
             } => OptExpr::TypeAssert {
+                id,
                 inner: Box::new(self.propagate(*inner, env)),
                 expect,
                 on_present,
             },
-            leaf @ (OptExpr::Const(_)
-            | OptExpr::Register(_)
-            | OptExpr::SourceField(_)
-            | OptExpr::Fields(_)) => leaf,
+            // A block's bindings stay in the outer fact environment (the facts
+            // proved above still hold inside); we do not yet derive facts about
+            // the block's own bound registers, so threading `env` unchanged is the
+            // conservative, sound choice.
+            OptExpr::Block {
+                id,
+                statements,
+                result,
+            } => OptExpr::Block {
+                id,
+                statements: statements
+                    .into_iter()
+                    .map(|statement| OptStatement {
+                        register: statement.register,
+                        value: self.propagate(statement.value, env),
+                    })
+                    .collect(),
+                result: Box::new(self.propagate(*result, env)),
+            },
+            leaf @ (OptExpr::Const(..)
+            | OptExpr::Register(..)
+            | OptExpr::SourceField(..)
+            | OptExpr::Fields(..)) => leaf,
         }
     }
 
@@ -255,7 +307,7 @@ impl GuardPropagation {
     /// non-null fact carries no concrete value, a numeric equality is not
     /// representation-stable).
     fn pinned_value(&self, condition: &OptExpr, truth: bool) -> Option<(FrozenOperand, Value)> {
-        let OptExpr::Call { func, args } = condition else {
+        let OptExpr::Call { func, args, .. } = condition else {
             return None;
         };
         let func = Some(*func);
@@ -297,10 +349,10 @@ fn operand_and_const(args: &[OptExpr]) -> Option<(FrozenOperand, Value)> {
     let [first, second] = args else {
         return None;
     };
-    if let (Some(operand), OptExpr::Const(constant)) = (first.frozen_operand(), second) {
+    if let (Some(operand), OptExpr::Const(_, constant)) = (first.frozen_operand(), second) {
         return Some((operand, constant.clone()));
     }
-    if let (OptExpr::Const(constant), Some(operand)) = (first, second.frozen_operand()) {
+    if let (OptExpr::Const(_, constant), Some(operand)) = (first, second.frozen_operand()) {
         return Some((operand, constant.clone()));
     }
     None

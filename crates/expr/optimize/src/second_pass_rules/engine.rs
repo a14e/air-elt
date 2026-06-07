@@ -15,6 +15,7 @@ use air_elt_expr_funcs::FunctionRegistry;
 use super::constant_inliner::ConstantInliner;
 use super::field_hoist::FieldHoister;
 use super::register_pruner::RegisterPruner;
+use crate::model::node_id::NodeCounter;
 use crate::model::opt_program::OptProgram;
 use crate::pass::Pass;
 
@@ -27,7 +28,12 @@ use crate::pass::Pass;
 /// Finalization passes (run once by [`SecondPassDriver::finalize`]) may grow
 /// the program — they execute after the fixpoint has converged.
 pub(crate) trait ProgramPass {
-    fn run(&self, program: &mut OptProgram, registry: &FunctionRegistry);
+    fn run(
+        &self,
+        program: &mut OptProgram,
+        registry: &FunctionRegistry,
+        node_counter: &NodeCounter,
+    );
 }
 
 /// The registered second-pass program rules, split into the size-non-increasing
@@ -64,11 +70,20 @@ impl SecondPassSet {
 pub(crate) struct SecondPassDriver<'a> {
     passes: &'a SecondPassSet,
     registry: &'a FunctionRegistry,
+    node_counter: &'a NodeCounter,
 }
 
 impl<'a> SecondPassDriver<'a> {
-    pub(crate) fn create(passes: &'a SecondPassSet, registry: &'a FunctionRegistry) -> Self {
-        Self { passes, registry }
+    pub(crate) fn create(
+        passes: &'a SecondPassSet,
+        registry: &'a FunctionRegistry,
+        node_counter: &'a NodeCounter,
+    ) -> Self {
+        Self {
+            passes,
+            registry,
+            node_counter,
+        }
     }
 }
 
@@ -77,7 +92,7 @@ impl Pass for SecondPassDriver<'_> {
     /// order. Called each round of the fixpoint.
     fn optimize(&self, program: &mut OptProgram) {
         for pass in self.passes.passes() {
-            pass.run(program, self.registry);
+            pass.run(program, self.registry, self.node_counter);
         }
     }
 
@@ -85,7 +100,7 @@ impl Pass for SecondPassDriver<'_> {
     /// converged. These may grow the program.
     fn finalize(&self, program: &mut OptProgram) {
         for pass in self.passes.finalizers() {
-            pass.run(program, self.registry);
+            pass.run(program, self.registry, self.node_counter);
         }
     }
 }

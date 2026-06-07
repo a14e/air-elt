@@ -20,16 +20,16 @@ use crate::model::opt_expr::OptExpr;
 pub(crate) struct FieldCollapse;
 
 impl Rule for FieldCollapse {
-    fn apply(&self, node: OptExpr, _cx: &RuleCx) -> Rewrite {
-        let OptExpr::Field(inner) = node else {
+    fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
+        let OptExpr::Field(id, inner) = node else {
             return Rewrite::Same(node);
         };
 
         match *inner {
-            OptExpr::Const(Value::Text(name)) | OptExpr::SourceField(name) => {
-                Rewrite::Changed(OptExpr::SourceField(name))
+            OptExpr::Const(_, Value::Text(name)) | OptExpr::SourceField(_, name) => {
+                Rewrite::Changed(OptExpr::SourceField(cx.node_counter.fresh_id(), name))
             }
-            other => Rewrite::Same(OptExpr::Field(Box::new(other))),
+            other => Rewrite::Same(OptExpr::Field(id, Box::new(other))),
         }
     }
 }

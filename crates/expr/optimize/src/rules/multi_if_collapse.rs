@@ -29,6 +29,7 @@
 //! error-context label (`"multiIf"` → `"if"`) on a non-bool condition.
 
 use super::{Rewrite, Rule, RuleCx};
+use crate::model::node_id::NodeCounter;
 use crate::model::opt_expr::OptExpr;
 
 /// Largest branch count a `multiIf` may have to still collapse. A single-branch
@@ -39,25 +40,39 @@ const MAX_COLLAPSE_BRANCHES: usize = 2;
 pub(crate) struct MultiIfCollapse;
 
 impl Rule for MultiIfCollapse {
-    fn apply(&self, node: OptExpr, _cx: &RuleCx) -> Rewrite {
-        let OptExpr::MultiIf { branches, default } = node else {
+    fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
+        let OptExpr::MultiIf {
+            id,
+            branches,
+            default,
+        } = node
+        else {
             return Rewrite::Same(node);
         };
 
         if branches.len() > MAX_COLLAPSE_BRANCHES {
-            return Rewrite::Same(OptExpr::MultiIf { branches, default });
+            return Rewrite::Same(OptExpr::MultiIf {
+                id,
+                branches,
+                default,
+            });
         }
 
-        Rewrite::Changed(fold_into_ifs(branches, *default))
+        Rewrite::Changed(fold_into_ifs(branches, *default, cx.node_counter))
     }
 }
 
 /// Fold `(condition, value)` branches right-to-left into nested `if`s, so the
 /// first branch is the outermost test and `default` is the innermost else.
-fn fold_into_ifs(branches: Vec<(OptExpr, OptExpr)>, default: OptExpr) -> OptExpr {
+fn fold_into_ifs(
+    branches: Vec<(OptExpr, OptExpr)>,
+    default: OptExpr,
+    node_counter: &NodeCounter,
+) -> OptExpr {
     let mut else_branch = default;
     for (condition, value) in branches.into_iter().rev() {
         else_branch = OptExpr::If {
+            id: node_counter.fresh_id(),
             condition: Box::new(condition),
             then_branch: Box::new(value),
             else_branch: Box::new(else_branch),

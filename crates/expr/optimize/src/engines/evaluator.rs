@@ -219,6 +219,18 @@ impl<'a> ProgramEvaluator<'a> {
                 expect,
                 on_present,
             } => self.eval_type_assert(*inner, *expect, *on_present, next),
+            // Evaluate the binding into its register, then the body. Reached only
+            // when control descends here, so the binding is written lazily — a
+            // block inside an untaken branch never runs.
+            OptNode::Bind {
+                register,
+                value,
+                body,
+            } => {
+                let bound = self.eval_node(*value, next)?;
+                self.registers[*register as usize] = bound;
+                self.eval_node(*body, next)
+            }
         }
     }
 

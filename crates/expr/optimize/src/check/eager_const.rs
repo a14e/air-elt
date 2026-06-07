@@ -17,7 +17,7 @@ impl Check for EagerConstEval {
         if !eager {
             return Ok(());
         }
-        let OptExpr::Call { func, args } = node else {
+        let OptExpr::Call { func, args, .. } = node else {
             return Ok(());
         };
         let constants: Option<FuncArgVec> =

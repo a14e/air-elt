@@ -72,18 +72,29 @@ impl RoundTripCollapse {
 }
 
 impl Rule for RoundTripCollapse {
-    fn apply(&self, node: OptExpr, _cx: &RuleCx) -> Rewrite {
-        let OptExpr::Call { func: outer, args } = node else {
+    fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
+        let OptExpr::Call {
+            id,
+            func: outer,
+            args,
+        } = node
+        else {
             return Rewrite::Same(node);
         };
         if args.len() != 1 {
-            return Rewrite::Same(OptExpr::Call { func: outer, args });
+            return Rewrite::Same(OptExpr::Call {
+                id,
+                func: outer,
+                args,
+            });
         }
 
         let mut args = args;
         let inner_call = args.swap_remove(0);
         let matched = match &inner_call {
-            OptExpr::Call { func, args } if args.len() == 1 => self.matching_class(outer, *func),
+            OptExpr::Call { func, args, .. } if args.len() == 1 => {
+                self.matching_class(outer, *func)
+            }
             _ => None,
         };
         // A `Some` match already proved `inner_call` is a single-arg `Call`; the
@@ -98,12 +109,14 @@ impl Rule for RoundTripCollapse {
             ) => {
                 let operand = inner_args.swap_remove(0);
                 Rewrite::Changed(OptExpr::TypeAssert {
+                    id: cx.node_counter.fresh_id(),
                     inner: Box::new(operand),
                     expect,
                     on_present: AssertYield::Identity,
                 })
             }
             (_, inner_call) => Rewrite::Same(OptExpr::Call {
+                id,
                 func: outer,
                 args: vec![inner_call],
             }),

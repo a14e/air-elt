@@ -22,6 +22,7 @@ use air_elt_expr_funcs::signature::EvalContext;
 use air_elt_types::Value;
 
 use super::{Rewrite, RuleCx, RuleSet};
+use crate::model::node_id::NodeCounter;
 use crate::model::opt_expr::OptExpr;
 use crate::model::opt_program::{OptProgram, OptStatement};
 use crate::pass::Pass;
@@ -54,12 +55,14 @@ impl<'a> RewriteDriver<'a> {
         rules: &'a RuleSet,
         registry: &'a FunctionRegistry,
         eval_context: &'a EvalContext,
+        node_counter: &'a NodeCounter,
     ) -> Self {
         Self {
             rules,
             cx: RuleCx {
                 registry,
                 eval_context,
+                node_counter,
             },
         }
     }
@@ -95,7 +98,8 @@ impl<'a> RewriteDriver<'a> {
         }
         program.statements = rewritten;
 
-        let result = std::mem::replace(&mut program.result, OptExpr::Const(Value::Null));
+        let placeholder = OptExpr::Const(self.cx.node_counter.fresh_id(), Value::Null);
+        let result = std::mem::replace(&mut program.result, placeholder);
         program.result = rewrite(self, result);
     }
 
@@ -126,62 +130,87 @@ impl<'a> RewriteDriver<'a> {
     /// [`guard_propagation`](crate::engines::guard_propagation) threads a fact environment
     /// that varies per branch — neither of which this `fn`-pointer can carry.
     fn map_children(&self, expr: OptExpr, recurse: fn(&Self, OptExpr) -> OptExpr) -> OptExpr {
+        // Re-optimizing children preserves the node's identity — the same logical
+        // node with canonicalized operands — so every arm carries `id` forward.
         match expr {
-            OptExpr::Const(_)
-            | OptExpr::Register(_)
-            | OptExpr::SourceField(_)
-            | OptExpr::Fields(_) => expr,
-            OptExpr::Field(inner) => OptExpr::Field(Box::new(recurse(self, *inner))),
-            OptExpr::Call { func, args } => OptExpr::Call {
+            OptExpr::Const(..)
+            | OptExpr::Register(..)
+            | OptExpr::SourceField(..)
+            | OptExpr::Fields(..) => expr,
+            OptExpr::Field(id, inner) => OptExpr::Field(id, Box::new(recurse(self, *inner))),
+            OptExpr::Call { id, func, args } => OptExpr::Call {
+                id,
                 func,
                 args: args.into_iter().map(|arg| recurse(self, arg)).collect(),
             },
             OptExpr::If {
+                id,
                 condition,
                 then_branch,
                 else_branch,
             } => OptExpr::If {
+                id,
                 condition: Box::new(recurse(self, *condition)),
                 then_branch: Box::new(recurse(self, *then_branch)),
                 else_branch: Box::new(recurse(self, *else_branch)),
             },
-            OptExpr::MultiIf { branches, default } => OptExpr::MultiIf {
+            OptExpr::MultiIf {
+                id,
+                branches,
+                default,
+            } => OptExpr::MultiIf {
+                id,
                 branches: branches
                     .into_iter()
                     .map(|(condition, value)| (recurse(self, condition), recurse(self, value)))
                     .collect(),
                 default: Box::new(recurse(self, *default)),
             },
-            OptExpr::IfNull { value, alternative } => OptExpr::IfNull {
+            OptExpr::IfNull {
+                id,
+                value,
+                alternative,
+            } => OptExpr::IfNull {
+                id,
                 value: Box::new(recurse(self, *value)),
                 alternative: Box::new(recurse(self, *alternative)),
             },
-            OptExpr::NullIf { value, sentinel } => OptExpr::NullIf {
+            OptExpr::NullIf {
+                id,
+                value,
+                sentinel,
+            } => OptExpr::NullIf {
+                id,
                 value: Box::new(recurse(self, *value)),
                 sentinel: Box::new(recurse(self, *sentinel)),
             },
-            OptExpr::And { left, right } => OptExpr::And {
+            OptExpr::And { id, left, right } => OptExpr::And {
+                id,
                 left: Box::new(recurse(self, *left)),
                 right: Box::new(recurse(self, *right)),
             },
-            OptExpr::Or { left, right } => OptExpr::Or {
+            OptExpr::Or { id, left, right } => OptExpr::Or {
+                id,
                 left: Box::new(recurse(self, *left)),
                 right: Box::new(recurse(self, *right)),
             },
-            OptExpr::Interpolation(segments) => {
-                OptExpr::Interpolation(segments.into_iter().map(|s| recurse(self, s)).collect())
+            OptExpr::Interpolation(id, segments) => {
+                OptExpr::Interpolation(id, segments.into_iter().map(|s| recurse(self, s)).collect())
             }
-            OptExpr::Object(entries) => OptExpr::Object(
+            OptExpr::Object(id, entries) => OptExpr::Object(
+                id,
                 entries
                     .into_iter()
                     .map(|(key, value)| (key, recurse(self, value)))
                     .collect(),
             ),
             OptExpr::Switch {
+                id,
                 inputs,
                 table,
                 default,
             } => OptExpr::Switch {
+                id,
                 inputs: inputs.into_iter().map(|i| recurse(self, i)).collect(),
                 table: table
                     .into_iter()
@@ -190,13 +219,30 @@ impl<'a> RewriteDriver<'a> {
                 default: Box::new(recurse(self, *default)),
             },
             OptExpr::TypeAssert {
+                id,
                 inner,
                 expect,
                 on_present,
             } => OptExpr::TypeAssert {
+                id,
                 inner: Box::new(recurse(self, *inner)),
                 expect,
                 on_present,
+            },
+            OptExpr::Block {
+                id,
+                statements,
+                result,
+            } => OptExpr::Block {
+                id,
+                statements: statements
+                    .into_iter()
+                    .map(|statement| OptStatement {
+                        register: statement.register,
+                        value: recurse(self, statement.value),
+                    })
+                    .collect(),
+                result: Box::new(recurse(self, *result)),
             },
         }
     }

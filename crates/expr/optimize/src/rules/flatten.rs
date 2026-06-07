@@ -35,19 +35,19 @@ impl Flatten {
 
 impl Rule for Flatten {
     fn apply(&self, node: OptExpr, _cx: &RuleCx) -> Rewrite {
-        let OptExpr::Call { func, args } = node else {
+        let OptExpr::Call { id, func, args } = node else {
             return Rewrite::Same(node);
         };
 
         if !self.operators.contains(&func) {
-            return Rewrite::Same(OptExpr::Call { func, args });
+            return Rewrite::Same(OptExpr::Call { id, func, args });
         }
 
         let has_nested = args
             .iter()
             .any(|arg| matches!(arg, OptExpr::Call { func: inner, .. } if *inner == func));
         if !has_nested {
-            return Rewrite::Same(OptExpr::Call { func, args });
+            return Rewrite::Same(OptExpr::Call { id, func, args });
         }
 
         let mut flattened = Vec::with_capacity(args.len());
@@ -56,12 +56,14 @@ impl Rule for Flatten {
                 OptExpr::Call {
                     func: inner,
                     args: inner_args,
+                    ..
                 } if inner == func => flattened.extend(inner_args),
                 other => flattened.push(other),
             }
         }
 
         Rewrite::Changed(OptExpr::Call {
+            id,
             func,
             args: flattened,
         })

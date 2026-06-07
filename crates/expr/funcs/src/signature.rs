@@ -135,21 +135,31 @@ pub trait ExprFunction: Send + Sync {
     fn evaluate(&self, args: &mut dyn ArgWindow, context: &EvalContext)
     -> Result<Value, FuncError>;
 
-    /// Whether this function may be evaluated at compile time (const
-    /// folding / compile-time context). Default is **`false`** (fail-closed):
-    /// a function must explicitly opt into purity. An unmarked function is
-    /// merely not const-folded (a missed optimization, never a correctness
-    /// bug); impure functions (`now`, `today`, unseeded `random*`) correctly
-    /// stay impure by default.
+    /// Whether this function is **referentially transparent**: a call returns
+    /// the same value every time *within one program evaluation*, so the
+    /// optimizer may share it (CSE / dedup), drop it when unused, or substitute
+    /// it. Default **`false`** (fail-closed) — a function opts in.
+    ///
+    /// This is NOT the same as compile-time-foldable. `now`/`today` are
+    /// referentially transparent (pinned to the batch clock at init, so repeated
+    /// calls agree) yet read a value unknown at compile time — they return `true`
+    /// here but override [`Self::purity`] to `false`. Const-folding gates on
+    /// [`Self::purity`], not on this. Unseeded `random*` is neither (each call
+    /// differs even within a run).
     fn is_pure(&self) -> bool {
         false
     }
 
-    /// Purity refined by which arguments are constant. `const_args[i]` is
-    /// `true` when argument `i` folds to a constant. The default ignores
-    /// argument constness and defers to [`Self::is_pure`]; functions whose
-    /// purity depends on an argument (e.g. `random(min, max, seed)` is pure
-    /// only when `seed` is constant) override this.
+    /// Whether this function may be **evaluated at compile time** (const folding
+    /// / the compile-time context), refined by which arguments are constant.
+    /// `const_args[i]` is `true` when argument `i` folds to a constant. This —
+    /// not [`Self::is_pure`] — is the gate the optimizer's const-folding
+    /// consults. The default defers to [`Self::is_pure`] (a referentially
+    /// transparent function with constant inputs is compile-time-foldable);
+    /// override it when foldability differs from transparency: a function pure
+    /// only for a constant argument (`random(min, max, seed)` needs a constant
+    /// `seed`), or a transparent-but-runtime-reading function (`now`/`today`
+    /// return `true` from `is_pure` yet `false` here).
     fn purity(&self, const_args: &[bool]) -> bool {
         let _ = const_args;
         self.is_pure()
@@ -203,10 +213,11 @@ pub struct EvalContext {
     pub now: chrono::DateTime<chrono::Utc>,
     pub base_dir: std::path::PathBuf,
     /// `true` when evaluating in a compile-time context (config patching,
-    /// const folding). The type-check pass uses this to reject impure
-    /// functions (`is_pure() == false`) in compile-time positions; the
-    /// evaluator itself does not gate on it (const folding instead skips
-    /// impure calls via [`ExprFunction::purity`]).
+    /// const folding). What actually keeps a runtime-only call out of a
+    /// compile-time fold is [`ExprFunction::purity`] (const folding skips a
+    /// call whose `purity` is `false`, e.g. `now`/`today`), NOT this flag. The
+    /// flag is reserved for a future compile-time-impurity rejection pass that
+    /// is not yet wired — no consumer reads it today.
     pub is_compile_time: bool,
     /// Per-flow compiled-artifact caches (regex, JSONPath). Built once with the
     /// context and shared across rows; warmed at compile time by

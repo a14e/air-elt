@@ -17,25 +17,33 @@ use air_elt_expr_types::limits::MAX_EXPR_DEPTH;
 use air_elt_types::Value;
 
 use crate::error::OptimizeError;
+use crate::model::node_id::{NodeCounter, NodeId};
 use crate::model::opt_expr::OptExpr;
 use crate::model::opt_program::{OptProgram, OptStatement};
 
 /// Converts a parsed program into the optimization IR against a function registry.
 pub(crate) struct OptProgramConverter<'a> {
     registry: &'a FunctionRegistry,
+    node_counter: &'a NodeCounter,
     name_to_register: AHashMap<String, u16>,
     next_register: u16,
     depth: usize,
 }
 
 impl<'a> OptProgramConverter<'a> {
-    pub(crate) fn create(registry: &'a FunctionRegistry) -> Self {
+    pub(crate) fn create(registry: &'a FunctionRegistry, node_counter: &'a NodeCounter) -> Self {
         Self {
             registry,
+            node_counter,
             name_to_register: AHashMap::new(),
             next_register: 0,
             depth: 0,
         }
+    }
+
+    /// Mint a fresh node id for a node this converter is about to construct.
+    fn next_id(&self) -> NodeId {
+        self.node_counter.fresh_id()
     }
 
     /// Convert a whole program: bindings in order, then the result expression.
@@ -83,14 +91,17 @@ impl<'a> OptProgramConverter<'a> {
 
     fn lower_expr_inner(&mut self, expr: &Expr) -> Result<OptExpr, OptimizeError> {
         match expr {
-            Expr::Literal(literal) => Ok(OptExpr::Const(literal_to_value(literal))),
+            Expr::Literal(literal) => Ok(OptExpr::Const(self.next_id(), literal_to_value(literal))),
             Expr::Variable(name) => self.lower_variable(name),
             Expr::FunctionCall { name, args } => self.lower_call(name, args),
             Expr::Conditional(conditional) => self.lower_conditional(conditional),
             Expr::Interpolation(segments) => self.lower_interpolation(segments),
             Expr::Object(entries) => self.lower_object(entries),
-            Expr::Field(inner) => Ok(OptExpr::Field(Box::new(self.lower_expr(inner)?))),
-            Expr::Fields(selector) => Ok(OptExpr::Fields(selector.clone())),
+            Expr::Field(inner) => Ok(OptExpr::Field(
+                self.next_id(),
+                Box::new(self.lower_expr(inner)?),
+            )),
+            Expr::Fields(selector) => Ok(OptExpr::Fields(self.next_id(), selector.clone())),
         }
     }
 
@@ -100,7 +111,7 @@ impl<'a> OptProgramConverter<'a> {
                 name: name.to_string(),
             }
         })?;
-        Ok(OptExpr::Register(register))
+        Ok(OptExpr::Register(self.next_id(), register))
     }
 
     fn lower_call(&mut self, name: &str, args: &[Expr]) -> Result<OptExpr, OptimizeError> {
@@ -110,6 +121,7 @@ impl<'a> OptProgramConverter<'a> {
             .map(|arg| self.lower_expr(arg))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(OptExpr::Call {
+            id: self.next_id(),
             func,
             args: lowered,
         })
@@ -124,11 +136,13 @@ impl<'a> OptProgramConverter<'a> {
         let lowered = segments
             .iter()
             .map(|segment| match segment {
-                InterpolationSegment::Text(text) => Ok(OptExpr::Const(Value::Text(text.clone()))),
+                InterpolationSegment::Text(text) => {
+                    Ok(OptExpr::Const(self.next_id(), Value::Text(text.clone())))
+                }
                 InterpolationSegment::Expression(expr) => self.lower_expr(expr),
             })
             .collect::<Result<Vec<_>, OptimizeError>>()?;
-        Ok(OptExpr::Interpolation(lowered))
+        Ok(OptExpr::Interpolation(self.next_id(), lowered))
     }
 
     fn lower_object(&mut self, entries: &[(String, Expr)]) -> Result<OptExpr, OptimizeError> {
@@ -142,7 +156,7 @@ impl<'a> OptProgramConverter<'a> {
             .iter()
             .map(|(key, value)| Ok((key.clone(), self.lower_expr(value)?)))
             .collect::<Result<Vec<_>, OptimizeError>>()?;
-        Ok(OptExpr::Object(lowered))
+        Ok(OptExpr::Object(self.next_id(), lowered))
     }
 
     fn lower_conditional(
@@ -155,6 +169,7 @@ impl<'a> OptProgramConverter<'a> {
                 then_branch,
                 else_branch,
             } => Ok(OptExpr::If {
+                id: self.next_id(),
                 condition: Box::new(self.lower_expr(condition)?),
                 then_branch: Box::new(self.lower_expr(then_branch)?),
                 else_branch: Box::new(self.lower_expr(else_branch)?),
@@ -167,23 +182,28 @@ impl<'a> OptProgramConverter<'a> {
                     })
                     .collect::<Result<Vec<_>, OptimizeError>>()?;
                 Ok(OptExpr::MultiIf {
+                    id: self.next_id(),
                     branches: lowered,
                     default: Box::new(self.lower_expr(default)?),
                 })
             }
             ConditionalExpr::IfNull { value, alternative } => Ok(OptExpr::IfNull {
+                id: self.next_id(),
                 value: Box::new(self.lower_expr(value)?),
                 alternative: Box::new(self.lower_expr(alternative)?),
             }),
             ConditionalExpr::NullIf { value, sentinel } => Ok(OptExpr::NullIf {
+                id: self.next_id(),
                 value: Box::new(self.lower_expr(value)?),
                 sentinel: Box::new(self.lower_expr(sentinel)?),
             }),
             ConditionalExpr::And { left, right } => Ok(OptExpr::And {
+                id: self.next_id(),
                 left: Box::new(self.lower_expr(left)?),
                 right: Box::new(self.lower_expr(right)?),
             }),
             ConditionalExpr::Or { left, right } => Ok(OptExpr::Or {
+                id: self.next_id(),
                 left: Box::new(self.lower_expr(left)?),
                 right: Box::new(self.lower_expr(right)?),
             }),

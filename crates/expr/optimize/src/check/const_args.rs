@@ -14,7 +14,7 @@ pub(crate) struct ConstArgsValidation;
 
 impl Check for ConstArgsValidation {
     fn check(&self, node: &OptExpr, _eager: bool, cx: &CheckCx) -> Result<(), OptimizeError> {
-        let OptExpr::Call { func, args } = node else {
+        let OptExpr::Call { func, args, .. } = node else {
             return Ok(());
         };
         let const_args: Vec<Option<&Value>> = args.iter().map(OptExpr::as_const).collect();

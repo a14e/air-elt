@@ -20,6 +20,7 @@ pub(crate) struct TypeAssertCollapse;
 impl Rule for TypeAssertCollapse {
     fn apply(&self, node: OptExpr, _cx: &RuleCx) -> Rewrite {
         let OptExpr::TypeAssert {
+            id,
             inner,
             expect,
             on_present,
@@ -38,6 +39,7 @@ impl Rule for TypeAssertCollapse {
         );
         if !inner_is_redundant {
             return Rewrite::Same(OptExpr::TypeAssert {
+                id,
                 inner,
                 expect,
                 on_present,
@@ -46,12 +48,14 @@ impl Rule for TypeAssertCollapse {
 
         match *inner {
             OptExpr::TypeAssert { inner: operand, .. } => Rewrite::Changed(OptExpr::TypeAssert {
+                id,
                 inner: operand,
                 expect,
                 on_present,
             }),
             // `inner_is_redundant` already proved the inner is a TypeAssert.
             other => Rewrite::Same(OptExpr::TypeAssert {
+                id,
                 inner: Box::new(other),
                 expect,
                 on_present,

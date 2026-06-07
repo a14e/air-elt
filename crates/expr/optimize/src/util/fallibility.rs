@@ -22,43 +22,48 @@ use crate::model::opt_expr::OptExpr;
 /// `TypeMismatch`), makes the whole expression fallible.
 pub(crate) fn can_fail(expr: &OptExpr, registry: &FunctionRegistry) -> bool {
     match expr {
-        OptExpr::Const(_) | OptExpr::Register(_) | OptExpr::SourceField(_) | OptExpr::Fields(_) => {
-            false
-        }
-        OptExpr::Field(inner) => can_fail(inner, registry),
-        OptExpr::Call { func, args } => {
+        OptExpr::Const(..)
+        | OptExpr::Register(..)
+        | OptExpr::SourceField(..)
+        | OptExpr::Fields(..) => false,
+        OptExpr::Field(_, inner) => can_fail(inner, registry),
+        OptExpr::Call { func, args, .. } => {
             registry.get_by_ref(*func).can_fail() || args.iter().any(|arg| can_fail(arg, registry))
         }
         OptExpr::If {
             condition,
             then_branch,
             else_branch,
+            ..
         } => {
             can_fail(condition, registry)
                 || can_fail(then_branch, registry)
                 || can_fail(else_branch, registry)
         }
-        OptExpr::MultiIf { branches, default } => {
+        OptExpr::MultiIf {
+            branches, default, ..
+        } => {
             branches.iter().any(|(condition, value)| {
                 can_fail(condition, registry) || can_fail(value, registry)
             }) || can_fail(default, registry)
         }
-        OptExpr::IfNull { value, alternative } => {
-            can_fail(value, registry) || can_fail(alternative, registry)
-        }
-        OptExpr::NullIf { value, sentinel } => {
-            can_fail(value, registry) || can_fail(sentinel, registry)
-        }
-        OptExpr::And { left, right } | OptExpr::Or { left, right } => {
+        OptExpr::IfNull {
+            value, alternative, ..
+        } => can_fail(value, registry) || can_fail(alternative, registry),
+        OptExpr::NullIf {
+            value, sentinel, ..
+        } => can_fail(value, registry) || can_fail(sentinel, registry),
+        OptExpr::And { left, right, .. } | OptExpr::Or { left, right, .. } => {
             can_fail(left, registry) || can_fail(right, registry)
         }
         // Interpolation can raise `StringTooLarge` even with infallible segments.
-        OptExpr::Interpolation(_) => true,
-        OptExpr::Object(entries) => entries.iter().any(|(_, value)| can_fail(value, registry)),
+        OptExpr::Interpolation(..) => true,
+        OptExpr::Object(_, entries) => entries.iter().any(|(_, value)| can_fail(value, registry)),
         OptExpr::Switch {
             inputs,
             table,
             default,
+            ..
         } => {
             inputs.iter().any(|input| can_fail(input, registry))
                 || table.iter().any(|(_, value)| can_fail(value, registry))
@@ -67,5 +72,17 @@ pub(crate) fn can_fail(expr: &OptExpr, registry: &FunctionRegistry) -> bool {
         // A TypeAssert exists precisely to raise the preserved `TypeMismatch` on a
         // present, wrong-typed operand — so it can always fail.
         OptExpr::TypeAssert { .. } => true,
+        // A block fails if any binding or its result can fail. Its bindings are
+        // evaluated only when control reaches the block (it is a sub-expression),
+        // mirroring the program-level eager statement semantics scoped to the
+        // subtree.
+        OptExpr::Block {
+            statements, result, ..
+        } => {
+            statements
+                .iter()
+                .any(|statement| can_fail(&statement.value, registry))
+                || can_fail(result, registry)
+        }
     }
 }

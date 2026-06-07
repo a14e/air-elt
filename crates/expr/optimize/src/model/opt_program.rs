@@ -16,7 +16,7 @@ pub(crate) struct OptProgram {
 }
 
 /// A lowered variable binding: evaluate `value` into `register`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct OptStatement {
     pub(crate) register: u16,
     pub(crate) value: OptExpr,

@@ -20,10 +20,12 @@ use air_elt_expr_funcs::FunctionRegistry;
 use air_elt_expr_funcs::signature::EvalContext;
 
 use super::{
-    concat_collapse, const_fold, dce, de_morgan, empty_needle, encode_round_trip, field_collapse,
-    flatten, flatten_conditionals, idempotent, multi_if_collapse, object_access, or_membership,
-    round_trip, switch_collapse, switch_lower, type_assert_collapse,
+    concat_collapse, const_fold, dce, de_morgan, empty_needle, encode_round_trip,
+    extremum_null_drop, field_collapse, flatten, flatten_conditionals, idempotent,
+    multi_if_collapse, object_access, or_membership, round_trip, switch_collapse, switch_lower,
+    type_assert_collapse,
 };
+use crate::model::node_id::NodeCounter;
 use crate::model::opt_expr::OptExpr;
 
 /// The outcome of applying a rule to a node.
@@ -34,10 +36,14 @@ pub(crate) enum Rewrite {
     Same(OptExpr),
 }
 
-/// Shared context a rule may consult while rewriting.
+/// Shared context a rule may consult while rewriting. Carries the
+/// [`NodeCounter`] so a rule that constructs a genuinely new node mints a fresh
+/// [`NodeId`](crate::model::node_id::NodeId) for it (a rule that merely
+/// restructures existing nodes carries their ids forward instead).
 pub(crate) struct RuleCx<'a> {
     pub(crate) registry: &'a FunctionRegistry,
     pub(crate) eval_context: &'a EvalContext,
+    pub(crate) node_counter: &'a NodeCounter,
 }
 
 /// A single rewrite rule.
@@ -84,6 +90,7 @@ impl RuleSet {
             Box::new(encode_round_trip::EncodeRoundTrip::create(registry)),
             Box::new(empty_needle::EmptyNeedle::create(registry)),
             Box::new(flatten::Flatten::create(registry)),
+            Box::new(extremum_null_drop::ExtremumNullDrop::create(registry)),
             Box::new(concat_collapse::ConcatCollapse::create(registry)),
             Box::new(concat_collapse::TrimConcat::create(registry)),
             Box::new(type_assert_collapse::TypeAssertCollapse),

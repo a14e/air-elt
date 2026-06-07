@@ -12,28 +12,43 @@
 use air_elt_types::{Key, Value};
 
 use super::{Rewrite, Rule, RuleCx};
+use crate::model::node_id::NodeId;
 use crate::model::opt_expr::OptExpr;
 
 pub(crate) struct BranchPrune;
 
 impl Rule for BranchPrune {
-    fn apply(&self, node: OptExpr, _cx: &RuleCx) -> Rewrite {
+    fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
         match node {
             OptExpr::If {
+                id,
                 condition,
                 then_branch,
                 else_branch,
-            } => self.prune_if(condition, then_branch, else_branch),
-            OptExpr::MultiIf { branches, default } => self.prune_multi_if(branches, default),
-            OptExpr::IfNull { value, alternative } => self.prune_if_null(value, alternative),
-            OptExpr::NullIf { value, sentinel } => self.prune_null_if(value, sentinel),
-            OptExpr::And { left, right } => self.prune_and(left, right),
-            OptExpr::Or { left, right } => self.prune_or(left, right),
+            } => self.prune_if(id, condition, then_branch, else_branch),
+            OptExpr::MultiIf {
+                id,
+                branches,
+                default,
+            } => self.prune_multi_if(id, branches, default),
+            OptExpr::IfNull {
+                id,
+                value,
+                alternative,
+            } => self.prune_if_null(id, value, alternative),
+            OptExpr::NullIf {
+                id,
+                value,
+                sentinel,
+            } => self.prune_null_if(id, value, sentinel, cx),
+            OptExpr::And { id, left, right } => self.prune_and(id, left, right, cx),
+            OptExpr::Or { id, left, right } => self.prune_or(id, left, right, cx),
             OptExpr::Switch {
+                id,
                 inputs,
                 table,
                 default,
-            } => self.prune_switch(inputs, table, default),
+            } => self.prune_switch(id, inputs, table, default),
             other => Rewrite::Same(other),
         }
     }
@@ -42,6 +57,7 @@ impl Rule for BranchPrune {
 impl BranchPrune {
     fn prune_if(
         &self,
+        id: NodeId,
         condition: Box<OptExpr>,
         then_branch: Box<OptExpr>,
         else_branch: Box<OptExpr>,
@@ -50,6 +66,7 @@ impl BranchPrune {
             Some(Value::Bool(true)) => Rewrite::Changed(*then_branch),
             Some(Value::Bool(false)) | Some(Value::Null) => Rewrite::Changed(*else_branch),
             _ => Rewrite::Same(OptExpr::If {
+                id,
                 condition,
                 then_branch,
                 else_branch,
@@ -57,7 +74,12 @@ impl BranchPrune {
         }
     }
 
-    fn prune_multi_if(&self, branches: Vec<(OptExpr, OptExpr)>, default: Box<OptExpr>) -> Rewrite {
+    fn prune_multi_if(
+        &self,
+        id: NodeId,
+        branches: Vec<(OptExpr, OptExpr)>,
+        default: Box<OptExpr>,
+    ) -> Rewrite {
         let mut kept = Vec::with_capacity(branches.len());
         let mut new_default: Option<Box<OptExpr>> = None;
         let mut changed = false;
@@ -89,18 +111,20 @@ impl BranchPrune {
         }
         if changed {
             Rewrite::Changed(OptExpr::MultiIf {
+                id,
                 branches: kept,
                 default,
             })
         } else {
             Rewrite::Same(OptExpr::MultiIf {
+                id,
                 branches: kept,
                 default,
             })
         }
     }
 
-    fn prune_if_null(&self, value: Box<OptExpr>, alternative: Box<OptExpr>) -> Rewrite {
+    fn prune_if_null(&self, id: NodeId, value: Box<OptExpr>, alternative: Box<OptExpr>) -> Rewrite {
         // `ifNull(value, null)` returns `value` in every case — a null `value`
         // yields the null alternative, which equals `value` — so the wrapper is
         // redundant. (This is what collapses an alternative that guard propagation
@@ -116,20 +140,34 @@ impl BranchPrune {
                     Rewrite::Changed(*value)
                 }
             }
-            None => Rewrite::Same(OptExpr::IfNull { value, alternative }),
+            None => Rewrite::Same(OptExpr::IfNull {
+                id,
+                value,
+                alternative,
+            }),
         }
     }
 
-    fn prune_null_if(&self, value: Box<OptExpr>, sentinel: Box<OptExpr>) -> Rewrite {
+    fn prune_null_if(
+        &self,
+        id: NodeId,
+        value: Box<OptExpr>,
+        sentinel: Box<OptExpr>,
+        cx: &RuleCx,
+    ) -> Rewrite {
         match (value.as_const(), sentinel.as_const()) {
             (Some(left), Some(right)) => {
                 if left == right {
-                    Rewrite::Changed(OptExpr::Const(Value::Null))
+                    Rewrite::Changed(OptExpr::Const(cx.node_counter.fresh_id(), Value::Null))
                 } else {
                     Rewrite::Changed(*value)
                 }
             }
-            _ => Rewrite::Same(OptExpr::NullIf { value, sentinel }),
+            _ => Rewrite::Same(OptExpr::NullIf {
+                id,
+                value,
+                sentinel,
+            }),
         }
     }
 
@@ -140,6 +178,7 @@ impl BranchPrune {
     /// branch selection (dead-branch elimination), not constant folding.
     fn prune_switch(
         &self,
+        id: NodeId,
         inputs: Vec<OptExpr>,
         table: Vec<(Key, OptExpr)>,
         default: Box<OptExpr>,
@@ -147,6 +186,7 @@ impl BranchPrune {
         let Some(values): Option<Vec<&Value>> = inputs.iter().map(OptExpr::as_const).collect()
         else {
             return Rewrite::Same(OptExpr::Switch {
+                id,
                 inputs,
                 table,
                 default,
@@ -172,33 +212,57 @@ impl BranchPrune {
         }
     }
 
-    fn prune_and(&self, left: Box<OptExpr>, right: Box<OptExpr>) -> Rewrite {
+    fn prune_and(
+        &self,
+        id: NodeId,
+        left: Box<OptExpr>,
+        right: Box<OptExpr>,
+        cx: &RuleCx,
+    ) -> Rewrite {
         match left.as_const() {
-            Some(Value::Bool(false)) => Rewrite::Changed(OptExpr::Const(Value::Bool(false))),
+            Some(Value::Bool(false)) => Rewrite::Changed(OptExpr::Const(
+                cx.node_counter.fresh_id(),
+                Value::Bool(false),
+            )),
             Some(Value::Bool(true)) => Rewrite::Changed(*right),
             Some(Value::Null) => match right.as_const() {
-                Some(Value::Bool(false)) => Rewrite::Changed(OptExpr::Const(Value::Bool(false))),
+                Some(Value::Bool(false)) => Rewrite::Changed(OptExpr::Const(
+                    cx.node_counter.fresh_id(),
+                    Value::Bool(false),
+                )),
                 Some(Value::Bool(true)) | Some(Value::Null) => {
-                    Rewrite::Changed(OptExpr::Const(Value::Null))
+                    Rewrite::Changed(OptExpr::Const(cx.node_counter.fresh_id(), Value::Null))
                 }
-                _ => Rewrite::Same(OptExpr::And { left, right }),
+                _ => Rewrite::Same(OptExpr::And { id, left, right }),
             },
-            _ => Rewrite::Same(OptExpr::And { left, right }),
+            _ => Rewrite::Same(OptExpr::And { id, left, right }),
         }
     }
 
-    fn prune_or(&self, left: Box<OptExpr>, right: Box<OptExpr>) -> Rewrite {
+    fn prune_or(
+        &self,
+        id: NodeId,
+        left: Box<OptExpr>,
+        right: Box<OptExpr>,
+        cx: &RuleCx,
+    ) -> Rewrite {
         match left.as_const() {
-            Some(Value::Bool(true)) => Rewrite::Changed(OptExpr::Const(Value::Bool(true))),
+            Some(Value::Bool(true)) => Rewrite::Changed(OptExpr::Const(
+                cx.node_counter.fresh_id(),
+                Value::Bool(true),
+            )),
             Some(Value::Bool(false)) => Rewrite::Changed(*right),
             Some(Value::Null) => match right.as_const() {
-                Some(Value::Bool(true)) => Rewrite::Changed(OptExpr::Const(Value::Bool(true))),
+                Some(Value::Bool(true)) => Rewrite::Changed(OptExpr::Const(
+                    cx.node_counter.fresh_id(),
+                    Value::Bool(true),
+                )),
                 Some(Value::Bool(false)) | Some(Value::Null) => {
-                    Rewrite::Changed(OptExpr::Const(Value::Null))
+                    Rewrite::Changed(OptExpr::Const(cx.node_counter.fresh_id(), Value::Null))
                 }
-                _ => Rewrite::Same(OptExpr::Or { left, right }),
+                _ => Rewrite::Same(OptExpr::Or { id, left, right }),
             },
-            _ => Rewrite::Same(OptExpr::Or { left, right }),
+            _ => Rewrite::Same(OptExpr::Or { id, left, right }),
         }
     }
 }

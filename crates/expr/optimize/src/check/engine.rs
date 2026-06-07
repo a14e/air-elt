@@ -70,12 +70,12 @@ impl<'a> StaticCheckEngine<'a> {
     /// only if the parent is eager AND the position is always evaluated.
     fn walk_children(&self, node: &OptExpr, eager: bool) -> Result<(), OptimizeError> {
         match node {
-            OptExpr::Const(_)
-            | OptExpr::Register(_)
-            | OptExpr::SourceField(_)
-            | OptExpr::Fields(_) => Ok(()),
+            OptExpr::Const(..)
+            | OptExpr::Register(..)
+            | OptExpr::SourceField(..)
+            | OptExpr::Fields(..) => Ok(()),
             // The field name is always evaluated.
-            OptExpr::Field(inner) => self.walk(inner, eager),
+            OptExpr::Field(_, inner) => self.walk(inner, eager),
             // Every argument of a call is evaluated iff the call is.
             OptExpr::Call { args, .. } => self.walk_all(args, eager),
             // The condition is always evaluated; both branches are lazy.
@@ -83,6 +83,7 @@ impl<'a> StaticCheckEngine<'a> {
                 condition,
                 then_branch,
                 else_branch,
+                ..
             } => {
                 self.walk(condition, eager)?;
                 self.walk(then_branch, false)?;
@@ -90,7 +91,9 @@ impl<'a> StaticCheckEngine<'a> {
             }
             // Only the first condition is unconditionally evaluated; later
             // conditions and all values/default are reached only on a prior miss.
-            OptExpr::MultiIf { branches, default } => {
+            OptExpr::MultiIf {
+                branches, default, ..
+            } => {
                 for (index, (condition, value)) in branches.iter().enumerate() {
                     self.walk(condition, eager && index == 0)?;
                     self.walk(value, false)?;
@@ -98,24 +101,28 @@ impl<'a> StaticCheckEngine<'a> {
                 self.walk(default, false)
             }
             // The value is always evaluated; the alternative only when it is null.
-            OptExpr::IfNull { value, alternative } => {
+            OptExpr::IfNull {
+                value, alternative, ..
+            } => {
                 self.walk(value, eager)?;
                 self.walk(alternative, false)
             }
             // `nullIf` evaluates both operands unconditionally.
-            OptExpr::NullIf { value, sentinel } => {
+            OptExpr::NullIf {
+                value, sentinel, ..
+            } => {
                 self.walk(value, eager)?;
                 self.walk(sentinel, eager)
             }
             // Short-circuit: only the left operand is always evaluated.
-            OptExpr::And { left, right } | OptExpr::Or { left, right } => {
+            OptExpr::And { left, right, .. } | OptExpr::Or { left, right, .. } => {
                 self.walk(left, eager)?;
                 self.walk(right, false)
             }
             // Every interpolation segment is rendered.
-            OptExpr::Interpolation(segments) => self.walk_all(segments, eager),
+            OptExpr::Interpolation(_, segments) => self.walk_all(segments, eager),
             // Every object value is evaluated.
-            OptExpr::Object(entries) => {
+            OptExpr::Object(_, entries) => {
                 for (_, value) in entries {
                     self.walk(value, eager)?;
                 }
@@ -127,6 +134,7 @@ impl<'a> StaticCheckEngine<'a> {
                 inputs,
                 table,
                 default,
+                ..
             } => {
                 self.walk_all(inputs, eager)?;
                 for (_, value) in table {
@@ -136,6 +144,16 @@ impl<'a> StaticCheckEngine<'a> {
             }
             // The asserted operand is always evaluated when the assert is.
             OptExpr::TypeAssert { inner, .. } => self.walk(inner, eager),
+            // A block's bindings and result are evaluated (in order) exactly when
+            // the block is reached, so they inherit the block's eager bit.
+            OptExpr::Block {
+                statements, result, ..
+            } => {
+                for statement in statements {
+                    self.walk(&statement.value, eager)?;
+                }
+                self.walk(result, eager)
+            }
         }
     }
 

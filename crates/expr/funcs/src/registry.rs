@@ -294,30 +294,57 @@ mod tests {
         );
     }
 
-    /// Fail-closed purity contract, resolved end-to-end through the real
-    /// builtin registry: pure functions opt into `is_pure`, clock-dependent
-    /// and unseeded-random functions stay impure (the default).
+    /// Fail-closed purity contract, resolved end-to-end through the real builtin
+    /// registry. Two distinct properties: `is_pure` is referential transparency
+    /// (safe to share/dedup/drop), `purity` is compile-time-foldability. They
+    /// agree for ordinary builtins, but `now`/`today` are transparent (batch
+    /// clock is stable within a run) yet NOT foldable (the clock is unknown at
+    /// compile time).
     #[test]
     fn builtin_purity_classification() {
         let registry = FunctionRegistry::with_builtins();
-        let is_pure = |name: &str, arity: usize| {
+        let func = |name: &str, arity: usize| {
             let r = registry
                 .get_ref(name, Some(arity))
                 .expect("builtin must exist");
-            registry.get_by_ref(r).is_pure()
+            registry.get_by_ref(r)
         };
-        // Pure builtins explicitly opt in.
-        assert!(is_pure("add", 2));
-        assert!(is_pure("concat", 2));
-        assert!(is_pure("upper", 1));
-        assert!(is_pure("toInt64", 1));
-        assert!(is_pure("addDays", 2));
-        assert!(is_pure("regexMatch", 2));
-        // Clock-dependent → impure.
-        assert!(!is_pure("now", 0));
-        assert!(!is_pure("today", 0));
-        // Random without a constant seed → impure (bare `is_pure`).
+        let is_pure = |name: &str, arity: usize| func(name, arity).is_pure();
+        let purity = |name: &str, arity: usize| func(name, arity).purity(&vec![false; arity]);
+        // Pure builtins opt into both: transparent AND compile-time-foldable.
+        for (name, arity) in [
+            ("add", 2),
+            ("concat", 2),
+            ("upper", 1),
+            ("toInt64", 1),
+            ("addDays", 2),
+            ("regexMatch", 2),
+        ] {
+            assert!(
+                is_pure(name, arity),
+                "{name} must be referentially transparent"
+            );
+            assert!(purity(name, arity), "{name} must be const-foldable");
+        }
+        // Clock-dependent → transparent (stable within a batch) but NOT foldable
+        // (the batch clock is unknown at compile time).
+        for (name, arity) in [("now", 0), ("today", 0)] {
+            assert!(
+                is_pure(name, arity),
+                "{name} must be referentially transparent"
+            );
+            assert!(!purity(name, arity), "{name} must not be const-folded");
+        }
+        // Random without a constant seed → neither transparent nor foldable.
         assert!(!is_pure("randomInt", 2));
         assert!(!is_pure("randomUuid", 0));
+        assert!(
+            !purity("randomInt", 2),
+            "unseeded random must not be const-folded"
+        );
+        assert!(
+            !purity("randomUuid", 0),
+            "unseeded random must not be const-folded"
+        );
     }
 }
