@@ -3,7 +3,7 @@ use air_elt_types::{DataType, Value};
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
-use crate::signature::{EvalContext, ExprFunction};
+use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
 static NOT: NotFunc = NotFunc;
 
@@ -14,6 +14,10 @@ pub fn register(registry: &mut FunctionRegistry) {
 struct NotFunc;
 
 impl ExprFunction for NotFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "not"
     }
@@ -30,13 +34,17 @@ impl ExprFunction for NotFunc {
         Ok(NullableExprType::new(DataType::Bool, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
         match a {
-            Value::Bool(x) => Ok(Value::Bool(!x)),
+            Value::Bool(x) => Ok(Value::Bool(!*x)),
             other => Err(FuncError::TypeMismatch {
                 function: "not".to_owned(),
                 expected: "Bool".to_owned(),
@@ -50,19 +58,19 @@ impl ExprFunction for NotFunc {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::ctx;
+    use crate::test_support::{ctx, eval};
 
     #[test]
     fn not_true() {
         let f = NotFunc;
-        let result = f.evaluate(vec![Value::Bool(true)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Bool(true)], &ctx()).unwrap();
         assert_eq!(result, Value::Bool(false));
     }
 
     #[test]
     fn not_null_propagation() {
         let f = NotFunc;
-        let result = f.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 }

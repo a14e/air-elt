@@ -14,6 +14,7 @@ doctest = false
 air-elt-expr-parse = { workspace = true }
 air-elt-expr-funcs = { workspace = true }
 air-elt-expr-types = { workspace = true }
+air-elt-expr-optimize = { workspace = true }
 air-elt-types = { workspace = true }
 ahash = { workspace = true }
 chrono = { workspace = true }

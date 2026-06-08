@@ -6,7 +6,13 @@ user-invocable: false
 
 # Expression language
 
-Air Elt configs use an expression language for computed column values, defaults, and string interpolation. Expressions are pure (no I/O at evaluation time) and evaluated during the **assemble** phase of the validation pipeline.
+Air Elt configs use an expression language for computed column values, defaults, and string interpolation. Expressions are pure (no I/O at evaluation time).
+
+Two evaluation contexts:
+- **Assemble-time (once per flow):** `default = ...`, switch values, component-config and `${VAR}` interpolation. No row access — `field()` / `fields()` are rejected here (`create_comptime` grammar).
+- **Per-row (in the Transform):** `compute = "<expr>"` mapping columns and the `[flow.<name>.compute-mapping]` shorthand. These are the **only** place runtime scripts run; they may read source columns via `field("col")` / backtick `` `col` ``, the named pack `fields("a,b")`, or the whole-row pack `fields("*")` (which projects the entire source schema). Compiled once to a `RuntimeProgram`, then run per row. A script that const-folds becomes a literal column; a bare `field("x")` becomes an identity rename; otherwise it runs as a per-row `Compute` op coerced to the sink type. See the `config-format` skill ("Compute columns").
+
+**`now()` / `today()` batch semantics:** referentially transparent (`is_pure() == true`) but NOT compile-time-foldable (`purity() == false`) — pinned to one batch clock at program init, so every row in one write batch shares the same timestamp (SQL `NOW()` / `CURRENT_TIMESTAMP`). Never const-folded (the clock is unknown at compile time). When adding a runtime-reading-but-stable builtin, set `is_pure` by determinism and override `purity` → false; do not gate folding on `is_pure`.
 
 ## Syntax
 
@@ -14,22 +20,26 @@ Literals: integer (`42`), float (`3.14`), bool (`true`/`false`), null (`null`), 
 
 Variables: `x = expr` (assignment via `=`, separated by `;`).
 
-Operators (in precedence order, low to high):
+Operators (in precedence order, low to high; binary operators are left-associative unless noted):
 - `||` logical OR
 - `&&` logical AND
-- `==`, `!=` equality
-- `<`, `>`, `<=`, `>=` comparison
 - `|` bitwise OR
 - `^` bitwise XOR
 - `&` bitwise AND
+- `==`, `!=`, `<`, `>`, `<=`, `>=` comparison — **non-associative** (`a < b < c` is a parse error; parenthesize)
 - `<<`, `>>` shift
 - `+`, `-` additive
 - `*`, `/`, `%` multiplicative
+- `**` power — **right-associative**
 - `!`, `~`, unary `-` (prefix)
 
+The parser is precedence-climbing (one `PrattOperator` table in `pratt_operator.rs`), so deeply nested expressions stay shallow on the native stack and the depth guard (`MAX_EXPR_DEPTH`) returns a clean error instead of overflowing.
+
 Function calls: `name(arg1, arg2, ...)`.
-Object literals: `{ "key" = expr, "other" = expr }`.
+Object literals: `{ "key" = expr, "other" = expr }`. An object literal evaluates to a `Value::Object` (ordered key/value list, type `DataType::Object`) — the only producer of `Value::Object` in the language, and what the `object*` functions consume. Values keep their canonical types (an `Int64` field stays `Int64`, not a JSON number). A repeated key is a **compile-time error** (rejected in the optimizer's converter, before const-folding can collapse the literal). Arrays have no `Value` variant — a nested array value is carried as `Value::Json(Array)`.
 String interpolation: `"prefix {expr} suffix"`.
+
+Comments: `#` starts a line comment that runs to the end of the line (a trailing comment on a statement or a whole comment line). The newline is preserved, so a comment never merges two statements. A `#` inside a string literal (`'a # b'`, `"#fff"`) is a literal character, not a comment — only top-level expression source (and `{...}` interpolation segments) treats `#` as a comment.
 
 ## Detection rules
 
@@ -57,36 +67,15 @@ Config format matters for expression quoting: in YAML, expressions need no outer
 
 ## Type algebra
 
-Type algebra determines the output `DataType` at type-check time (before evaluation). Rules live in `crates/expr/funcs/src/arithmetic_utils.rs` (arithmetic) and each function's `resolve_type` method.
+Type algebra fixes a function's output `DataType` at type-check time (before evaluation), in `crates/expr/funcs/src/arithmetic_utils.rs` and each `resolve_type`. The load-bearing rules:
 
-**Arithmetic promotion** (`bounds::arithmetic_result_type` + `bounds::scalar_arithmetic`):
+- **Arithmetic** promotes by `int_bound` bit-width (add/sub `max+1`, mul `a+b`, div `a`, mod `min`), staying `Int64` until bits exceed 64 then `BigInt{width}`; mixed int/float → `Float64`, anything with `Decimal` → `Decimal`. `negate`/`abs` preserve type; `ceil`/`floor`/`round`/`sign` → `Int64`; `power`/`sqrt` → `Float64`. `power` (`**`) always evaluates as `Float64`; the optimizer reduces only the exact float identities `x ** 1 → x` and `x ** 0 → 1.0` (the latter gated on a non-null, infallible base), and deliberately leaves `x ** 2`/`x ** 3` as `power` calls because `powf` is not portably bit-equal to repeated multiplication.
+- **String functions** return `Text` (`length`/`indexOf` → `Int64`; `startsWith`/`endsWith`/`contains` → `Bool`) and are **strict** — a non-text argument is a `TypeMismatch`, never silently stringified (`trim(1)`, `concat(x, 5)` are errors). Stringify explicitly with `toString`; interpolation (`"{expr}"`) renders any type via `value_to_string`, not through `concat`. The optimizer turns `concat(x, "")` / `concat(x)` into a `TypeAssert{String}`.
+- **Comparisons** return total **non-null `Bool`**: `==`/`!=` treat null as a value (`null==null`→true, so `x==null` is a real null test); `<`/`>`/`<=`/`>=` return `false` on any null operand. They never leak null into `&&`/`||`/`if`.
+- **`min`/`max`** skip NULL arguments (SQL semantics) and yield NULL only when *every* argument is NULL — so the result is nullable exactly when every argument is nullable (one non-null argument forces a non-null result). The optimizer exploits this: it drops NULL-literal arguments (`max(a, null, b)` → `max(a, b)`) and saturates against an integer operand's type bound (`max(x, TYPE_MAX)` → `TYPE_MAX`, `min(x, TYPE_MIN)` → `TYPE_MIN`).
+- **Casts** return their target type. **Conditionals** (`if`/`multiIf`/`ifNull`/`nullIf`, resolved in `type_resolver.rs`) take the first/value branch's type with per-form nullability; an `if`/`else if` chain folds to a flat `multiIf` at parse time (bounded by `MAX_AST_NODES`, not depth), and a large equality `multiIf` over 1–2 pure keys lowers to an O(1) `Switch`.
 
-When both operands carry `int_bound`, bit-level rules apply: add/subtract = `max(a,b)+1` bits, multiply = `a+b` bits, divide = `a` bits, modulo = `min(a,b)` bits. Result stays `Int64` with the computed bound while bits <= 64; above 64 it promotes to `BigInt{width}`. Without `int_bound`, the DataType-level fallback is used:
-
-| Left | Right | Result |
-|------|-------|--------|
-| IntN | IntN | next wider int (8->16->32->64->BigInt) per bit rules |
-| Float32 | Float32 | Float32 |
-| Float32/64 | Float64/32 | Float64 |
-| any int | any float | Float64 |
-| BigInt | BigInt | BigInt (wider width, capped at MAX_BIGINT_WIDTH) |
-| any int | BigInt | BigInt |
-| Decimal | any numeric | Decimal{precision:None, scale:None} |
-| Text | Text | `concat_result_type`: sums sizes when both bounded, else unbounded |
-
-Unary: `negate`/`abs` preserve the input type. `ceil`/`floor`/`round`/`sign` return `Int64`. `power`/`sqrt` return `Float64`.
-
-**String functions:** all return `Text{size:None}` (unbounded). Exception: `length`/`indexOf` return `Int64`; `startsWith`/`endsWith`/`contains` return `Bool`. Size-aware algebra (e.g. `concat(Text(5), Text(5))` returning `Text(10)`) exists in `concat_result_type` but is not wired through `ConcatFunc.resolve_type` yet.
-
-**Comparison functions:** always return `Bool`.
-
-**Cast functions:** return the target type (`toInt64` returns `Int64`, `toBigInt` returns `BigInt{width:None}`, `toDecimal` returns `Decimal{precision:None, scale:None}`, etc.).
-
-**Conditional functions** (parsed as AST nodes, resolved in `type_resolver.rs`):
-- `if(cond, then, else)`: returns `then`'s data type; nullable if either branch is nullable.
-- `multiIf(c1,v1,...,default)`: returns the first branch's data type; nullable if any branch is nullable.
-- `ifNull(value, alt)`: returns `value`'s data type; nullable = `alt.nullable` (the value itself is non-null after the check).
-- `nullIf(value, sentinel)`: returns `value`'s data type; always nullable (can produce null).
+Full promotion matrix, DataType fallbacks, size-aware `concat`, and exhaustive per-function rules: [references/type-algebra.md](references/type-algebra.md).
 
 ## Function categories
 
@@ -107,6 +96,7 @@ All functions are registered as static items implementing `ExprFunction`. Brief 
 | Crypto | `md5`, `sha1`, `sha256`, `sha512`, `xxHash64`, `xxHash32`, `cityHash64`, `hmac` |
 | JSON | `parseJson`, `toJson`, `jsPath`, `jsPathString`, `jsPathInt`, `jsPathFloat`, `jsPathBool`, `jsonLength` |
 | Object | `objectLength`, `objectKeys`, `objectValues`, `objectHasKey`, `objectGet` |
+| Regex | `regexMatch`, `regexReplace` |
 | Random | `randomUuid`, `randomInt`, `randomFloat`, `randomAlphanumeric`, `randomHex`, `randomBytes`, `randomChoice` |
 | Bitwise | `bitAnd`, `bitOr`, `bitXor`, `bitNot`, `bitShiftLeft`, `bitShiftRight`, `bitCount` |
 | Env | `env` (1 or 2 args) |

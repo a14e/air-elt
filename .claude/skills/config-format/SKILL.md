@@ -289,8 +289,31 @@ status_label = { from = "status", switch = { ACTIVE = "active", FINISHED = "fini
 | `truncate` | bool | `false` | Opt the column into narrowing conversions: text/bytes shrink (UTF-safe for text), integer/float saturate to target's max/min, decimal scale drop, decimal → float magnitude overflow saturates to `±INFINITY`, json/xml → `text(n)` serialize. `Decimal → Float64`/`Float32` is lossless without `truncate` when the declared precision fits the target's mantissa (≤ 15 / ≤ 7 respectively); wider or unbounded Decimal requires `truncate = true`. Forbidden combinations (`Json → Json`, `Xml → Xml`, UUID truncations, `Date → Timestamp`, `Float → Decimal/BigInt`) remain rejected. |
 | `default` | scalar / table | none | Fallback value substituted when the source value is `Null` and when `switch` produces no match. Permits mapping a nullable source into a `NOT NULL` sink. On the Direct path validation rejects `default` if the source column is `NOT NULL`. The value is expression-evaluated via `Evaluator::evaluate_expr_value()` and checked against the resolved sink `DataType` (see `default` value evaluation below). |
 | `switch` | inline table | none | Value-to-value lookup. Keys (inline-table keys — always strings in TOML) are parsed against the source column's `DataType`; values are parsed against the sink column's `DataType` (or contribute to union-collapse for schemaless sinks). Output: the matched value, or `default` on miss / NULL input, or `Value::Null` if no `default`. See **Switch** below. |
+| `compute` | string | none | Expression **script** producing the column's value per row. Mutually exclusive with `from` and `switch`. Unlike `default` (a fixed compile-time value), a compute script runs **per row in the Transform** and may read source columns via `field("col")` / `` `col` `` (backtick) and `fields("*")`. `truncate` / `default` still apply (the `default` is the NULL-fallback of the computed value). See **Compute columns** below. |
 
 `#[serde(deny_unknown_fields)]` rejects any additional keys at parse time on the long form — including a stray `to` field (the map key already carries it).
+
+**Compute columns**
+
+A `compute` mapping declares a **runtime script** — the only place expression scripts run per row (everything else, `default` / switch values, is evaluated once at assemble time). Two surfaces:
+
+```toml
+[flow.<name>.mapping]
+# long form (carries truncate / default):
+total = { compute = "`price` * `qty`", truncate = true }
+
+[flow.<name>.compute-mapping]
+# shorthand table: each value is a bare expression string.
+# Backtick column refs read naturally here; truncate = false, default = null.
+full_name = "concat(`first`, ' ', `last`)"
+ingested_at = "now()"
+```
+
+Inside a script, source columns are read with `field("col")` or the backtick literal `` `col` `` (prefer the backtick in YAML — no inner quoting). `fields("a,b")` builds an object of the named columns; `fields("*")` builds an object of the whole row. Every column a script reads is auto-added to the source read projection — you do **not** list them under `from`. `fields("*")` pulls in the entire source schema (for Mongo, the sampled schema, since compute requires `validation.fields = true`), so the packed object carries every column the schema knows.
+
+Lowering (transparent, but explains the cost): a script that const-folds to a literal (e.g. `1 + 2`, `now()` is *not* const-folded — it is per-batch) becomes a plain constant column; a bare `field("x")` becomes an identity `Take` (a normal rename); anything else compiles to a per-row `Compute` op whose result is coerced to the sink column type. `now()` / `today()` are pinned to one timestamp **per batch** (SQL `NOW()` semantics) — every row in a write batch shares the same clock.
+
+Requires `validation.fields = true` (the sink type must be known to type-check the script). The script's result type is checked against the sink column at validate time (`ComputeCompile` on mismatch).
 
 **Short-form grammar** — string RHS:
 

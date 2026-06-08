@@ -195,6 +195,13 @@ pub enum ValidationError {
     SwitchRequiresFields { flow: String, column: String },
 
     #[error(
+        "flow {flow:?} compute column {column:?}: `compute` requires `validation.fields = true` \
+         so the sink type can be resolved and the script type-checked; with `fields = false` no \
+         schema introspection runs"
+    )]
+    ComputeRequiresFields { flow: String, column: String },
+
+    #[error(
         "flow {flow:?} field {column:?}: `switch` without a `default` against a NOT NULL \
          sink column — any miss would emit NULL and violate the constraint"
     )]
@@ -202,6 +209,13 @@ pub enum ValidationError {
 
     #[error("flow {flow:?} field {column:?}: default value error: {reason}")]
     DefaultEval {
+        flow: String,
+        column: String,
+        reason: String,
+    },
+
+    #[error("flow {flow:?} compute column {column:?}: {reason}")]
+    ComputeCompile {
         flow: String,
         column: String,
         reason: String,
@@ -402,6 +416,13 @@ pub enum RuntimeError {
     #[error("derived plan invariant: {detail}")]
     DerivedPlanInvariant { detail: String },
 
+    /// A per-row compute script failed at evaluation time (the optimizer's
+    /// arena evaluator returned an `EvalError`). Carries the operator-facing
+    /// detail; the connection is fine, the row's data is the problem — so,
+    /// like `JsonEncode` / `Type`, it does NOT trigger a ctx rebuild.
+    #[error("compute evaluation failed: {detail}")]
+    ComputeEval { detail: String },
+
     #[error("{0}")]
     Other(String),
 }
@@ -436,6 +457,7 @@ impl RuntimeError {
             RuntimeError::Validation(_) => "validation",
             RuntimeError::JsonEncode(_) => "json_encode",
             RuntimeError::DerivedPlanInvariant { .. } => "derived_plan_invariant",
+            RuntimeError::ComputeEval { .. } => "compute_eval",
             RuntimeError::Other(_) => "other",
         }
     }

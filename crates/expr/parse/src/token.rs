@@ -6,6 +6,8 @@ pub enum Token {
     FloatLit(f64),
     StringLit(Vec<StringPart>),
     RawStringLit(String),
+    /// Backtick-delimited field literal `` `name` `` — the raw inner text.
+    FieldLit(String),
     BoolLit(bool),
     NullLit,
 

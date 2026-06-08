@@ -3,7 +3,7 @@ use air_elt_types::{DataType, Value};
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
-use crate::signature::{EvalContext, ExprFunction};
+use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
 static IS_NULL: IsNullFunc = IsNullFunc;
 static IS_NOT_NULL: IsNotNullFunc = IsNotNullFunc;
@@ -16,6 +16,10 @@ pub fn register(registry: &mut FunctionRegistry) {
 struct IsNullFunc;
 
 impl ExprFunction for IsNullFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "isNull"
     }
@@ -32,15 +36,22 @@ impl ExprFunction for IsNullFunc {
         Ok(NullableExprType::non_null(DataType::Bool))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        Ok(Value::Bool(a.is_null()))
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        Ok(Value::Bool(args.read(0).is_null()))
     }
 }
 
 struct IsNotNullFunc;
 
 impl ExprFunction for IsNotNullFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "isNotNull"
     }
@@ -57,9 +68,12 @@ impl ExprFunction for IsNotNullFunc {
         Ok(NullableExprType::non_null(DataType::Bool))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        Ok(Value::Bool(!a.is_null()))
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        Ok(Value::Bool(!args.read(0).is_null()))
     }
 }
 
@@ -67,26 +81,26 @@ impl ExprFunction for IsNotNullFunc {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::ctx;
+    use crate::test_support::{ctx, eval};
 
     #[test]
     fn is_null_true() {
         let f = IsNullFunc;
-        let result = f.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
     #[test]
     fn is_null_false() {
         let f = IsNullFunc;
-        let result = f.evaluate(vec![Value::Int64(5)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(5)], &ctx()).unwrap();
         assert_eq!(result, Value::Bool(false));
     }
 
     #[test]
     fn is_not_null() {
         let f = IsNotNullFunc;
-        let result = f.evaluate(vec![Value::Int64(5)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(5)], &ctx()).unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 }

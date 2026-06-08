@@ -13,6 +13,17 @@ pub fn extract_text(val: Value, func_name: &str) -> Result<String, FuncError> {
     }
 }
 
+pub fn extract_text_ref<'a>(val: &'a Value, func_name: &str) -> Result<&'a str, FuncError> {
+    match val {
+        Value::Text(s) => Ok(s),
+        other => Err(FuncError::TypeMismatch {
+            function: func_name.to_owned(),
+            expected: "Text".to_owned(),
+            actual: format!("{:?}", other.data_type()),
+        }),
+    }
+}
+
 pub fn extract_bytes(val: Value, func_name: &str) -> Result<Vec<u8>, FuncError> {
     match val {
         Value::Bytes(b) => Ok(b),

@@ -33,6 +33,7 @@
 //!
 //! [`Value`]: crate::value::Value
 
+use crate::convert::utils::bytes_to_hex;
 use crate::error::JsonEncodeError;
 use crate::value::Value;
 
@@ -144,16 +145,6 @@ fn float64_to_json(n: f64) -> serde_json::Value {
     serde_json::Number::from_f64(n)
         .map(serde_json::Value::Number)
         .unwrap_or(serde_json::Value::Null)
-}
-
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
 }
 
 #[cfg(test)]

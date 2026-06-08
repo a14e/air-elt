@@ -1,7 +1,43 @@
 use air_elt_expr_types::error::ExprTypeError;
 use air_elt_expr_types::limits::MAX_BIGINT_WIDTH;
 use air_elt_expr_types::nullable::NullableExprType;
-use air_elt_types::DataType;
+use air_elt_types::{DataType, Value};
+use num_traits::ToPrimitive;
+
+use crate::error::FuncError;
+
+/// Convert any numeric [`Value`] to `f64` for the float-domain math builtins
+/// (trig, logarithms, `sqrt`, `power`, `isNaN`, `isInfinite`). Covers EVERY
+/// numeric variant — narrow and unsigned integers, `BigInt`, and `Decimal` — so a
+/// source column arriving as `Int32` / `UInt32` / `BigInt` is accepted rather than
+/// rejected at runtime (the arithmetic builtins canonicalise via `widen_numeric`;
+/// the float-domain ones go straight through `f64`). A `BigInt` / `Decimal` past
+/// the `f64` range converts to `±INFINITY` — the IEEE result that `to_f64()`
+/// returns as `Some(inf)`, which `isInfinite` then reports faithfully. On the rare
+/// path where `num-traits` returns `None` (no finite or infinite representation),
+/// and for any non-numeric value, this is a `TypeMismatch`.
+pub(crate) fn value_to_f64(val: &Value, func_name: &str) -> Result<f64, FuncError> {
+    let mismatch = || FuncError::TypeMismatch {
+        function: func_name.to_owned(),
+        expected: "numeric".to_owned(),
+        actual: format!("{:?}", val.data_type()),
+    };
+    match val {
+        Value::Int8(x) => Ok(f64::from(*x)),
+        Value::Int16(x) => Ok(f64::from(*x)),
+        Value::Int32(x) => Ok(f64::from(*x)),
+        Value::Int64(x) => Ok(*x as f64),
+        Value::UInt8(x) => Ok(f64::from(*x)),
+        Value::UInt16(x) => Ok(f64::from(*x)),
+        Value::UInt32(x) => Ok(f64::from(*x)),
+        Value::UInt64(x) => Ok(*x as f64),
+        Value::Float32(x) => Ok(f64::from(*x)),
+        Value::Float64(x) => Ok(*x),
+        Value::BigInt(x) => x.to_f64().ok_or_else(mismatch),
+        Value::Decimal(x) => x.to_f64().ok_or_else(mismatch),
+        _ => Err(mismatch()),
+    }
+}
 
 /// Compute the result type of arithmetic between two expression types.
 /// When both operands carry `int_bound`, uses precise bit arithmetic.
@@ -53,6 +89,78 @@ pub fn arithmetic_result_type(
         nullable,
         int_bound: None,
     })
+}
+
+/// Result type of `min` / `max` over `args`: the single common type every
+/// argument coerces to. Numeric arguments widen to one common numeric type
+/// (a plain widening join — no bit inflation, unlike arithmetic); identical
+/// non-numeric comparable categories pass through (`Text`/`Bytes` widen to
+/// unbounded). Mixing categories whose ordering is undefined against each
+/// other (e.g. a number and text) is rejected — `min`/`max` are not defined
+/// on such a comparison.
+///
+/// `min`/`max` skip NULL arguments and yield NULL only when EVERY argument is
+/// NULL, so the result is nullable exactly when every argument is nullable: a
+/// single non-null argument guarantees a non-null extremum.
+pub fn comparable_join(
+    args: &[NullableExprType],
+    op: &str,
+) -> Result<NullableExprType, ExprTypeError> {
+    let mut accumulator = args[0].data_type.clone();
+    for arg in &args[1..] {
+        accumulator = join_comparable(&accumulator, &arg.data_type, op)?;
+    }
+    let nullable = args.iter().all(|arg| arg.nullable);
+    Ok(NullableExprType::new(accumulator, nullable))
+}
+
+fn join_comparable(left: &DataType, right: &DataType, op: &str) -> Result<DataType, ExprTypeError> {
+    if left == right {
+        return Ok(left.clone());
+    }
+    if is_numeric(left) && is_numeric(right) {
+        return numeric_join(left, right, op);
+    }
+    match (left, right) {
+        (DataType::Text { .. }, DataType::Text { .. }) => Ok(DataType::text()),
+        (DataType::Bytes { .. }, DataType::Bytes { .. }) => Ok(DataType::bytes()),
+        _ => Err(type_mismatch(op, left, right)),
+    }
+}
+
+/// Widening join of two numeric types (no bit inflation): the narrower type
+/// widens into the wider one. Mirrors the type pairs of [`scalar_arithmetic`]
+/// but keeps the width rather than growing it.
+fn numeric_join(left: &DataType, right: &DataType, op: &str) -> Result<DataType, ExprTypeError> {
+    use DataType::*;
+    match (left, right) {
+        (l, r) if is_integer(l) && is_integer(r) => {
+            bits_to_int_type(integer_bits(l).max(integer_bits(r)))
+        }
+        (Float32, Float32) => Ok(Float32),
+        (l, r) if is_float(l) && is_float(r) => Ok(Float64),
+        (l, r) if (is_integer(l) && is_float(r)) || (is_float(l) && is_integer(r)) => Ok(Float64),
+        (BigInt { .. }, BigInt { .. }) => Ok(BigInt { width: None }),
+        (l, BigInt { .. }) | (BigInt { .. }, l) if is_integer(l) => Ok(BigInt { width: None }),
+        (l, r)
+            if (is_numeric(l) && matches!(r, Decimal { .. }))
+                || (matches!(l, Decimal { .. }) && is_numeric(r)) =>
+        {
+            Ok(Decimal {
+                precision: None,
+                scale: None,
+            })
+        }
+        _ => Err(type_mismatch(op, left, right)),
+    }
+}
+
+fn type_mismatch(op: &str, left: &DataType, right: &DataType) -> ExprTypeError {
+    ExprTypeError::TypeMismatch {
+        operation: op.to_owned(),
+        left: format!("{left}"),
+        right: format!("{right}"),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,6 +1,6 @@
 # Expression language -- function reference
 
-All functions propagate null (return `Value::Null` if any argument is null) unless noted otherwise.
+All functions propagate null (return `Value::Null` if any argument is null) unless noted otherwise. The comparison operators are the notable exception — they are **total** and never return null (see [Comparison](#comparison)).
 
 ## Conditional
 
@@ -36,6 +36,15 @@ All functions propagate null (return `Value::Null` if any argument is null) unle
 | `repeat` | `(Text, Int64) -> Text` | Repeat string N times |
 | `leftPad` | `(Text, Int64, Text?) -> Text` | Pad left to target length |
 | `rightPad` | `(Text, Int64, Text?) -> Text` | Pad right to target length |
+
+## Regex
+
+Patterns use the `regex` crate syntax. The pattern compiles on every call (no per-flow cache yet) and an invalid pattern raises `RegexCompileFailed`. Both functions are pure and null-propagate on any null argument.
+
+| Function | Signature | Description |
+|---|---|---|
+| `regexMatch` | `(Text, Text) -> Bool` | True if `text` contains a match for `pattern` |
+| `regexReplace` | `(Text, Text, Text) -> Text` | Replace all matches of `pattern` in `text` with `replacement` |
 
 ## Arithmetic
 
@@ -106,7 +115,9 @@ Integer overflow promotes to `BigInt` automatically.
 | `greaterOrEquals` | `(T, T) -> Bool` | Greater than or equal |
 | `lessOrEquals` | `(T, T) -> Bool` | Less than or equal |
 
-Comparable type categories: numeric, text, bool, date, timestamp, uuid.
+Comparable type categories: numeric, text, bool, date, timestamp, uuid. Operands must share a category (checked at type resolution; a mismatch is a `TypeMismatch`).
+
+The six operators are **total** — they never return null, so they resolve to non-null `Bool`. Equality treats null as a value: `null == null` is `true`, `null == <non-null>` is `false` (so `x == null` is a real null test). The ordering operators (`<`, `>`, `<=`, `>=`) return `false` whenever either operand is null — null is unordered, mirroring SQL filtering and deliberately unlike `==`.
 
 ## Logical
 
@@ -140,10 +151,12 @@ Comparable type categories: numeric, text, bool, date, timestamp, uuid.
 
 ## Datetime
 
+`now`/`today` are pinned to the batch clock (`EvalContext.now`) at program initialization, so **every call within one batch returns the same value** — the SQL `NOW()` / `CURRENT_TIMESTAMP` semantics an ELT engine needs (one timestamp per inserted batch). They are therefore **referentially transparent** (`is_pure() == true`) and the optimizer may share/dedup/drop them, but **not compile-time-foldable** (`purity() == false`): the batch clock is unknown at compile time, so const folding never freezes a compile-time clock into the program.
+
 | Function | Signature | Description |
 |---|---|---|
-| `now` | `() -> Timestamp` | Current UTC timestamp (from EvalContext) |
-| `today` | `() -> Date` | Current UTC date |
+| `now` | `() -> Timestamp` | Current UTC timestamp (batch clock; stable within a batch) |
+| `today` | `() -> Date` | Current UTC date (batch clock; stable within a batch) |
 | `second` | `(Timestamp) -> Int64` | Extract second (0-59) |
 | `minute` | `(Timestamp) -> Int64` | Extract minute (0-59) |
 | `hour` | `(Timestamp) -> Int64` | Extract hour (0-23) |

@@ -89,6 +89,12 @@ impl Workspace {
 const CLASSIFICATION_RULES: &[(&str, CrateCategory)] = &[
     ("crates/types", CrateCategory::Foundation),
     ("crates/commons/lib", CrateCategory::Foundation),
+    // Generic, dependency-free utility crates — Foundation so that the
+    // `expr/*` crates may depend on them (Expression may only depend on
+    // Foundation or Expression). Must precede the wide `crates/commons/`
+    // rule below.
+    ("crates/commons/caching", CrateCategory::Foundation),
+    ("crates/commons/arena", CrateCategory::Foundation),
     ("crates/commons/testing", CrateCategory::CommonsTesting),
     ("crates/commons/", CrateCategory::CommonsDb),
     ("crates/monitoring", CrateCategory::Monitoring),

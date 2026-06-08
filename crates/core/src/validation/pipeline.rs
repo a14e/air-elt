@@ -436,6 +436,12 @@ fn passthrough_plans(
     direct
         .iter()
         .map(|m| {
+            if m.compute.is_some() {
+                return Err(ValidationError::ComputeRequiresFields {
+                    flow: flow_name.to_string(),
+                    column: m.to.clone(),
+                });
+            }
             if m.default_literal.is_some() {
                 return Err(ValidationError::DefaultRequiresFields {
                     flow: flow_name.to_string(),
@@ -966,6 +972,10 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
             &[],
             &read_columns,
             flow.source.schemaless(),
+            // `passthrough_plans` already rejected any compute column, so
+            // there are no lowerings or compute context on this path.
+            &[],
+            None,
         )?;
         DerivedPlans {
             read_spec,
@@ -1082,6 +1092,15 @@ mod tests {
                 key: "x".into(),
                 value: toml::Value::String("y".into()),
             }],
+            default_literal: None,
+        }
+    }
+
+    fn rule_compute(to: &str, expr: &str) -> ColumnMapping {
+        ColumnMapping::Compute {
+            to: to.into(),
+            expr_source: expr.into(),
+            truncate: false,
             default_literal: None,
         }
     }
@@ -1256,6 +1275,30 @@ mod tests {
         assert!(
             matches!(err, ValidationError::SwitchRequiresFields { .. }),
             "expected SwitchRequiresFields, got {err:?}"
+        );
+    }
+
+    /// Mirror of the `DefaultRequiresFields` / `SwitchRequiresFields` tests
+    /// for the compute branch (`passthrough_plans`). A compute script needs
+    /// the sink type to type-check, so without schema introspection
+    /// (`fields = false`) the mapping is rejected at validate time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fields_check_false_with_compute_rejected() {
+        let mut source = default_source_mock();
+        source.expect_name().return_const("src".to_string());
+        source.expect_describe_schema().times(0);
+        let mut sink = MockSink::new();
+        sink.expect_describe_schema().times(0);
+        sink.expect_schemaless().return_const(false);
+        let storage = MockStorage::new();
+
+        let rules = vec![rule_compute("a", "1 + 2")];
+        let flow = flow_with(source, sink, storage, rules, false);
+
+        let err = validate_flow(flow).await.unwrap_err();
+        assert!(
+            matches!(err, ValidationError::ComputeRequiresFields { .. }),
+            "expected ComputeRequiresFields, got {err:?}"
         );
     }
 

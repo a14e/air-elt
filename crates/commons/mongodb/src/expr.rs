@@ -5,7 +5,7 @@
 
 use air_elt_expr_funcs::error::FuncError;
 use air_elt_expr_funcs::registry::FunctionRegistry;
-use air_elt_expr_funcs::signature::{EvalContext, ExprFunction};
+use air_elt_expr_funcs::signature::{ArgWindow, EvalContext, ExprFunction};
 use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::{DataType, Value};
 use rand::Rng;
@@ -37,8 +37,12 @@ impl ExprFunction for ObjectIdFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let hex_str = match args.remove(0) {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let hex_str = match args.take(0) {
             Value::Text(s) => s,
             Value::Null => return Ok(Value::Null),
             other => {
@@ -87,8 +91,12 @@ impl ExprFunction for SecondsFunc {
         Ok(NullableExprType::new(DataType::Int64, nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let bytes = match args.remove(0) {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let bytes = match args.take(0) {
             Value::Bytes(b) => b,
             Value::Null => return Ok(Value::Null),
             other => {
@@ -135,7 +143,11 @@ impl ExprFunction for NewObjectIdFunc {
         }))
     }
 
-    fn evaluate(&self, _args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(
+        &self,
+        _args: &mut dyn ArgWindow,
+        context: &EvalContext,
+    ) -> Result<Value, FuncError> {
         let timestamp = context.now.timestamp() as u32;
         let mut bytes = [0u8; 12];
         bytes[0..4].copy_from_slice(&timestamp.to_be_bytes());
@@ -167,6 +179,7 @@ pub fn register_functions(registry: &mut FunctionRegistry) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use air_elt_expr_funcs::signature::{FuncArgVec, OwnedArgWindow};
 
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -198,6 +211,8 @@ mod tests {
             file_resolver: Arc::new(NoopFiles),
             now: Utc::now(),
             base_dir: PathBuf::from("."),
+            is_compile_time: false,
+            caches: air_elt_expr_funcs::ExprCaches::default(),
         }
     }
 
@@ -205,7 +220,9 @@ mod tests {
     fn object_id_valid_hex() {
         let ctx = test_context();
         let args = vec![Value::Text("507f1f77bcf86cd799439011".to_owned())];
-        let result = OBJECT_ID.evaluate(args, &ctx).unwrap();
+        let result = OBJECT_ID
+            .evaluate(&mut OwnedArgWindow::create(args), &ctx)
+            .unwrap();
         let expected = hex::decode("507f1f77bcf86cd799439011").unwrap();
         assert_eq!(result, Value::Bytes(expected));
     }
@@ -214,7 +231,7 @@ mod tests {
     fn object_id_wrong_length() {
         let ctx = test_context();
         let args = vec![Value::Text("abcdef".to_owned())];
-        let result = OBJECT_ID.evaluate(args, &ctx);
+        let result = OBJECT_ID.evaluate(&mut OwnedArgWindow::create(args), &ctx);
         assert!(matches!(result, Err(FuncError::EvalFailed { .. })));
     }
 
@@ -222,7 +239,7 @@ mod tests {
     fn object_id_invalid_hex() {
         let ctx = test_context();
         let args = vec![Value::Text("zzzzzzzzzzzzzzzzzzzzzzzz".to_owned())];
-        let result = OBJECT_ID.evaluate(args, &ctx);
+        let result = OBJECT_ID.evaluate(&mut OwnedArgWindow::create(args), &ctx);
         assert!(matches!(result, Err(FuncError::EvalFailed { .. })));
     }
 
@@ -230,7 +247,9 @@ mod tests {
     fn object_id_null_propagation() {
         let ctx = test_context();
         let args = vec![Value::Null];
-        let result = OBJECT_ID.evaluate(args, &ctx).unwrap();
+        let result = OBJECT_ID
+            .evaluate(&mut OwnedArgWindow::create(args), &ctx)
+            .unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -240,7 +259,9 @@ mod tests {
         // ObjectId "507f1f77..." has first 4 bytes = 0x507f1f77 = 1350508407
         let oid_bytes = hex::decode("507f1f77bcf86cd799439011").unwrap();
         let args = vec![Value::Bytes(oid_bytes)];
-        let result = SECONDS.evaluate(args, &ctx).unwrap();
+        let result = SECONDS
+            .evaluate(&mut OwnedArgWindow::create(args), &ctx)
+            .unwrap();
         assert_eq!(result, Value::Int64(1_350_508_407));
     }
 
@@ -248,7 +269,7 @@ mod tests {
     fn seconds_too_short() {
         let ctx = test_context();
         let args = vec![Value::Bytes(vec![1, 2, 3])];
-        let result = SECONDS.evaluate(args, &ctx);
+        let result = SECONDS.evaluate(&mut OwnedArgWindow::create(args), &ctx);
         assert!(matches!(result, Err(FuncError::EvalFailed { .. })));
     }
 
@@ -256,14 +277,18 @@ mod tests {
     fn seconds_null_propagation() {
         let ctx = test_context();
         let args = vec![Value::Null];
-        let result = SECONDS.evaluate(args, &ctx).unwrap();
+        let result = SECONDS
+            .evaluate(&mut OwnedArgWindow::create(args), &ctx)
+            .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn new_object_id_produces_12_bytes() {
         let ctx = test_context();
-        let result = NEW_OBJECT_ID.evaluate(vec![], &ctx).unwrap();
+        let result = NEW_OBJECT_ID
+            .evaluate(&mut OwnedArgWindow::create(FuncArgVec::new()), &ctx)
+            .unwrap();
         match result {
             Value::Bytes(b) => assert_eq!(b.len(), 12),
             other => panic!("expected Bytes, got {other:?}"),
@@ -274,7 +299,9 @@ mod tests {
     fn new_object_id_embeds_timestamp() {
         let ctx = test_context();
         let expected_ts = ctx.now.timestamp() as u32;
-        let result = NEW_OBJECT_ID.evaluate(vec![], &ctx).unwrap();
+        let result = NEW_OBJECT_ID
+            .evaluate(&mut OwnedArgWindow::create(FuncArgVec::new()), &ctx)
+            .unwrap();
         match result {
             Value::Bytes(b) => {
                 let ts = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);

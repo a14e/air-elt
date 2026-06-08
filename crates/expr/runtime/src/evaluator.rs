@@ -1,11 +1,12 @@
 use ahash::AHashMap;
-use air_elt_expr_funcs::FunctionRegistry;
 use air_elt_expr_funcs::signature::EvalContext;
+use air_elt_expr_funcs::{FunctionRegistry, SliceArgWindow};
 use air_elt_expr_parse::model::{
     ConditionalExpr, Expr, InterpolationSegment, LiteralValue, Program, Statement,
 };
 use air_elt_expr_types::limits::MAX_EXPR_DEPTH;
 use air_elt_types::Value;
+use air_elt_types::value_to_string;
 
 use crate::context::ExpressionContext;
 use crate::error::ExprError;
@@ -40,6 +41,11 @@ struct EvaluatorState<'a> {
     context: &'a EvalContext,
     variables: AHashMap<String, Value>,
     depth: usize,
+    /// Shared per-program argument stack. Each call pushes its evaluated
+    /// arguments above `base = arg_stack.len()` (nested calls stack on top) and
+    /// truncates back once the function returns, so the allocation is reused
+    /// across every call instead of a per-call vector.
+    arg_stack: Vec<Value>,
 }
 
 impl<'a> EvaluatorState<'a> {
@@ -49,6 +55,7 @@ impl<'a> EvaluatorState<'a> {
             context,
             variables: AHashMap::new(),
             depth: 0,
+            arg_stack: Vec::new(),
         }
     }
 
@@ -73,6 +80,7 @@ impl<'a> EvaluatorState<'a> {
             Expr::Conditional(conditional) => self.eval_conditional(conditional),
             Expr::Interpolation(segments) => self.eval_interpolation(segments),
             Expr::Object(entries) => self.eval_object(entries),
+            Expr::Field(..) | Expr::Fields(..) => Err(ExprError::FieldOutsideTransform),
         }
     }
 
@@ -95,14 +103,25 @@ impl<'a> EvaluatorState<'a> {
             .into());
         }
 
-        let function = self.registry.resolve(name, args.len())?;
+        let func_ref = self.registry.get_ref(name, Some(args.len()))?;
+        let function = self.registry.get_by_ref(func_ref);
 
-        let mut evaluated_args = Vec::with_capacity(args.len());
+        // Evaluate the arguments onto the shared argument stack (nested calls
+        // stack above `base`), then hand the function a window over that slice —
+        // no per-call allocation. The stack is truncated back to `base` whether
+        // the function succeeds or fails.
+        let base = self.arg_stack.len();
         for arg in args {
-            evaluated_args.push(self.eval_expr(arg)?);
+            let value = self.eval_expr(arg)?;
+            self.arg_stack.push(value);
         }
 
-        let result = function.evaluate(evaluated_args, self.context)?;
+        let outcome = {
+            let mut window = SliceArgWindow::create(&mut self.arg_stack[base..]);
+            function.evaluate(&mut window, self.context)
+        };
+        self.arg_stack.truncate(base);
+        let result = outcome?;
         self.depth -= 1;
         Ok(result)
     }
@@ -302,13 +321,12 @@ impl<'a> EvaluatorState<'a> {
     }
 
     fn eval_object(&mut self, entries: &[(String, Expr)]) -> Result<Value, ExprError> {
-        let mut map = serde_json::Map::with_capacity(entries.len());
+        let mut fields = Vec::with_capacity(entries.len());
         for (key, value_expr) in entries {
             let value = self.eval_expr(value_expr)?;
-            let json_val = air_elt_types::value_to_json(&value).unwrap_or(serde_json::Value::Null);
-            map.insert(key.clone(), json_val);
+            fields.push((key.clone(), value));
         }
-        Ok(Value::Json(serde_json::Value::Object(map)))
+        Ok(Value::Object(fields))
     }
 }
 
@@ -319,46 +337,6 @@ fn eval_literal(lit: &LiteralValue) -> Value {
         LiteralValue::Int(i) => Value::Int64(*i),
         LiteralValue::Float(f) => Value::Float64(*f),
         LiteralValue::String(s) => Value::Text(s.clone()),
-    }
-}
-
-fn value_to_string(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::Bool(b) => b.to_string(),
-        Value::Int8(v) => v.to_string(),
-        Value::Int16(v) => v.to_string(),
-        Value::Int32(v) => v.to_string(),
-        Value::Int64(v) => v.to_string(),
-        Value::UInt8(v) => v.to_string(),
-        Value::UInt16(v) => v.to_string(),
-        Value::UInt32(v) => v.to_string(),
-        Value::UInt64(v) => v.to_string(),
-        Value::Float32(v) => v.to_string(),
-        Value::Float64(v) => v.to_string(),
-        Value::Text(s) => s.clone(),
-        Value::BigInt(v) => v.to_string(),
-        Value::Decimal(v) => v.to_string(),
-        Value::Uuid(v) => v.to_string(),
-        Value::Date(d) => d.to_string(),
-        Value::Timestamp(t) => t.to_rfc3339(),
-        Value::Bytes(b) => format!("{b:?}"),
-        Value::Ipv4(v) => v.to_string(),
-        Value::Ipv6(v) => v.to_string(),
-        Value::Json(v) => v.to_string(),
-        Value::Object(entries) => {
-            let map: serde_json::Map<String, serde_json::Value> = entries
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        air_elt_types::value_to_json(v).unwrap_or(serde_json::Value::Null),
-                    )
-                })
-                .collect();
-            serde_json::Value::Object(map).to_string()
-        }
-        Value::Custom(v) => format!("{v:?}"),
     }
 }
 
@@ -416,6 +394,8 @@ mod tests {
             file_resolver: Arc::new(NoopFiles),
             now: chrono::Utc::now(),
             base_dir: PathBuf::from("/tmp"),
+            is_compile_time: false,
+            caches: air_elt_expr_funcs::ExprCaches::default(),
         }
     }
 
@@ -425,6 +405,8 @@ mod tests {
             file_resolver: Arc::new(NoopFiles),
             now: chrono::Utc::now(),
             base_dir: PathBuf::from("/tmp"),
+            is_compile_time: false,
+            caches: air_elt_expr_funcs::ExprCaches::default(),
         }
     }
 
@@ -548,24 +530,22 @@ mod tests {
     #[test]
     fn object_literal() {
         let result = eval("{\"key\" = 1 + 1}").unwrap();
-        match result {
-            Value::Json(obj) => {
-                assert_eq!(obj.get("key"), Some(&serde_json::json!(2)));
-            }
-            other => panic!("expected Json, got {other:?}"),
-        }
+        assert_eq!(
+            result,
+            Value::Object(vec![("key".to_string(), Value::Int64(2))])
+        );
     }
 
     #[test]
     fn object_literal_multiple_keys() {
         let result = eval("{\"a\" = 1, \"b\" = 'hello'}").unwrap();
-        match result {
-            Value::Json(obj) => {
-                assert_eq!(obj.get("a"), Some(&serde_json::json!(1)));
-                assert_eq!(obj.get("b"), Some(&serde_json::json!("hello")));
-            }
-            other => panic!("expected Json, got {other:?}"),
-        }
+        assert_eq!(
+            result,
+            Value::Object(vec![
+                ("a".to_string(), Value::Int64(1)),
+                ("b".to_string(), Value::Text("hello".to_string())),
+            ])
+        );
     }
 
     #[test]
@@ -836,5 +816,169 @@ mod tests {
         let program = Parser::create().parse("hello {1 + 2} world").unwrap();
         let result = evaluator.evaluate(&program).unwrap();
         assert_eq!(result, Value::Text("hello 3 world".to_string()));
+    }
+
+    // --- Differential oracle: heap (AST) evaluator vs arena evaluator ---------
+    //
+    // Production const / default / switch / patch evaluation runs through the
+    // optimizer's arena evaluator (`compile` → `RuntimeProgram::evaluate`). This
+    // proptest pins that path to the original heap AST evaluator retained here:
+    // for any field-free program they must produce the same value (or both
+    // error). This is the gate that let the patcher and core call-sites migrate
+    // off the heap evaluator.
+
+    use air_elt_expr_optimize::Optimizer;
+    use proptest::prelude::*;
+
+    use crate::program::RuntimeProgram;
+
+    /// Random field-free (comptime) expressions: numeric / string / bool / null
+    /// and impure (`now`/`env`) leaves under arithmetic, comparison, Kleene
+    /// logic, conditional, null-handling, and interpolation ops — the shapes the
+    /// const / default / switch / patch path actually evaluates. The impure
+    /// leaves matter: the optimizer leaves `now`/`env` unfolded, so the arena
+    /// evaluator runs them per the same `EvalContext` the heap evaluator uses,
+    /// and the oracle pins that they still agree.
+    fn const_expression() -> impl Strategy<Value = String> {
+        let leaf = prop_oneof![
+            6 => (0i64..20).prop_map(|n| n.to_string()),
+            2 => (0i64..20).prop_map(|n| format!("'{n}'")),
+            1 => Just("true".to_owned()),
+            1 => Just("false".to_owned()),
+            1 => Just("null".to_owned()),
+            1 => Just("now()".to_owned()),
+            1 => Just("env('AIR_ELT_ABSENT', 'fallback')".to_owned()),
+        ];
+        leaf.prop_recursive(4, 64, 3, |inner| {
+            // A boolean sub-expression, so `&&` / `||` exercise real Kleene logic
+            // (not just a non-bool type error on both sides).
+            let boolean = (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("({a} < {b})"));
+            prop_oneof![
+                (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("({a} + {b})")),
+                (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("({a} - {b})")),
+                (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("({a} * {b})")),
+                (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("min({a}, {b})")),
+                (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("max({a}, {b})")),
+                (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("ifNull({a}, {b})")),
+                (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("nullIf({a}, {b})")),
+                (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("({a} == {b})")),
+                inner.clone().prop_map(|a| format!("(-{a})")),
+                (boolean.clone(), boolean.clone()).prop_map(|(a, b)| format!("({a} && {b})")),
+                (boolean.clone(), boolean.clone()).prop_map(|(a, b)| format!("({a} || {b})")),
+                inner.clone().prop_map(|a| format!("\"x{{{a}}}y\"")),
+                // Single-key object literal (distinct key → never a duplicate-key
+                // compile error) and its round-trip through `objectGet`, so the
+                // oracle also pins `Value::Object` construction across heap/arena.
+                inner.clone().prop_map(|a| format!("{{\"k\" = {a}}}")),
+                inner
+                    .clone()
+                    .prop_map(|a| format!("objectGet({{\"k\" = {a}}}, \"k\")")),
+                (inner.clone(), inner.clone(), inner.clone())
+                    .prop_map(|(a, b, c)| format!("if(({a} < {b}), {a}, {c})")),
+            ]
+        })
+    }
+
+    fn arena_eval(
+        program: &air_elt_expr_parse::Program,
+        registry: &FunctionRegistry,
+        context: &EvalContext,
+    ) -> Result<Value, ()> {
+        // A compile error means the optimizer hit a constant that fails in an
+        // eager position; the heap evaluator must then fail too (checked below).
+        let compact = Optimizer::create(registry, context)
+            .compile(program, None, None)
+            .map_err(|_| ())?;
+        RuntimeProgram::create(compact)
+            .evaluate(registry, context)
+            .map_err(|_| ())
+    }
+
+    /// Programs that bind an **impure** value to a variable and reuse it several
+    /// times inside a single call. The binding must be impure so it is NOT
+    /// const-folded away (a folded constant would reach the call as `Const`, not
+    /// a register) yet **deterministic** across the heap and arena evaluators
+    /// (both share `context.now`), so `toString(now())` / `toString(today())` fit
+    /// while non-deterministic `random*` would falsely diverge. A variable read
+    /// lowers to a register read, so reusing `v` in one call produces the same
+    /// register aliasing that `field_hoist` creates for a repeated field —
+    /// exercising the arena's register move/clone choice (`ArgStackItem::Register`
+    /// vs `RegisterTake`) under the heap↔arena oracle, which the field-free
+    /// `const_expression` cannot reach (the heap evaluator has no field binding).
+    fn shared_register_program() -> impl Strategy<Value = String> {
+        let bound = prop_oneof![
+            Just("toString(now())".to_owned()),
+            Just("toString(today())".to_owned()),
+            Just("concat(toString(now()), 'q')".to_owned()),
+        ];
+        // Each reuses `v` >=2 times in one call, across ascending-take
+        // (`concat`), descending-take (`replace`), and nested-move (`upper(v)`)
+        // shapes — the cases the aliasing bug spanned.
+        let shape = prop_oneof![
+            Just("concat(v, v)"),
+            Just("replace(v, v, v)"),
+            Just("concat(v, upper(v))"),
+            Just("concat(upper(v), v)"),
+            Just("concat(v, concat(v, v))"),
+            Just("substring(v, 0, 1)"),
+        ];
+        (bound, shape).prop_map(|(bound, shape)| format!("v = {bound}; {shape}"))
+    }
+
+    proptest! {
+        /// The shared-register programs must evaluate identically on the heap and
+        /// arena paths — the regression guard for hoisted/aliased register moves.
+        #[test]
+        fn heap_and_arena_agree_on_shared_registers(source in shared_register_program()) {
+            let registry = FunctionRegistry::with_builtins();
+            let context = test_context();
+            let Ok(program) = Parser::create().parse_expression(&source) else {
+                return Ok(());
+            };
+            let heap = evaluate(&program, &registry, &context).map_err(|_| ());
+            let arena = arena_eval(&program, &registry, &context);
+            match (heap, arena) {
+                (Ok(left), Ok(right)) => prop_assert!(
+                    left == right,
+                    "value mismatch for `{source}`: {left:?} (heap) vs {right:?} (arena)"
+                ),
+                (Err(()), Err(())) => {}
+                (left, right) => prop_assert!(
+                    false,
+                    "ok/err mismatch for `{source}`: {left:?} (heap) vs {right:?} (arena)"
+                ),
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn heap_and_arena_agree(source in const_expression()) {
+            let registry = FunctionRegistry::with_builtins();
+            let context = test_context();
+            // The grammar can compose syntactically invalid sources (e.g. an
+            // object literal as the whole content of an interpolation slot —
+            // `"x{{"k"=0}}y"` — where the object's `{` collides with the `{{`
+            // brace-escape). This oracle is an eval-equivalence check, so an
+            // unparseable source is outside its domain: skip it.
+            let Ok(program) = Parser::create().parse_expression(&source) else {
+                return Ok(());
+            };
+
+            let heap = evaluate(&program, &registry, &context).map_err(|_| ());
+            let arena = arena_eval(&program, &registry, &context);
+
+            match (heap, arena) {
+                (Ok(left), Ok(right)) => prop_assert!(
+                    left == right,
+                    "value mismatch for `{source}`: {left:?} (heap) vs {right:?} (arena)"
+                ),
+                (Err(()), Err(())) => {}
+                (left, right) => prop_assert!(
+                    false,
+                    "ok/err mismatch for `{source}`: {left:?} (heap) vs {right:?} (arena)"
+                ),
+            }
+        }
     }
 }

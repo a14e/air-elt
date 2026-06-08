@@ -24,7 +24,6 @@ use chrono::{DateTime, NaiveDate, Utc};
 use num_bigint::BigInt;
 use uuid::Uuid;
 
-use air_elt_expr_runtime::Evaluator;
 use air_elt_types::Key;
 
 use crate::error::ValidationError;
@@ -85,7 +84,6 @@ pub fn compile_switch(
         });
     }
 
-    let evaluator = Evaluator::create(expr_context);
     let mut table_cases: ahash::AHashMap<Key, Value> = ahash::AHashMap::with_capacity(cases.len());
     let mut observed_value_types: Vec<DataType> = Vec::with_capacity(cases.len() + 1);
 
@@ -125,16 +123,15 @@ pub fn compile_switch(
                 detail: e.to_string(),
             }
         })?;
-        let resolved =
-            evaluator
-                .evaluate(&program)
-                .map_err(|e| ValidationError::SwitchValueTypeMismatch {
-                    flow: flow.into(),
-                    column: column.into(),
-                    key: case.key.clone(),
-                    sink_type: sink_dt.clone(),
-                    detail: e.to_string(),
-                })?;
+        let resolved = expr_context.evaluate_const(&program).map_err(|e| {
+            ValidationError::SwitchValueTypeMismatch {
+                flow: flow.into(),
+                column: column.into(),
+                key: case.key.clone(),
+                sink_type: sink_dt.clone(),
+                detail: e.to_string(),
+            }
+        })?;
 
         let (out_value, out_type) = if schemaless_sink {
             let dt = resolved
@@ -170,16 +167,15 @@ pub fn compile_switch(
                     sink_type: sink_dt.clone(),
                     detail: e.to_string(),
                 })?;
-        let resolved =
-            evaluator
-                .evaluate(&program)
-                .map_err(|e| ValidationError::SwitchValueTypeMismatch {
-                    flow: flow.into(),
-                    column: column.into(),
-                    key: "<default>".into(),
-                    sink_type: sink_dt.clone(),
-                    detail: e.to_string(),
-                })?;
+        let resolved = expr_context.evaluate_const(&program).map_err(|e| {
+            ValidationError::SwitchValueTypeMismatch {
+                flow: flow.into(),
+                column: column.into(),
+                key: "<default>".into(),
+                sink_type: sink_dt.clone(),
+                detail: e.to_string(),
+            }
+        })?;
         if schemaless_sink {
             let dt = resolved
                 .data_type()

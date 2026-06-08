@@ -1,3 +1,4 @@
+use chrono::format::{Item, StrftimeItems};
 use chrono::{DateTime, Datelike, Duration, Months, Timelike, Utc};
 
 use air_elt_expr_types::nullable::NullableExprType;
@@ -6,7 +7,7 @@ use air_elt_types::{DataType, Value};
 use super::arg_extract::extract_int64;
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
-use crate::signature::{EvalContext, ExprFunction};
+use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
 // ---------------------------------------------------------------------------
 // Static instances
@@ -114,7 +115,7 @@ fn extract_timestamp(val: Value, func: &str) -> Result<DateTime<Utc>, FuncError>
     }
 }
 
-fn extract_string(val: Value, func: &str) -> Result<String, FuncError> {
+fn extract_string_ref<'a>(val: &'a Value, func: &str) -> Result<&'a str, FuncError> {
     match val {
         Value::Text(s) => Ok(s),
         _ => Err(FuncError::TypeMismatch {
@@ -123,6 +124,20 @@ fn extract_string(val: Value, func: &str) -> Result<String, FuncError> {
             actual: format!("{:?}", val.data_type()),
         }),
     }
+}
+
+/// Validates a strftime mask by scanning its parsed items for an error item.
+/// Shared by `formatDateTime`'s `evaluate` and `validate_const_args` so both
+/// reject the same malformed masks.
+fn validate_strftime_mask(mask: &str) -> Result<(), FuncError> {
+    let has_error = StrftimeItems::new(mask).any(|item| matches!(item, Item::Error));
+    if has_error {
+        return Err(FuncError::EvalFailed {
+            function: "formatDateTime".to_owned(),
+            reason: format!("invalid format mask: {mask:?}"),
+        });
+    }
+    Ok(())
 }
 
 /// Resolve type for functions accepting a timestamp/date argument.
@@ -144,6 +159,19 @@ fn timestamp_input_type(args: &[NullableExprType], func: &str) -> Result<(), Fun
 struct NowFunc;
 
 impl ExprFunction for NowFunc {
+    /// Referentially transparent: `now` is pinned to the batch clock
+    /// (`context.now`) at program initialization, so every call in one run
+    /// returns the same value — safe to share (CSE/dedup) or drop when unused.
+    fn is_pure(&self) -> bool {
+        true
+    }
+
+    /// NOT const-foldable: the batch clock is unknown at compile time, so const
+    /// folding must never freeze a compile-time `now` into the program.
+    fn purity(&self, _const_args: &[bool]) -> bool {
+        false
+    }
+
     fn name(&self) -> &str {
         "now"
     }
@@ -160,7 +188,11 @@ impl ExprFunction for NowFunc {
         Ok(NullableExprType::non_null(DataType::Timestamp))
     }
 
-    fn evaluate(&self, _args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(
+        &self,
+        _args: &mut dyn ArgWindow,
+        context: &EvalContext,
+    ) -> Result<Value, FuncError> {
         Ok(Value::Timestamp(context.now))
     }
 }
@@ -168,6 +200,18 @@ impl ExprFunction for NowFunc {
 struct TodayFunc;
 
 impl ExprFunction for TodayFunc {
+    /// Referentially transparent: `today` is derived from the batch clock
+    /// (`context.now`) pinned at program initialization, so every call in one
+    /// run returns the same value — safe to share (CSE/dedup) or drop when unused.
+    fn is_pure(&self) -> bool {
+        true
+    }
+
+    /// NOT const-foldable: the batch clock is unknown at compile time.
+    fn purity(&self, _const_args: &[bool]) -> bool {
+        false
+    }
+
     fn name(&self) -> &str {
         "today"
     }
@@ -184,7 +228,11 @@ impl ExprFunction for TodayFunc {
         Ok(NullableExprType::non_null(DataType::Date))
     }
 
-    fn evaluate(&self, _args: Vec<Value>, context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(
+        &self,
+        _args: &mut dyn ArgWindow,
+        context: &EvalContext,
+    ) -> Result<Value, FuncError> {
         Ok(Value::Date(context.now.date_naive()))
     }
 }
@@ -198,6 +246,10 @@ macro_rules! extract_component_func {
         struct $struct_name;
 
         impl ExprFunction for $struct_name {
+            fn is_pure(&self) -> bool {
+                true
+            }
+
             fn name(&self) -> &str {
                 $func_name
             }
@@ -220,10 +272,10 @@ macro_rules! extract_component_func {
 
             fn evaluate(
                 &self,
-                mut args: Vec<Value>,
+                args: &mut dyn ArgWindow,
                 _context: &EvalContext,
             ) -> Result<Value, FuncError> {
-                let a = args.remove(0);
+                let a = args.take(0);
                 if a.is_null() {
                     return Ok(Value::Null);
                 }
@@ -258,6 +310,10 @@ extract_component_func!(DayOfYearFunc, "dayOfYear", |dt: DateTime<Utc>| {
 struct ToSecondsFunc;
 
 impl ExprFunction for ToSecondsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toSeconds"
     }
@@ -275,8 +331,12 @@ impl ExprFunction for ToSecondsFunc {
         Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.take(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
@@ -288,6 +348,10 @@ impl ExprFunction for ToSecondsFunc {
 struct ToMillisFunc;
 
 impl ExprFunction for ToMillisFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toMillis"
     }
@@ -305,8 +369,12 @@ impl ExprFunction for ToMillisFunc {
         Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.take(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
@@ -322,6 +390,10 @@ impl ExprFunction for ToMillisFunc {
 struct FromSecondsFunc;
 
 impl ExprFunction for FromSecondsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "fromSeconds"
     }
@@ -338,8 +410,12 @@ impl ExprFunction for FromSecondsFunc {
         Ok(NullableExprType::new(DataType::Timestamp, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.take(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
@@ -355,6 +431,10 @@ impl ExprFunction for FromSecondsFunc {
 struct FromMillisFunc;
 
 impl ExprFunction for FromMillisFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "fromMillis"
     }
@@ -371,8 +451,12 @@ impl ExprFunction for FromMillisFunc {
         Ok(NullableExprType::new(DataType::Timestamp, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.take(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
@@ -394,6 +478,10 @@ macro_rules! duration_arithmetic_func {
         struct $struct_name;
 
         impl ExprFunction for $struct_name {
+            fn is_pure(&self) -> bool {
+                true
+            }
+
             fn name(&self) -> &str {
                 $func_name
             }
@@ -417,11 +505,11 @@ macro_rules! duration_arithmetic_func {
 
             fn evaluate(
                 &self,
-                mut args: Vec<Value>,
+                args: &mut dyn ArgWindow,
                 _context: &EvalContext,
             ) -> Result<Value, FuncError> {
-                let b = args.remove(1);
-                let a = args.remove(0);
+                let b = args.take(1);
+                let a = args.take(0);
                 if a.is_null() || b.is_null() {
                     return Ok(Value::Null);
                 }
@@ -449,6 +537,10 @@ macro_rules! duration_subtract_func {
         struct $struct_name;
 
         impl ExprFunction for $struct_name {
+            fn is_pure(&self) -> bool {
+                true
+            }
+
             fn name(&self) -> &str {
                 $func_name
             }
@@ -472,11 +564,11 @@ macro_rules! duration_subtract_func {
 
             fn evaluate(
                 &self,
-                mut args: Vec<Value>,
+                args: &mut dyn ArgWindow,
                 _context: &EvalContext,
             ) -> Result<Value, FuncError> {
-                let b = args.remove(1);
-                let a = args.remove(0);
+                let b = args.take(1);
+                let a = args.take(0);
                 if a.is_null() || b.is_null() {
                     return Ok(Value::Null);
                 }
@@ -529,6 +621,10 @@ duration_subtract_func!(SubtractMillisecondsFunc, "subtractMilliseconds", |n| {
 struct AddMonthsFunc;
 
 impl ExprFunction for AddMonthsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "addMonths"
     }
@@ -547,9 +643,13 @@ impl ExprFunction for AddMonthsFunc {
         Ok(NullableExprType::new(DataType::Timestamp, nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let b = args.take(1);
+        let a = args.take(0);
         if a.is_null() || b.is_null() {
             return Ok(Value::Null);
         }
@@ -562,6 +662,10 @@ impl ExprFunction for AddMonthsFunc {
 struct SubtractMonthsFunc;
 
 impl ExprFunction for SubtractMonthsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "subtractMonths"
     }
@@ -580,9 +684,13 @@ impl ExprFunction for SubtractMonthsFunc {
         Ok(NullableExprType::new(DataType::Timestamp, nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let b = args.take(1);
+        let a = args.take(0);
         if a.is_null() || b.is_null() {
             return Ok(Value::Null);
         }
@@ -595,6 +703,10 @@ impl ExprFunction for SubtractMonthsFunc {
 struct AddYearsFunc;
 
 impl ExprFunction for AddYearsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "addYears"
     }
@@ -613,9 +725,13 @@ impl ExprFunction for AddYearsFunc {
         Ok(NullableExprType::new(DataType::Timestamp, nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let b = args.take(1);
+        let a = args.take(0);
         if a.is_null() || b.is_null() {
             return Ok(Value::Null);
         }
@@ -632,6 +748,10 @@ impl ExprFunction for AddYearsFunc {
 struct SubtractYearsFunc;
 
 impl ExprFunction for SubtractYearsFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "subtractYears"
     }
@@ -650,9 +770,13 @@ impl ExprFunction for SubtractYearsFunc {
         Ok(NullableExprType::new(DataType::Timestamp, nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b = args.remove(1);
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let b = args.take(1);
+        let a = args.take(0);
         if a.is_null() || b.is_null() {
             return Ok(Value::Null);
         }
@@ -729,6 +853,10 @@ fn subtract_months_from_dt(dt: DateTime<Utc>, n: i64, func: &str) -> Result<Valu
 struct DateDiffFunc;
 
 impl ExprFunction for DateDiffFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "dateDiff"
     }
@@ -746,18 +874,22 @@ impl ExprFunction for DateDiffFunc {
         Ok(NullableExprType::new(DataType::Int64, nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let dt2_val = args.remove(2);
-        let dt1_val = args.remove(1);
-        let unit_val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let dt2_val = args.take(2);
+        let dt1_val = args.take(1);
+        let unit_val = args.read(0);
         if unit_val.is_null() || dt1_val.is_null() || dt2_val.is_null() {
             return Ok(Value::Null);
         }
-        let unit = extract_string(unit_val, "dateDiff")?;
+        let unit = extract_string_ref(unit_val, "dateDiff")?;
         let dt1 = extract_timestamp(dt1_val, "dateDiff")?;
         let dt2 = extract_timestamp(dt2_val, "dateDiff")?;
         let diff = dt2 - dt1;
-        let result = match unit.as_str() {
+        let result = match unit {
             "second" => diff.num_seconds(),
             "minute" => diff.num_minutes(),
             "hour" => diff.num_hours(),
@@ -782,6 +914,10 @@ impl ExprFunction for DateDiffFunc {
 struct FormatDateTimeFunc;
 
 impl ExprFunction for FormatDateTimeFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "formatDateTime"
     }
@@ -802,15 +938,31 @@ impl ExprFunction for FormatDateTimeFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let mask_val = args.remove(1);
-        let dt_val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let dt_val = args.take(0);
+        let mask_val = args.read(1);
         if dt_val.is_null() || mask_val.is_null() {
             return Ok(Value::Null);
         }
         let dt = extract_timestamp(dt_val, "formatDateTime")?;
-        let mask = extract_string(mask_val, "formatDateTime")?;
-        Ok(Value::Text(dt.format(&mask).to_string()))
+        let mask = extract_string_ref(mask_val, "formatDateTime")?;
+        validate_strftime_mask(mask)?;
+        Ok(Value::Text(dt.format(mask).to_string()))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        if let Some(Some(Value::Text(mask))) = args.get(1) {
+            validate_strftime_mask(mask)?;
+        }
+        Ok(())
     }
 }
 
@@ -830,6 +982,7 @@ mod tests {
 
     use crate::ExprFunction;
     use crate::signature::EvalContext;
+    use crate::test_support::eval;
 
     use super::*;
 
@@ -839,6 +992,8 @@ mod tests {
             file_resolver: Arc::new(crate::test_support::NoopFiles),
             now: Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 45).unwrap(),
             base_dir: PathBuf::new(),
+            is_compile_time: false,
+            caches: crate::cache::ExprCaches::default(),
         }
     }
 
@@ -857,17 +1012,40 @@ mod tests {
     #[test]
     fn now_returns_context_now() {
         let c = ctx();
-        let result = NowFunc.evaluate(vec![], &c).unwrap();
+        let result = eval(&NowFunc, smallvec::smallvec![], &c).unwrap();
         assert_eq!(result, Value::Timestamp(c.now));
     }
 
     #[test]
     fn today_returns_date_part() {
         let c = ctx();
-        let result = TodayFunc.evaluate(vec![], &c).unwrap();
+        let result = eval(&TodayFunc, smallvec::smallvec![], &c).unwrap();
         assert_eq!(
             result,
             Value::Date(NaiveDate::from_ymd_opt(2024, 6, 15).unwrap())
+        );
+    }
+
+    #[test]
+    fn now_and_today_are_pure_but_not_const_foldable() {
+        // Referentially transparent (pinned to the batch clock at init, so
+        // repeated calls in one run agree) — safe to CSE/dedup/drop.
+        assert!(NowFunc.is_pure(), "now must be referentially transparent");
+        assert!(
+            TodayFunc.is_pure(),
+            "today must be referentially transparent"
+        );
+        // ...but NOT const-foldable: the batch clock is unknown at compile time,
+        // so const folding must never freeze a compile-time clock into the
+        // program. `purity` is the gate const folding consults, and it stays
+        // false regardless of (the empty set of) argument constness.
+        assert!(
+            !NowFunc.purity(&[]),
+            "now must not be const-folded (reads the batch clock)"
+        );
+        assert!(
+            !TodayFunc.purity(&[]),
+            "today must not be const-folded (reads the batch clock)"
         );
     }
 
@@ -877,49 +1055,67 @@ mod tests {
 
     #[test]
     fn second_extraction() {
-        let result = SecondFunc
-            .evaluate(vec![ts(2024, 6, 15, 10, 30, 45)], &ctx())
-            .unwrap();
+        let result = eval(
+            &SecondFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 30, 45)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(45));
     }
 
     #[test]
     fn minute_extraction() {
-        let result = MinuteFunc
-            .evaluate(vec![ts(2024, 6, 15, 10, 30, 45)], &ctx())
-            .unwrap();
+        let result = eval(
+            &MinuteFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 30, 45)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(30));
     }
 
     #[test]
     fn hour_extraction() {
-        let result = HourFunc
-            .evaluate(vec![ts(2024, 6, 15, 10, 30, 45)], &ctx())
-            .unwrap();
+        let result = eval(
+            &HourFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 30, 45)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(10));
     }
 
     #[test]
     fn day_extraction() {
-        let result = DayFunc
-            .evaluate(vec![ts(2024, 6, 15, 10, 30, 45)], &ctx())
-            .unwrap();
+        let result = eval(
+            &DayFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 30, 45)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(15));
     }
 
     #[test]
     fn month_extraction() {
-        let result = MonthFunc
-            .evaluate(vec![ts(2024, 6, 15, 10, 30, 45)], &ctx())
-            .unwrap();
+        let result = eval(
+            &MonthFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 30, 45)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(6));
     }
 
     #[test]
     fn year_extraction() {
-        let result = YearFunc
-            .evaluate(vec![ts(2024, 6, 15, 10, 30, 45)], &ctx())
-            .unwrap();
+        let result = eval(
+            &YearFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 30, 45)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(2024));
     }
 
@@ -930,36 +1126,48 @@ mod tests {
             .unwrap()
             .with_nanosecond(123_000_000)
             .unwrap();
-        let result = MillisecondFunc
-            .evaluate(vec![Value::Timestamp(dt)], &ctx())
-            .unwrap();
+        let result = eval(
+            &MillisecondFunc,
+            smallvec::smallvec![Value::Timestamp(dt)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(123));
     }
 
     #[test]
     fn day_of_week_monday_is_1() {
         // 2024-06-17 is a Monday
-        let result = DayOfWeekFunc
-            .evaluate(vec![ts(2024, 6, 17, 0, 0, 0)], &ctx())
-            .unwrap();
+        let result = eval(
+            &DayOfWeekFunc,
+            smallvec::smallvec![ts(2024, 6, 17, 0, 0, 0)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(1));
     }
 
     #[test]
     fn day_of_week_sunday_is_7() {
         // 2024-06-16 is a Sunday
-        let result = DayOfWeekFunc
-            .evaluate(vec![ts(2024, 6, 16, 0, 0, 0)], &ctx())
-            .unwrap();
+        let result = eval(
+            &DayOfWeekFunc,
+            smallvec::smallvec![ts(2024, 6, 16, 0, 0, 0)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(7));
     }
 
     #[test]
     fn day_of_year_extraction() {
         // 2024-06-15 is day 167 (leap year)
-        let result = DayOfYearFunc
-            .evaluate(vec![ts(2024, 6, 15, 0, 0, 0)], &ctx())
-            .unwrap();
+        let result = eval(
+            &DayOfYearFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 0, 0, 0)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(167));
     }
 
@@ -970,18 +1178,24 @@ mod tests {
     #[test]
     fn to_seconds_conversion() {
         let dt = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        let result = ToSecondsFunc
-            .evaluate(vec![Value::Timestamp(dt)], &ctx())
-            .unwrap();
+        let result = eval(
+            &ToSecondsFunc,
+            smallvec::smallvec![Value::Timestamp(dt)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(dt.timestamp()));
     }
 
     #[test]
     fn to_millis_conversion() {
         let dt = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        let result = ToMillisFunc
-            .evaluate(vec![Value::Timestamp(dt)], &ctx())
-            .unwrap();
+        let result = eval(
+            &ToMillisFunc,
+            smallvec::smallvec![Value::Timestamp(dt)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(dt.timestamp_millis()));
     }
 
@@ -993,9 +1207,12 @@ mod tests {
     fn from_seconds_roundtrip() {
         let original = Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 45).unwrap();
         let secs = original.timestamp();
-        let result = FromSecondsFunc
-            .evaluate(vec![Value::Int64(secs)], &ctx())
-            .unwrap();
+        let result = eval(
+            &FromSecondsFunc,
+            smallvec::smallvec![Value::Int64(secs)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Timestamp(original));
     }
 
@@ -1003,9 +1220,12 @@ mod tests {
     fn from_millis_roundtrip() {
         let original = Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 45).unwrap();
         let millis = original.timestamp_millis();
-        let result = FromMillisFunc
-            .evaluate(vec![Value::Int64(millis)], &ctx())
-            .unwrap();
+        let result = eval(
+            &FromMillisFunc,
+            smallvec::smallvec![Value::Int64(millis)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Timestamp(original));
     }
 
@@ -1015,57 +1235,78 @@ mod tests {
 
     #[test]
     fn add_days_basic() {
-        let result = AddDaysFunc
-            .evaluate(vec![ts(2024, 6, 15, 10, 0, 0), Value::Int64(5)], &ctx())
-            .unwrap();
+        let result = eval(
+            &AddDaysFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 0, 0), Value::Int64(5)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, ts(2024, 6, 20, 10, 0, 0));
     }
 
     #[test]
     fn subtract_days_basic() {
-        let result = SubtractDaysFunc
-            .evaluate(vec![ts(2024, 6, 15, 10, 0, 0), Value::Int64(5)], &ctx())
-            .unwrap();
+        let result = eval(
+            &SubtractDaysFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 0, 0), Value::Int64(5)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, ts(2024, 6, 10, 10, 0, 0));
     }
 
     #[test]
     fn add_hours_basic() {
-        let result = AddHoursFunc
-            .evaluate(vec![ts(2024, 6, 15, 10, 0, 0), Value::Int64(3)], &ctx())
-            .unwrap();
+        let result = eval(
+            &AddHoursFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 0, 0), Value::Int64(3)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, ts(2024, 6, 15, 13, 0, 0));
     }
 
     #[test]
     fn add_months_basic() {
-        let result = AddMonthsFunc
-            .evaluate(vec![ts(2024, 6, 15, 10, 0, 0), Value::Int64(2)], &ctx())
-            .unwrap();
+        let result = eval(
+            &AddMonthsFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 0, 0), Value::Int64(2)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, ts(2024, 8, 15, 10, 0, 0));
     }
 
     #[test]
     fn subtract_months_basic() {
-        let result = SubtractMonthsFunc
-            .evaluate(vec![ts(2024, 6, 15, 10, 0, 0), Value::Int64(3)], &ctx())
-            .unwrap();
+        let result = eval(
+            &SubtractMonthsFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 0, 0), Value::Int64(3)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, ts(2024, 3, 15, 10, 0, 0));
     }
 
     #[test]
     fn add_years_basic() {
-        let result = AddYearsFunc
-            .evaluate(vec![ts(2024, 6, 15, 10, 0, 0), Value::Int64(2)], &ctx())
-            .unwrap();
+        let result = eval(
+            &AddYearsFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 0, 0), Value::Int64(2)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, ts(2026, 6, 15, 10, 0, 0));
     }
 
     #[test]
     fn subtract_years_basic() {
-        let result = SubtractYearsFunc
-            .evaluate(vec![ts(2024, 6, 15, 10, 0, 0), Value::Int64(1)], &ctx())
-            .unwrap();
+        let result = eval(
+            &SubtractYearsFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 0, 0), Value::Int64(1)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, ts(2023, 6, 15, 10, 0, 0));
     }
 
@@ -1075,38 +1316,39 @@ mod tests {
 
     #[test]
     fn date_diff_days() {
-        let result = DateDiffFunc
-            .evaluate(
-                vec![
-                    Value::Text("day".into()),
-                    ts(2024, 6, 10, 0, 0, 0),
-                    ts(2024, 6, 15, 0, 0, 0),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &DateDiffFunc,
+            smallvec::smallvec![
+                Value::Text("day".into()),
+                ts(2024, 6, 10, 0, 0, 0),
+                ts(2024, 6, 15, 0, 0, 0),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(5));
     }
 
     #[test]
     fn date_diff_hours() {
-        let result = DateDiffFunc
-            .evaluate(
-                vec![
-                    Value::Text("hour".into()),
-                    ts(2024, 6, 15, 10, 0, 0),
-                    ts(2024, 6, 15, 13, 0, 0),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &DateDiffFunc,
+            smallvec::smallvec![
+                Value::Text("hour".into()),
+                ts(2024, 6, 15, 10, 0, 0),
+                ts(2024, 6, 15, 13, 0, 0),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(3));
     }
 
     #[test]
     fn date_diff_invalid_unit() {
-        let result = DateDiffFunc.evaluate(
-            vec![
+        let result = eval(
+            &DateDiffFunc,
+            smallvec::smallvec![
                 Value::Text("week".into()),
                 ts(2024, 6, 10, 0, 0, 0),
                 ts(2024, 6, 15, 0, 0, 0),
@@ -1122,26 +1364,26 @@ mod tests {
 
     #[test]
     fn format_date_time_basic() {
-        let result = FormatDateTimeFunc
-            .evaluate(
-                vec![
-                    ts(2024, 6, 15, 10, 30, 45),
-                    Value::Text("%Y-%m-%d %H:%M:%S".into()),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &FormatDateTimeFunc,
+            smallvec::smallvec![
+                ts(2024, 6, 15, 10, 30, 45),
+                Value::Text("%Y-%m-%d %H:%M:%S".into()),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Text("2024-06-15 10:30:45".into()));
     }
 
     #[test]
     fn format_date_time_date_only() {
-        let result = FormatDateTimeFunc
-            .evaluate(
-                vec![ts(2024, 6, 15, 10, 30, 45), Value::Text("%Y-%m-%d".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &FormatDateTimeFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 30, 45), Value::Text("%Y-%m-%d".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Text("2024-06-15".into()));
     }
 
@@ -1151,47 +1393,77 @@ mod tests {
 
     #[test]
     fn null_propagation_extraction() {
-        let result = SecondFunc.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&SecondFunc, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn null_propagation_add_days() {
-        let result = AddDaysFunc
-            .evaluate(vec![Value::Null, Value::Int64(5)], &ctx())
-            .unwrap();
+        let result = eval(
+            &AddDaysFunc,
+            smallvec::smallvec![Value::Null, Value::Int64(5)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn null_propagation_add_days_second_arg() {
-        let result = AddDaysFunc
-            .evaluate(vec![ts(2024, 6, 15, 10, 0, 0), Value::Null], &ctx())
-            .unwrap();
+        let result = eval(
+            &AddDaysFunc,
+            smallvec::smallvec![ts(2024, 6, 15, 10, 0, 0), Value::Null],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn null_propagation_date_diff() {
-        let result = DateDiffFunc
-            .evaluate(
-                vec![
-                    Value::Text("day".into()),
-                    Value::Null,
-                    ts(2024, 6, 15, 0, 0, 0),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &DateDiffFunc,
+            smallvec::smallvec![
+                Value::Text("day".into()),
+                Value::Null,
+                ts(2024, 6, 15, 0, 0, 0),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn null_propagation_format() {
-        let result = FormatDateTimeFunc
-            .evaluate(vec![Value::Null, Value::Text("%Y".into())], &ctx())
-            .unwrap();
+        let result = eval(
+            &FormatDateTimeFunc,
+            smallvec::smallvec![Value::Null, Value::Text("%Y".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn validate_const_mask_valid_ok() {
+        let mask = Value::Text("%Y-%m-%d %H:%M:%S".into());
+        let result = FormatDateTimeFunc.validate_const_args(&[None, Some(&mask)], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_mask_dynamic_ok() {
+        let result = FormatDateTimeFunc.validate_const_args(&[None, None], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_mask_invalid_errors() {
+        // %Q is not a valid chrono specifier — parses to an error item.
+        let mask = Value::Text("%Q".into());
+        let result = FormatDateTimeFunc.validate_const_args(&[None, Some(&mask)], &ctx());
+        assert!(matches!(result, Err(FuncError::EvalFailed { .. })));
     }
 
     // -----------------------------------------------------------------------
@@ -1200,23 +1472,29 @@ mod tests {
 
     #[test]
     fn extract_from_date_value() {
-        let result = YearFunc.evaluate(vec![date(2024, 6, 15)], &ctx()).unwrap();
+        let result = eval(&YearFunc, smallvec::smallvec![date(2024, 6, 15)], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(2024));
     }
 
     #[test]
     fn add_days_from_date_value() {
-        let result = AddDaysFunc
-            .evaluate(vec![date(2024, 6, 15), Value::Int64(1)], &ctx())
-            .unwrap();
+        let result = eval(
+            &AddDaysFunc,
+            smallvec::smallvec![date(2024, 6, 15), Value::Int64(1)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, ts(2024, 6, 16, 0, 0, 0));
     }
 
     #[test]
     fn to_seconds_from_date() {
-        let result = ToSecondsFunc
-            .evaluate(vec![date(2024, 1, 1)], &ctx())
-            .unwrap();
+        let result = eval(
+            &ToSecondsFunc,
+            smallvec::smallvec![date(2024, 1, 1)],
+            &ctx(),
+        )
+        .unwrap();
         let expected = Utc
             .with_ymd_and_hms(2024, 1, 1, 0, 0, 0)
             .unwrap()

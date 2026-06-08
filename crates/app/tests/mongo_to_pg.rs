@@ -670,3 +670,146 @@ v6 = "v6"
 
     pg.pool.close().await;
 }
+
+/// AIR-117 computed sink columns from a **schemaless** source (mongo → pg).
+/// Compute scripts compile with no source schema (`field` types are
+/// unknown) and dispatch dynamically at runtime; a field absent from the
+/// document reads as `Null` (so `ifNull` falls through), exercising the
+/// missing-field path that a typed source would reject at compile time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongo_to_pg_compute_columns() {
+    let mongo = mongo_pool().await;
+    let pg = pg_pool().await;
+
+    let src_db = format!("{}_csrc", mongo.database);
+    let state_db = format!("{}_cstate", mongo.database);
+    let dst_schema = format!("{}_cdst", pg.schema);
+
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{dst_schema}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{dst_schema}\".enriched (
+                    id           bigint PRIMARY KEY,
+                    tag          integer,
+                    label        text,
+                    missing_note text,
+                    doc          jsonb,
+                    ingested_at  timestamptz
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let src = mongo
+        .client
+        .database(&src_db)
+        .collection::<bson::Document>("docs");
+    for d in [
+        doc! { "_id": 1_i64, "name": "a", "qty": 7_i64 },
+        doc! { "_id": 2_i64, "name": "b", "qty": 42_i64 },
+    ] {
+        src.insert_one(d).await.unwrap();
+    }
+
+    let mongo_url = mongo.url.clone();
+    let pg_url = pg.url_with_search_path();
+    let config_toml = format!(
+        r#"
+[[sources]]
+name = "mongo_src"
+type = "mongodb"
+config = {{ url = "{mongo_url}", database = "{src_db}" }}
+
+[[sinks]]
+name = "pg_sink"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[storages]]
+name = "mongo_state"
+type = "mongodb"
+config = {{ url = "{mongo_url}", database = "{state_db}" }}
+
+[flow.docs]
+source = "mongo_src"
+sink = "pg_sink"
+storage = "mongo_state"
+from = "docs"
+to = "{dst_schema}.enriched"
+batch-limit = 8
+
+cursor = {{ fields = ["_id"], order = "asc", interval = "100ms" }}
+
+[flow.docs.mapping]
+id = {{ from = "_id", default = 0 }}
+tag = {{ compute = "10 * 2" }}
+
+[flow.docs.compute-mapping]
+label = "concat('user-', toString(`qty`))"
+# `absent` is in no document → projected as Null → ifNull falls through.
+missing_note = "ifNull(field('absent'), 'none')"
+# `fields("*")` packs the whole row — every sampled source column is
+# projected and emitted as a JSON object.
+doc = "fields(\"*\")"
+ingested_at = "now()"
+"#,
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let app = App::from_path(&config_path).expect("App::from_path");
+    // Bracket the run so we can assert the batch-pinned `now()` lands inside
+    // the actual wall-clock window — not merely that all rows agree.
+    let before = Utc::now();
+    app.run_once().await.expect("run_once");
+    let after = Utc::now();
+
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(i64, i32, String, String, DateTime<Utc>)> = sqlx::query_as(&format!(
+        "SELECT id, tag, label, missing_note, ingested_at \
+         FROM \"{dst_schema}\".enriched ORDER BY id"
+    ))
+    .fetch_all(&pg.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.1 == 20), "const compute = 20");
+    assert_eq!(rows[0].2, "user-7");
+    assert_eq!(rows[1].2, "user-42");
+    assert!(
+        rows.iter().all(|r| r.3 == "none"),
+        "absent field → Null → ifNull fallback"
+    );
+    let ts0 = rows[0].4;
+    assert!(rows.iter().all(|r| r.4 == ts0), "now() batch-stable");
+    assert!(
+        ts0 >= before && ts0 <= after,
+        "batch now() {ts0} must fall within the run window [{before}, {after}]"
+    );
+
+    // `fields("*")` packed the whole sampled row into `doc` — every source
+    // column is present with its canonical value (extracted via JSON path so
+    // the assertion is independent of key ordering / extra projected keys).
+    let docs: Vec<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT doc->>'_id', doc->>'name', doc->>'qty' \
+         FROM \"{dst_schema}\".enriched ORDER BY id"
+    ))
+    .fetch_all(&pg.pool)
+    .await
+    .unwrap();
+    assert_eq!(docs[0].0.as_deref(), Some("1"), "doc carries _id");
+    assert_eq!(docs[0].1.as_deref(), Some("a"), "doc carries name");
+    assert_eq!(docs[0].2.as_deref(), Some("7"), "doc carries qty");
+    assert_eq!(docs[1].1.as_deref(), Some("b"));
+    assert_eq!(docs[1].2.as_deref(), Some("42"));
+
+    pg.pool.close().await;
+}

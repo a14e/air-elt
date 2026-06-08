@@ -7,16 +7,15 @@
 //! open. XML declarations, comments, and processing instructions are
 //! tolerated; empty / whitespace-only / multi-root inputs are rejected.
 //!
-//! `xml_to_text(size)` is a pure serialise (XML is already a string)
-//! followed by UTF-safe truncation when the sink is bounded — `Xml → Text*`
-//! (unbounded) needs no truncation. `text_to_xml` validates via
-//! [`validate`] so invalid markup never reaches a typed sink column.
+//! `Xml → Text` rendering lives in [`to_text`](super::to_text) (XML is already
+//! a string); this module owns only validation and `text_to_xml`, which
+//! validates via [`validate`] so invalid markup never reaches a typed sink
+//! column.
 
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
 use super::error::ConvertError;
-use super::text_truncate::truncate_chars;
 use crate::{DataType, Value};
 
 pub fn validate(s: &str) -> Result<(), String> {
@@ -65,22 +64,6 @@ pub fn validate(s: &str) -> Result<(), String> {
         return Err("no element".into());
     }
     Ok(())
-}
-
-pub fn xml_to_text(
-    value: Value,
-    src: &DataType,
-    sink_size: Option<u32>,
-) -> Result<Value, ConvertError> {
-    let s = match value {
-        Value::Text(s) => s,
-        _ => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
-    };
-    let out = match sink_size {
-        None => s,
-        Some(max) => truncate_chars(&s, max as usize).to_string(),
-    };
-    Ok(Value::Text(out))
 }
 
 pub fn text_to_xml(value: Value, src: &DataType) -> Result<Value, ConvertError> {
@@ -162,32 +145,6 @@ mod tests {
     #[test]
     fn comment_around_root_ok() {
         assert!(validate("<!-- prologue --><root/><!-- epilogue -->").is_ok());
-    }
-
-    // ---- xml_to_text() ------------------------------------------------
-
-    #[test]
-    fn xml_to_text_unbounded_passthrough() {
-        let out = xml_to_text(Value::Text("<a/>".into()), &DataType::Xml, None).unwrap();
-        assert_eq!(out, Value::Text("<a/>".into()));
-    }
-
-    #[test]
-    fn xml_to_text_bounded_truncates() {
-        let out = xml_to_text(Value::Text("<aaa/>".into()), &DataType::Xml, Some(3)).unwrap();
-        assert_eq!(out, Value::Text("<aa".into()));
-    }
-
-    #[test]
-    fn xml_to_text_size_zero_yields_empty() {
-        let out = xml_to_text(Value::Text("<a/>".into()), &DataType::Xml, Some(0)).unwrap();
-        assert_eq!(out, Value::Text(String::new()));
-    }
-
-    #[test]
-    fn xml_to_text_value_shape_mismatch() {
-        let res = xml_to_text(Value::Int32(1), &DataType::Xml, None);
-        assert!(matches!(res, Err(ConvertError::ValueShapeMismatch { .. })));
     }
 
     // ---- text_to_xml() ------------------------------------------------

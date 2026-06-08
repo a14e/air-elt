@@ -8,7 +8,7 @@ use air_elt_types::{DataType, Value};
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
-use crate::signature::{EvalContext, ExprFunction};
+use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
 static CAST_TO_STRING: CastToStringFunc = CastToStringFunc;
 static CAST_TO_INT8: CastToInt8Func = CastToInt8Func;
@@ -75,6 +75,10 @@ fn convert_error_to_func_error(function: &str, error: ConvertError) -> FuncError
 struct CastToStringFunc;
 
 impl ExprFunction for CastToStringFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toStringCast"
     }
@@ -114,14 +118,18 @@ impl ExprFunction for CastToStringFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.take(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
         match a {
             Value::Text(s) => Ok(Value::Text(s)),
-            other => Ok(Value::Text(value_to_string(&other))),
+            other => Ok(Value::Text(air_elt_types::value_to_string(&other))),
         }
     }
 }
@@ -133,6 +141,10 @@ impl ExprFunction for CastToStringFunc {
 struct CastToInt8Func;
 
 impl ExprFunction for CastToInt8Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toInt8"
     }
@@ -149,12 +161,15 @@ impl ExprFunction for CastToInt8Func {
         Ok(NullableExprType::new(DataType::Int8, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        if a.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
-        let n = to_i64_via_convert("toInt8", a)?;
+        let n = to_i64_via_convert("toInt8", args.read(0))?;
         let narrow = i8::try_from(n).map_err(|_| FuncError::EvalFailed {
             function: "toInt8".to_owned(),
             reason: format!("value {n} out of Int8 range (-128..127)"),
@@ -170,6 +185,10 @@ impl ExprFunction for CastToInt8Func {
 struct CastToInt16Func;
 
 impl ExprFunction for CastToInt16Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toInt16"
     }
@@ -186,12 +205,15 @@ impl ExprFunction for CastToInt16Func {
         Ok(NullableExprType::new(DataType::Int16, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        if a.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
-        let n = to_i64_via_convert("toInt16", a)?;
+        let n = to_i64_via_convert("toInt16", args.read(0))?;
         let narrow = i16::try_from(n).map_err(|_| FuncError::EvalFailed {
             function: "toInt16".to_owned(),
             reason: format!("value {n} out of Int16 range (-32768..32767)"),
@@ -207,6 +229,10 @@ impl ExprFunction for CastToInt16Func {
 struct CastToInt32Func;
 
 impl ExprFunction for CastToInt32Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toInt32"
     }
@@ -223,12 +249,15 @@ impl ExprFunction for CastToInt32Func {
         Ok(NullableExprType::new(DataType::Int32, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        if a.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
-        let n = to_i64_via_convert("toInt32", a)?;
+        let n = to_i64_via_convert("toInt32", args.read(0))?;
         let narrow = i32::try_from(n).map_err(|_| FuncError::EvalFailed {
             function: "toInt32".to_owned(),
             reason: format!("value {n} out of Int32 range"),
@@ -244,6 +273,10 @@ impl ExprFunction for CastToInt32Func {
 struct CastToInt64Func;
 
 impl ExprFunction for CastToInt64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toInt64"
     }
@@ -260,12 +293,15 @@ impl ExprFunction for CastToInt64Func {
         Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        if a.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
-        let n = to_i64_via_convert("toInt64", a)?;
+        let n = to_i64_via_convert("toInt64", args.read(0))?;
         Ok(Value::Int64(n))
     }
 }
@@ -277,6 +313,10 @@ impl ExprFunction for CastToInt64Func {
 struct CastToUInt8Func;
 
 impl ExprFunction for CastToUInt8Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toUInt8"
     }
@@ -293,12 +333,15 @@ impl ExprFunction for CastToUInt8Func {
         Ok(NullableExprType::new(DataType::UInt8, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        if a.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
-        let n = to_i64_via_convert("toUInt8", a)?;
+        let n = to_i64_via_convert("toUInt8", args.read(0))?;
         if n < 0 {
             return Err(FuncError::EvalFailed {
                 function: "toUInt8".to_owned(),
@@ -320,6 +363,10 @@ impl ExprFunction for CastToUInt8Func {
 struct CastToUInt16Func;
 
 impl ExprFunction for CastToUInt16Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toUInt16"
     }
@@ -336,12 +383,15 @@ impl ExprFunction for CastToUInt16Func {
         Ok(NullableExprType::new(DataType::UInt16, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        if a.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
-        let n = to_i64_via_convert("toUInt16", a)?;
+        let n = to_i64_via_convert("toUInt16", args.read(0))?;
         if n < 0 {
             return Err(FuncError::EvalFailed {
                 function: "toUInt16".to_owned(),
@@ -363,6 +413,10 @@ impl ExprFunction for CastToUInt16Func {
 struct CastToUInt32Func;
 
 impl ExprFunction for CastToUInt32Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toUInt32"
     }
@@ -379,12 +433,15 @@ impl ExprFunction for CastToUInt32Func {
         Ok(NullableExprType::new(DataType::UInt32, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        if a.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
-        let n = to_i64_via_convert("toUInt32", a)?;
+        let n = to_i64_via_convert("toUInt32", args.read(0))?;
         if n < 0 {
             return Err(FuncError::EvalFailed {
                 function: "toUInt32".to_owned(),
@@ -406,6 +463,10 @@ impl ExprFunction for CastToUInt32Func {
 struct CastToUInt64Func;
 
 impl ExprFunction for CastToUInt64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toUInt64"
     }
@@ -422,14 +483,18 @@ impl ExprFunction for CastToUInt64Func {
         Ok(NullableExprType::new(DataType::UInt64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        if a.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
-        match a {
-            Value::UInt64(n) => Ok(Value::UInt64(n)),
+        match args.read(0) {
+            Value::UInt64(n) => Ok(Value::UInt64(*n)),
             Value::Int64(n) => {
+                let n = *n;
                 if n < 0 {
                     return Err(FuncError::EvalFailed {
                         function: "toUInt64".to_owned(),
@@ -439,6 +504,7 @@ impl ExprFunction for CastToUInt64Func {
                 Ok(Value::UInt64(n as u64))
             }
             Value::Float64(n) => {
+                let n = *n;
                 if n < 0.0 {
                     return Err(FuncError::EvalFailed {
                         function: "toUInt64".to_owned(),
@@ -457,7 +523,7 @@ impl ExprFunction for CastToUInt64Func {
             Value::Bool(b) => {
                 // Delegate Bool->UInt64 to the type conversion system.
                 air_elt_types::convert::convert(
-                    Value::Bool(b),
+                    Value::Bool(*b),
                     &DataType::Bool,
                     &DataType::UInt64,
                     &cast_context(),
@@ -487,6 +553,10 @@ impl ExprFunction for CastToUInt64Func {
 struct CastToFloat32Func;
 
 impl ExprFunction for CastToFloat32Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toFloat32"
     }
@@ -503,24 +573,27 @@ impl ExprFunction for CastToFloat32Func {
         Ok(NullableExprType::new(DataType::Float32, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        if a.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
-        match a {
-            Value::Float32(n) => Ok(Value::Float32(n)),
+        match args.read(0) {
+            Value::Float32(n) => Ok(Value::Float32(*n)),
             Value::Float64(n) => {
                 let src_type = DataType::Float64;
                 air_elt_types::convert::convert(
-                    Value::Float64(n),
+                    Value::Float64(*n),
                     &src_type,
                     &DataType::Float32,
                     &cast_context(),
                 )
                 .map_err(|e| convert_error_to_func_error("toFloat32", e))
             }
-            Value::Int64(n) => Ok(Value::Float32(n as f32)),
+            Value::Int64(n) => Ok(Value::Float32(*n as f32)),
             Value::Text(s) => {
                 let n: f32 = s.trim().parse().map_err(|_| FuncError::EvalFailed {
                     function: "toFloat32".to_owned(),
@@ -544,6 +617,10 @@ impl ExprFunction for CastToFloat32Func {
 struct CastToFloat64Func;
 
 impl ExprFunction for CastToFloat64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toFloat64"
     }
@@ -560,14 +637,17 @@ impl ExprFunction for CastToFloat64Func {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        if a.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
-        match a {
-            Value::Float64(n) => Ok(Value::Float64(n)),
-            Value::Int64(n) => Ok(Value::Float64(n as f64)),
+        match args.read(0) {
+            Value::Float64(n) => Ok(Value::Float64(*n)),
+            Value::Int64(n) => Ok(Value::Float64(*n as f64)),
             Value::Text(s) => {
                 let n: f64 = s.trim().parse().map_err(|_| FuncError::EvalFailed {
                     function: "toFloat64".to_owned(),
@@ -591,6 +671,10 @@ impl ExprFunction for CastToFloat64Func {
 struct CastToBoolFunc;
 
 impl ExprFunction for CastToBoolFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toBool"
     }
@@ -607,14 +691,17 @@ impl ExprFunction for CastToBoolFunc {
         Ok(NullableExprType::new(DataType::Bool, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        if a.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
-        match a {
-            Value::Bool(b) => Ok(Value::Bool(b)),
-            Value::Int64(n) => Ok(Value::Bool(n != 0)),
+        match args.read(0) {
+            Value::Bool(b) => Ok(Value::Bool(*b)),
+            Value::Int64(n) => Ok(Value::Bool(*n != 0)),
             Value::Text(s) => {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
@@ -639,6 +726,10 @@ impl ExprFunction for CastToBoolFunc {
 struct CastToDateFunc;
 
 impl ExprFunction for CastToDateFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toDate"
     }
@@ -655,17 +746,20 @@ impl ExprFunction for CastToDateFunc {
         Ok(NullableExprType::new(DataType::Date, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        if a.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
-        match a {
-            Value::Date(d) => Ok(Value::Date(d)),
+        match args.read(0) {
+            Value::Date(d) => Ok(Value::Date(*d)),
             Value::Timestamp(ts) => {
                 // Delegate Timestamp->Date to the type conversion system.
                 air_elt_types::convert::convert(
-                    Value::Timestamp(ts),
+                    Value::Timestamp(*ts),
                     &DataType::Timestamp,
                     &DataType::Date,
                     &cast_context(),
@@ -697,6 +791,10 @@ impl ExprFunction for CastToDateFunc {
 struct CastToTimestampFunc;
 
 impl ExprFunction for CastToTimestampFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toTimestamp"
     }
@@ -713,14 +811,18 @@ impl ExprFunction for CastToTimestampFunc {
         Ok(NullableExprType::new(DataType::Timestamp, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
-        if a.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
-        match a {
-            Value::Timestamp(ts) => Ok(Value::Timestamp(ts)),
+        match args.read(0) {
+            Value::Timestamp(ts) => Ok(Value::Timestamp(*ts)),
             Value::Int64(secs) => {
+                let secs = *secs;
                 let ts =
                     Utc.timestamp_opt(secs, 0)
                         .single()
@@ -765,6 +867,10 @@ impl ExprFunction for CastToTimestampFunc {
 struct CastToUuidFunc;
 
 impl ExprFunction for CastToUuidFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toUuid"
     }
@@ -781,8 +887,12 @@ impl ExprFunction for CastToUuidFunc {
         Ok(NullableExprType::new(DataType::Uuid, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.take(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
@@ -807,6 +917,10 @@ impl ExprFunction for CastToUuidFunc {
 struct CastToBigIntFunc;
 
 impl ExprFunction for CastToBigIntFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toBigInt"
     }
@@ -826,8 +940,12 @@ impl ExprFunction for CastToBigIntFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.take(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
@@ -865,6 +983,10 @@ impl ExprFunction for CastToBigIntFunc {
 struct CastToDecimalFunc;
 
 impl ExprFunction for CastToDecimalFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "toDecimal"
     }
@@ -887,17 +1009,21 @@ impl ExprFunction for CastToDecimalFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let scale_val = args.remove(2);
-        let precision_val = args.remove(1);
-        let a = args.remove(0);
-
-        if a.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
 
-        let precision = extract_u32("toDecimal", "precision", &precision_val)?;
-        let scale = extract_u32("toDecimal", "scale", &scale_val)?;
+        // precision/scale are inspect-only; borrow them. The value (arg 0) is a
+        // true passthrough (`Value::Decimal(d) => d` moves the inner BigDecimal),
+        // so it must be taken by value.
+        let precision = extract_u32("toDecimal", "precision", args.read(1))?;
+        let scale = extract_u32("toDecimal", "scale", args.read(2))?;
+        let a = args.take(0);
 
         if scale > precision {
             return Err(FuncError::EvalFailed {
@@ -969,9 +1095,9 @@ impl ExprFunction for CastToDecimalFunc {
 /// inputs (Float→Int64 with truncation, Bool→Int64, identity, etc.), and
 /// handles Text→i64 parsing directly since the conversion system does not
 /// support that path.
-fn to_i64_via_convert(function: &str, value: Value) -> Result<i64, FuncError> {
+fn to_i64_via_convert(function: &str, value: &Value) -> Result<i64, FuncError> {
     match value {
-        Value::Int64(n) => Ok(n),
+        Value::Int64(n) => Ok(*n),
         Value::Text(s) => {
             let n: i64 = s.trim().parse().map_err(|_| FuncError::EvalFailed {
                 function: function.to_owned(),
@@ -981,8 +1107,9 @@ fn to_i64_via_convert(function: &str, value: Value) -> Result<i64, FuncError> {
         }
         other => {
             let src_type = other.data_type().unwrap_or(DataType::Text { size: None });
+            // Only the non-Int64/non-Text path needs an owned value for `convert`.
             let result = air_elt_types::convert::convert(
-                other,
+                other.clone(),
                 &src_type,
                 &DataType::Int64,
                 &cast_context(),
@@ -1027,112 +1154,74 @@ fn extract_u32(function: &str, param_name: &str, value: &Value) -> Result<u32, F
     }
 }
 
-fn value_to_string(val: &Value) -> String {
-    match val {
-        Value::Null => "null".to_owned(),
-        Value::Bool(b) => b.to_string(),
-        Value::Int8(n) => n.to_string(),
-        Value::Int16(n) => n.to_string(),
-        Value::Int32(n) => n.to_string(),
-        Value::Int64(n) => n.to_string(),
-        Value::UInt8(n) => n.to_string(),
-        Value::UInt16(n) => n.to_string(),
-        Value::UInt32(n) => n.to_string(),
-        Value::UInt64(n) => n.to_string(),
-        Value::Float32(n) => n.to_string(),
-        Value::Float64(n) => n.to_string(),
-        Value::BigInt(n) => n.to_string(),
-        Value::Decimal(n) => n.to_string(),
-        Value::Text(s) => s.clone(),
-        Value::Bytes(b) => format!("{b:?}"),
-        Value::Date(d) => d.to_string(),
-        Value::Timestamp(t) => t.to_rfc3339(),
-        Value::Uuid(u) => u.to_string(),
-        Value::Ipv4(a) => a.to_string(),
-        Value::Ipv6(a) => a.to_string(),
-        Value::Json(j) => j.to_string(),
-        Value::Object(entries) => {
-            let map: serde_json::Map<String, serde_json::Value> = entries
-                .iter()
-                .map(|(k, v)| {
-                    let json_v = air_elt_types::value_to_json(v).unwrap_or(serde_json::Value::Null);
-                    (k.clone(), json_v)
-                })
-                .collect();
-            serde_json::Value::Object(map).to_string()
-        }
-        Value::Custom(_) => "<custom>".to_owned(),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use chrono::{NaiveDate, TimeZone, Utc};
 
     use super::*;
-    use crate::test_support::ctx;
+    use crate::test_support::{ctx, eval};
 
     #[test]
     fn to_string_from_int() {
         let f = CastToStringFunc;
-        let result = f.evaluate(vec![Value::Int64(42)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(42)], &ctx()).unwrap();
         assert_eq!(result, Value::Text("42".into()));
     }
 
     #[test]
     fn to_string_from_bool() {
         let f = CastToStringFunc;
-        let result = f.evaluate(vec![Value::Bool(true)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Bool(true)], &ctx()).unwrap();
         assert_eq!(result, Value::Text("true".into()));
     }
 
     #[test]
     fn to_int64_from_text() {
         let f = CastToInt64Func;
-        let result = f.evaluate(vec![Value::Text("123".into())], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Text("123".into())], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(123));
     }
 
     #[test]
     fn to_int64_from_float() {
         let f = CastToInt64Func;
-        let result = f.evaluate(vec![Value::Float64(3.7)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Float64(3.7)], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(3));
     }
 
     #[test]
     fn to_int64_invalid_text() {
         let f = CastToInt64Func;
-        let result = f.evaluate(vec![Value::Text("abc".into())], &ctx());
+        let result = eval(&f, smallvec::smallvec![Value::Text("abc".into())], &ctx());
         assert!(result.is_err());
     }
 
     #[test]
     fn to_float64_from_int() {
         let f = CastToFloat64Func;
-        let result = f.evaluate(vec![Value::Int64(5)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(5)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(5.0));
     }
 
     #[test]
     fn to_float64_from_text() {
         let f = CastToFloat64Func;
-        let result = f.evaluate(vec![Value::Text("1.5".into())], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Text("1.5".into())], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(1.5));
     }
 
     #[test]
     fn to_bool_from_int_zero() {
         let f = CastToBoolFunc;
-        let result = f.evaluate(vec![Value::Int64(0)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(0)], &ctx()).unwrap();
         assert_eq!(result, Value::Bool(false));
     }
 
     #[test]
     fn to_bool_from_int_nonzero() {
         let f = CastToBoolFunc;
-        let result = f.evaluate(vec![Value::Int64(42)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(42)], &ctx()).unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
@@ -1140,7 +1229,7 @@ mod tests {
     fn to_bool_from_text_false_variants() {
         let f = CastToBoolFunc;
         for s in ["false", "f", "no", "0", ""] {
-            let result = f.evaluate(vec![Value::Text(s.into())], &ctx()).unwrap();
+            let result = eval(&f, smallvec::smallvec![Value::Text(s.into())], &ctx()).unwrap();
             assert_eq!(result, Value::Bool(false), "expected false for {s:?}");
         }
     }
@@ -1148,14 +1237,14 @@ mod tests {
     #[test]
     fn to_bool_from_text_true() {
         let f = CastToBoolFunc;
-        let result = f.evaluate(vec![Value::Text("yes".into())], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Text("yes".into())], &ctx()).unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
     #[test]
     fn null_propagation() {
         let f = CastToInt64Func;
-        let result = f.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -1164,28 +1253,28 @@ mod tests {
     #[test]
     fn to_int8_valid() {
         let f = CastToInt8Func;
-        let result = f.evaluate(vec![Value::Int64(127)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(127)], &ctx()).unwrap();
         assert_eq!(result, Value::Int8(127));
     }
 
     #[test]
     fn to_int8_negative() {
         let f = CastToInt8Func;
-        let result = f.evaluate(vec![Value::Int64(-128)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(-128)], &ctx()).unwrap();
         assert_eq!(result, Value::Int8(-128));
     }
 
     #[test]
     fn to_int8_overflow() {
         let f = CastToInt8Func;
-        let result = f.evaluate(vec![Value::Int64(128)], &ctx());
+        let result = eval(&f, smallvec::smallvec![Value::Int64(128)], &ctx());
         assert!(result.is_err());
     }
 
     #[test]
     fn to_int8_null() {
         let f = CastToInt8Func;
-        let result = f.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -1194,14 +1283,14 @@ mod tests {
     #[test]
     fn to_int16_valid() {
         let f = CastToInt16Func;
-        let result = f.evaluate(vec![Value::Int64(32767)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(32767)], &ctx()).unwrap();
         assert_eq!(result, Value::Int16(32767));
     }
 
     #[test]
     fn to_int16_overflow() {
         let f = CastToInt16Func;
-        let result = f.evaluate(vec![Value::Int64(32768)], &ctx());
+        let result = eval(&f, smallvec::smallvec![Value::Int64(32768)], &ctx());
         assert!(result.is_err());
     }
 
@@ -1210,16 +1299,23 @@ mod tests {
     #[test]
     fn to_int32_valid() {
         let f = CastToInt32Func;
-        let result = f
-            .evaluate(vec![Value::Text("100000".into())], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("100000".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int32(100000));
     }
 
     #[test]
     fn to_int32_overflow() {
         let f = CastToInt32Func;
-        let result = f.evaluate(vec![Value::Int64(i64::from(i32::MAX) + 1)], &ctx());
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Int64(i64::from(i32::MAX) + 1)],
+            &ctx(),
+        );
         assert!(result.is_err());
     }
 
@@ -1228,21 +1324,21 @@ mod tests {
     #[test]
     fn to_uint8_valid() {
         let f = CastToUInt8Func;
-        let result = f.evaluate(vec![Value::Int64(255)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(255)], &ctx()).unwrap();
         assert_eq!(result, Value::UInt8(255));
     }
 
     #[test]
     fn to_uint8_negative() {
         let f = CastToUInt8Func;
-        let result = f.evaluate(vec![Value::Int64(-1)], &ctx());
+        let result = eval(&f, smallvec::smallvec![Value::Int64(-1)], &ctx());
         assert!(result.is_err());
     }
 
     #[test]
     fn to_uint8_overflow() {
         let f = CastToUInt8Func;
-        let result = f.evaluate(vec![Value::Int64(256)], &ctx());
+        let result = eval(&f, smallvec::smallvec![Value::Int64(256)], &ctx());
         assert!(result.is_err());
     }
 
@@ -1251,7 +1347,7 @@ mod tests {
     #[test]
     fn to_uint16_valid() {
         let f = CastToUInt16Func;
-        let result = f.evaluate(vec![Value::Int64(65535)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(65535)], &ctx()).unwrap();
         assert_eq!(result, Value::UInt16(65535));
     }
 
@@ -1260,9 +1356,7 @@ mod tests {
     #[test]
     fn to_uint32_valid() {
         let f = CastToUInt32Func;
-        let result = f
-            .evaluate(vec![Value::Int64(4_294_967_295)], &ctx())
-            .unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(4_294_967_295)], &ctx()).unwrap();
         assert_eq!(result, Value::UInt32(4_294_967_295));
     }
 
@@ -1271,16 +1365,19 @@ mod tests {
     #[test]
     fn to_uint64_from_text() {
         let f = CastToUInt64Func;
-        let result = f
-            .evaluate(vec![Value::Text("18446744073709551615".into())], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("18446744073709551615".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::UInt64(u64::MAX));
     }
 
     #[test]
     fn to_uint64_negative() {
         let f = CastToUInt64Func;
-        let result = f.evaluate(vec![Value::Int64(-1)], &ctx());
+        let result = eval(&f, smallvec::smallvec![Value::Int64(-1)], &ctx());
         assert!(result.is_err());
     }
 
@@ -1289,7 +1386,7 @@ mod tests {
     #[test]
     fn to_float32_from_float64() {
         let f = CastToFloat32Func;
-        let result = f.evaluate(vec![Value::Float64(1.5)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Float64(1.5)], &ctx()).unwrap();
         assert_eq!(result, Value::Float32(1.5));
     }
 
@@ -1297,9 +1394,7 @@ mod tests {
     #[allow(clippy::approx_constant)]
     fn to_float32_from_text() {
         let f = CastToFloat32Func;
-        let result = f
-            .evaluate(vec![Value::Text("3.14".into())], &ctx())
-            .unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Text("3.14".into())], &ctx()).unwrap();
         // f32 precision — 3.14 is intentional, not std::f32::consts::PI.
         assert!(
             (match result {
@@ -1316,9 +1411,12 @@ mod tests {
     #[test]
     fn to_date_from_text() {
         let f = CastToDateFunc;
-        let result = f
-            .evaluate(vec![Value::Text("2024-03-15".into())], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("2024-03-15".into())],
+            &ctx(),
+        )
+        .unwrap();
         let expected = NaiveDate::from_ymd_opt(2024, 3, 15).unwrap();
         assert_eq!(result, Value::Date(expected));
     }
@@ -1327,7 +1425,7 @@ mod tests {
     fn to_date_from_timestamp() {
         let f = CastToDateFunc;
         let ts = Utc.with_ymd_and_hms(2024, 6, 15, 10, 30, 0).unwrap();
-        let result = f.evaluate(vec![Value::Timestamp(ts)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Timestamp(ts)], &ctx()).unwrap();
         let expected = NaiveDate::from_ymd_opt(2024, 6, 15).unwrap();
         assert_eq!(result, Value::Date(expected));
     }
@@ -1335,14 +1433,18 @@ mod tests {
     #[test]
     fn to_date_invalid() {
         let f = CastToDateFunc;
-        let result = f.evaluate(vec![Value::Text("not-a-date".into())], &ctx());
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("not-a-date".into())],
+            &ctx(),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn to_date_null() {
         let f = CastToDateFunc;
-        let result = f.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -1351,9 +1453,7 @@ mod tests {
     #[test]
     fn to_timestamp_from_int() {
         let f = CastToTimestampFunc;
-        let result = f
-            .evaluate(vec![Value::Int64(1_700_000_000)], &ctx())
-            .unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(1_700_000_000)], &ctx()).unwrap();
         match result {
             Value::Timestamp(ts) => assert_eq!(ts.timestamp(), 1_700_000_000),
             other => panic!("expected Timestamp, got {other:?}"),
@@ -1363,9 +1463,12 @@ mod tests {
     #[test]
     fn to_timestamp_from_rfc3339() {
         let f = CastToTimestampFunc;
-        let result = f
-            .evaluate(vec![Value::Text("2024-01-15T12:30:00Z".into())], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("2024-01-15T12:30:00Z".into())],
+            &ctx(),
+        )
+        .unwrap();
         match result {
             Value::Timestamp(ts) => {
                 assert_eq!(ts.year(), 2024);
@@ -1379,7 +1482,7 @@ mod tests {
     fn to_timestamp_from_date() {
         let f = CastToTimestampFunc;
         let date = NaiveDate::from_ymd_opt(2024, 6, 15).unwrap();
-        let result = f.evaluate(vec![Value::Date(date)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Date(date)], &ctx()).unwrap();
         match result {
             Value::Timestamp(ts) => {
                 assert_eq!(ts.date_naive(), date);
@@ -1391,7 +1494,7 @@ mod tests {
     #[test]
     fn to_timestamp_null() {
         let f = CastToTimestampFunc;
-        let result = f.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -1400,12 +1503,12 @@ mod tests {
     #[test]
     fn to_uuid_from_text() {
         let f = CastToUuidFunc;
-        let result = f
-            .evaluate(
-                vec![Value::Text("550e8400-e29b-41d4-a716-446655440000".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("550e8400-e29b-41d4-a716-446655440000".into())],
+            &ctx(),
+        )
+        .unwrap();
         match result {
             Value::Uuid(id) => {
                 assert_eq!(id.to_string(), "550e8400-e29b-41d4-a716-446655440000");
@@ -1417,14 +1520,18 @@ mod tests {
     #[test]
     fn to_uuid_invalid() {
         let f = CastToUuidFunc;
-        let result = f.evaluate(vec![Value::Text("not-a-uuid".into())], &ctx());
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("not-a-uuid".into())],
+            &ctx(),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn to_uuid_null() {
         let f = CastToUuidFunc;
-        let result = f.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -1433,19 +1540,19 @@ mod tests {
     #[test]
     fn to_bigint_from_int64() {
         let f = CastToBigIntFunc;
-        let result = f.evaluate(vec![Value::Int64(999_999)], &ctx()).unwrap();
+        let result = eval(&f, smallvec::smallvec![Value::Int64(999_999)], &ctx()).unwrap();
         assert_eq!(result, Value::BigInt(BigInt::from(999_999)));
     }
 
     #[test]
     fn to_bigint_from_text() {
         let f = CastToBigIntFunc;
-        let result = f
-            .evaluate(
-                vec![Value::Text("123456789012345678901234567890".into())],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Text("123456789012345678901234567890".into())],
+            &ctx(),
+        )
+        .unwrap();
         let expected: BigInt = "123456789012345678901234567890".parse().unwrap();
         assert_eq!(result, Value::BigInt(expected));
     }
@@ -1455,16 +1562,16 @@ mod tests {
     #[test]
     fn to_decimal_from_text() {
         let f = CastToDecimalFunc;
-        let result = f
-            .evaluate(
-                vec![
-                    Value::Text("123.45".into()),
-                    Value::Int64(5),
-                    Value::Int64(2),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![
+                Value::Text("123.45".into()),
+                Value::Int64(5),
+                Value::Int64(2),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         match result {
             Value::Decimal(d) => {
                 assert_eq!(d.to_string(), "123.45");
@@ -1477,8 +1584,9 @@ mod tests {
     fn to_decimal_overflow() {
         let f = CastToDecimalFunc;
         // precision=3, scale=1 means max 2 integer digits; 999 has 3
-        let result = f.evaluate(
-            vec![
+        let result = eval(
+            &f,
+            smallvec::smallvec![
                 Value::Text("999.9".into()),
                 Value::Int64(3),
                 Value::Int64(1),
@@ -1491,15 +1599,94 @@ mod tests {
     #[test]
     fn to_decimal_null() {
         let f = CastToDecimalFunc;
-        let result = f
-            .evaluate(vec![Value::Null, Value::Int64(10), Value::Int64(2)], &ctx())
-            .unwrap();
+        let result = eval(
+            &f,
+            smallvec::smallvec![Value::Null, Value::Int64(10), Value::Int64(2)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     use chrono::Datelike;
 
     // --- Allocation optimization tests ---
+
+    // A `Value::Custom` must render through the canonical `value_to_string`
+    // form (`DynValue::to_json`), not the old `"<custom>"` placeholder.
+    #[test]
+    fn to_string_cast_custom_renders_canonical_form() {
+        use std::any::Any;
+
+        use air_elt_types::convert::ConvertError;
+        use air_elt_types::convert::context::ConversionContext;
+        use air_elt_types::dynamic::{DynType, DynValue};
+        use air_elt_types::error::JsonEncodeError;
+        use serde_json::json;
+
+        #[derive(Debug, Clone)]
+        struct StubType;
+        impl DynType for StubType {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn kind(&self) -> &str {
+                "stub.objectid"
+            }
+            fn can_convert_to(&self, _: &DataType, _: bool) -> bool {
+                false
+            }
+            fn can_construct_from(&self, _: &DataType, _: bool) -> bool {
+                false
+            }
+            fn convert(
+                &self,
+                _: Value,
+                _: &DataType,
+                _: &ConversionContext,
+            ) -> Result<Value, ConvertError> {
+                unimplemented!()
+            }
+            fn construct(
+                &self,
+                _: Value,
+                _: &DataType,
+                _: &ConversionContext,
+            ) -> Result<Value, ConvertError> {
+                unimplemented!()
+            }
+            fn clone_box(&self) -> Box<dyn DynType> {
+                Box::new(StubType)
+            }
+        }
+
+        #[derive(Debug, Clone)]
+        struct StubVal;
+        impl DynValue for StubVal {
+            fn dyn_type(&self) -> Box<dyn DynType> {
+                Box::new(StubType)
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn into_any(self: Box<Self>) -> Box<dyn Any> {
+                self
+            }
+            fn is_equal(&self, _: &dyn DynValue) -> bool {
+                true
+            }
+            fn clone_box(&self) -> Box<dyn DynValue> {
+                Box::new(self.clone())
+            }
+            fn to_json(&self) -> Result<serde_json::Value, JsonEncodeError> {
+                Ok(json!("507f1f77bcf86cd799439011"))
+            }
+        }
+
+        let input = Value::Custom(Box::new(StubVal));
+        let result = eval(&CAST_TO_STRING, smallvec::smallvec![input], &ctx()).unwrap();
+        assert_eq!(result, Value::Text("507f1f77bcf86cd799439011".into()));
+    }
 
     #[test]
     fn to_string_cast_passthrough() {
@@ -1508,7 +1695,7 @@ mod tests {
             Value::Text(s) => s.as_ptr(),
             _ => unreachable!(),
         };
-        let result = CAST_TO_STRING.evaluate(vec![input], &ctx()).unwrap();
+        let result = eval(&CAST_TO_STRING, smallvec::smallvec![input], &ctx()).unwrap();
         let ptr_after = match &result {
             Value::Text(s) => s.as_ptr(),
             _ => unreachable!(),

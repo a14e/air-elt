@@ -3,7 +3,7 @@ use air_elt_types::{DataType, Value};
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
-use crate::signature::{EvalContext, ExprFunction};
+use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
 static SIN: SinFunc = SinFunc;
 static COS: CosFunc = CosFunc;
@@ -72,15 +72,7 @@ pub fn register(registry: &mut FunctionRegistry) {
 }
 
 fn to_f64(val: &Value, func_name: &str) -> Result<f64, FuncError> {
-    match val {
-        Value::Int64(x) => Ok(*x as f64),
-        Value::Float64(x) => Ok(*x),
-        other => Err(FuncError::TypeMismatch {
-            function: func_name.to_owned(),
-            expected: "numeric".to_owned(),
-            actual: format!("{:?}", other.data_type()),
-        }),
-    }
+    crate::arithmetic_utils::value_to_f64(val, func_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +82,10 @@ fn to_f64(val: &Value, func_name: &str) -> Result<f64, FuncError> {
 struct SinFunc;
 
 impl ExprFunction for SinFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "sin"
     }
@@ -106,12 +102,16 @@ impl ExprFunction for SinFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "sin")?;
+        let x = to_f64(a, "sin")?;
         Ok(Value::Float64(x.sin()))
     }
 }
@@ -119,6 +119,10 @@ impl ExprFunction for SinFunc {
 struct CosFunc;
 
 impl ExprFunction for CosFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cos"
     }
@@ -135,12 +139,16 @@ impl ExprFunction for CosFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "cos")?;
+        let x = to_f64(a, "cos")?;
         Ok(Value::Float64(x.cos()))
     }
 }
@@ -148,6 +156,10 @@ impl ExprFunction for CosFunc {
 struct TanFunc;
 
 impl ExprFunction for TanFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "tan"
     }
@@ -164,12 +176,16 @@ impl ExprFunction for TanFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "tan")?;
+        let x = to_f64(a, "tan")?;
         Ok(Value::Float64(x.tan()))
     }
 }
@@ -177,6 +193,10 @@ impl ExprFunction for TanFunc {
 struct AsinFunc;
 
 impl ExprFunction for AsinFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "asin"
     }
@@ -193,12 +213,16 @@ impl ExprFunction for AsinFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "asin")?;
+        let x = to_f64(a, "asin")?;
         Ok(Value::Float64(x.asin()))
     }
 }
@@ -206,6 +230,10 @@ impl ExprFunction for AsinFunc {
 struct AcosFunc;
 
 impl ExprFunction for AcosFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "acos"
     }
@@ -222,12 +250,16 @@ impl ExprFunction for AcosFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "acos")?;
+        let x = to_f64(a, "acos")?;
         Ok(Value::Float64(x.acos()))
     }
 }
@@ -235,6 +267,10 @@ impl ExprFunction for AcosFunc {
 struct AtanFunc;
 
 impl ExprFunction for AtanFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "atan"
     }
@@ -251,12 +287,16 @@ impl ExprFunction for AtanFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "atan")?;
+        let x = to_f64(a, "atan")?;
         Ok(Value::Float64(x.atan()))
     }
 }
@@ -264,6 +304,10 @@ impl ExprFunction for AtanFunc {
 struct Atan2Func;
 
 impl ExprFunction for Atan2Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "atan2"
     }
@@ -281,14 +325,18 @@ impl ExprFunction for Atan2Func {
         Ok(NullableExprType::new(DataType::Float64, nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let x = args.remove(1);
-        let y = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let y = args.read(0);
+        let x = args.read(1);
         if y.is_null() || x.is_null() {
             return Ok(Value::Null);
         }
-        let y_val = to_f64(&y, "atan2")?;
-        let x_val = to_f64(&x, "atan2")?;
+        let y_val = to_f64(y, "atan2")?;
+        let x_val = to_f64(x, "atan2")?;
         Ok(Value::Float64(y_val.atan2(x_val)))
     }
 }
@@ -300,6 +348,10 @@ impl ExprFunction for Atan2Func {
 struct LogFunc;
 
 impl ExprFunction for LogFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "log"
     }
@@ -316,12 +368,16 @@ impl ExprFunction for LogFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "log")?;
+        let x = to_f64(a, "log")?;
         Ok(Value::Float64(x.ln()))
     }
 }
@@ -329,6 +385,10 @@ impl ExprFunction for LogFunc {
 struct Log2Func;
 
 impl ExprFunction for Log2Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "log2"
     }
@@ -345,12 +405,16 @@ impl ExprFunction for Log2Func {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "log2")?;
+        let x = to_f64(a, "log2")?;
         Ok(Value::Float64(x.log2()))
     }
 }
@@ -358,6 +422,10 @@ impl ExprFunction for Log2Func {
 struct Log10Func;
 
 impl ExprFunction for Log10Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "log10"
     }
@@ -374,12 +442,16 @@ impl ExprFunction for Log10Func {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "log10")?;
+        let x = to_f64(a, "log10")?;
         Ok(Value::Float64(x.log10()))
     }
 }
@@ -387,6 +459,10 @@ impl ExprFunction for Log10Func {
 struct ExpFunc;
 
 impl ExprFunction for ExpFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "exp"
     }
@@ -403,12 +479,16 @@ impl ExprFunction for ExpFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "exp")?;
+        let x = to_f64(a, "exp")?;
         Ok(Value::Float64(x.exp()))
     }
 }
@@ -420,6 +500,10 @@ impl ExprFunction for ExpFunc {
 struct CbrtFunc;
 
 impl ExprFunction for CbrtFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cbrt"
     }
@@ -436,12 +520,16 @@ impl ExprFunction for CbrtFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "cbrt")?;
+        let x = to_f64(a, "cbrt")?;
         Ok(Value::Float64(x.cbrt()))
     }
 }
@@ -453,6 +541,10 @@ impl ExprFunction for CbrtFunc {
 struct PiFunc;
 
 impl ExprFunction for PiFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "pi"
     }
@@ -469,7 +561,11 @@ impl ExprFunction for PiFunc {
         Ok(NullableExprType::new(DataType::Float64, false))
     }
 
-    fn evaluate(&self, _args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(
+        &self,
+        _args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
         Ok(Value::Float64(std::f64::consts::PI))
     }
 }
@@ -477,6 +573,10 @@ impl ExprFunction for PiFunc {
 struct EFunc;
 
 impl ExprFunction for EFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "e"
     }
@@ -493,7 +593,11 @@ impl ExprFunction for EFunc {
         Ok(NullableExprType::new(DataType::Float64, false))
     }
 
-    fn evaluate(&self, _args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(
+        &self,
+        _args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
         Ok(Value::Float64(std::f64::consts::E))
     }
 }
@@ -501,6 +605,10 @@ impl ExprFunction for EFunc {
 struct PhiFunc;
 
 impl ExprFunction for PhiFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "phi"
     }
@@ -517,7 +625,11 @@ impl ExprFunction for PhiFunc {
         Ok(NullableExprType::new(DataType::Float64, false))
     }
 
-    fn evaluate(&self, _args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(
+        &self,
+        _args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
         // Golden ratio: (1 + sqrt(5)) / 2
         Ok(Value::Float64((1.0 + 5.0_f64.sqrt()) / 2.0))
     }
@@ -526,6 +638,10 @@ impl ExprFunction for PhiFunc {
 struct TauFunc;
 
 impl ExprFunction for TauFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "tau"
     }
@@ -542,7 +658,11 @@ impl ExprFunction for TauFunc {
         Ok(NullableExprType::new(DataType::Float64, false))
     }
 
-    fn evaluate(&self, _args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
+    fn evaluate(
+        &self,
+        _args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
         Ok(Value::Float64(std::f64::consts::TAU))
     }
 }
@@ -554,6 +674,10 @@ impl ExprFunction for TauFunc {
 struct ErfFunc;
 
 impl ExprFunction for ErfFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "erf"
     }
@@ -570,12 +694,16 @@ impl ExprFunction for ErfFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "erf")?;
+        let x = to_f64(a, "erf")?;
         Ok(Value::Float64(statrs::function::erf::erf(x)))
     }
 }
@@ -583,6 +711,10 @@ impl ExprFunction for ErfFunc {
 struct ErfcFunc;
 
 impl ExprFunction for ErfcFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "erfc"
     }
@@ -599,12 +731,16 @@ impl ExprFunction for ErfcFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "erfc")?;
+        let x = to_f64(a, "erfc")?;
         Ok(Value::Float64(statrs::function::erf::erfc(x)))
     }
 }
@@ -616,6 +752,10 @@ impl ExprFunction for ErfcFunc {
 struct GammaFunc;
 
 impl ExprFunction for GammaFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "gamma"
     }
@@ -632,12 +772,16 @@ impl ExprFunction for GammaFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "gamma")?;
+        let x = to_f64(a, "gamma")?;
         Ok(Value::Float64(statrs::function::gamma::gamma(x)))
     }
 }
@@ -645,6 +789,10 @@ impl ExprFunction for GammaFunc {
 struct LnGammaFunc;
 
 impl ExprFunction for LnGammaFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "lnGamma"
     }
@@ -661,12 +809,16 @@ impl ExprFunction for LnGammaFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "lnGamma")?;
+        let x = to_f64(a, "lnGamma")?;
         Ok(Value::Float64(statrs::function::gamma::ln_gamma(x)))
     }
 }
@@ -678,6 +830,10 @@ impl ExprFunction for LnGammaFunc {
 struct BetaFunc;
 
 impl ExprFunction for BetaFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "beta"
     }
@@ -695,14 +851,18 @@ impl ExprFunction for BetaFunc {
         Ok(NullableExprType::new(DataType::Float64, nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b_val = args.remove(1);
-        let a_val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a_val = args.read(0);
+        let b_val = args.read(1);
         if a_val.is_null() || b_val.is_null() {
             return Ok(Value::Null);
         }
-        let a = to_f64(&a_val, "beta")?;
-        let b = to_f64(&b_val, "beta")?;
+        let a = to_f64(a_val, "beta")?;
+        let b = to_f64(b_val, "beta")?;
         Ok(Value::Float64(statrs::function::beta::beta(a, b)))
     }
 }
@@ -714,6 +874,10 @@ impl ExprFunction for BetaFunc {
 struct LambertWFunc;
 
 impl ExprFunction for LambertWFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "lambertW"
     }
@@ -730,12 +894,16 @@ impl ExprFunction for LambertWFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "lambertW")?;
+        let x = to_f64(a, "lambertW")?;
         Ok(Value::Float64(lambert_w::lambert_w0(x)))
     }
 }
@@ -747,6 +915,10 @@ impl ExprFunction for LambertWFunc {
 struct SinhFunc;
 
 impl ExprFunction for SinhFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "sinh"
     }
@@ -763,12 +935,16 @@ impl ExprFunction for SinhFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "sinh")?;
+        let x = to_f64(a, "sinh")?;
         Ok(Value::Float64(x.sinh()))
     }
 }
@@ -776,6 +952,10 @@ impl ExprFunction for SinhFunc {
 struct CoshFunc;
 
 impl ExprFunction for CoshFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cosh"
     }
@@ -792,12 +972,16 @@ impl ExprFunction for CoshFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "cosh")?;
+        let x = to_f64(a, "cosh")?;
         Ok(Value::Float64(x.cosh()))
     }
 }
@@ -805,6 +989,10 @@ impl ExprFunction for CoshFunc {
 struct TanhFunc;
 
 impl ExprFunction for TanhFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "tanh"
     }
@@ -821,12 +1009,16 @@ impl ExprFunction for TanhFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "tanh")?;
+        let x = to_f64(a, "tanh")?;
         Ok(Value::Float64(x.tanh()))
     }
 }
@@ -834,6 +1026,10 @@ impl ExprFunction for TanhFunc {
 struct AsinhFunc;
 
 impl ExprFunction for AsinhFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "asinh"
     }
@@ -850,12 +1046,16 @@ impl ExprFunction for AsinhFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "asinh")?;
+        let x = to_f64(a, "asinh")?;
         Ok(Value::Float64(x.asinh()))
     }
 }
@@ -863,6 +1063,10 @@ impl ExprFunction for AsinhFunc {
 struct AcoshFunc;
 
 impl ExprFunction for AcoshFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "acosh"
     }
@@ -879,12 +1083,16 @@ impl ExprFunction for AcoshFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "acosh")?;
+        let x = to_f64(a, "acosh")?;
         Ok(Value::Float64(x.acosh()))
     }
 }
@@ -892,6 +1100,10 @@ impl ExprFunction for AcoshFunc {
 struct AtanhFunc;
 
 impl ExprFunction for AtanhFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "atanh"
     }
@@ -908,12 +1120,16 @@ impl ExprFunction for AtanhFunc {
         Ok(NullableExprType::new(DataType::Float64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "atanh")?;
+        let x = to_f64(a, "atanh")?;
         Ok(Value::Float64(x.atanh()))
     }
 }
@@ -925,6 +1141,10 @@ impl ExprFunction for AtanhFunc {
 struct IsNanFunc;
 
 impl ExprFunction for IsNanFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "isNaN"
     }
@@ -941,12 +1161,16 @@ impl ExprFunction for IsNanFunc {
         Ok(NullableExprType::new(DataType::Bool, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "isNaN")?;
+        let x = to_f64(a, "isNaN")?;
         Ok(Value::Bool(x.is_nan()))
     }
 }
@@ -954,6 +1178,10 @@ impl ExprFunction for IsNanFunc {
 struct IsInfiniteFunc;
 
 impl ExprFunction for IsInfiniteFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "isInfinite"
     }
@@ -970,12 +1198,16 @@ impl ExprFunction for IsInfiniteFunc {
         Ok(NullableExprType::new(DataType::Bool, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let a = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let a = args.read(0);
         if a.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&a, "isInfinite")?;
+        let x = to_f64(a, "isInfinite")?;
         Ok(Value::Bool(x.is_infinite()))
     }
 }
@@ -983,6 +1215,10 @@ impl ExprFunction for IsInfiniteFunc {
 struct ClampFunc;
 
 impl ExprFunction for ClampFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "clamp"
     }
@@ -1000,16 +1236,20 @@ impl ExprFunction for ClampFunc {
         Ok(NullableExprType::new(DataType::Float64, nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let max_val = args.remove(2);
-        let min_val = args.remove(1);
-        let x_val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let x_val = args.read(0);
+        let min_val = args.read(1);
+        let max_val = args.read(2);
         if x_val.is_null() || min_val.is_null() || max_val.is_null() {
             return Ok(Value::Null);
         }
-        let x = to_f64(&x_val, "clamp")?;
-        let min = to_f64(&min_val, "clamp")?;
-        let max = to_f64(&max_val, "clamp")?;
+        let x = to_f64(x_val, "clamp")?;
+        let min = to_f64(min_val, "clamp")?;
+        let max = to_f64(max_val, "clamp")?;
         Ok(Value::Float64(x.clamp(min, max)))
     }
 }
@@ -1018,43 +1258,46 @@ impl ExprFunction for ClampFunc {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::ctx;
+    use crate::test_support::{ctx, eval};
 
     #[test]
     fn sin_zero() {
-        let result = SIN.evaluate(vec![Value::Float64(0.0)], &ctx()).unwrap();
+        let result = eval(&SIN, smallvec::smallvec![Value::Float64(0.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(0.0));
     }
 
     #[test]
     fn cos_zero() {
-        let result = COS.evaluate(vec![Value::Float64(0.0)], &ctx()).unwrap();
+        let result = eval(&COS, smallvec::smallvec![Value::Float64(0.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(1.0));
     }
 
     #[test]
     fn tan_zero() {
-        let result = TAN.evaluate(vec![Value::Float64(0.0)], &ctx()).unwrap();
+        let result = eval(&TAN, smallvec::smallvec![Value::Float64(0.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(0.0));
     }
 
     #[test]
     fn sin_null_propagation() {
-        let result = SIN.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&SIN, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn cos_null_propagation() {
-        let result = COS.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&COS, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn atan2_basic() {
-        let result = ATAN2
-            .evaluate(vec![Value::Float64(1.0), Value::Float64(1.0)], &ctx())
-            .unwrap();
+        let result = eval(
+            &ATAN2,
+            smallvec::smallvec![Value::Float64(1.0), Value::Float64(1.0)],
+            &ctx(),
+        )
+        .unwrap();
         match result {
             Value::Float64(v) => {
                 let expected = std::f64::consts::FRAC_PI_4;
@@ -1069,23 +1312,29 @@ mod tests {
 
     #[test]
     fn atan2_null_propagation() {
-        let result = ATAN2
-            .evaluate(vec![Value::Null, Value::Float64(1.0)], &ctx())
-            .unwrap();
+        let result = eval(
+            &ATAN2,
+            smallvec::smallvec![Value::Null, Value::Float64(1.0)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn log_one() {
-        let result = LOG.evaluate(vec![Value::Float64(1.0)], &ctx()).unwrap();
+        let result = eval(&LOG, smallvec::smallvec![Value::Float64(1.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(0.0));
     }
 
     #[test]
     fn log_e() {
-        let result = LOG
-            .evaluate(vec![Value::Float64(std::f64::consts::E)], &ctx())
-            .unwrap();
+        let result = eval(
+            &LOG,
+            smallvec::smallvec![Value::Float64(std::f64::consts::E)],
+            &ctx(),
+        )
+        .unwrap();
         match result {
             Value::Float64(v) => {
                 assert!((v - 1.0).abs() < 1e-10, "log(e) = {v}, expected 1.0");
@@ -1096,15 +1345,13 @@ mod tests {
 
     #[test]
     fn log2_basic() {
-        let result = LOG2.evaluate(vec![Value::Float64(8.0)], &ctx()).unwrap();
+        let result = eval(&LOG2, smallvec::smallvec![Value::Float64(8.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(3.0));
     }
 
     #[test]
     fn log10_basic() {
-        let result = LOG10
-            .evaluate(vec![Value::Float64(1000.0)], &ctx())
-            .unwrap();
+        let result = eval(&LOG10, smallvec::smallvec![Value::Float64(1000.0)], &ctx()).unwrap();
         match result {
             Value::Float64(v) => {
                 assert!((v - 3.0).abs() < 1e-10, "log10(1000) = {v}, expected 3.0");
@@ -1115,13 +1362,13 @@ mod tests {
 
     #[test]
     fn exp_zero() {
-        let result = EXP.evaluate(vec![Value::Float64(0.0)], &ctx()).unwrap();
+        let result = eval(&EXP, smallvec::smallvec![Value::Float64(0.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(1.0));
     }
 
     #[test]
     fn exp_one() {
-        let result = EXP.evaluate(vec![Value::Float64(1.0)], &ctx()).unwrap();
+        let result = eval(&EXP, smallvec::smallvec![Value::Float64(1.0)], &ctx()).unwrap();
         match result {
             Value::Float64(v) => {
                 let expected = std::f64::consts::E;
@@ -1136,19 +1383,19 @@ mod tests {
 
     #[test]
     fn cbrt_basic() {
-        let result = CBRT.evaluate(vec![Value::Float64(27.0)], &ctx()).unwrap();
+        let result = eval(&CBRT, smallvec::smallvec![Value::Float64(27.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(3.0));
     }
 
     #[test]
     fn cbrt_int_input() {
-        let result = CBRT.evaluate(vec![Value::Int64(8)], &ctx()).unwrap();
+        let result = eval(&CBRT, smallvec::smallvec![Value::Int64(8)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(2.0));
     }
 
     #[test]
     fn pi_constant() {
-        let result = PI.evaluate(vec![], &ctx()).unwrap();
+        let result = eval(&PI, smallvec::smallvec![], &ctx()).unwrap();
         match result {
             Value::Float64(v) => {
                 assert!(
@@ -1163,7 +1410,7 @@ mod tests {
 
     #[test]
     fn e_constant() {
-        let result = E.evaluate(vec![], &ctx()).unwrap();
+        let result = eval(&E, smallvec::smallvec![], &ctx()).unwrap();
         match result {
             Value::Float64(v) => {
                 assert!(
@@ -1178,37 +1425,37 @@ mod tests {
 
     #[test]
     fn asin_zero() {
-        let result = ASIN.evaluate(vec![Value::Float64(0.0)], &ctx()).unwrap();
+        let result = eval(&ASIN, smallvec::smallvec![Value::Float64(0.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(0.0));
     }
 
     #[test]
     fn acos_one() {
-        let result = ACOS.evaluate(vec![Value::Float64(1.0)], &ctx()).unwrap();
+        let result = eval(&ACOS, smallvec::smallvec![Value::Float64(1.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(0.0));
     }
 
     #[test]
     fn atan_zero() {
-        let result = ATAN.evaluate(vec![Value::Float64(0.0)], &ctx()).unwrap();
+        let result = eval(&ATAN, smallvec::smallvec![Value::Float64(0.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(0.0));
     }
 
     #[test]
     fn log_null_propagation() {
-        let result = LOG.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&LOG, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn exp_null_propagation() {
-        let result = EXP.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&EXP, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn cbrt_null_propagation() {
-        let result = CBRT.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&CBRT, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -1216,13 +1463,13 @@ mod tests {
 
     #[test]
     fn erf_zero() {
-        let result = ERF.evaluate(vec![Value::Float64(0.0)], &ctx()).unwrap();
+        let result = eval(&ERF, smallvec::smallvec![Value::Float64(0.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(0.0));
     }
 
     #[test]
     fn erf_one() {
-        let result = ERF.evaluate(vec![Value::Float64(1.0)], &ctx()).unwrap();
+        let result = eval(&ERF, smallvec::smallvec![Value::Float64(1.0)], &ctx()).unwrap();
         match result {
             Value::Float64(v) => {
                 assert!((v - 0.8427).abs() < 1e-4, "erf(1) = {v}, expected ~0.8427");
@@ -1233,19 +1480,19 @@ mod tests {
 
     #[test]
     fn erf_null_propagation() {
-        let result = ERF.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&ERF, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn erfc_zero() {
-        let result = ERFC.evaluate(vec![Value::Float64(0.0)], &ctx()).unwrap();
+        let result = eval(&ERFC, smallvec::smallvec![Value::Float64(0.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(1.0));
     }
 
     #[test]
     fn erfc_null_propagation() {
-        let result = ERFC.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&ERFC, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -1254,7 +1501,7 @@ mod tests {
     #[test]
     fn gamma_five() {
         // Gamma(5) = 4! = 24
-        let result = GAMMA.evaluate(vec![Value::Float64(5.0)], &ctx()).unwrap();
+        let result = eval(&GAMMA, smallvec::smallvec![Value::Float64(5.0)], &ctx()).unwrap();
         match result {
             Value::Float64(v) => {
                 assert!((v - 24.0).abs() < 1e-10, "gamma(5) = {v}, expected 24.0");
@@ -1266,7 +1513,7 @@ mod tests {
     #[test]
     fn gamma_half() {
         // Gamma(0.5) = sqrt(pi)
-        let result = GAMMA.evaluate(vec![Value::Float64(0.5)], &ctx()).unwrap();
+        let result = eval(&GAMMA, smallvec::smallvec![Value::Float64(0.5)], &ctx()).unwrap();
         let expected = std::f64::consts::PI.sqrt();
         match result {
             Value::Float64(v) => {
@@ -1281,16 +1528,14 @@ mod tests {
 
     #[test]
     fn gamma_null_propagation() {
-        let result = GAMMA.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&GAMMA, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn ln_gamma_one() {
         // lnGamma(1) = ln(Gamma(1)) = ln(1) = 0
-        let result = LN_GAMMA
-            .evaluate(vec![Value::Float64(1.0)], &ctx())
-            .unwrap();
+        let result = eval(&LN_GAMMA, smallvec::smallvec![Value::Float64(1.0)], &ctx()).unwrap();
         match result {
             Value::Float64(v) => {
                 assert!(v.abs() < 1e-10, "lnGamma(1) = {v}, expected 0.0");
@@ -1301,7 +1546,7 @@ mod tests {
 
     #[test]
     fn ln_gamma_null_propagation() {
-        let result = LN_GAMMA.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&LN_GAMMA, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -1310,9 +1555,12 @@ mod tests {
     #[test]
     fn beta_one_one() {
         // B(1, 1) = 1
-        let result = BETA
-            .evaluate(vec![Value::Float64(1.0), Value::Float64(1.0)], &ctx())
-            .unwrap();
+        let result = eval(
+            &BETA,
+            smallvec::smallvec![Value::Float64(1.0), Value::Float64(1.0)],
+            &ctx(),
+        )
+        .unwrap();
         match result {
             Value::Float64(v) => {
                 assert!((v - 1.0).abs() < 1e-10, "beta(1,1) = {v}, expected 1.0");
@@ -1324,9 +1572,12 @@ mod tests {
     #[test]
     fn beta_two_three() {
         // B(2, 3) = Gamma(2)*Gamma(3)/Gamma(5) = 1*2/24 = 1/12 ~ 0.0833
-        let result = BETA
-            .evaluate(vec![Value::Float64(2.0), Value::Float64(3.0)], &ctx())
-            .unwrap();
+        let result = eval(
+            &BETA,
+            smallvec::smallvec![Value::Float64(2.0), Value::Float64(3.0)],
+            &ctx(),
+        )
+        .unwrap();
         match result {
             Value::Float64(v) => {
                 assert!(
@@ -1340,9 +1591,12 @@ mod tests {
 
     #[test]
     fn beta_null_propagation() {
-        let result = BETA
-            .evaluate(vec![Value::Null, Value::Float64(1.0)], &ctx())
-            .unwrap();
+        let result = eval(
+            &BETA,
+            smallvec::smallvec![Value::Null, Value::Float64(1.0)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -1350,9 +1604,7 @@ mod tests {
 
     #[test]
     fn lambert_w_zero() {
-        let result = LAMBERT_W
-            .evaluate(vec![Value::Float64(0.0)], &ctx())
-            .unwrap();
+        let result = eval(&LAMBERT_W, smallvec::smallvec![Value::Float64(0.0)], &ctx()).unwrap();
         match result {
             Value::Float64(v) => {
                 assert!(v.abs() < 1e-10, "lambertW(0) = {v}, expected 0.0");
@@ -1364,9 +1616,7 @@ mod tests {
     #[test]
     fn lambert_w_one() {
         // W(1) ~ 0.5671
-        let result = LAMBERT_W
-            .evaluate(vec![Value::Float64(1.0)], &ctx())
-            .unwrap();
+        let result = eval(&LAMBERT_W, smallvec::smallvec![Value::Float64(1.0)], &ctx()).unwrap();
         match result {
             Value::Float64(v) => {
                 assert!(
@@ -1381,9 +1631,12 @@ mod tests {
     #[test]
     fn lambert_w_e() {
         // W(e) = 1
-        let result = LAMBERT_W
-            .evaluate(vec![Value::Float64(std::f64::consts::E)], &ctx())
-            .unwrap();
+        let result = eval(
+            &LAMBERT_W,
+            smallvec::smallvec![Value::Float64(std::f64::consts::E)],
+            &ctx(),
+        )
+        .unwrap();
         match result {
             Value::Float64(v) => {
                 assert!((v - 1.0).abs() < 1e-10, "lambertW(e) = {v}, expected 1.0");
@@ -1394,7 +1647,7 @@ mod tests {
 
     #[test]
     fn lambert_w_null_propagation() {
-        let result = LAMBERT_W.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&LAMBERT_W, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -1402,55 +1655,55 @@ mod tests {
 
     #[test]
     fn sinh_zero() {
-        let result = SINH.evaluate(vec![Value::Float64(0.0)], &ctx()).unwrap();
+        let result = eval(&SINH, smallvec::smallvec![Value::Float64(0.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(0.0));
     }
 
     #[test]
     fn cosh_zero() {
-        let result = COSH.evaluate(vec![Value::Float64(0.0)], &ctx()).unwrap();
+        let result = eval(&COSH, smallvec::smallvec![Value::Float64(0.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(1.0));
     }
 
     #[test]
     fn tanh_zero() {
-        let result = TANH.evaluate(vec![Value::Float64(0.0)], &ctx()).unwrap();
+        let result = eval(&TANH, smallvec::smallvec![Value::Float64(0.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(0.0));
     }
 
     #[test]
     fn sinh_null_propagation() {
-        let result = SINH.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&SINH, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn cosh_null_propagation() {
-        let result = COSH.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&COSH, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn tanh_null_propagation() {
-        let result = TANH.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&TANH, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn asinh_zero() {
-        let result = ASINH.evaluate(vec![Value::Float64(0.0)], &ctx()).unwrap();
+        let result = eval(&ASINH, smallvec::smallvec![Value::Float64(0.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(0.0));
     }
 
     #[test]
     fn acosh_one() {
-        let result = ACOSH.evaluate(vec![Value::Float64(1.0)], &ctx()).unwrap();
+        let result = eval(&ACOSH, smallvec::smallvec![Value::Float64(1.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(0.0));
     }
 
     #[test]
     fn atanh_zero() {
-        let result = ATANH.evaluate(vec![Value::Float64(0.0)], &ctx()).unwrap();
+        let result = eval(&ATANH, smallvec::smallvec![Value::Float64(0.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(0.0));
     }
 
@@ -1458,7 +1711,7 @@ mod tests {
 
     #[test]
     fn phi_constant() {
-        let result = PHI.evaluate(vec![], &ctx()).unwrap();
+        let result = eval(&PHI, smallvec::smallvec![], &ctx()).unwrap();
         match result {
             Value::Float64(v) => {
                 assert!(
@@ -1472,7 +1725,7 @@ mod tests {
 
     #[test]
     fn tau_constant() {
-        let result = TAU.evaluate(vec![], &ctx()).unwrap();
+        let result = eval(&TAU, smallvec::smallvec![], &ctx()).unwrap();
         match result {
             Value::Float64(v) => {
                 assert!(
@@ -1489,118 +1742,154 @@ mod tests {
 
     #[test]
     fn is_nan_with_nan() {
-        let result = IS_NAN
-            .evaluate(vec![Value::Float64(f64::NAN)], &ctx())
-            .unwrap();
+        let result = eval(
+            &IS_NAN,
+            smallvec::smallvec![Value::Float64(f64::NAN)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
     #[test]
     fn is_nan_with_normal() {
-        let result = IS_NAN.evaluate(vec![Value::Float64(1.0)], &ctx()).unwrap();
+        let result = eval(&IS_NAN, smallvec::smallvec![Value::Float64(1.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Bool(false));
     }
 
     #[test]
     fn is_nan_null_propagation() {
-        let result = IS_NAN.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&IS_NAN, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn is_infinite_with_inf() {
-        let result = IS_INFINITE
-            .evaluate(vec![Value::Float64(f64::INFINITY)], &ctx())
-            .unwrap();
+        let result = eval(
+            &IS_INFINITE,
+            smallvec::smallvec![Value::Float64(f64::INFINITY)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
     #[test]
     fn is_infinite_with_neg_inf() {
-        let result = IS_INFINITE
-            .evaluate(vec![Value::Float64(f64::NEG_INFINITY)], &ctx())
-            .unwrap();
+        let result = eval(
+            &IS_INFINITE,
+            smallvec::smallvec![Value::Float64(f64::NEG_INFINITY)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
     #[test]
     fn is_infinite_with_normal() {
-        let result = IS_INFINITE
-            .evaluate(vec![Value::Float64(1.0)], &ctx())
-            .unwrap();
+        let result = eval(
+            &IS_INFINITE,
+            smallvec::smallvec![Value::Float64(1.0)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(false));
+    }
+
+    /// `isNaN` / `isInfinite` accept narrow and unsigned integer operands via the
+    /// shared `value_to_f64` — they never NaN or overflow, so the answer is false
+    /// (no runtime `TypeMismatch`, which is what the optimizer's fold relies on).
+    #[test]
+    fn is_nan_and_is_infinite_accept_integer_operands() {
+        for operand in [
+            Value::Int32(-5),
+            Value::UInt32(42),
+            Value::Int16(300),
+            Value::UInt64(7),
+        ] {
+            assert_eq!(
+                eval(&IS_NAN, smallvec::smallvec![operand.clone()], &ctx()).unwrap(),
+                Value::Bool(false),
+                "isNaN({operand:?})"
+            );
+            assert_eq!(
+                eval(&IS_INFINITE, smallvec::smallvec![operand.clone()], &ctx()).unwrap(),
+                Value::Bool(false),
+                "isInfinite({operand:?})"
+            );
+        }
     }
 
     #[test]
     fn is_infinite_null_propagation() {
-        let result = IS_INFINITE.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&IS_INFINITE, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn clamp_above_max() {
-        let result = CLAMP
-            .evaluate(
-                vec![
-                    Value::Float64(5.0),
-                    Value::Float64(0.0),
-                    Value::Float64(3.0),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &CLAMP,
+            smallvec::smallvec![
+                Value::Float64(5.0),
+                Value::Float64(0.0),
+                Value::Float64(3.0),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Float64(3.0));
     }
 
     #[test]
     fn clamp_below_min() {
-        let result = CLAMP
-            .evaluate(
-                vec![
-                    Value::Float64(-1.0),
-                    Value::Float64(0.0),
-                    Value::Float64(10.0),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &CLAMP,
+            smallvec::smallvec![
+                Value::Float64(-1.0),
+                Value::Float64(0.0),
+                Value::Float64(10.0),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Float64(0.0));
     }
 
     #[test]
     fn clamp_within_range() {
-        let result = CLAMP
-            .evaluate(
-                vec![
-                    Value::Float64(5.0),
-                    Value::Float64(0.0),
-                    Value::Float64(10.0),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &CLAMP,
+            smallvec::smallvec![
+                Value::Float64(5.0),
+                Value::Float64(0.0),
+                Value::Float64(10.0),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Float64(5.0));
     }
 
     #[test]
     fn clamp_null_propagation() {
-        let result = CLAMP
-            .evaluate(
-                vec![Value::Null, Value::Float64(0.0), Value::Float64(10.0)],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &CLAMP,
+            smallvec::smallvec![Value::Null, Value::Float64(0.0), Value::Float64(10.0)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn clamp_int_inputs() {
-        let result = CLAMP
-            .evaluate(
-                vec![Value::Int64(5), Value::Int64(0), Value::Int64(3)],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &CLAMP,
+            smallvec::smallvec![Value::Int64(5), Value::Int64(0), Value::Int64(3)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Float64(3.0));
     }
 }

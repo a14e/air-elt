@@ -5,7 +5,7 @@ use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_P
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
-use crate::signature::{EvalContext, ExprFunction};
+use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
 static BYTE_LENGTH: ByteLengthFunc = ByteLengthFunc;
 static BYTE_AT: ByteAtFunc = ByteAtFunc;
@@ -35,7 +35,7 @@ pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&URL_DECODE);
 }
 
-fn extract_bytes(val: Value, func_name: &str) -> Result<Vec<u8>, FuncError> {
+fn extract_bytes_ref<'a>(val: &'a Value, func_name: &str) -> Result<&'a [u8], FuncError> {
     match val {
         Value::Bytes(b) => Ok(b),
         other => Err(FuncError::TypeMismatch {
@@ -46,7 +46,7 @@ fn extract_bytes(val: Value, func_name: &str) -> Result<Vec<u8>, FuncError> {
     }
 }
 
-fn extract_text(val: Value, func_name: &str) -> Result<String, FuncError> {
+fn extract_text_ref<'a>(val: &'a Value, func_name: &str) -> Result<&'a str, FuncError> {
     match val {
         Value::Text(s) => Ok(s),
         other => Err(FuncError::TypeMismatch {
@@ -57,9 +57,9 @@ fn extract_text(val: Value, func_name: &str) -> Result<String, FuncError> {
     }
 }
 
-fn extract_int64(val: Value, func_name: &str) -> Result<i64, FuncError> {
+fn extract_int64_ref(val: &Value, func_name: &str) -> Result<i64, FuncError> {
     match val {
-        Value::Int64(n) => Ok(n),
+        Value::Int64(n) => Ok(*n),
         other => Err(FuncError::TypeMismatch {
             function: func_name.to_owned(),
             expected: "Int64".to_owned(),
@@ -73,6 +73,10 @@ fn extract_int64(val: Value, func_name: &str) -> Result<i64, FuncError> {
 struct ByteLengthFunc;
 
 impl ExprFunction for ByteLengthFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "byteLength"
     }
@@ -90,12 +94,16 @@ impl ExprFunction for ByteLengthFunc {
         Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let val = args.read(0);
         if val.is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(val, "byteLength")?;
+        let bytes = extract_bytes_ref(val, "byteLength")?;
         Ok(Value::Int64(bytes.len() as i64))
     }
 }
@@ -105,6 +113,10 @@ impl ExprFunction for ByteLengthFunc {
 struct ByteAtFunc;
 
 impl ExprFunction for ByteAtFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "byteAt"
     }
@@ -122,14 +134,18 @@ impl ExprFunction for ByteAtFunc {
         Ok(NullableExprType::nullable(DataType::Int64))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let idx_val = args.remove(1);
-        let bytes_val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let idx_val = args.read(1);
+        let bytes_val = args.read(0);
         if bytes_val.is_null() || idx_val.is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(bytes_val, "byteAt")?;
-        let idx = extract_int64(idx_val, "byteAt")?;
+        let idx = extract_int64_ref(idx_val, "byteAt")?;
+        let bytes = extract_bytes_ref(bytes_val, "byteAt")?;
         if idx < 0 {
             return Ok(Value::Null);
         }
@@ -146,6 +162,10 @@ impl ExprFunction for ByteAtFunc {
 struct ByteSliceFunc;
 
 impl ExprFunction for ByteSliceFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "byteSlice"
     }
@@ -167,30 +187,26 @@ impl ExprFunction for ByteSliceFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let len_val = if args.len() == 3 {
-            Some(args.remove(2))
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let has_len = args.len() == 3;
+        if args.read(0).is_null() || args.read(1).is_null() {
+            return Ok(Value::Null);
+        }
+        if has_len && args.read(2).is_null() {
+            return Ok(Value::Null);
+        }
+
+        let start = extract_int64_ref(args.read(1), "byteSlice")?;
+        let max_len = if has_len {
+            Some(extract_int64_ref(args.read(2), "byteSlice")?)
         } else {
             None
         };
-        let start_val = args.remove(1);
-        let bytes_val = args.remove(0);
-
-        if bytes_val.is_null() || start_val.is_null() {
-            return Ok(Value::Null);
-        }
-        if let Some(ref lv) = len_val {
-            if lv.is_null() {
-                return Ok(Value::Null);
-            }
-        }
-
-        let mut bytes = extract_bytes(bytes_val, "byteSlice")?;
-        let start = extract_int64(start_val, "byteSlice")?;
-        let max_len = match len_val {
-            Some(v) => Some(extract_int64(v, "byteSlice")?),
-            None => None,
-        };
+        let bytes = extract_bytes_ref(args.read(0), "byteSlice")?;
 
         let start = if start < 0 { 0usize } else { start as usize };
 
@@ -198,17 +214,15 @@ impl ExprFunction for ByteSliceFunc {
             return Ok(Value::Bytes(Vec::new()));
         }
 
-        // In-place truncation: drain prefix, then truncate
-        if start > 0 {
-            bytes.drain(..start);
-        }
+        let end = match max_len {
+            Some(len) => {
+                let len = if len < 0 { 0usize } else { len as usize };
+                start.saturating_add(len).min(bytes.len())
+            }
+            None => bytes.len(),
+        };
 
-        if let Some(len) = max_len {
-            let len = if len < 0 { 0usize } else { len as usize };
-            bytes.truncate(len);
-        }
-
-        Ok(Value::Bytes(bytes))
+        Ok(Value::Bytes(bytes[start..end].to_vec()))
     }
 }
 
@@ -217,6 +231,10 @@ impl ExprFunction for ByteSliceFunc {
 struct BytesFromHexFunc;
 
 impl ExprFunction for BytesFromHexFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bytesFromHex"
     }
@@ -237,16 +255,33 @@ impl ExprFunction for BytesFromHexFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let val = args.read(0);
         if val.is_null() {
             return Ok(Value::Null);
         }
-        let s = extract_text(val, "bytesFromHex")?;
-        let bytes = hex::decode(&s).map_err(|e| FuncError::EncodingError {
+        let s = extract_text_ref(val, "bytesFromHex")?;
+        let bytes = hex::decode(s).map_err(|e| FuncError::EncodingError {
             reason: format!("hex decode failed: {e}"),
         })?;
         Ok(Value::Bytes(bytes))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        if let Some(Some(Value::Text(s))) = args.first() {
+            hex::decode(s).map_err(|e| FuncError::EncodingError {
+                reason: format!("hex decode failed: {e}"),
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -255,6 +290,10 @@ impl ExprFunction for BytesFromHexFunc {
 struct BytesFromBase64Func;
 
 impl ExprFunction for BytesFromBase64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bytesFromBase64"
     }
@@ -275,18 +314,37 @@ impl ExprFunction for BytesFromBase64Func {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let val = args.read(0);
         if val.is_null() {
             return Ok(Value::Null);
         }
-        let s = extract_text(val, "bytesFromBase64")?;
+        let s = extract_text_ref(val, "bytesFromBase64")?;
         let bytes = BASE64_STANDARD
             .decode(s.as_bytes())
             .map_err(|e| FuncError::EncodingError {
                 reason: format!("base64 decode failed: {e}"),
             })?;
         Ok(Value::Bytes(bytes))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        if let Some(Some(Value::Text(s))) = args.first() {
+            BASE64_STANDARD
+                .decode(s.as_bytes())
+                .map_err(|e| FuncError::EncodingError {
+                    reason: format!("base64 decode failed: {e}"),
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -295,6 +353,10 @@ impl ExprFunction for BytesFromBase64Func {
 struct BytesFromUtf8Func;
 
 impl ExprFunction for BytesFromUtf8Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bytesFromUtf8"
     }
@@ -315,13 +377,17 @@ impl ExprFunction for BytesFromUtf8Func {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let val = args.read(0);
         if val.is_null() {
             return Ok(Value::Null);
         }
-        let s = extract_text(val, "bytesFromUtf8")?;
-        Ok(Value::Bytes(s.into_bytes()))
+        let s = extract_text_ref(val, "bytesFromUtf8")?;
+        Ok(Value::Bytes(s.as_bytes().to_vec()))
     }
 }
 
@@ -330,6 +396,10 @@ impl ExprFunction for BytesFromUtf8Func {
 struct HexFunc;
 
 impl ExprFunction for HexFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "hex"
     }
@@ -350,13 +420,17 @@ impl ExprFunction for HexFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let val = args.read(0);
         if val.is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(val, "hex")?;
-        Ok(Value::Text(hex::encode(&bytes)))
+        let bytes = extract_bytes_ref(val, "hex")?;
+        Ok(Value::Text(hex::encode(bytes)))
     }
 }
 
@@ -365,6 +439,10 @@ impl ExprFunction for HexFunc {
 struct Base64Func;
 
 impl ExprFunction for Base64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "base64"
     }
@@ -385,13 +463,17 @@ impl ExprFunction for Base64Func {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let val = args.read(0);
         if val.is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(val, "base64")?;
-        Ok(Value::Text(BASE64_STANDARD.encode(&bytes)))
+        let bytes = extract_bytes_ref(val, "base64")?;
+        Ok(Value::Text(BASE64_STANDARD.encode(bytes)))
     }
 }
 
@@ -400,6 +482,10 @@ impl ExprFunction for Base64Func {
 struct Base64UrlFunc;
 
 impl ExprFunction for Base64UrlFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "base64Url"
     }
@@ -420,13 +506,17 @@ impl ExprFunction for Base64UrlFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let val = args.read(0);
         if val.is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(val, "base64Url")?;
-        Ok(Value::Text(URL_SAFE_NO_PAD.encode(&bytes)))
+        let bytes = extract_bytes_ref(val, "base64Url")?;
+        Ok(Value::Text(URL_SAFE_NO_PAD.encode(bytes)))
     }
 }
 
@@ -435,6 +525,10 @@ impl ExprFunction for Base64UrlFunc {
 struct BytesEqualFunc;
 
 impl ExprFunction for BytesEqualFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "bytesEqual"
     }
@@ -454,14 +548,16 @@ impl ExprFunction for BytesEqualFunc {
         Ok(NullableExprType::new(DataType::Bool, nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let b_val = args.remove(1);
-        let a_val = args.remove(0);
-        if a_val.is_null() || b_val.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() || args.read(1).is_null() {
             return Ok(Value::Null);
         }
-        let a = extract_bytes(a_val, "bytesEqual")?;
-        let b = extract_bytes(b_val, "bytesEqual")?;
+        let a = extract_bytes_ref(args.read(0), "bytesEqual")?;
+        let b = extract_bytes_ref(args.read(1), "bytesEqual")?;
         Ok(Value::Bool(a == b))
     }
 }
@@ -491,6 +587,10 @@ fn validate_text_arg(function: &str, dt: &DataType) -> Result<(), FuncError> {
 struct UrlEncodeFunc;
 
 impl ExprFunction for UrlEncodeFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "urlEncode"
     }
@@ -511,19 +611,27 @@ impl ExprFunction for UrlEncodeFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let val = args.read(0);
         if val.is_null() {
             return Ok(Value::Null);
         }
-        let s = extract_text(val, "urlEncode")?;
-        Ok(Value::Text(urlencoding::encode(&s).into_owned()))
+        let s = extract_text_ref(val, "urlEncode")?;
+        Ok(Value::Text(urlencoding::encode(s).into_owned()))
     }
 }
 
 struct UrlDecodeFunc;
 
 impl ExprFunction for UrlDecodeFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "urlDecode"
     }
@@ -544,13 +652,17 @@ impl ExprFunction for UrlDecodeFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let val = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let val = args.read(0);
         if val.is_null() {
             return Ok(Value::Null);
         }
-        let s = extract_text(val, "urlDecode")?;
-        let decoded = urlencoding::decode(&s).map_err(|e| FuncError::EncodingError {
+        let s = extract_text_ref(val, "urlDecode")?;
+        let decoded = urlencoding::decode(s).map_err(|e| FuncError::EncodingError {
             reason: format!("URL decode failed: {e}"),
         })?;
         Ok(Value::Text(decoded.into_owned()))
@@ -561,184 +673,251 @@ impl ExprFunction for UrlDecodeFunc {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::ctx;
+    use crate::test_support::{ctx, eval};
 
     #[test]
     fn hex_roundtrip() {
         let original = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let encoded = HexFunc
-            .evaluate(vec![Value::Bytes(original.clone())], &ctx())
-            .unwrap();
+        let encoded = eval(
+            &HexFunc,
+            smallvec::smallvec![Value::Bytes(original.clone())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(encoded, Value::Text("deadbeef".into()));
 
-        let decoded = BytesFromHexFunc
-            .evaluate(vec![Value::Text("deadbeef".into())], &ctx())
-            .unwrap();
+        let decoded = eval(
+            &BytesFromHexFunc,
+            smallvec::smallvec![Value::Text("deadbeef".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(decoded, Value::Bytes(original));
     }
 
     #[test]
     fn base64_roundtrip() {
         let original = vec![0x01, 0x02, 0x03, 0x04, 0x05];
-        let encoded = Base64Func
-            .evaluate(vec![Value::Bytes(original.clone())], &ctx())
-            .unwrap();
+        let encoded = eval(
+            &Base64Func,
+            smallvec::smallvec![Value::Bytes(original.clone())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(encoded, Value::Text("AQIDBAU=".into()));
 
-        let decoded = BytesFromBase64Func
-            .evaluate(vec![Value::Text("AQIDBAU=".into())], &ctx())
-            .unwrap();
+        let decoded = eval(
+            &BytesFromBase64Func,
+            smallvec::smallvec![Value::Text("AQIDBAU=".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(decoded, Value::Bytes(original));
     }
 
     #[test]
     fn base64_url_no_padding() {
         let original = vec![0x01, 0x02, 0x03, 0x04, 0x05];
-        let encoded = Base64UrlFunc
-            .evaluate(vec![Value::Bytes(original)], &ctx())
-            .unwrap();
+        let encoded = eval(
+            &Base64UrlFunc,
+            smallvec::smallvec![Value::Bytes(original)],
+            &ctx(),
+        )
+        .unwrap();
         // URL-safe base64 with no padding
         assert_eq!(encoded, Value::Text("AQIDBAU".into()));
     }
 
     #[test]
     fn byte_length_basic() {
-        let result = ByteLengthFunc
-            .evaluate(vec![Value::Bytes(vec![1, 2, 3, 4, 5])], &ctx())
-            .unwrap();
+        let result = eval(
+            &ByteLengthFunc,
+            smallvec::smallvec![Value::Bytes(vec![1, 2, 3, 4, 5])],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(5));
     }
 
     #[test]
     fn byte_length_empty() {
-        let result = ByteLengthFunc
-            .evaluate(vec![Value::Bytes(vec![])], &ctx())
-            .unwrap();
+        let result = eval(
+            &ByteLengthFunc,
+            smallvec::smallvec![Value::Bytes(vec![])],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(0));
     }
 
     #[test]
     fn byte_at_valid_index() {
-        let result = ByteAtFunc
-            .evaluate(
-                vec![Value::Bytes(vec![10, 20, 30]), Value::Int64(1)],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &ByteAtFunc,
+            smallvec::smallvec![Value::Bytes(vec![10, 20, 30]), Value::Int64(1)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(20));
     }
 
     #[test]
     fn byte_at_out_of_bounds() {
-        let result = ByteAtFunc
-            .evaluate(
-                vec![Value::Bytes(vec![10, 20, 30]), Value::Int64(10)],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &ByteAtFunc,
+            smallvec::smallvec![Value::Bytes(vec![10, 20, 30]), Value::Int64(10)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn byte_at_negative_index() {
-        let result = ByteAtFunc
-            .evaluate(
-                vec![Value::Bytes(vec![10, 20, 30]), Value::Int64(-1)],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &ByteAtFunc,
+            smallvec::smallvec![Value::Bytes(vec![10, 20, 30]), Value::Int64(-1)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn byte_slice_with_length() {
-        let result = ByteSliceFunc
-            .evaluate(
-                vec![
-                    Value::Bytes(vec![1, 2, 3, 4, 5]),
-                    Value::Int64(1),
-                    Value::Int64(3),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &ByteSliceFunc,
+            smallvec::smallvec![
+                Value::Bytes(vec![1, 2, 3, 4, 5]),
+                Value::Int64(1),
+                Value::Int64(3),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bytes(vec![2, 3, 4]));
     }
 
     #[test]
     fn byte_slice_without_length() {
-        let result = ByteSliceFunc
-            .evaluate(
-                vec![Value::Bytes(vec![1, 2, 3, 4, 5]), Value::Int64(2)],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &ByteSliceFunc,
+            smallvec::smallvec![Value::Bytes(vec![1, 2, 3, 4, 5]), Value::Int64(2)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bytes(vec![3, 4, 5]));
     }
 
     #[test]
     fn byte_slice_start_beyond_end() {
-        let result = ByteSliceFunc
-            .evaluate(vec![Value::Bytes(vec![1, 2, 3]), Value::Int64(10)], &ctx())
-            .unwrap();
+        let result = eval(
+            &ByteSliceFunc,
+            smallvec::smallvec![Value::Bytes(vec![1, 2, 3]), Value::Int64(10)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bytes(vec![]));
     }
 
     #[test]
     fn bytes_from_utf8_basic() {
-        let result = BytesFromUtf8Func
-            .evaluate(vec![Value::Text("hello".into())], &ctx())
-            .unwrap();
+        let result = eval(
+            &BytesFromUtf8Func,
+            smallvec::smallvec![Value::Text("hello".into())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bytes(b"hello".to_vec()));
     }
 
     #[test]
     fn bytes_equal_true() {
-        let result = BytesEqualFunc
-            .evaluate(
-                vec![Value::Bytes(vec![1, 2, 3]), Value::Bytes(vec![1, 2, 3])],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &BytesEqualFunc,
+            smallvec::smallvec![Value::Bytes(vec![1, 2, 3]), Value::Bytes(vec![1, 2, 3])],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(true));
     }
 
     #[test]
     fn bytes_equal_false() {
-        let result = BytesEqualFunc
-            .evaluate(
-                vec![Value::Bytes(vec![1, 2, 3]), Value::Bytes(vec![4, 5, 6])],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &BytesEqualFunc,
+            smallvec::smallvec![Value::Bytes(vec![1, 2, 3]), Value::Bytes(vec![4, 5, 6])],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Bool(false));
     }
 
     #[test]
     fn null_propagation_byte_length() {
-        let result = ByteLengthFunc.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&ByteLengthFunc, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn null_propagation_hex() {
-        let result = HexFunc.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&HexFunc, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn null_propagation_bytes_equal() {
-        let result = BytesEqualFunc
-            .evaluate(vec![Value::Bytes(vec![1, 2, 3]), Value::Null], &ctx())
-            .unwrap();
+        let result = eval(
+            &BytesEqualFunc,
+            smallvec::smallvec![Value::Bytes(vec![1, 2, 3]), Value::Null],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn null_propagation_byte_slice() {
-        let result = ByteSliceFunc
-            .evaluate(vec![Value::Null, Value::Int64(0)], &ctx())
-            .unwrap();
+        let result = eval(
+            &ByteSliceFunc,
+            smallvec::smallvec![Value::Null, Value::Int64(0)],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn validate_const_from_hex_valid_ok() {
+        let s = Value::Text("deadbeef".into());
+        let result = BytesFromHexFunc.validate_const_args(&[Some(&s)], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_from_hex_dynamic_ok() {
+        let result = BytesFromHexFunc.validate_const_args(&[None], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_from_hex_invalid_errors() {
+        let s = Value::Text("xyz".into());
+        let result = BytesFromHexFunc.validate_const_args(&[Some(&s)], &ctx());
+        assert!(matches!(result, Err(FuncError::EncodingError { .. })));
+    }
+
+    #[test]
+    fn validate_const_from_base64_valid_ok() {
+        let s = Value::Text("AQIDBAU=".into());
+        let result = BytesFromBase64Func.validate_const_args(&[Some(&s)], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_const_from_base64_invalid_errors() {
+        let s = Value::Text("not valid base64!!!".into());
+        let result = BytesFromBase64Func.validate_const_args(&[Some(&s)], &ctx());
+        assert!(matches!(result, Err(FuncError::EncodingError { .. })));
     }
 }

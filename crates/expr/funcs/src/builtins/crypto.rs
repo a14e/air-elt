@@ -9,7 +9,7 @@ use xxhash_rust::xxh64::xxh64;
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
-use crate::signature::{EvalContext, ExprFunction};
+use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
 static MD5: Md5Func = Md5Func;
 static SHA1: Sha1Func = Sha1Func;
@@ -46,11 +46,11 @@ fn hash_to_hex<D: Digest>(input: &[u8]) -> String {
     hex::encode(result)
 }
 
-fn extract_bytes(value: Value, function_name: &str) -> Result<Vec<u8>, FuncError> {
+fn extract_bytes_ref<'a>(value: &'a Value, function_name: &str) -> Result<&'a [u8], FuncError> {
     match value {
-        Value::Text(s) => Ok(s.into_bytes()),
+        Value::Text(s) => Ok(s.as_bytes()),
         Value::Bytes(b) => Ok(b),
-        Value::Null => Ok(vec![]),
+        Value::Null => Ok(&[]),
         other => Err(FuncError::TypeMismatch {
             function: function_name.to_owned(),
             expected: "Text or Bytes".to_owned(),
@@ -66,6 +66,10 @@ fn extract_bytes(value: Value, function_name: &str) -> Result<Vec<u8>, FuncError
 struct Md5Func;
 
 impl ExprFunction for Md5Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "md5"
     }
@@ -85,13 +89,17 @@ impl ExprFunction for Md5Func {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let input = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let input = args.read(0);
         if input.is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(input, "md5")?;
-        Ok(Value::Text(hash_to_hex::<Md5>(&bytes)))
+        let bytes = extract_bytes_ref(input, "md5")?;
+        Ok(Value::Text(hash_to_hex::<Md5>(bytes)))
     }
 }
 
@@ -102,6 +110,10 @@ impl ExprFunction for Md5Func {
 struct Sha1Func;
 
 impl ExprFunction for Sha1Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "sha1"
     }
@@ -121,13 +133,17 @@ impl ExprFunction for Sha1Func {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let input = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let input = args.read(0);
         if input.is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(input, "sha1")?;
-        Ok(Value::Text(hash_to_hex::<Sha1>(&bytes)))
+        let bytes = extract_bytes_ref(input, "sha1")?;
+        Ok(Value::Text(hash_to_hex::<Sha1>(bytes)))
     }
 }
 
@@ -138,6 +154,10 @@ impl ExprFunction for Sha1Func {
 struct Sha256Func;
 
 impl ExprFunction for Sha256Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "sha256"
     }
@@ -157,13 +177,17 @@ impl ExprFunction for Sha256Func {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let input = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let input = args.read(0);
         if input.is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(input, "sha256")?;
-        Ok(Value::Text(hash_to_hex::<Sha256>(&bytes)))
+        let bytes = extract_bytes_ref(input, "sha256")?;
+        Ok(Value::Text(hash_to_hex::<Sha256>(bytes)))
     }
 }
 
@@ -174,6 +198,10 @@ impl ExprFunction for Sha256Func {
 struct Sha512Func;
 
 impl ExprFunction for Sha512Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "sha512"
     }
@@ -193,13 +221,17 @@ impl ExprFunction for Sha512Func {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let input = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let input = args.read(0);
         if input.is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(input, "sha512")?;
-        Ok(Value::Text(hash_to_hex::<Sha512>(&bytes)))
+        let bytes = extract_bytes_ref(input, "sha512")?;
+        Ok(Value::Text(hash_to_hex::<Sha512>(bytes)))
     }
 }
 
@@ -210,6 +242,10 @@ impl ExprFunction for Sha512Func {
 struct XxHash64Func;
 
 impl ExprFunction for XxHash64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "xxHash64"
     }
@@ -226,13 +262,17 @@ impl ExprFunction for XxHash64Func {
         Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let input = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let input = args.read(0);
         if input.is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(input, "xxHash64")?;
-        let hash = xxh64(&bytes, 0);
+        let bytes = extract_bytes_ref(input, "xxHash64")?;
+        let hash = xxh64(bytes, 0);
         Ok(Value::Int64(hash as i64))
     }
 }
@@ -244,6 +284,10 @@ impl ExprFunction for XxHash64Func {
 struct XxHash32Func;
 
 impl ExprFunction for XxHash32Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "xxHash32"
     }
@@ -260,13 +304,17 @@ impl ExprFunction for XxHash32Func {
         Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let input = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let input = args.read(0);
         if input.is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(input, "xxHash32")?;
-        let hash = xxh32(&bytes, 0);
+        let bytes = extract_bytes_ref(input, "xxHash32")?;
+        let hash = xxh32(bytes, 0);
         Ok(Value::Int64(i64::from(hash)))
     }
 }
@@ -278,9 +326,25 @@ impl ExprFunction for XxHash32Func {
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
 
+/// Supported HMAC algorithm labels (arg index 0). Shared by `evaluate` and
+/// `validate_const_args` so the accepted set never drifts.
+const HMAC_ALGORITHMS: [&str; 2] = ["sha256", "sha512"];
+
+/// Builds the "unsupported algorithm" error for an unrecognised HMAC label.
+fn unsupported_hmac_algorithm_error(algorithm: &str) -> FuncError {
+    FuncError::EvalFailed {
+        function: "hmac".to_owned(),
+        reason: format!("unsupported algorithm: {algorithm} (supported: sha256, sha512)"),
+    }
+}
+
 struct HmacFunc;
 
 impl ExprFunction for HmacFunc {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "hmac"
     }
@@ -301,17 +365,17 @@ impl ExprFunction for HmacFunc {
         ))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let key = args.remove(2);
-        let message = args.remove(1);
-        let algorithm = args.remove(0);
-
-        if algorithm.is_null() || message.is_null() || key.is_null() {
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        if args.read(0).is_null() || args.read(1).is_null() || args.read(2).is_null() {
             return Ok(Value::Null);
         }
 
-        let algorithm_str = match algorithm {
-            Value::Text(s) => s,
+        let algorithm_str = match args.read(0) {
+            Value::Text(s) => s.as_str(),
             other => {
                 return Err(FuncError::TypeMismatch {
                     function: "hmac".to_owned(),
@@ -321,37 +385,45 @@ impl ExprFunction for HmacFunc {
             }
         };
 
-        let message_bytes = extract_bytes(message, "hmac")?;
-        let key_bytes = extract_bytes(key, "hmac")?;
+        let message_bytes = extract_bytes_ref(args.read(1), "hmac")?;
+        let key_bytes = extract_bytes_ref(args.read(2), "hmac")?;
 
-        let hex_result = match algorithm_str.as_str() {
+        let hex_result = match algorithm_str {
             "sha256" => {
                 let mut mac =
-                    HmacSha256::new_from_slice(&key_bytes).map_err(|e| FuncError::EvalFailed {
+                    HmacSha256::new_from_slice(key_bytes).map_err(|e| FuncError::EvalFailed {
                         function: "hmac".to_owned(),
                         reason: format!("invalid key: {e}"),
                     })?;
-                mac.update(&message_bytes);
+                mac.update(message_bytes);
                 hex::encode(mac.finalize().into_bytes())
             }
             "sha512" => {
                 let mut mac =
-                    HmacSha512::new_from_slice(&key_bytes).map_err(|e| FuncError::EvalFailed {
+                    HmacSha512::new_from_slice(key_bytes).map_err(|e| FuncError::EvalFailed {
                         function: "hmac".to_owned(),
                         reason: format!("invalid key: {e}"),
                     })?;
-                mac.update(&message_bytes);
+                mac.update(message_bytes);
                 hex::encode(mac.finalize().into_bytes())
             }
-            other => {
-                return Err(FuncError::EvalFailed {
-                    function: "hmac".to_owned(),
-                    reason: format!("unsupported algorithm: {other} (supported: sha256, sha512)"),
-                });
-            }
+            other => return Err(unsupported_hmac_algorithm_error(other)),
         };
 
         Ok(Value::Text(hex_result))
+    }
+
+    fn validate_const_args(
+        &self,
+        args: &[Option<&Value>],
+        _context: &EvalContext,
+    ) -> Result<(), FuncError> {
+        if let Some(Some(Value::Text(algorithm))) = args.first() {
+            if !HMAC_ALGORITHMS.contains(&algorithm.as_str()) {
+                return Err(unsupported_hmac_algorithm_error(algorithm));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -362,6 +434,10 @@ impl ExprFunction for HmacFunc {
 struct CityHash64Func;
 
 impl ExprFunction for CityHash64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cityHash64"
     }
@@ -378,13 +454,17 @@ impl ExprFunction for CityHash64Func {
         Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let input = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let input = args.read(0);
         if input.is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(input, "cityHash64")?;
-        let hash = city_hash_64(&bytes);
+        let bytes = extract_bytes_ref(input, "cityHash64")?;
+        let hash = city_hash_64(bytes);
         Ok(Value::Int64(hash as i64))
     }
 }
@@ -400,6 +480,10 @@ fn city_hash_64(data: &[u8]) -> u64 {
 struct SipHash64Func;
 
 impl ExprFunction for SipHash64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "sipHash64"
     }
@@ -416,13 +500,17 @@ impl ExprFunction for SipHash64Func {
         Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let input = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let input = args.read(0);
         if input.is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(input, "sipHash64")?;
-        let hash = sip_hash_64(&bytes);
+        let bytes = extract_bytes_ref(input, "sipHash64")?;
+        let hash = sip_hash_64(bytes);
         Ok(Value::Int64(hash as i64))
     }
 }
@@ -442,6 +530,10 @@ fn sip_hash_64(data: &[u8]) -> u64 {
 struct Fnv1a64Func;
 
 impl ExprFunction for Fnv1a64Func {
+    fn is_pure(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "fnv1a64"
     }
@@ -458,13 +550,17 @@ impl ExprFunction for Fnv1a64Func {
         Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
     }
 
-    fn evaluate(&self, mut args: Vec<Value>, _context: &EvalContext) -> Result<Value, FuncError> {
-        let input = args.remove(0);
+    fn evaluate(
+        &self,
+        args: &mut dyn ArgWindow,
+        _context: &EvalContext,
+    ) -> Result<Value, FuncError> {
+        let input = args.read(0);
         if input.is_null() {
             return Ok(Value::Null);
         }
-        let bytes = extract_bytes(input, "fnv1a64")?;
-        let hash = fnv1a_64(&bytes);
+        let bytes = extract_bytes_ref(input, "fnv1a64")?;
+        let hash = fnv1a_64(bytes);
         Ok(Value::Int64(hash as i64))
     }
 }
@@ -486,13 +582,16 @@ fn fnv1a_64(data: &[u8]) -> u64 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::test_support::ctx;
+    use crate::test_support::{ctx, eval};
 
     #[test]
     fn md5_empty_string() {
-        let result = Md5Func
-            .evaluate(vec![Value::Text(String::new())], &ctx())
-            .unwrap();
+        let result = eval(
+            &Md5Func,
+            smallvec::smallvec![Value::Text(String::new())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(
             result,
             Value::Text("d41d8cd98f00b204e9800998ecf8427e".to_owned())
@@ -501,15 +600,18 @@ mod tests {
 
     #[test]
     fn md5_null_propagation() {
-        let result = Md5Func.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&Md5Func, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn sha1_hello() {
-        let result = Sha1Func
-            .evaluate(vec![Value::Text("hello".to_owned())], &ctx())
-            .unwrap();
+        let result = eval(
+            &Sha1Func,
+            smallvec::smallvec![Value::Text("hello".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(
             result,
             Value::Text("aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_owned())
@@ -518,15 +620,18 @@ mod tests {
 
     #[test]
     fn sha1_null_propagation() {
-        let result = Sha1Func.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&Sha1Func, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn sha256_hello() {
-        let result = Sha256Func
-            .evaluate(vec![Value::Text("hello".to_owned())], &ctx())
-            .unwrap();
+        let result = eval(
+            &Sha256Func,
+            smallvec::smallvec![Value::Text("hello".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(
             result,
             Value::Text(
@@ -537,15 +642,18 @@ mod tests {
 
     #[test]
     fn sha256_null_propagation() {
-        let result = Sha256Func.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&Sha256Func, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn sha512_non_empty() {
-        let result = Sha512Func
-            .evaluate(vec![Value::Text("hello".to_owned())], &ctx())
-            .unwrap();
+        let result = eval(
+            &Sha512Func,
+            smallvec::smallvec![Value::Text("hello".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         match result {
             Value::Text(hex) => {
                 assert_eq!(hex.len(), 128);
@@ -561,52 +669,52 @@ mod tests {
 
     #[test]
     fn sha512_null_propagation() {
-        let result = Sha512Func.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&Sha512Func, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn xxhash64_deterministic() {
         let input = Value::Text("test data".to_owned());
-        let result_a = XxHash64Func.evaluate(vec![input.clone()], &ctx()).unwrap();
-        let result_b = XxHash64Func.evaluate(vec![input], &ctx()).unwrap();
+        let result_a = eval(&XxHash64Func, smallvec::smallvec![input.clone()], &ctx()).unwrap();
+        let result_b = eval(&XxHash64Func, smallvec::smallvec![input], &ctx()).unwrap();
         assert_eq!(result_a, result_b);
         assert!(matches!(result_a, Value::Int64(_)));
     }
 
     #[test]
     fn xxhash64_null_propagation() {
-        let result = XxHash64Func.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&XxHash64Func, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn xxhash32_deterministic() {
         let input = Value::Text("test data".to_owned());
-        let result_a = XxHash32Func.evaluate(vec![input.clone()], &ctx()).unwrap();
-        let result_b = XxHash32Func.evaluate(vec![input], &ctx()).unwrap();
+        let result_a = eval(&XxHash32Func, smallvec::smallvec![input.clone()], &ctx()).unwrap();
+        let result_b = eval(&XxHash32Func, smallvec::smallvec![input], &ctx()).unwrap();
         assert_eq!(result_a, result_b);
         assert!(matches!(result_a, Value::Int64(_)));
     }
 
     #[test]
     fn xxhash32_null_propagation() {
-        let result = XxHash32Func.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&XxHash32Func, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn hmac_sha256_known_value() {
-        let result = HmacFunc
-            .evaluate(
-                vec![
-                    Value::Text("sha256".to_owned()),
-                    Value::Text("message".to_owned()),
-                    Value::Text("key".to_owned()),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &HmacFunc,
+            smallvec::smallvec![
+                Value::Text("sha256".to_owned()),
+                Value::Text("message".to_owned()),
+                Value::Text("key".to_owned()),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(
             result,
             Value::Text(
@@ -617,16 +725,16 @@ mod tests {
 
     #[test]
     fn hmac_sha512_known_value() {
-        let result = HmacFunc
-            .evaluate(
-                vec![
-                    Value::Text("sha512".to_owned()),
-                    Value::Text("message".to_owned()),
-                    Value::Text("key".to_owned()),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &HmacFunc,
+            smallvec::smallvec![
+                Value::Text("sha512".to_owned()),
+                Value::Text("message".to_owned()),
+                Value::Text("key".to_owned()),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         match result {
             Value::Text(hex) => assert_eq!(hex.len(), 128),
             other => panic!("expected Text, got {other:?}"),
@@ -635,23 +743,24 @@ mod tests {
 
     #[test]
     fn hmac_null_propagation() {
-        let result = HmacFunc
-            .evaluate(
-                vec![
-                    Value::Text("sha256".to_owned()),
-                    Value::Null,
-                    Value::Text("key".to_owned()),
-                ],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &HmacFunc,
+            smallvec::smallvec![
+                Value::Text("sha256".to_owned()),
+                Value::Null,
+                Value::Text("key".to_owned()),
+            ],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn hmac_unsupported_algorithm() {
-        let result = HmacFunc.evaluate(
-            vec![
+        let result = eval(
+            &HmacFunc,
+            smallvec::smallvec![
                 Value::Text("md5".to_owned()),
                 Value::Text("message".to_owned()),
                 Value::Text("key".to_owned()),
@@ -662,23 +771,46 @@ mod tests {
     }
 
     #[test]
+    fn hmac_validate_const_valid_ok() {
+        let algorithm = Value::Text("sha512".to_owned());
+        let result = HmacFunc.validate_const_args(&[Some(&algorithm), None, None], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn hmac_validate_const_dynamic_ok() {
+        let result = HmacFunc.validate_const_args(&[None, None, None], &ctx());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn hmac_validate_const_invalid_errors() {
+        let algorithm = Value::Text("md5".to_owned());
+        let result = HmacFunc.validate_const_args(&[Some(&algorithm), None, None], &ctx());
+        assert!(matches!(result, Err(FuncError::EvalFailed { .. })));
+    }
+
+    #[test]
     fn md5_bytes_input() {
-        let result = Md5Func
-            .evaluate(
-                vec![Value::Bytes(vec![0x68, 0x65, 0x6c, 0x6c, 0x6f])],
-                &ctx(),
-            )
-            .unwrap();
+        let result = eval(
+            &Md5Func,
+            smallvec::smallvec![Value::Bytes(vec![0x68, 0x65, 0x6c, 0x6c, 0x6f])],
+            &ctx(),
+        )
+        .unwrap();
         // "hello" in bytes
-        let expected = Md5Func
-            .evaluate(vec![Value::Text("hello".to_owned())], &ctx())
-            .unwrap();
+        let expected = eval(
+            &Md5Func,
+            smallvec::smallvec![Value::Text("hello".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, expected);
     }
 
     #[test]
     fn type_mismatch_on_non_bytes_input() {
-        let result = Md5Func.evaluate(vec![Value::Int64(42)], &ctx());
+        let result = eval(&Md5Func, smallvec::smallvec![Value::Int64(42)], &ctx());
         assert!(matches!(result, Err(FuncError::TypeMismatch { .. })));
     }
 
@@ -686,34 +818,46 @@ mod tests {
 
     #[test]
     fn city_hash64_deterministic_with_golden_value() {
-        let result = CityHash64Func
-            .evaluate(vec![Value::Text("test data".to_owned())], &ctx())
-            .unwrap();
+        let result = eval(
+            &CityHash64Func,
+            smallvec::smallvec![Value::Text("test data".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         // Golden value from ch_cityhash102 reference (ClickHouse CityHash v1.0.2)
         let expected = ch_cityhash102::cityhash64(b"test data") as i64;
         assert_eq!(result, Value::Int64(expected));
 
-        let empty = CityHash64Func
-            .evaluate(vec![Value::Text(String::new())], &ctx())
-            .unwrap();
+        let empty = eval(
+            &CityHash64Func,
+            smallvec::smallvec![Value::Text(String::new())],
+            &ctx(),
+        )
+        .unwrap();
         let expected_empty = ch_cityhash102::cityhash64(b"") as i64;
         assert_eq!(empty, Value::Int64(expected_empty));
     }
 
     #[test]
     fn city_hash64_null_propagation() {
-        let result = CityHash64Func.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&CityHash64Func, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn city_hash64_different_inputs_different_hashes() {
-        let result_a = CityHash64Func
-            .evaluate(vec![Value::Text("hello".to_owned())], &ctx())
-            .unwrap();
-        let result_b = CityHash64Func
-            .evaluate(vec![Value::Text("world".to_owned())], &ctx())
-            .unwrap();
+        let result_a = eval(
+            &CityHash64Func,
+            smallvec::smallvec![Value::Text("hello".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
+        let result_b = eval(
+            &CityHash64Func,
+            smallvec::smallvec![Value::Text("world".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_ne!(result_a, result_b);
     }
 
@@ -722,26 +866,32 @@ mod tests {
     #[test]
     fn sip_hash64_deterministic() {
         let input = Value::Text("test data".to_owned());
-        let result_a = SipHash64Func.evaluate(vec![input.clone()], &ctx()).unwrap();
-        let result_b = SipHash64Func.evaluate(vec![input], &ctx()).unwrap();
+        let result_a = eval(&SipHash64Func, smallvec::smallvec![input.clone()], &ctx()).unwrap();
+        let result_b = eval(&SipHash64Func, smallvec::smallvec![input], &ctx()).unwrap();
         assert_eq!(result_a, result_b);
         assert!(matches!(result_a, Value::Int64(_)));
     }
 
     #[test]
     fn sip_hash64_null_propagation() {
-        let result = SipHash64Func.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&SipHash64Func, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn sip_hash64_different_inputs_different_hashes() {
-        let result_a = SipHash64Func
-            .evaluate(vec![Value::Text("hello".to_owned())], &ctx())
-            .unwrap();
-        let result_b = SipHash64Func
-            .evaluate(vec![Value::Text("world".to_owned())], &ctx())
-            .unwrap();
+        let result_a = eval(
+            &SipHash64Func,
+            smallvec::smallvec![Value::Text("hello".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
+        let result_b = eval(
+            &SipHash64Func,
+            smallvec::smallvec![Value::Text("world".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_ne!(result_a, result_b);
     }
 
@@ -750,50 +900,62 @@ mod tests {
     #[test]
     fn fnv1a64_deterministic() {
         let input = Value::Text("test data".to_owned());
-        let result_a = Fnv1a64Func.evaluate(vec![input.clone()], &ctx()).unwrap();
-        let result_b = Fnv1a64Func.evaluate(vec![input], &ctx()).unwrap();
+        let result_a = eval(&Fnv1a64Func, smallvec::smallvec![input.clone()], &ctx()).unwrap();
+        let result_b = eval(&Fnv1a64Func, smallvec::smallvec![input], &ctx()).unwrap();
         assert_eq!(result_a, result_b);
         assert!(matches!(result_a, Value::Int64(_)));
     }
 
     #[test]
     fn fnv1a64_null_propagation() {
-        let result = Fnv1a64Func.evaluate(vec![Value::Null], &ctx()).unwrap();
+        let result = eval(&Fnv1a64Func, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 
     #[test]
     fn fnv1a64_known_value_empty() {
         // FNV-1a offset basis for empty input is the offset basis itself
-        let result = Fnv1a64Func
-            .evaluate(vec![Value::Text(String::new())], &ctx())
-            .unwrap();
+        let result = eval(
+            &Fnv1a64Func,
+            smallvec::smallvec![Value::Text(String::new())],
+            &ctx(),
+        )
+        .unwrap();
         // FNV-1a 64-bit offset basis = 0xcbf29ce484222325
         assert_eq!(result, Value::Int64(0xcbf2_9ce4_8422_2325_u64 as i64));
     }
 
     #[test]
     fn fnv1a64_different_inputs_different_hashes() {
-        let result_a = Fnv1a64Func
-            .evaluate(vec![Value::Text("hello".to_owned())], &ctx())
-            .unwrap();
-        let result_b = Fnv1a64Func
-            .evaluate(vec![Value::Text("world".to_owned())], &ctx())
-            .unwrap();
+        let result_a = eval(
+            &Fnv1a64Func,
+            smallvec::smallvec![Value::Text("hello".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
+        let result_b = eval(
+            &Fnv1a64Func,
+            smallvec::smallvec![Value::Text("world".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_ne!(result_a, result_b);
     }
 
     #[test]
     fn fnv1a64_bytes_input() {
-        let result = Fnv1a64Func
-            .evaluate(
-                vec![Value::Bytes(vec![0x68, 0x65, 0x6c, 0x6c, 0x6f])],
-                &ctx(),
-            )
-            .unwrap();
-        let expected = Fnv1a64Func
-            .evaluate(vec![Value::Text("hello".to_owned())], &ctx())
-            .unwrap();
+        let result = eval(
+            &Fnv1a64Func,
+            smallvec::smallvec![Value::Bytes(vec![0x68, 0x65, 0x6c, 0x6c, 0x6f])],
+            &ctx(),
+        )
+        .unwrap();
+        let expected = eval(
+            &Fnv1a64Func,
+            smallvec::smallvec![Value::Text("hello".to_owned())],
+            &ctx(),
+        )
+        .unwrap();
         assert_eq!(result, expected);
     }
 }

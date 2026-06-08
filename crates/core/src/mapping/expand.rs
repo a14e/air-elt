@@ -83,6 +83,12 @@ pub struct DirectMapping {
     pub truncate: bool,
     pub default_literal: Option<toml::Value>,
     pub switch: Option<SwitchSpec>,
+    /// Expression script for a computed column (`compute = "<expr>"`).
+    /// `None` for ordinary `from`-driven / switch columns. When `Some`,
+    /// `from` is empty — the column reads its inputs from the script —
+    /// and the plan stage compiles + lowers it (literal / `Take` /
+    /// per-row `Compute`).
+    pub compute: Option<String>,
 }
 
 /// Raw switch-table spec attached to a [`DirectMapping`]. `cases` keeps
@@ -224,6 +230,7 @@ pub fn expand(
                 truncate: false,
                 default_literal: None,
                 switch: None,
+                compute: None,
             });
         }
     }
@@ -244,6 +251,7 @@ pub fn expand(
                 truncate: *truncate,
                 default_literal: default_literal.clone(),
                 switch: None,
+                compute: None,
             },
             ColumnMapping::Switch {
                 from,
@@ -259,6 +267,24 @@ pub fn expand(
                 switch: Some(SwitchSpec {
                     cases: cases.clone(),
                 }),
+                compute: None,
+            },
+            // Computed columns are 1:1 outputs like Direct — carried with an
+            // empty `from` and the script in `compute`. The plan stage
+            // compiles + lowers them; the source columns the script reads
+            // are unioned into the read projection there.
+            ColumnMapping::Compute {
+                to,
+                expr_source,
+                truncate,
+                default_literal,
+            } => DirectMapping {
+                from: String::new(),
+                to: to.clone(),
+                truncate: *truncate,
+                default_literal: default_literal.clone(),
+                switch: None,
+                compute: Some(expr_source.clone()),
             },
             ColumnMapping::Wildcard | ColumnMapping::Body { .. } => continue,
         };
@@ -288,6 +314,10 @@ pub fn expand(
         let mut source_columns: Vec<String> = Vec::new();
         let mut seen: ahash::AHashSet<String> = ahash::AHashSet::new();
         for d in &direct {
+            // Compute columns have no source `from` to fold into the body.
+            if d.compute.is_some() {
+                continue;
+            }
             if seen.insert(d.from.clone()) {
                 source_columns.push(d.from.clone());
             }
@@ -328,7 +358,15 @@ impl ExpandedMapping {
     /// the validation pipeline and the runner-side rebuild path so both
     /// produce byte-identical read columns.
     pub fn read_columns(&self) -> Vec<String> {
-        let mut cols: Vec<String> = self.direct.iter().map(|d| d.from.clone()).collect();
+        // Compute columns carry an empty `from` — they read their inputs
+        // through the script, and those columns are unioned into the
+        // projection by the plan stage (after the script is compiled).
+        let mut cols: Vec<String> = self
+            .direct
+            .iter()
+            .filter(|d| d.compute.is_none())
+            .map(|d| d.from.clone())
+            .collect();
         if let Some(jp) = &self.body {
             for col in &jp.source_columns {
                 if !cols.iter().any(|c| c == col) {
@@ -437,6 +475,7 @@ mod tests {
             truncate: false,
             default_literal: None,
             switch: None,
+            compute: None,
         }
     }
 

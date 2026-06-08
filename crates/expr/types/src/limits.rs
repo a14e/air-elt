@@ -1,11 +1,17 @@
 /// Maximum nesting depth for expression AST nodes.
 pub const MAX_EXPR_DEPTH: usize = 128;
 
-/// Maximum length of a single expression source string in bytes.
-pub const MAX_EXPR_SOURCE_LEN: usize = 65_536;
+/// Maximum length of a single expression source string in bytes. Bounds the
+/// lexer, which holds the whole token stream in memory (≈ O(len)); 1 MiB admits
+/// large generated dispatch expressions while keeping that cost modest.
+pub const MAX_EXPR_SOURCE_LEN: usize = 1_048_576;
 
-/// Maximum number of AST nodes in a single parsed expression.
-pub const MAX_AST_NODES: usize = 10_000;
+/// Maximum number of AST nodes in a single parsed expression. Sized to admit
+/// large generated `multiIf` / `if`-`else if` ladders (thousands of branches).
+/// Capped below `u16::MAX` because the optimizer compacts every node into a
+/// `u16`-indexed arena — a larger budget would need the arena (and its index
+/// types) widened to `u32`.
+pub const MAX_AST_NODES: usize = 60_000;
 
 /// Maximum number of arguments a function call can accept.
 pub const MAX_FUNCTION_ARGS: usize = 128;
@@ -25,7 +31,9 @@ pub const MAX_EXPR_FILE_BYTES: usize = 1_048_576;
 /// Maximum nesting depth for object literals in expressions.
 pub const MAX_OBJECT_DEPTH: usize = 128;
 
-/// Names reserved for control-flow expressions handled at the AST level.
-/// These cannot be registered as regular functions.
-pub const RESERVED_CONTROL_FLOW_NAMES: &[&str] =
-    &["if", "multiIf", "coalesce", "ifNull", "nullIf", "and", "or"];
+/// Names reserved for expressions handled at the AST level (control flow,
+/// plus the `field`/`fields` source-reference grammar). These cannot be
+/// registered as regular functions.
+pub const RESERVED_CONTROL_FLOW_NAMES: &[&str] = &[
+    "if", "multiIf", "coalesce", "ifNull", "nullIf", "and", "or", "field", "fields",
+];

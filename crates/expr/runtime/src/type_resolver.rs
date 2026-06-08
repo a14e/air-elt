@@ -57,6 +57,7 @@ impl<'a> TypeCheckerState<'a> {
             Expr::Conditional(conditional) => self.check_conditional(conditional),
             Expr::Interpolation(segments) => self.check_interpolation(segments),
             Expr::Object(entries) => self.check_object(entries),
+            Expr::Field(..) | Expr::Fields(..) => Err(ExprError::FieldOutsideTransform),
         }
     }
 
@@ -98,7 +99,8 @@ impl<'a> TypeCheckerState<'a> {
             .map(|arg| self.check_expr(arg))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let function = self.registry.resolve(name, args.len())?;
+        let func_ref = self.registry.get_ref(name, Some(args.len()))?;
+        let function = self.registry.get_by_ref(func_ref);
         let result_type = function.resolve_type(&arg_types)?;
         Ok(result_type)
     }

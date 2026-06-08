@@ -18,6 +18,23 @@ pub enum Expr {
 
     /// Object literal: { "key" = expr, ... }
     Object(Vec<(String, Expr)>),
+
+    /// Source column reference: `field(<expr>)` or the backtick shorthand `` `name` ``.
+    /// The inner expression must (after optimization) fold to a constant string
+    /// column name. It carries an arbitrary inner `Expr` for now.
+    Field(Box<Expr>),
+
+    /// Whole-body / named-fields JSON object: `fields("*")` or `fields("a,b,c")`.
+    Fields(FieldsSelector),
+}
+
+/// Selector for the `fields(...)` expression node.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldsSelector {
+    /// `fields("*")` — the whole record body as a JSON object.
+    All,
+    /// `fields("a,b,c")` — a JSON object of the named fields.
+    Named(Vec<String>),
 }
 
 /// Short-circuit conditional expressions evaluated lazily by the evaluator.
