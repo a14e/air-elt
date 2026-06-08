@@ -445,12 +445,24 @@ impl FlowRunner {
         }
 
         // Transform is pure compute, no I/O — runs without any permit.
+        // Pin one batch clock so every `now()` / `today()` in a compute
+        // script agrees across the batch (SQL `NOW()` batch semantics); the
+        // clone is cheap (the context's caches/resolvers are `Arc`-backed).
         let batch = {
             let _timer = self.metrics.start_recording_transform();
-            self.flow.derived().transform.apply(raw).inspect_err(|e| {
-                self.metrics
-                    .inc_error(air_elt_monitoring::ErrorStage::Transform, e.kind())
-            })?
+            let ctx = self
+                .flow
+                .expr_context
+                .eval_context()
+                .with_now(chrono::Utc::now());
+            self.flow
+                .derived()
+                .transform
+                .apply(raw, &ctx)
+                .inspect_err(|e| {
+                    self.metrics
+                        .inc_error(air_elt_monitoring::ErrorStage::Transform, e.kind())
+                })?
         };
         self.finish_tick(batch, dry_run).await
     }
@@ -653,6 +665,7 @@ fn should_drop_ctx_on(err: &RuntimeError) -> bool {
         RuntimeError::JsonEncode(_)
         | RuntimeError::Type(_)
         | RuntimeError::Conversion(_)
+        | RuntimeError::ComputeEval { .. }
         | RuntimeError::Serde(_) => false,
         // Validation errors at runtime usually mean schema drift between
         // snapshots — the source schema may have evolved since the last

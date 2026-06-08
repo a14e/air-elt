@@ -1,7 +1,43 @@
 use air_elt_expr_types::error::ExprTypeError;
 use air_elt_expr_types::limits::MAX_BIGINT_WIDTH;
 use air_elt_expr_types::nullable::NullableExprType;
-use air_elt_types::DataType;
+use air_elt_types::{DataType, Value};
+use num_traits::ToPrimitive;
+
+use crate::error::FuncError;
+
+/// Convert any numeric [`Value`] to `f64` for the float-domain math builtins
+/// (trig, logarithms, `sqrt`, `power`, `isNaN`, `isInfinite`). Covers EVERY
+/// numeric variant — narrow and unsigned integers, `BigInt`, and `Decimal` — so a
+/// source column arriving as `Int32` / `UInt32` / `BigInt` is accepted rather than
+/// rejected at runtime (the arithmetic builtins canonicalise via `widen_numeric`;
+/// the float-domain ones go straight through `f64`). A `BigInt` / `Decimal` past
+/// the `f64` range converts to `±INFINITY` — the IEEE result that `to_f64()`
+/// returns as `Some(inf)`, which `isInfinite` then reports faithfully. On the rare
+/// path where `num-traits` returns `None` (no finite or infinite representation),
+/// and for any non-numeric value, this is a `TypeMismatch`.
+pub(crate) fn value_to_f64(val: &Value, func_name: &str) -> Result<f64, FuncError> {
+    let mismatch = || FuncError::TypeMismatch {
+        function: func_name.to_owned(),
+        expected: "numeric".to_owned(),
+        actual: format!("{:?}", val.data_type()),
+    };
+    match val {
+        Value::Int8(x) => Ok(f64::from(*x)),
+        Value::Int16(x) => Ok(f64::from(*x)),
+        Value::Int32(x) => Ok(f64::from(*x)),
+        Value::Int64(x) => Ok(*x as f64),
+        Value::UInt8(x) => Ok(f64::from(*x)),
+        Value::UInt16(x) => Ok(f64::from(*x)),
+        Value::UInt32(x) => Ok(f64::from(*x)),
+        Value::UInt64(x) => Ok(*x as f64),
+        Value::Float32(x) => Ok(f64::from(*x)),
+        Value::Float64(x) => Ok(*x),
+        Value::BigInt(x) => x.to_f64().ok_or_else(mismatch),
+        Value::Decimal(x) => x.to_f64().ok_or_else(mismatch),
+        _ => Err(mismatch()),
+    }
+}
 
 /// Compute the result type of arithmetic between two expression types.
 /// When both operands carry `int_bound`, uses precise bit arithmetic.

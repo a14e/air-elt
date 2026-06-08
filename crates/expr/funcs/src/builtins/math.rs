@@ -72,15 +72,7 @@ pub fn register(registry: &mut FunctionRegistry) {
 }
 
 fn to_f64(val: &Value, func_name: &str) -> Result<f64, FuncError> {
-    match val {
-        Value::Int64(x) => Ok(*x as f64),
-        Value::Float64(x) => Ok(*x),
-        other => Err(FuncError::TypeMismatch {
-            function: func_name.to_owned(),
-            expected: "numeric".to_owned(),
-            actual: format!("{:?}", other.data_type()),
-        }),
-    }
+    crate::arithmetic_utils::value_to_f64(val, func_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1802,6 +1794,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, Value::Bool(false));
+    }
+
+    /// `isNaN` / `isInfinite` accept narrow and unsigned integer operands via the
+    /// shared `value_to_f64` — they never NaN or overflow, so the answer is false
+    /// (no runtime `TypeMismatch`, which is what the optimizer's fold relies on).
+    #[test]
+    fn is_nan_and_is_infinite_accept_integer_operands() {
+        for operand in [
+            Value::Int32(-5),
+            Value::UInt32(42),
+            Value::Int16(300),
+            Value::UInt64(7),
+        ] {
+            assert_eq!(
+                eval(&IS_NAN, smallvec::smallvec![operand.clone()], &ctx()).unwrap(),
+                Value::Bool(false),
+                "isNaN({operand:?})"
+            );
+            assert_eq!(
+                eval(&IS_INFINITE, smallvec::smallvec![operand.clone()], &ctx()).unwrap(),
+                Value::Bool(false),
+                "isInfinite({operand:?})"
+            );
+        }
     }
 
     #[test]

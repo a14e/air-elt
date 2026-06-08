@@ -263,7 +263,34 @@ pub fn build_derived_plans_from_expanded(
         effective_dst,
         dst_schemaless,
     )?;
-    let columns = expanded.read_columns();
+    // Read projection = the direct `from` columns plus every source column
+    // a compute script reads (order-preserving union). The compute columns
+    // are unknown until each script is compiled, hence the union here.
+    let mut columns = expanded.read_columns();
+    for column in &conversions.compute_columns {
+        if !columns.iter().any(|c| c == column) {
+            columns.push(column.clone());
+        }
+    }
+    // A `fields("*")` compute reads the whole row, so project every
+    // source-schema column (in schema order, appended after the explicitly
+    // referenced ones). `src_schema` is always present here when a compute
+    // exists — compute requires `validation.fields = true`, which yields a
+    // `Fixed` (typed) or `SchemalessWithSample` (sampled Mongo) schema — so
+    // the wildcard resolves to the full set of columns the schema knows.
+    if conversions.reads_all_columns {
+        if let Some(schema) = src_schema {
+            for field in schema.fields() {
+                if !columns.iter().any(|c| c == &field.name) {
+                    columns.push(field.name.clone());
+                }
+            }
+        }
+    }
+    // Row schema for `Compute` ops: one `Field` per projection column (in
+    // `columns` order, so `index_of(name)` matches the `Row.values` slot),
+    // typed from the source schema where known.
+    let read_schema = build_read_schema(&columns, src_schema);
     let read_spec = ReadSpec {
         columns: columns.clone(),
         table: flow.config_read_spec.table.clone(),
@@ -280,19 +307,58 @@ pub fn build_derived_plans_from_expanded(
         table: flow.config_write_spec.table.clone(),
         conflict: flow.config_write_spec.conflict.clone(),
     };
+    // Attach the compute-eval context only when a `Compute` op is actually
+    // emitted (const / identity lowerings need neither schema nor registry).
+    let has_compute = conversions
+        .lowerings
+        .iter()
+        .any(|l| matches!(l, crate::transform::ComputeLowering::Compute { .. }));
+    let compute_ctx = if has_compute {
+        Some((read_schema, flow.expr_context.registry().clone()))
+    } else {
+        None
+    };
     let transform = crate::transform::compile_to_transform(
         expanded,
         body_data_type,
-        &conversions,
+        &conversions.plans,
         &body_conversions,
         &columns,
         flow.source.schemaless(),
+        &conversions.lowerings,
+        compute_ctx,
     )?;
     Ok(DerivedPlans {
         read_spec,
         write_spec,
         transform,
     })
+}
+
+/// Build the row schema a `Compute` op binds `field("c")` against: one
+/// `Field` per projection column, in `columns` order so `index_of(name)`
+/// equals the column's slot in `Row.values`. Types come from the source
+/// schema where known; unknown / schemaless columns get a nullable `Json`
+/// placeholder (the runtime only consults `index_of`, never the type).
+fn build_read_schema(columns: &[String], src_schema: Option<&Schema>) -> Schema {
+    use crate::model::Field;
+    Schema::new(
+        columns
+            .iter()
+            .map(|name| match src_schema.and_then(|s| s.find(name)) {
+                Some(f) => Field {
+                    name: name.clone(),
+                    data_type: f.data_type.clone(),
+                    nullable: f.nullable,
+                },
+                None => Field {
+                    name: name.clone(),
+                    data_type: DataType::Json,
+                    nullable: true,
+                },
+            })
+            .collect(),
+    )
 }
 
 /// Build per-body-target `ColumnConversionPlan`s. The source-side type is
@@ -378,26 +444,68 @@ fn resolve_default_literal(
     air_elt_types::ensure_sink_compatible(value, sink_dt)
 }
 
+/// Output of [`build_conversions`]: the per-direct-column conversion plans
+/// plus, parallel to them, the compute-lowering decisions and the union of
+/// source columns the compute scripts read (order-preserving). The plans
+/// and lowerings align 1:1 with `expanded.direct`.
+pub(crate) struct ConversionBuild {
+    pub plans: Vec<ColumnConversionPlan>,
+    pub lowerings: Vec<crate::transform::ComputeLowering>,
+    pub compute_columns: Vec<String>,
+    /// `true` when any compute script reads the whole row via `fields("*")`.
+    /// The read projection then unions every source-schema column, so the
+    /// runtime `fields("*")` object carries the entire row.
+    pub reads_all_columns: bool,
+}
+
 /// Build per-column ColumnConversionPlans from the expanded mapping. Mirrors
 /// the logic in `validation::pipeline::validate_flow` so a rebuild
-/// produces the same plans the pipeline did initially.
+/// produces the same plans the pipeline did initially. Compute columns
+/// (those carrying `DirectMapping.compute`) are compiled here through
+/// `flow.expr_context` and classified into a [`ComputeLowering`]
+/// (`Const` / `Identity` / `Compute`); the columns their scripts read are
+/// accumulated into [`ConversionBuild::compute_columns`] for the read
+/// projection.
 fn build_conversions(
     flow: &AssembledFlow,
     expanded: &ExpandedMapping,
     src_schema: Option<&Schema>,
     dst_schema: Option<&Schema>,
-) -> Result<Vec<ColumnConversionPlan>, ValidationError> {
+) -> Result<ConversionBuild, ValidationError> {
+    use crate::transform::ComputeLowering;
+
     let flow_name = &flow.name;
     let dst_schemaless = flow.sink.schemaless();
     let src_schemaless = flow.source.schemaless();
     let mut plans: Vec<ColumnConversionPlan> = Vec::with_capacity(expanded.direct.len());
+    let mut lowerings: Vec<ComputeLowering> = Vec::with_capacity(expanded.direct.len());
+    let mut compute_columns: Vec<String> = Vec::new();
+    let mut reads_all_columns = false;
     for m in &expanded.direct {
+        // Compute columns are compiled + classified separately — they have
+        // no source `from` to look up.
+        if m.compute.is_some() {
+            let (plan, lowering) = build_compute_lowering(
+                flow,
+                m,
+                src_schema,
+                dst_schema,
+                src_schemaless,
+                dst_schemaless,
+                &mut compute_columns,
+                &mut reads_all_columns,
+            )?;
+            plans.push(plan);
+            lowerings.push(lowering);
+            continue;
+        }
         let DirectMapping {
             from,
             to,
             truncate,
             default_literal,
             switch,
+            compute: _,
         } = m;
         // Look up the source field from the sample-derived schema, if
         // any. For schemaless sources the sample is non-authoritative —
@@ -543,6 +651,7 @@ fn build_conversions(
             ctx,
             switch: switch_table,
         });
+        lowerings.push(ComputeLowering::None);
     }
     // Body / wildcard-pack outputs are produced by `TransformOp::Body`
     // ops in the compiled program — they read `Row.body` populated by
@@ -550,7 +659,261 @@ fn build_conversions(
     // sink's row slot at the matching position. No `ColumnConversionPlan`
     // is emitted for them; per-body-target plans, if any, are added
     // separately by `build_body_conversions` above.
-    Ok(plans)
+    Ok(ConversionBuild {
+        plans,
+        lowerings,
+        compute_columns,
+        reads_all_columns,
+    })
+}
+
+/// Compile and classify one compute column (`DirectMapping.compute` set)
+/// into a `(ColumnConversionPlan, ComputeLowering)` pair. The source
+/// columns the script reads are appended (deduplicated, order-preserving)
+/// to `compute_columns`.
+#[allow(clippy::too_many_arguments)]
+fn build_compute_lowering(
+    flow: &AssembledFlow,
+    m: &DirectMapping,
+    src_schema: Option<&Schema>,
+    dst_schema: Option<&Schema>,
+    src_schemaless: bool,
+    dst_schemaless: bool,
+    compute_columns: &mut Vec<String>,
+    reads_all_columns: &mut bool,
+) -> Result<(ColumnConversionPlan, crate::transform::ComputeLowering), ValidationError> {
+    use crate::transform::ComputeLowering;
+
+    let flow_name = &flow.name;
+    let to = &m.to;
+    let truncate = m.truncate;
+    let expr = m
+        .compute
+        .as_deref()
+        .expect("build_compute_lowering called only for compute mappings");
+
+    // Sink type: typed sink → its declared column type; schemaless sink →
+    // unknown (`None`), so the value is written without coercion.
+    let sink_dt_opt: Option<DataType> = if dst_schemaless {
+        None
+    } else {
+        match dst_schema.and_then(|s| s.find(to)) {
+            Some(f) => Some(f.data_type.clone()),
+            None => {
+                return Err(ValidationError::MissingField {
+                    side: "sink",
+                    field: to.clone(),
+                });
+            }
+        }
+    };
+
+    // Compile the script. Typed source → check field existence + types
+    // against the schema; schemaless source → no schema. Typed sink → the
+    // expected output type checks the result at compile time.
+    let schema_for_compile = if src_schemaless { None } else { src_schema };
+    let expected = sink_dt_opt.as_ref().map(|dt| (dt, truncate));
+    let program = flow
+        .expr_context
+        .compile_runtime(expr, schema_for_compile, expected)
+        .map_err(|e| ValidationError::ComputeCompile {
+            flow: flow_name.clone(),
+            column: to.clone(),
+            reason: e.to_string(),
+        })?;
+
+    for column in program.needed_columns() {
+        if !compute_columns.iter().any(|c| c == column) {
+            compute_columns.push(column.clone());
+        }
+    }
+    // `fields("*")` reads the whole row — flag it so the read projection
+    // unions every source-schema column (handled in
+    // `build_derived_plans_from_expanded`).
+    if program.reads_all_columns() {
+        *reads_all_columns = true;
+    }
+
+    // Const-folded compute → a literal column.
+    if program.is_value() {
+        let raw = program
+            .as_value()
+            .expect("is_value implies as_value")
+            .clone();
+        let (value, output) = match &sink_dt_opt {
+            Some(sink_dt) => {
+                // Coerce the constant to the sink type now, paid once at
+                // compile time. A NULL const falls back to `default`; an
+                // explicit `truncate` routes through the narrowing matrix;
+                // otherwise the literal is auto-narrowed if it fits (the same
+                // path a `default` literal takes — `ensure_sink_compatible`),
+                // so an in-range `1 + 2` lands in an `Int32` sink.
+                let coerced = if matches!(raw, Value::Null) {
+                    match &m.default_literal {
+                        Some(lit) => resolve_default_literal(lit, sink_dt, &flow.expr_context)
+                            .map_err(|reason| ValidationError::DefaultEval {
+                                flow: flow_name.clone(),
+                                column: to.clone(),
+                                reason,
+                            })?,
+                        None => Value::Null,
+                    }
+                } else if truncate {
+                    let mut ctx = ConversionContext::passthrough();
+                    ctx.truncate = true;
+                    let src_dt = raw.data_type().unwrap_or_else(|| sink_dt.clone());
+                    crate::types::convert::convert(raw, &src_dt, sink_dt, &ctx).map_err(|e| {
+                        ValidationError::ComputeCompile {
+                            flow: flow_name.clone(),
+                            column: to.clone(),
+                            reason: e.to_string(),
+                        }
+                    })?
+                } else {
+                    air_elt_types::ensure_sink_compatible(raw, sink_dt).map_err(|reason| {
+                        ValidationError::ComputeCompile {
+                            flow: flow_name.clone(),
+                            column: to.clone(),
+                            reason,
+                        }
+                    })?
+                };
+                (coerced, sink_dt.clone())
+            }
+            // Schemaless sink: write the raw constant; its `DataType` is
+            // advisory only.
+            None => {
+                let output = raw.data_type().unwrap_or(DataType::Json);
+                (raw, output)
+            }
+        };
+        return Ok((
+            ColumnConversionPlan::identity(output.clone()),
+            ComputeLowering::Const { value, output },
+        ));
+    }
+
+    // Identity compute (`field("x")`) → a plain `Take` of column `x`,
+    // lowered exactly like a direct mapping `from = "x"`.
+    if let Some(column) = program.identity_column() {
+        let column = column.to_string();
+        let plan = build_identity_compute_plan(
+            flow,
+            &column,
+            to,
+            truncate,
+            m.default_literal.as_ref(),
+            src_schema,
+            &sink_dt_opt,
+            src_schemaless,
+        )?;
+        return Ok((plan, ComputeLowering::Identity { column }));
+    }
+
+    // General per-row compute. Typed sink → a `Compute` op that
+    // self-coerces to the sink type at runtime (`coerce_compute`, carrying
+    // `truncate` + the resolved `default`); schemaless sink → bare `Compute`
+    // that writes the raw value. We deliberately do NOT wrap in `Convert`:
+    // the strict matrix rejects an in-range `Int64 → Int32` narrowing that
+    // arithmetic promotion produces, whereas `coerce_compute` auto-narrows
+    // in-range values via `ensure_sink_compatible`.
+    match &sink_dt_opt {
+        Some(sink_dt) => {
+            let mut ctx = ConversionContext::passthrough();
+            ctx.truncate = truncate;
+            ctx.default = match &m.default_literal {
+                Some(lit) => Some(
+                    resolve_default_literal(lit, sink_dt, &flow.expr_context).map_err(
+                        |reason| ValidationError::DefaultEval {
+                            flow: flow_name.clone(),
+                            column: to.clone(),
+                            reason,
+                        },
+                    )?,
+                ),
+                None => None,
+            };
+            let plan = ColumnConversionPlan {
+                source: None,
+                sink: sink_dt.clone(),
+                ctx,
+                switch: None,
+            };
+            Ok((
+                plan,
+                ComputeLowering::Compute {
+                    program: std::sync::Arc::new(program),
+                    wrap: true,
+                },
+            ))
+        }
+        None => Ok((
+            ColumnConversionPlan::identity(DataType::Json),
+            ComputeLowering::Compute {
+                program: std::sync::Arc::new(program),
+                wrap: false,
+            },
+        )),
+    }
+}
+
+/// Build the conversion plan for an identity compute column (`field("x")`),
+/// mirroring the `from = "x"` direct path: resolve the source column type,
+/// honour the optional NULL-fallback default, and pick the static vs
+/// dynamic source dispatch.
+#[allow(clippy::too_many_arguments)]
+fn build_identity_compute_plan(
+    flow: &AssembledFlow,
+    column: &str,
+    to: &str,
+    truncate: bool,
+    default_literal: Option<&toml::Value>,
+    src_schema: Option<&Schema>,
+    sink_dt_opt: &Option<DataType>,
+    src_schemaless: bool,
+) -> Result<ColumnConversionPlan, ValidationError> {
+    let src_field = src_schema.and_then(|s| s.find(column));
+    // Sink type: typed sink uses its declared column type; schemaless sink
+    // falls back to the source column type (identity — no coercion) or
+    // `Json` when even that is unknown.
+    let sink_dt = match sink_dt_opt {
+        Some(dt) => dt.clone(),
+        None => src_field
+            .as_ref()
+            .map(|f| f.data_type.clone())
+            .unwrap_or(DataType::Json),
+    };
+    let parsed_default = match default_literal {
+        Some(lit) => Some(
+            resolve_default_literal(lit, &sink_dt, &flow.expr_context).map_err(|reason| {
+                ValidationError::DefaultEval {
+                    flow: flow.name.clone(),
+                    column: to.to_string(),
+                    reason,
+                }
+            })?,
+        ),
+        None => None,
+    };
+    let mut ctx = ConversionContext::passthrough();
+    ctx.truncate = truncate;
+    ctx.default = parsed_default;
+    let plan_source_dt = if src_schemaless {
+        None
+    } else {
+        Some(
+            src_field
+                .as_ref()
+                .map(|f| f.data_type.clone())
+                .unwrap_or_else(|| sink_dt.clone()),
+        )
+    };
+    Ok(ColumnConversionPlan {
+        source: plan_source_dt,
+        sink: sink_dt,
+        ctx,
+        switch: None,
+    })
 }
 
 /// Field access on `FlowState` reads through to the assembled flow — the
@@ -1133,5 +1496,181 @@ mod tests {
             other => panic!("expected Convert op, got {other:?}"),
         };
         assert_eq!(*default_val, Value::Int32(30));
+    }
+
+    // ---- compute columns: lowering classification ---------------------------
+
+    fn compute_rule(to: &str, expr: &str) -> ColumnMapping {
+        ColumnMapping::Compute {
+            to: to.into(),
+            expr_source: expr.into(),
+            truncate: false,
+            default_literal: None,
+        }
+    }
+
+    /// A const-folded compute lowers to `TransformOp::Const`.
+    #[test]
+    fn const_compute_lowers_to_const_op() {
+        use crate::transform::TransformOp;
+        let flow = assembled(vec![compute_rule("c", "1 + 2")]);
+        let src = schema(&[("x", DataType::Int64, false)]);
+        let dst = schema(&[("c", DataType::Int64, false)]);
+        let plans = build_derived_plans(&flow, &src, &dst).unwrap();
+        match &plans.transform.cols[0] {
+            TransformOp::Const { value, output } => {
+                assert_eq!(*value, Value::Int64(3));
+                assert_eq!(*output, DataType::Int64);
+            }
+            other => panic!("expected Const, got {other:?}"),
+        }
+        // No source columns referenced → read projection unaffected.
+        assert!(plans.read_spec.columns.is_empty());
+    }
+
+    /// An identity compute (`field("x")`) lowers to a plain `Take`.
+    #[test]
+    fn identity_compute_lowers_to_take() {
+        use crate::transform::TransformOp;
+        let flow = assembled(vec![compute_rule("c", "`x`")]);
+        let src = schema(&[("x", DataType::Int64, false)]);
+        let dst = schema(&[("c", DataType::Int64, false)]);
+        let plans = build_derived_plans(&flow, &src, &dst).unwrap();
+        assert!(matches!(
+            &plans.transform.cols[0],
+            TransformOp::Take { source_index: 0 }
+        ));
+        assert_eq!(plans.read_spec.columns, vec!["x".to_string()]);
+    }
+
+    /// A general compute lowers to `Convert { input: Compute }` and unions the
+    /// columns its script reads into the read projection.
+    #[test]
+    fn general_compute_lowers_to_wrapped_compute_and_unions_columns() {
+        use crate::transform::TransformOp;
+        let flow = assembled(vec![compute_rule("c", "concat(`x`, '!')")]);
+        let src = schema(&[("x", DataType::Text { size: None }, false)]);
+        let dst = schema(&[("c", DataType::Text { size: None }, false)]);
+        let plans = build_derived_plans(&flow, &src, &dst).unwrap();
+        match &plans.transform.cols[0] {
+            TransformOp::Compute { sink, .. } => {
+                assert_eq!(
+                    sink.as_ref(),
+                    Some(&DataType::Text { size: None }),
+                    "typed-sink compute carries its sink type for self-coercion"
+                );
+            }
+            other => panic!("expected a self-coercing Compute, got {other:?}"),
+        }
+        // `x` is read by the script → unioned into the read projection.
+        assert_eq!(plans.read_spec.columns, vec!["x".to_string()]);
+    }
+
+    /// A compute referencing a column absent from a fixed source schema is a
+    /// `ComputeCompile` error.
+    #[test]
+    fn compute_referencing_missing_field_errors() {
+        let flow = assembled(vec![compute_rule("c", "`missing` + 1")]);
+        let src = schema(&[("x", DataType::Int64, false)]);
+        let dst = schema(&[("c", DataType::Int64, false)]);
+        match build_derived_plans(&flow, &src, &dst) {
+            Err(ValidationError::ComputeCompile { column, .. }) => assert_eq!(column, "c"),
+            Err(other) => panic!("expected ComputeCompile, got {other:?}"),
+            Ok(_) => panic!("expected ComputeCompile, got Ok"),
+        }
+    }
+
+    /// A compute whose result type is incompatible with the sink column is
+    /// rejected at compile time (the optimizer's expected-output check),
+    /// surfaced as `ComputeCompile`.
+    #[test]
+    fn compute_output_incompatible_with_sink_rejected() {
+        let flow = assembled(vec![compute_rule("c", "concat(`x`, '!')")]);
+        let src = schema(&[("x", DataType::Text { size: None }, false)]);
+        // Text result into an Int64 sink — incompatible.
+        let dst = schema(&[("c", DataType::Int64, false)]);
+        match build_derived_plans(&flow, &src, &dst) {
+            Err(ValidationError::ComputeCompile { column, .. }) => assert_eq!(column, "c"),
+            Err(other) => panic!("expected ComputeCompile, got {other:?}"),
+            Ok(_) => panic!("expected ComputeCompile, got Ok"),
+        }
+    }
+
+    /// A compute alongside a direct mapping: both columns appear, and the
+    /// direct + compute-referenced source columns are both in the projection.
+    #[test]
+    fn compute_and_direct_columns_coexist() {
+        use crate::transform::TransformOp;
+        let flow = assembled(vec![
+            ColumnMapping::Direct {
+                from: "id".into(),
+                to: "id".into(),
+                truncate: false,
+                default_literal: None,
+            },
+            compute_rule("label", "concat(`name`, '!')"),
+        ]);
+        let src = schema(&[
+            ("id", DataType::Int64, false),
+            ("name", DataType::Text { size: None }, false),
+        ]);
+        let dst = schema(&[
+            ("id", DataType::Int64, false),
+            ("label", DataType::Text { size: None }, false),
+        ]);
+        let plans = build_derived_plans(&flow, &src, &dst).unwrap();
+        assert_eq!(plans.transform.cols.len(), 2);
+        assert!(matches!(
+            &plans.transform.cols[0],
+            TransformOp::Take { source_index: 0 }
+        ));
+        // `id` (direct) then `name` (compute-referenced) — order preserved.
+        assert_eq!(
+            plans.read_spec.columns,
+            vec!["id".to_string(), "name".into()]
+        );
+    }
+
+    /// A `fields("*")` compute reads the whole row, so EVERY source-schema
+    /// column is unioned into the read projection (not just the explicitly
+    /// referenced ones) and the `Compute` op registers all of them as
+    /// `needed_indices` so a shared `Take` clones instead of moving.
+    #[test]
+    fn wildcard_fields_compute_projects_all_source_columns() {
+        use crate::transform::TransformOp;
+        let flow = assembled(vec![
+            ColumnMapping::Direct {
+                from: "id".into(),
+                to: "id".into(),
+                truncate: false,
+                default_literal: None,
+            },
+            compute_rule("doc", "fields(\"*\")"),
+        ]);
+        // `extra` is referenced by no mapping — only `fields("*")` pulls it in.
+        let src = schema(&[
+            ("id", DataType::Int64, false),
+            ("name", DataType::Text { size: None }, false),
+            ("extra", DataType::Int64, true),
+        ]);
+        let dst = schema(&[
+            ("id", DataType::Int64, false),
+            ("doc", DataType::Json, true),
+        ]);
+        let plans = build_derived_plans(&flow, &src, &dst).unwrap();
+        // `id` (direct) first, then every source column the wildcard pulls in.
+        assert_eq!(
+            plans.read_spec.columns,
+            vec!["id".to_string(), "name".into(), "extra".into()]
+        );
+        // The compute op registers all three projection slots so the shared
+        // `id` slot (also a `Take`) is cloned, not moved out before the
+        // wildcard reads it.
+        match &plans.transform.cols[1] {
+            TransformOp::Compute { needed_indices, .. } => {
+                assert_eq!(needed_indices, &vec![0_usize, 1, 2]);
+            }
+            other => panic!("expected Compute, got {other:?}"),
+        }
     }
 }

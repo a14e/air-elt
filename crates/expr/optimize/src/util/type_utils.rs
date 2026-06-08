@@ -126,6 +126,32 @@ pub(crate) fn is_float(data_type: &DataType) -> bool {
     matches!(data_type, DataType::Float32 | DataType::Float64)
 }
 
+/// A fixed-width signed/unsigned integer (excludes the unbounded `BigInt`). Every
+/// such value converts to a FINITE `f64` — its magnitude is below `2^64`, far
+/// under `f64::MAX` — so `isInfinite` over it is statically `false`. `BigInt` is
+/// excluded precisely because a large one overflows `f64` to infinity.
+pub(crate) fn is_fixed_width_integer(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
+}
+
+/// An unsigned integer type — always non-negative, so `abs` is the identity.
+pub(crate) fn is_unsigned_integer(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+    )
+}
+
 /// Whether `value` is a fixed-width integer-typed zero (signed or unsigned).
 /// Excludes float `0.0` (whose `-0.0`/identity subtleties keep the integer-only
 /// identities sound) and `BigInt` (a literal `BigInt` zero would already have

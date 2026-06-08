@@ -19,6 +19,8 @@ pub(crate) mod algebraic_identities;
 pub(crate) mod engine;
 pub(crate) mod flatten;
 pub(crate) mod power_reduce;
+pub(crate) mod self_compare;
 pub(crate) mod strip;
+pub(crate) mod unary_reduce;
 
 pub(crate) use engine::{TypedRewriteDriver, TypedRuleSet};

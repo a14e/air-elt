@@ -29,6 +29,16 @@ All return `Text{size:None}` (unbounded). Exceptions: `length`/`indexOf` return 
 
 Always return **non-null `Bool`** — all six are total. `==`/`!=` treat null as a value (`null==null` → true, `null==x` → false), so `x==null` is a real null test that matches `values_equal`/`Key`; the ordering operators (`<`/`>`/`<=`/`>=`) return `false` on any null operand (null is unordered, mirroring SQL filtering and deliberately unlike `==`). Because they never produce null, comparisons do not propagate operand nullability into `&&`/`||`/`if`.
 
+## Typed optimizer identities (the `typed/` rewrite pass)
+
+The typed pass folds shapes a static type makes sound. Beyond the existing power reduction (`x ** 1 → x`, `x ** 0 → 1.0`), `min`/`max` saturation, and `x*1`/`x+0`/`x-x` identities:
+
+- **Self-comparison `x ⋈ x`** (`typed/self_compare.rs`). Both operands the same pure, infallible expression. `x > x` / `x < x` → **`false`** for every operand (`NaN > NaN` is false; ordering returns false on null). `x == x` → **`true`**, `x != x` → **`false`** for **non-float** operands (sound even when nullable — `null == null` is true). `x >= x` / `x <= x` → **`true`** for **non-float, non-null** operands (they return false on null). Floats are skipped entirely: `x == x` is the canonical `NaN` test and must keep its meaning. The purity gate is load-bearing — `random() > random()` is not always false.
+- **`isNaN(x) → false`** for any integer/`BigInt`; **`isInfinite(x) → false`** for a **fixed-width** integer only (a large `BigInt` overflows `f64` to infinity). Both drop the operand, so it must be non-null + infallible + pure (`isNaN(null)` is null, not false).
+- **`abs(x) → x`** for an unsigned-integer operand (always non-negative; `abs` preserves type, so the strip is type-preserving).
+
+Constant operands never reach these rules — `sqrt(1)`, `equals(c, c)`, `abs(1)` already const-fold in the untyped pass.
+
 ## Cast functions
 
 Return the target type (`toInt64` returns `Int64`, `toBigInt` returns `BigInt{width:None}`, `toDecimal` returns `Decimal{precision:None, scale:None}`, etc.).

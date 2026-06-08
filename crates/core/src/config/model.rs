@@ -114,6 +114,14 @@ pub struct FlowConfig {
     /// [`MappingEntry`] table without `to`.
     #[serde(default)]
     pub mapping: MappingMap,
+    /// Computed sink columns driven by expression scripts. A separate
+    /// `[flow.<name>.compute-mapping]` table keyed by sink column name,
+    /// each value an expression string (`compute = "<expr>"` shorthand).
+    /// Entries are appended to the main mapping; in this table the
+    /// defaults are `truncate = false` and `default = null` (no long
+    /// form). Runtime scripts (`field(...)`) run only in the Transform.
+    #[serde(default)]
+    pub compute_mapping: MappingMap,
     /// Cursor config. Pull-based sources (postgres, mysql, mongodb)
     /// require non-empty `fields`. CDC sources (mongo-cdc) require
     /// empty `fields` — pagination is driven by the resume token.
@@ -304,6 +312,11 @@ impl<'de> Visitor<'de> for MappingRhsVisitor {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct MappingEntry {
+    /// Source column name. Optional only when `compute` is set — a
+    /// compute column reads its inputs from the script, not from a single
+    /// named source column. `compute` is mutually exclusive with both
+    /// `from` and `switch` (enforced in `mapping::column::normalise_full`).
+    #[serde(default)]
     pub from: String,
     #[serde(default)]
     pub truncate: bool,
@@ -311,6 +324,10 @@ pub struct MappingEntry {
     pub default: Option<toml::Value>,
     #[serde(default)]
     pub switch: Option<SwitchTable>,
+    /// Expression script producing this sink column's value per row.
+    /// When set, this is a computed column (⊥ `from` / `switch`).
+    #[serde(default)]
+    pub compute: Option<String>,
 }
 
 /// Ordered switch lookup table. Each entry maps a source-side value
@@ -486,6 +503,62 @@ mod tests {
             cursor(Duration::from_secs(86_400), None).effective_jitter(),
             Duration::from_secs(300),
         );
+    }
+
+    /// A flow with a long-form `compute` mapping entry and a
+    /// `[compute-mapping]` shorthand section round-trips through serde.
+    #[test]
+    fn compute_field_and_compute_mapping_section_deserialize() {
+        let toml_src = r#"
+[[sources]]
+name = "s"
+type = "postgres"
+
+[[sinks]]
+name = "k"
+type = "postgres"
+
+[[storages]]
+name = "st"
+type = "postgres"
+
+[flow.f]
+source = "s"
+sink = "k"
+storage = "st"
+from = "t"
+to = "t"
+cursor = { fields = ["id"] }
+
+[flow.f.mapping]
+id = "id"
+total = { compute = "`price` * `qty`", truncate = true }
+
+[flow.f.compute-mapping]
+ingested_at = "now()"
+"#;
+        let cfg: RootConfig = toml::from_str(toml_src).unwrap();
+        let flow = &cfg.flow["f"];
+        // The long-form compute entry parses with its `compute` + `truncate`.
+        let total = flow
+            .mapping
+            .iter()
+            .find(|(k, _)| k == "total")
+            .map(|(_, v)| v)
+            .unwrap();
+        match total {
+            MappingRhs::Full(entry) => {
+                assert_eq!(entry.compute.as_deref(), Some("`price` * `qty`"));
+                assert!(entry.truncate);
+                assert!(entry.from.is_empty());
+            }
+            other => panic!("expected Full compute entry, got {other:?}"),
+        }
+        // The `[compute-mapping]` shorthand section parses as a MappingMap.
+        assert_eq!(flow.compute_mapping.len(), 1);
+        let (key, rhs) = flow.compute_mapping.iter().next().unwrap();
+        assert_eq!(key, "ingested_at");
+        assert!(matches!(rhs, MappingRhs::Short(s) if s == "now()"));
     }
 
     /// Operator-set `jitter` is passed through verbatim — including

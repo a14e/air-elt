@@ -6,7 +6,13 @@ user-invocable: false
 
 # Expression language
 
-Air Elt configs use an expression language for computed column values, defaults, and string interpolation. Expressions are pure (no I/O at evaluation time) and evaluated during the **assemble** phase of the validation pipeline.
+Air Elt configs use an expression language for computed column values, defaults, and string interpolation. Expressions are pure (no I/O at evaluation time).
+
+Two evaluation contexts:
+- **Assemble-time (once per flow):** `default = ...`, switch values, component-config and `${VAR}` interpolation. No row access — `field()` / `fields()` are rejected here (`create_comptime` grammar).
+- **Per-row (in the Transform):** `compute = "<expr>"` mapping columns and the `[flow.<name>.compute-mapping]` shorthand. These are the **only** place runtime scripts run; they may read source columns via `field("col")` / backtick `` `col` ``, the named pack `fields("a,b")`, or the whole-row pack `fields("*")` (which projects the entire source schema). Compiled once to a `RuntimeProgram`, then run per row. A script that const-folds becomes a literal column; a bare `field("x")` becomes an identity rename; otherwise it runs as a per-row `Compute` op coerced to the sink type. See the `config-format` skill ("Compute columns").
+
+**`now()` / `today()` batch semantics:** referentially transparent (`is_pure() == true`) but NOT compile-time-foldable (`purity() == false`) — pinned to one batch clock at program init, so every row in one write batch shares the same timestamp (SQL `NOW()` / `CURRENT_TIMESTAMP`). Never const-folded (the clock is unknown at compile time). When adding a runtime-reading-but-stable builtin, set `is_pure` by determinism and override `purity` → false; do not gate folding on `is_pure`.
 
 ## Syntax
 

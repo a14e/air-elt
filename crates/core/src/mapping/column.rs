@@ -49,6 +49,18 @@ pub enum ColumnMapping {
         cases: Vec<SwitchCase>,
         default_literal: Option<toml::Value>,
     },
+    /// A computed column driven by an expression script (`compute =
+    /// "<expr>"`, or the `[compute-mapping]` shorthand). `expr_source` is
+    /// the raw script; it is compiled to a `RuntimeProgram` during plan
+    /// construction and lowered to a literal (`Const`), a plain `Take`
+    /// (identity `field("x")`), or a per-row `Compute` op. Mutually
+    /// exclusive with `from` / `switch` at the config layer.
+    Compute {
+        to: String,
+        expr_source: String,
+        truncate: bool,
+        default_literal: Option<toml::Value>,
+    },
 }
 
 /// One arm of a [`ColumnMapping::Switch`] table. `key` is the literal
@@ -69,13 +81,14 @@ pub struct SwitchCase {
 /// empty/whitespace-only key or RHS, `to` field smuggled inside the
 /// long-form entry (rejected by `deny_unknown_fields` upstream).
 pub fn build(flow: &FlowConfig) -> Result<Vec<ColumnMapping>, ConfigError> {
-    if flow.mapping.is_empty() {
+    if flow.mapping.is_empty() && flow.compute_mapping.is_empty() {
         return Err(ConfigError::Invalid {
             reason: "mapping is empty — at least one column mapping is required".into(),
         });
     }
 
-    let mut out: Vec<ColumnMapping> = Vec::with_capacity(flow.mapping.len());
+    let mut out: Vec<ColumnMapping> =
+        Vec::with_capacity(flow.mapping.len() + flow.compute_mapping.len());
     let mut wildcard_seen = false;
     let mut body_seen = false;
 
@@ -108,9 +121,59 @@ pub fn build(flow: &FlowConfig) -> Result<Vec<ColumnMapping>, ConfigError> {
                 }
                 body_seen = true;
             }
-            ColumnMapping::Direct { .. } | ColumnMapping::Switch { .. } => {}
+            ColumnMapping::Direct { .. }
+            | ColumnMapping::Switch { .. }
+            | ColumnMapping::Compute { .. } => {}
         }
         out.push(normalised);
+    }
+
+    // `[compute-mapping]` shorthand: each value is a bare expression string
+    // (Short-only — `truncate`/`default` belong on the long-form `compute`
+    // field in `[mapping]`). Entries append to the main mapping. A sink
+    // column may not appear in both tables.
+    if !flow.compute_mapping.is_empty() {
+        let main_keys: ahash::AHashSet<&str> =
+            flow.mapping.iter().map(|(k, _)| k.as_str()).collect();
+        for (key, rhs) in flow.compute_mapping.iter() {
+            validate_key(key)?;
+            if key == WILDCARD_MARKER {
+                return Err(ConfigError::Invalid {
+                    reason: "compute-mapping cannot target the wildcard key \"*\"".into(),
+                });
+            }
+            if main_keys.contains(key.as_str()) {
+                return Err(ConfigError::Invalid {
+                    reason: format!(
+                        "sink column {key:?} appears in both [mapping] and [compute-mapping] — \
+                         a sink column must be declared once"
+                    ),
+                });
+            }
+            let expr = match rhs {
+                MappingRhs::Short(s) => s,
+                MappingRhs::Full(_) => {
+                    return Err(ConfigError::Invalid {
+                        reason: format!(
+                            "compute-mapping entry for key {key:?} must be a bare expression \
+                             string, not a `{{ ... }}` table — use the `compute` field under \
+                             [mapping] for truncate/default"
+                        ),
+                    });
+                }
+            };
+            if expr.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    reason: format!("compute-mapping entry for key {key:?} is empty"),
+                });
+            }
+            out.push(ColumnMapping::Compute {
+                to: key.clone(),
+                expr_source: expr.clone(),
+                truncate: false,
+                default_literal: None,
+            });
+        }
     }
 
     Ok(out)
@@ -176,6 +239,38 @@ fn normalise_full(key: &str, entry: &MappingEntry) -> Result<ColumnMapping, Conf
             reason: "mapping key \"*\" must use the short form `\"*\" = \"*\"` and cannot carry \
                      a full entry table"
                 .into(),
+        });
+    }
+    // Compute column: `compute = "<expr>"` is mutually exclusive with both
+    // `from` and `switch`. `truncate` / `default` still apply (the default
+    // is the NULL-fallback for the computed value).
+    if let Some(expr) = &entry.compute {
+        if !entry.from.is_empty() {
+            return Err(ConfigError::Invalid {
+                reason: format!(
+                    "mapping entry for key {key:?} sets both `compute` and `from` — \
+                     a computed column reads its inputs from the script"
+                ),
+            });
+        }
+        if entry.switch.is_some() {
+            return Err(ConfigError::Invalid {
+                reason: format!(
+                    "mapping entry for key {key:?} sets both `compute` and `switch` — \
+                     they are mutually exclusive"
+                ),
+            });
+        }
+        if expr.trim().is_empty() {
+            return Err(ConfigError::Invalid {
+                reason: format!("mapping entry for key {key:?} has empty `compute`"),
+            });
+        }
+        return Ok(ColumnMapping::Compute {
+            to: key.into(),
+            expr_source: expr.clone(),
+            truncate: entry.truncate,
+            default_literal: entry.default.clone(),
         });
     }
     if entry.from.is_empty() {
@@ -250,6 +345,7 @@ mod tests {
             from: "t".into(),
             to: "t".into(),
             mapping,
+            compute_mapping: MappingMap::default(),
             cursor: CursorConfig {
                 fields: vec!["id".into()],
                 order: CursorOrder::Asc,
@@ -269,6 +365,7 @@ mod tests {
             truncate: false,
             default: None,
             switch: None,
+            compute: None,
         })
     }
 
@@ -356,6 +453,7 @@ mod tests {
             truncate: true,
             default: Some(toml::Value::Integer(5)),
             switch: None,
+            compute: None,
         });
         let rules = build(&flow_with(vec![("dst", rhs)])).unwrap();
         assert_eq!(
@@ -380,6 +478,7 @@ mod tests {
             truncate: false,
             default: Some(toml::Value::String("unknown".into())),
             switch: Some(switch),
+            compute: None,
         });
         let rules = build(&flow_with(vec![("status_label", rhs)])).unwrap();
         assert_eq!(rules.len(), 1);
@@ -412,6 +511,7 @@ mod tests {
             truncate: false,
             default: None,
             switch: Some(SwitchTable(vec![])),
+            compute: None,
         });
         let err = build(&flow_with(vec![("status_label", rhs)])).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid { .. }));
@@ -471,6 +571,128 @@ mod tests {
             &rules[2],
             ColumnMapping::Direct { from, to, .. } if from == "id" && to == "id"
         ));
+    }
+
+    fn compute_entry(expr: &str) -> MappingRhs {
+        MappingRhs::Full(MappingEntry {
+            from: String::new(),
+            truncate: false,
+            default: None,
+            switch: None,
+            compute: Some(expr.into()),
+        })
+    }
+
+    fn flow_with_compute(
+        mapping: Vec<(&str, MappingRhs)>,
+        compute: Vec<(&str, MappingRhs)>,
+    ) -> FlowConfig {
+        let mut f = flow_with(mapping);
+        f.compute_mapping = MappingMap(compute.into_iter().map(|(k, v)| (k.into(), v)).collect());
+        f
+    }
+
+    #[test]
+    fn compute_long_form_normalises_to_compute() {
+        let rhs = MappingRhs::Full(MappingEntry {
+            from: String::new(),
+            truncate: true,
+            default: Some(toml::Value::Integer(0)),
+            switch: None,
+            compute: Some("`a` + 1".into()),
+        });
+        let rules = build(&flow_with(vec![("dst", rhs)])).unwrap();
+        assert_eq!(
+            rules,
+            vec![ColumnMapping::Compute {
+                to: "dst".into(),
+                expr_source: "`a` + 1".into(),
+                truncate: true,
+                default_literal: Some(toml::Value::Integer(0)),
+            }]
+        );
+    }
+
+    #[test]
+    fn compute_with_from_rejected() {
+        let rhs = MappingRhs::Full(MappingEntry {
+            from: "a".into(),
+            truncate: false,
+            default: None,
+            switch: None,
+            compute: Some("`a`".into()),
+        });
+        let err = build(&flow_with(vec![("dst", rhs)])).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+    }
+
+    #[test]
+    fn compute_with_switch_rejected() {
+        let rhs = MappingRhs::Full(MappingEntry {
+            from: String::new(),
+            truncate: false,
+            default: None,
+            switch: Some(SwitchTable(vec![(
+                "1".into(),
+                toml::Value::String("x".into()),
+            )])),
+            compute: Some("`a`".into()),
+        });
+        let err = build(&flow_with(vec![("dst", rhs)])).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+    }
+
+    #[test]
+    fn compute_on_wildcard_key_rejected() {
+        let err = build(&flow_with(vec![("*", compute_entry("`a`"))])).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+    }
+
+    #[test]
+    fn compute_mapping_shorthand_appends_compute_rules() {
+        let rules = build(&flow_with_compute(
+            vec![("id", short("id"))],
+            vec![("doubled", short("`id` * 2"))],
+        ))
+        .unwrap();
+        assert_eq!(rules.len(), 2);
+        assert!(matches!(&rules[0], ColumnMapping::Direct { to, .. } if to == "id"));
+        assert_eq!(
+            rules[1],
+            ColumnMapping::Compute {
+                to: "doubled".into(),
+                expr_source: "`id` * 2".into(),
+                truncate: false,
+                default_literal: None,
+            }
+        );
+    }
+
+    #[test]
+    fn compute_mapping_full_form_rejected() {
+        let err = build(&flow_with_compute(
+            vec![("id", short("id"))],
+            vec![("c", compute_entry("`id`"))],
+        ))
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+    }
+
+    #[test]
+    fn same_sink_column_in_both_tables_rejected() {
+        let err = build(&flow_with_compute(
+            vec![("dup", short("id"))],
+            vec![("dup", short("`id` + 1"))],
+        ))
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+    }
+
+    #[test]
+    fn only_compute_mapping_is_enough() {
+        let rules = build(&flow_with_compute(vec![], vec![("c", short("1 + 2"))])).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert!(matches!(&rules[0], ColumnMapping::Compute { to, .. } if to == "c"));
     }
 
     #[test]

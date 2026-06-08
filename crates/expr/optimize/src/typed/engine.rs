@@ -32,7 +32,9 @@ use air_elt_expr_funcs::FunctionRegistry;
 use super::algebraic_identities::AlgebraicIdentities;
 use super::flatten::TypedFlatten;
 use super::power_reduce::PowerReduce;
+use super::self_compare::SelfCompare;
 use super::strip::{AssertStrip, CastStrip};
+use super::unary_reduce::UnaryReduce;
 use crate::engines::type_check::TypeMap;
 use crate::model::opt_expr::OptExpr;
 use crate::model::opt_program::{OptProgram, OptStatement};
@@ -79,6 +81,8 @@ impl TypedRuleSet {
             Box::new(TypedFlatten::create(registry)),
             Box::new(AlgebraicIdentities::create(registry)),
             Box::new(PowerReduce::create(registry)),
+            Box::new(SelfCompare::create(registry)),
+            Box::new(UnaryReduce::create(registry)),
         ];
         Self { rules }
     }

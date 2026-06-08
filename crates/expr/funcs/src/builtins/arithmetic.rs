@@ -5,13 +5,36 @@ use crate::arithmetic_utils::{
 };
 use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::{DataType, Value, compare_values};
-use bigdecimal::BigDecimal;
+use bigdecimal::{BigDecimal, RoundingMode};
 use num_bigint::BigInt;
-use num_traits::Zero;
+use num_traits::{ToPrimitive, Zero};
 
 use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
 use crate::signature::{ArgWindow, EvalContext, ExprFunction, FuncArgVec};
+
+/// Widen a narrow numeric `Value` to the canonical wide form the binary
+/// arithmetic ops compute on (`Int64` / `Float64` / `BigInt` / `Decimal`).
+/// Source rows carry narrow variants (`Int32` for a PG `INT`, `Float32`
+/// for `REAL`, …); the type algebra already promotes to the wide form, so
+/// the runtime must canonicalise the actual values to match. Non-numeric
+/// values pass through unchanged.
+fn widen_numeric(value: Value) -> Value {
+    match value {
+        Value::Int8(x) => Value::Int64(i64::from(x)),
+        Value::Int16(x) => Value::Int64(i64::from(x)),
+        Value::Int32(x) => Value::Int64(i64::from(x)),
+        Value::UInt8(x) => Value::Int64(i64::from(x)),
+        Value::UInt16(x) => Value::Int64(i64::from(x)),
+        Value::UInt32(x) => Value::Int64(i64::from(x)),
+        Value::UInt64(x) => match i64::try_from(x) {
+            Ok(v) => Value::Int64(v),
+            Err(_) => Value::BigInt(BigInt::from(x)),
+        },
+        Value::Float32(x) => Value::Float64(f64::from(x)),
+        other => other,
+    }
+}
 
 static ADD: AddFunc = AddFunc;
 static SUBTRACT: SubtractFunc = SubtractFunc;
@@ -105,24 +128,12 @@ impl ExprFunction for AddFunc {
         args: &mut dyn ArgWindow,
         _context: &EvalContext,
     ) -> Result<Value, FuncError> {
-        let a = args.read(0);
-        let b = args.read(1);
-        if a.is_null() || b.is_null() {
+        if args.read(0).is_null() || args.read(1).is_null() {
             return Ok(Value::Null);
         }
-        // Inline fast path: borrow the operands, no `Null` write-back on the hot
-        // integer/float path.
-        match (a, b) {
-            (Value::Int64(x), Value::Int64(y)) => match x.checked_add(*y) {
-                Some(result) => return Ok(Value::Int64(result)),
-                None => return Ok(Value::BigInt(BigInt::from(*x) + BigInt::from(*y))),
-            },
-            (Value::Float64(x), Value::Float64(y)) => return Ok(Value::Float64(*x + *y)),
-            _ => {}
-        }
-        // Heap / mixed operands: take ownership of arg 0 (its buffer is reused
-        // for Text concat / BigInt / Decimal). For the Text case arg 1 is only
-        // READ — `push_str` borrows it, so taking would clone a const separator
+        // Take ownership of arg 0 (its buffer is reused for Text concat /
+        // BigInt / Decimal). For the Text case arg 1 is only READ —
+        // `push_str` borrows it, so taking would clone a const separator
         // (`' '`, `'-'`) on every row.
         let left = args.take(0);
         if let Value::Text(mut s) = left {
@@ -138,7 +149,14 @@ impl ExprFunction for AddFunc {
                 }),
             };
         }
-        match (left, args.take(1)) {
+        // Numeric: canonicalise narrow operands (`Int32`, `Float32`, …) to the
+        // wide form the arms compute on.
+        match (widen_numeric(left), widen_numeric(args.take(1))) {
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_add(y) {
+                Some(result) => Ok(Value::Int64(result)),
+                None => Ok(Value::BigInt(BigInt::from(x) + BigInt::from(y))),
+            },
+            (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x + y)),
             (Value::BigInt(x), Value::BigInt(y)) => Ok(Value::BigInt(x + y)),
             (Value::BigInt(x), Value::Int64(y)) => Ok(Value::BigInt(x + BigInt::from(y))),
             (Value::Int64(x), Value::BigInt(y)) => Ok(Value::BigInt(BigInt::from(x) + y)),
@@ -196,20 +214,15 @@ impl ExprFunction for SubtractFunc {
         args: &mut dyn ArgWindow,
         _context: &EvalContext,
     ) -> Result<Value, FuncError> {
-        let a = args.read(0);
-        let b = args.read(1);
-        if a.is_null() || b.is_null() {
+        if args.read(0).is_null() || args.read(1).is_null() {
             return Ok(Value::Null);
         }
-        match (a, b) {
-            (Value::Int64(x), Value::Int64(y)) => match x.checked_sub(*y) {
-                Some(result) => return Ok(Value::Int64(result)),
-                None => return Ok(Value::BigInt(BigInt::from(*x) - BigInt::from(*y))),
+        match (widen_numeric(args.take(0)), widen_numeric(args.take(1))) {
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_sub(y) {
+                Some(result) => Ok(Value::Int64(result)),
+                None => Ok(Value::BigInt(BigInt::from(x) - BigInt::from(y))),
             },
-            (Value::Float64(x), Value::Float64(y)) => return Ok(Value::Float64(*x - *y)),
-            _ => {}
-        }
-        match (args.take(0), args.take(1)) {
+            (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x - y)),
             (Value::BigInt(x), Value::BigInt(y)) => Ok(Value::BigInt(x - y)),
             (Value::BigInt(x), Value::Int64(y)) => Ok(Value::BigInt(x - BigInt::from(y))),
             (Value::Int64(x), Value::BigInt(y)) => Ok(Value::BigInt(BigInt::from(x) - y)),
@@ -267,20 +280,15 @@ impl ExprFunction for MultiplyFunc {
         args: &mut dyn ArgWindow,
         _context: &EvalContext,
     ) -> Result<Value, FuncError> {
-        let a = args.read(0);
-        let b = args.read(1);
-        if a.is_null() || b.is_null() {
+        if args.read(0).is_null() || args.read(1).is_null() {
             return Ok(Value::Null);
         }
-        match (a, b) {
-            (Value::Int64(x), Value::Int64(y)) => match x.checked_mul(*y) {
-                Some(result) => return Ok(Value::Int64(result)),
-                None => return Ok(Value::BigInt(BigInt::from(*x) * BigInt::from(*y))),
+        match (widen_numeric(args.take(0)), widen_numeric(args.take(1))) {
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_mul(y) {
+                Some(result) => Ok(Value::Int64(result)),
+                None => Ok(Value::BigInt(BigInt::from(x) * BigInt::from(y))),
             },
-            (Value::Float64(x), Value::Float64(y)) => return Ok(Value::Float64(*x * *y)),
-            _ => {}
-        }
-        match (args.take(0), args.take(1)) {
+            (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x * y)),
             (Value::BigInt(x), Value::BigInt(y)) => Ok(Value::BigInt(x * y)),
             (Value::BigInt(x), Value::Int64(y)) => Ok(Value::BigInt(x * BigInt::from(y))),
             (Value::Int64(x), Value::BigInt(y)) => Ok(Value::BigInt(BigInt::from(x) * y)),
@@ -334,26 +342,21 @@ impl ExprFunction for DivideFunc {
         args: &mut dyn ArgWindow,
         _context: &EvalContext,
     ) -> Result<Value, FuncError> {
-        let a = args.read(0);
-        let b = args.read(1);
-        if a.is_null() || b.is_null() {
+        if args.read(0).is_null() || args.read(1).is_null() {
             return Ok(Value::Null);
         }
-        match (a, b) {
-            (Value::Int64(_), Value::Int64(0)) => return Err(FuncError::DivisionByZero),
-            (Value::Int64(x), Value::Int64(y)) => match x.checked_div(*y) {
-                Some(result) => return Ok(Value::Int64(result)),
-                None => return Ok(Value::BigInt(BigInt::from(*x) / BigInt::from(*y))),
+        match (widen_numeric(args.take(0)), widen_numeric(args.take(1))) {
+            (Value::Int64(_), Value::Int64(0)) => Err(FuncError::DivisionByZero),
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_div(y) {
+                Some(result) => Ok(Value::Int64(result)),
+                None => Ok(Value::BigInt(BigInt::from(x) / BigInt::from(y))),
             },
             (Value::Float64(x), Value::Float64(y)) => {
-                if *y == 0.0 {
+                if y == 0.0 {
                     return Err(FuncError::DivisionByZero);
                 }
-                return Ok(Value::Float64(*x / *y));
+                Ok(Value::Float64(x / y))
             }
-            _ => {}
-        }
-        match (args.take(0), args.take(1)) {
             (Value::BigInt(_), Value::BigInt(ref y)) if y.is_zero() => {
                 Err(FuncError::DivisionByZero)
             }
@@ -421,27 +424,22 @@ impl ExprFunction for ModuloFunc {
         args: &mut dyn ArgWindow,
         _context: &EvalContext,
     ) -> Result<Value, FuncError> {
-        let a = args.read(0);
-        let b = args.read(1);
-        if a.is_null() || b.is_null() {
+        if args.read(0).is_null() || args.read(1).is_null() {
             return Ok(Value::Null);
         }
-        match (a, b) {
-            (Value::Int64(_), Value::Int64(0)) => return Err(FuncError::DivisionByZero),
-            (Value::Int64(x), Value::Int64(y)) => match x.checked_rem(*y) {
-                Some(result) => return Ok(Value::Int64(result)),
+        match (widen_numeric(args.take(0)), widen_numeric(args.take(1))) {
+            (Value::Int64(_), Value::Int64(0)) => Err(FuncError::DivisionByZero),
+            (Value::Int64(x), Value::Int64(y)) => match x.checked_rem(y) {
+                Some(result) => Ok(Value::Int64(result)),
                 // i64::MIN % -1 overflows; promote to BigInt (result is 0).
-                None => return Ok(Value::BigInt(BigInt::from(*x) % BigInt::from(*y))),
+                None => Ok(Value::BigInt(BigInt::from(x) % BigInt::from(y))),
             },
             (Value::Float64(x), Value::Float64(y)) => {
-                if *y == 0.0 {
+                if y == 0.0 {
                     return Err(FuncError::DivisionByZero);
                 }
-                return Ok(Value::Float64(*x % *y));
+                Ok(Value::Float64(x % y))
             }
-            _ => {}
-        }
-        match (args.take(0), args.take(1)) {
             (Value::BigInt(_), Value::BigInt(ref y)) if y.is_zero() => {
                 Err(FuncError::DivisionByZero)
             }
@@ -491,7 +489,28 @@ impl ExprFunction for NegateFunc {
     }
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        Ok(args[0].clone())
+        // `negate` preserves the input type for every *signed* numeric (a signed
+        // `MIN` that overflows its own width promotes to `BigInt` at runtime, just
+        // like `abs`). Unsigned integers are the exception: the negation of a
+        // non-zero unsigned value is negative and CANNOT be represented in the
+        // unsigned type, so preserving the type would be unsound. They widen to the
+        // smallest signed type that holds every negated value:
+        //   UInt8/16/32 → Int64  (−(2^32−1) fits an `i64`)
+        //   UInt64      → BigInt  (−(2^64−1) does not fit any fixed-width int)
+        // `resolve_type` and `evaluate` must agree on this; see `evaluate`.
+        let arg = &args[0];
+        let widened = match arg.data_type {
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                let target = if matches!(arg.data_type, DataType::UInt64) {
+                    DataType::BigInt { width: None }
+                } else {
+                    DataType::Int64
+                };
+                NullableExprType::new(target, arg.nullable)
+            }
+            _ => arg.clone(),
+        };
+        Ok(widened)
     }
 
     fn evaluate(
@@ -503,11 +522,33 @@ impl ExprFunction for NegateFunc {
         if a.is_null() {
             return Ok(Value::Null);
         }
+        // Signed narrow / `Int64`: `checked_neg`, promoting to `BigInt` only on the
+        // `MIN` overflow (mirrors `abs`). The result type stays the operand's type,
+        // matching `resolve_type`.
         match a {
+            Value::Int8(x) => match x.checked_neg() {
+                Some(result) => return Ok(Value::Int8(result)),
+                None => return Ok(Value::BigInt(-BigInt::from(*x))),
+            },
+            Value::Int16(x) => match x.checked_neg() {
+                Some(result) => return Ok(Value::Int16(result)),
+                None => return Ok(Value::BigInt(-BigInt::from(*x))),
+            },
+            Value::Int32(x) => match x.checked_neg() {
+                Some(result) => return Ok(Value::Int32(result)),
+                None => return Ok(Value::BigInt(-BigInt::from(*x))),
+            },
             Value::Int64(x) => match x.checked_neg() {
                 Some(result) => return Ok(Value::Int64(result)),
                 None => return Ok(Value::BigInt(-BigInt::from(*x))),
             },
+            // Unsigned: widen to the signed form `resolve_type` promises.
+            // −(any UInt8/16/32) fits an `i64`; UInt64 needs `BigInt`.
+            Value::UInt8(x) => return Ok(Value::Int64(-i64::from(*x))),
+            Value::UInt16(x) => return Ok(Value::Int64(-i64::from(*x))),
+            Value::UInt32(x) => return Ok(Value::Int64(-i64::from(*x))),
+            Value::UInt64(x) => return Ok(Value::BigInt(-BigInt::from(*x))),
+            Value::Float32(x) => return Ok(Value::Float32(-*x)),
             Value::Float64(x) => return Ok(Value::Float64(-*x)),
             _ => {}
         }
@@ -555,11 +596,31 @@ impl ExprFunction for AbsFunc {
         if a.is_null() {
             return Ok(Value::Null);
         }
+        // `abs` preserves the operand's type. A signed integer's `MIN` has no
+        // representable absolute value in its own width, so — like the `Int64`
+        // arm — it promotes to `BigInt`. Unsigned integers are already
+        // non-negative, so `abs` is the identity.
         match a {
+            Value::Int8(x) => match x.checked_abs() {
+                Some(result) => return Ok(Value::Int8(result)),
+                None => return Ok(Value::BigInt(BigInt::from(*x).magnitude().clone().into())),
+            },
+            Value::Int16(x) => match x.checked_abs() {
+                Some(result) => return Ok(Value::Int16(result)),
+                None => return Ok(Value::BigInt(BigInt::from(*x).magnitude().clone().into())),
+            },
+            Value::Int32(x) => match x.checked_abs() {
+                Some(result) => return Ok(Value::Int32(result)),
+                None => return Ok(Value::BigInt(BigInt::from(*x).magnitude().clone().into())),
+            },
             Value::Int64(x) => match x.checked_abs() {
                 Some(result) => return Ok(Value::Int64(result)),
                 None => return Ok(Value::BigInt(BigInt::from(*x).magnitude().clone().into())),
             },
+            Value::UInt8(_) | Value::UInt16(_) | Value::UInt32(_) | Value::UInt64(_) => {
+                return Ok(a.clone());
+            }
+            Value::Float32(x) => return Ok(Value::Float32(x.abs())),
             Value::Float64(x) => return Ok(Value::Float64(x.abs())),
             _ => {}
         }
@@ -613,15 +674,11 @@ impl ExprFunction for CeilFunc {
         if a.is_null() {
             return Ok(Value::Null);
         }
-        match a {
-            Value::Int64(x) => Ok(Value::Int64(*x)),
-            Value::Float64(x) => Ok(Value::Int64(x.ceil() as i64)),
-            other => Err(FuncError::TypeMismatch {
-                function: "ceil".to_owned(),
-                expected: "numeric".to_owned(),
-                actual: format!("{:?}", other.data_type()),
-            }),
-        }
+        // `ceil` resolves to `Int64`. An integer operand is already integral, so
+        // return it exactly (no `f64` round-trip — large `Int64`s past 2^53 lose
+        // precision through `f64`). Float / `Decimal` operands take the ceiling via
+        // the shared `value_to_f64`, which accepts every numeric variant.
+        round_to_int64(a, "ceil", f64::ceil, RoundingMode::Ceiling)
     }
 }
 
@@ -657,15 +714,7 @@ impl ExprFunction for FloorFunc {
         if a.is_null() {
             return Ok(Value::Null);
         }
-        match a {
-            Value::Int64(x) => Ok(Value::Int64(*x)),
-            Value::Float64(x) => Ok(Value::Int64(x.floor() as i64)),
-            other => Err(FuncError::TypeMismatch {
-                function: "floor".to_owned(),
-                expected: "numeric".to_owned(),
-                actual: format!("{:?}", other.data_type()),
-            }),
-        }
+        round_to_int64(a, "floor", f64::floor, RoundingMode::Floor)
     }
 }
 
@@ -701,15 +750,7 @@ impl ExprFunction for RoundFunc {
         if a.is_null() {
             return Ok(Value::Null);
         }
-        match a {
-            Value::Int64(x) => Ok(Value::Int64(*x)),
-            Value::Float64(x) => Ok(Value::Int64(x.round() as i64)),
-            other => Err(FuncError::TypeMismatch {
-                function: "round".to_owned(),
-                expected: "numeric".to_owned(),
-                actual: format!("{:?}", other.data_type()),
-            }),
-        }
+        round_to_int64(a, "round", f64::round, RoundingMode::HalfUp)
     }
 }
 
@@ -871,8 +912,18 @@ impl ExprFunction for SignFunc {
         if a.is_null() {
             return Ok(Value::Null);
         }
+        // `sign` resolves to `Int64` (-1 / 0 / 1) for every numeric variant.
+        // Integers use their native `signum`; unsigned integers are 0 or 1.
+        // Float / `Decimal` compute the sign by comparison.
         match a {
+            Value::Int8(x) => Ok(Value::Int64(i64::from(x.signum()))),
+            Value::Int16(x) => Ok(Value::Int64(i64::from(x.signum()))),
+            Value::Int32(x) => Ok(Value::Int64(i64::from(x.signum()))),
             Value::Int64(x) => Ok(Value::Int64(x.signum())),
+            Value::UInt8(x) => Ok(Value::Int64(i64::from(*x != 0))),
+            Value::UInt16(x) => Ok(Value::Int64(i64::from(*x != 0))),
+            Value::UInt32(x) => Ok(Value::Int64(i64::from(*x != 0))),
+            Value::UInt64(x) => Ok(Value::Int64(i64::from(*x != 0))),
             Value::BigInt(x) => {
                 use num_bigint::Sign;
                 let s = match x.sign() {
@@ -893,15 +944,8 @@ impl ExprFunction for SignFunc {
                     Ok(Value::Int64(-1))
                 }
             }
-            Value::Float64(x) => {
-                if *x > 0.0 {
-                    Ok(Value::Int64(1))
-                } else if *x < 0.0 {
-                    Ok(Value::Int64(-1))
-                } else {
-                    Ok(Value::Int64(0))
-                }
-            }
+            Value::Float32(x) => Ok(Value::Int64(float_sign(f64::from(*x)))),
+            Value::Float64(x) => Ok(Value::Int64(float_sign(*x))),
             other => Err(FuncError::TypeMismatch {
                 function: "sign".to_owned(),
                 expected: "numeric".to_owned(),
@@ -995,14 +1039,77 @@ impl ExprFunction for SqrtFunc {
 }
 
 fn to_f64(val: &Value, func_name: &str) -> Result<f64, FuncError> {
+    crate::arithmetic_utils::value_to_f64(val, func_name)
+}
+
+/// Shared `ceil`/`floor`/`round` body: all three resolve to `Int64`, accept any
+/// numeric variant, and differ only in the rounding step — passed both as an
+/// `f64` rounder (for `Float32`/`Float64`) and as a [`RoundingMode`] (for the
+/// exact `Decimal` path).
+///
+/// Integer operands (narrow/unsigned/`Int64`/`BigInt`) are already integral, so
+/// the rounding direction is a no-op; they are converted to `Int64` *exactly*,
+/// bypassing the lossy `f64` path that would round-trip a large `Int64`
+/// (magnitude past 2^53) to a wrong value. `Decimal` rounds exactly via
+/// `with_scale_round(0, mode)` then converts to `Int64`. Float operands round via
+/// `value_to_f64` then cast to `Int64`, range-checked first.
+///
+/// Any operand (`UInt64`, `BigInt`, `Decimal`, or a float) whose rounded integral
+/// value exceeds the `i64` range is an [`FuncError::IntegerOverflow`] — never a
+/// silent saturating cast.
+fn round_to_int64(
+    val: &Value,
+    func_name: &str,
+    rounder: fn(f64) -> f64,
+    mode: RoundingMode,
+) -> Result<Value, FuncError> {
     match val {
-        Value::Int64(x) => Ok(*x as f64),
-        Value::Float64(x) => Ok(*x),
-        other => Err(FuncError::TypeMismatch {
-            function: func_name.to_owned(),
-            expected: "numeric".to_owned(),
-            actual: format!("{:?}", other.data_type()),
-        }),
+        Value::Int8(x) => Ok(Value::Int64(i64::from(*x))),
+        Value::Int16(x) => Ok(Value::Int64(i64::from(*x))),
+        Value::Int32(x) => Ok(Value::Int64(i64::from(*x))),
+        Value::Int64(x) => Ok(Value::Int64(*x)),
+        Value::UInt8(x) => Ok(Value::Int64(i64::from(*x))),
+        Value::UInt16(x) => Ok(Value::Int64(i64::from(*x))),
+        Value::UInt32(x) => Ok(Value::Int64(i64::from(*x))),
+        Value::UInt64(x) => i64::try_from(*x)
+            .map(Value::Int64)
+            .map_err(|_| FuncError::IntegerOverflow),
+        Value::BigInt(x) => x
+            .to_i64()
+            .map(Value::Int64)
+            .ok_or(FuncError::IntegerOverflow),
+        Value::Decimal(x) => {
+            // Round exactly to an integer in the requested direction, then convert.
+            let rounded = x.with_scale_round(0, mode);
+            rounded
+                .to_i64()
+                .map(Value::Int64)
+                .ok_or(FuncError::IntegerOverflow)
+        }
+        _ => {
+            // Float32 / Float64 (every other numeric is handled above).
+            let rounded = rounder(to_f64(val, func_name)?);
+            // `as i64` saturates; reject out-of-range explicitly to match the
+            // exact arms above. (`>=` upper bound: `i64::MAX` is not exactly
+            // representable in `f64`, so the nearest `f64` is `2^63`, which is one
+            // past the range.)
+            if rounded < i64::MIN as f64 || rounded >= 9_223_372_036_854_775_808.0 {
+                return Err(FuncError::IntegerOverflow);
+            }
+            Ok(Value::Int64(rounded as i64))
+        }
+    }
+}
+
+/// Float `sign`: -1 / 0 / 1. A `NaN` is neither `> 0` nor `< 0`, so it yields 0
+/// (matching the previous `Float64` behaviour, which fell through to the `else`).
+fn float_sign(x: f64) -> i64 {
+    if x > 0.0 {
+        1
+    } else if x < 0.0 {
+        -1
+    } else {
+        0
     }
 }
 
@@ -1052,6 +1159,20 @@ mod tests {
     use super::*;
     use crate::test_support::{ctx, eval};
 
+    /// Assert both the value AND the exact `Value` variant. `Value`'s `PartialEq`
+    /// is cross-numeric (`Int8(5) == Int64(5)`), so a value-only `assert_eq!`
+    /// would pass even if `evaluate` returned the wrong variant — which is the
+    /// exact property the narrow-type fixes are about. Comparing `data_type()`
+    /// pins the canonical type, catching a wrong-variant regression.
+    fn assert_value_and_type(got: &Value, want: &Value) {
+        assert_eq!(got, want, "value");
+        assert_eq!(
+            got.data_type(),
+            want.data_type(),
+            "variant: got {got:?}, want {want:?}"
+        );
+    }
+
     #[test]
     fn add_int() {
         let f = AddFunc;
@@ -1076,6 +1197,79 @@ mod tests {
         assert_eq!(
             result,
             Value::BigInt(BigInt::from(i64::MAX) + BigInt::from(1))
+        );
+    }
+
+    /// Narrow numeric operands (as a source row carries them — `Int32` for a
+    /// PG `INT`, `Float32` for `REAL`, …) are widened to the canonical form
+    /// the ops compute on, so arithmetic over real source columns works.
+    #[test]
+    fn arithmetic_widens_narrow_operands() {
+        // Int32 * Int32 → Int64 (the pg→pg compute case).
+        assert_value_and_type(
+            &eval(
+                &MultiplyFunc,
+                smallvec::smallvec![Value::Int32(5), Value::Int32(5)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::Int64(25),
+        );
+        // Int16 + Int16 → Int64.
+        assert_value_and_type(
+            &eval(
+                &AddFunc,
+                smallvec::smallvec![Value::Int16(100), Value::Int16(28)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::Int64(128),
+        );
+        // Int8 + UInt8 → Int64 (the smallest narrow arms).
+        assert_value_and_type(
+            &eval(
+                &AddFunc,
+                smallvec::smallvec![Value::Int8(-5), Value::UInt8(9)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::Int64(4),
+        );
+        // UInt32 + UInt32 → Int64.
+        assert_value_and_type(
+            &eval(
+                &AddFunc,
+                smallvec::smallvec![Value::UInt32(2), Value::UInt32(3)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::Int64(5),
+        );
+        // Float32 + Float32 → Float64.
+        assert_value_and_type(
+            &eval(
+                &AddFunc,
+                smallvec::smallvec![Value::Float32(1.5), Value::Float32(2.5)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::Float64(4.0),
+        );
+    }
+
+    /// A `UInt64` past `i64::MAX` cannot be an `Int64`, so `widen_numeric`
+    /// promotes it to `BigInt` — exercising that overflow arm end to end.
+    #[test]
+    fn arithmetic_widens_large_uint64_to_bigint() {
+        let result = eval(
+            &AddFunc,
+            smallvec::smallvec![Value::UInt64(u64::MAX), Value::Int64(1)],
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            Value::BigInt(BigInt::from(u64::MAX) + BigInt::from(1))
         );
     }
 
@@ -1138,6 +1332,36 @@ mod tests {
         let f = AbsFunc;
         let result = eval(&f, smallvec::smallvec![Value::Int64(-7)], &ctx()).unwrap();
         assert_eq!(result, Value::Int64(7));
+    }
+
+    /// `abs` preserves narrow/unsigned/float32 types (a source column arrives as
+    /// `Int32` / `UInt32` / `Float32`, not the canonical wide form).
+    #[test]
+    fn abs_preserves_narrow_and_unsigned_types() {
+        let cases = [
+            (Value::Int8(-5), Value::Int8(5)),
+            (Value::Int16(-300), Value::Int16(300)),
+            (Value::Int32(-9), Value::Int32(9)),
+            (Value::UInt8(7), Value::UInt8(7)),
+            (Value::UInt32(42), Value::UInt32(42)),
+            (Value::Float32(-2.5), Value::Float32(2.5)),
+        ];
+        for (input, want) in cases {
+            assert_value_and_type(
+                &eval(&AbsFunc, smallvec::smallvec![input.clone()], &ctx()).unwrap(),
+                &want,
+            );
+        }
+    }
+
+    /// A signed integer's `MIN` has no representable absolute value in its own
+    /// width, so it promotes to `BigInt` — mirroring the `Int64` arm.
+    #[test]
+    fn abs_of_narrow_min_promotes_to_bigint() {
+        assert_eq!(
+            eval(&AbsFunc, smallvec::smallvec![Value::Int8(i8::MIN)], &ctx()).unwrap(),
+            Value::BigInt(BigInt::from(128)),
+        );
     }
 
     #[test]
@@ -1245,6 +1469,315 @@ mod tests {
         assert_eq!(result, Value::Int64(1));
     }
 
+    /// `ceil`/`floor`/`round` resolve to `Int64` and must accept every numeric
+    /// variant a source row carries (narrow/unsigned integers, `Float32`,
+    /// `Decimal`) — returning an exact `Int64`, never a runtime `TypeMismatch`.
+    #[test]
+    fn rounders_accept_narrow_unsigned_and_float32() {
+        // Integer operands are already integral → returned exactly as Int64.
+        for f in [
+            &CeilFunc as &dyn ExprFunction,
+            &FloorFunc as &dyn ExprFunction,
+            &RoundFunc as &dyn ExprFunction,
+        ] {
+            assert_value_and_type(
+                &eval(f, smallvec::smallvec![Value::Int32(-7)], &ctx()).unwrap(),
+                &Value::Int64(-7),
+            );
+            assert_value_and_type(
+                &eval(f, smallvec::smallvec![Value::UInt8(200)], &ctx()).unwrap(),
+                &Value::Int64(200),
+            );
+            assert_value_and_type(
+                &eval(f, smallvec::smallvec![Value::Int16(42)], &ctx()).unwrap(),
+                &Value::Int64(42),
+            );
+        }
+        // Float32 operands round in the requested direction (Int64 result).
+        assert_value_and_type(
+            &eval(&CeilFunc, smallvec::smallvec![Value::Float32(2.3)], &ctx()).unwrap(),
+            &Value::Int64(3),
+        );
+        assert_value_and_type(
+            &eval(&FloorFunc, smallvec::smallvec![Value::Float32(2.7)], &ctx()).unwrap(),
+            &Value::Int64(2),
+        );
+        assert_value_and_type(
+            &eval(&RoundFunc, smallvec::smallvec![Value::Float32(2.5)], &ctx()).unwrap(),
+            &Value::Int64(3),
+        );
+        // Decimal operand rounds exactly in the requested direction.
+        assert_value_and_type(
+            &eval(
+                &CeilFunc,
+                smallvec::smallvec![Value::Decimal("3.1".parse().unwrap())],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::Int64(4),
+        );
+        assert_value_and_type(
+            &eval(
+                &FloorFunc,
+                smallvec::smallvec![Value::Decimal("3.9".parse().unwrap())],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::Int64(3),
+        );
+        assert_value_and_type(
+            &eval(
+                &RoundFunc,
+                smallvec::smallvec![Value::Decimal("2.5".parse().unwrap())],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::Int64(3),
+        );
+    }
+
+    /// The overflow arms of `ceil`/`floor`/`round`: a `BigInt`, a `UInt64`, or a
+    /// `Decimal` whose rounded integral value exceeds the `i64` range, plus an
+    /// out-of-range float — all must be a hard `IntegerOverflow`, never a silent
+    /// saturating cast to `i64::MAX`.
+    #[test]
+    fn rounders_reject_out_of_i64_range() {
+        let big = Value::BigInt(BigInt::from(i64::MAX) + BigInt::from(1));
+        let huge_uint = Value::UInt64(u64::MAX);
+        let huge_dec = Value::Decimal("1e30".parse().unwrap());
+        let huge_float = Value::Float64(1e30);
+        for f in [
+            &CeilFunc as &dyn ExprFunction,
+            &FloorFunc as &dyn ExprFunction,
+            &RoundFunc as &dyn ExprFunction,
+        ] {
+            for operand in [&big, &huge_uint, &huge_dec, &huge_float] {
+                let result = eval(f, smallvec::smallvec![operand.clone()], &ctx());
+                assert!(
+                    matches!(result, Err(FuncError::IntegerOverflow)),
+                    "{}({operand:?}) = {result:?}",
+                    f.name()
+                );
+            }
+        }
+    }
+
+    /// A large `Int64` (magnitude past 2^53) must round-trip *exactly*: the
+    /// integer fast-path returns it verbatim instead of degrading through `f64`.
+    #[test]
+    fn rounders_preserve_large_int64_exactly() {
+        let big = 9_007_199_254_740_993i64; // 2^53 + 1, not representable in f64
+        assert_value_and_type(
+            &eval(&RoundFunc, smallvec::smallvec![Value::Int64(big)], &ctx()).unwrap(),
+            &Value::Int64(big),
+        );
+    }
+
+    /// `sign` resolves to `Int64` (-1/0/1) and accepts every numeric variant.
+    #[test]
+    fn sign_accepts_narrow_unsigned_and_float32() {
+        assert_value_and_type(
+            &eval(&SignFunc, smallvec::smallvec![Value::Int16(-300)], &ctx()).unwrap(),
+            &Value::Int64(-1),
+        );
+        assert_value_and_type(
+            &eval(&SignFunc, smallvec::smallvec![Value::Int8(0)], &ctx()).unwrap(),
+            &Value::Int64(0),
+        );
+        // Unsigned is never negative → 0 or 1.
+        assert_value_and_type(
+            &eval(&SignFunc, smallvec::smallvec![Value::UInt32(42)], &ctx()).unwrap(),
+            &Value::Int64(1),
+        );
+        assert_value_and_type(
+            &eval(&SignFunc, smallvec::smallvec![Value::UInt8(0)], &ctx()).unwrap(),
+            &Value::Int64(0),
+        );
+        assert_value_and_type(
+            &eval(&SignFunc, smallvec::smallvec![Value::Float32(-2.5)], &ctx()).unwrap(),
+            &Value::Int64(-1),
+        );
+    }
+
+    /// `sign(NaN)` is neither `> 0` nor `< 0`, so the documented `float_sign`
+    /// NaN→0 arm yields `Int64(0)`.
+    #[test]
+    fn sign_of_nan_is_zero() {
+        assert_value_and_type(
+            &eval(
+                &SignFunc,
+                smallvec::smallvec![Value::Float64(f64::NAN)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::Int64(0),
+        );
+        assert_value_and_type(
+            &eval(
+                &SignFunc,
+                smallvec::smallvec![Value::Float32(f32::NAN)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::Int64(0),
+        );
+    }
+
+    /// `negate` preserves the input type for signed narrow / float32 operands.
+    #[test]
+    fn negate_preserves_signed_narrow_and_float32() {
+        assert_value_and_type(
+            &eval(&NegateFunc, smallvec::smallvec![Value::Int8(5)], &ctx()).unwrap(),
+            &Value::Int8(-5),
+        );
+        assert_value_and_type(
+            &eval(&NegateFunc, smallvec::smallvec![Value::Int16(-300)], &ctx()).unwrap(),
+            &Value::Int16(300),
+        );
+        assert_value_and_type(
+            &eval(&NegateFunc, smallvec::smallvec![Value::Int32(9)], &ctx()).unwrap(),
+            &Value::Int32(-9),
+        );
+        assert_value_and_type(
+            &eval(
+                &NegateFunc,
+                smallvec::smallvec![Value::Float32(2.5)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::Float32(-2.5),
+        );
+    }
+
+    /// A signed integer's `MIN` has no representable negation in its own width, so
+    /// `negate` promotes it to `BigInt` — mirroring `abs`. Covers every signed
+    /// narrow width (Int8/16/32) plus Int64.
+    #[test]
+    fn negate_of_narrow_min_promotes_to_bigint() {
+        assert_value_and_type(
+            &eval(
+                &NegateFunc,
+                smallvec::smallvec![Value::Int8(i8::MIN)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::BigInt(BigInt::from(128)),
+        );
+        assert_value_and_type(
+            &eval(
+                &NegateFunc,
+                smallvec::smallvec![Value::Int16(i16::MIN)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::BigInt(BigInt::from(32_768)),
+        );
+        assert_value_and_type(
+            &eval(
+                &NegateFunc,
+                smallvec::smallvec![Value::Int32(i32::MIN)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::BigInt(BigInt::from(2_147_483_648i64)),
+        );
+        assert_value_and_type(
+            &eval(
+                &NegateFunc,
+                smallvec::smallvec![Value::Int64(i64::MIN)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::BigInt(-BigInt::from(i64::MIN)),
+        );
+    }
+
+    /// Same MIN-overflow promotion for `abs` across every signed narrow width
+    /// (the existing suite only covered Int8 MIN).
+    #[test]
+    fn abs_of_narrow_min_promotes_to_bigint_all_widths() {
+        assert_value_and_type(
+            &eval(
+                &AbsFunc,
+                smallvec::smallvec![Value::Int16(i16::MIN)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::BigInt(BigInt::from(32_768)),
+        );
+        assert_value_and_type(
+            &eval(
+                &AbsFunc,
+                smallvec::smallvec![Value::Int32(i32::MIN)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::BigInt(BigInt::from(2_147_483_648i64)),
+        );
+    }
+
+    /// Negating an unsigned value is negative and cannot live in an unsigned type.
+    /// `resolve_type` widens UInt8/16/32 → Int64 (UInt64 → BigInt), and `evaluate`
+    /// must produce exactly that type so downstream coercion stays sound.
+    #[test]
+    fn negate_unsigned_widens_to_signed() {
+        // UInt8/16/32 → Int64 value.
+        assert_value_and_type(
+            &eval(&NegateFunc, smallvec::smallvec![Value::UInt8(5)], &ctx()).unwrap(),
+            &Value::Int64(-5),
+        );
+        assert_value_and_type(
+            &eval(&NegateFunc, smallvec::smallvec![Value::UInt32(7)], &ctx()).unwrap(),
+            &Value::Int64(-7),
+        );
+        // UInt64 → BigInt value (−(2^64−1) does not fit any fixed-width int).
+        assert_value_and_type(
+            &eval(
+                &NegateFunc,
+                smallvec::smallvec![Value::UInt64(u64::MAX)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::BigInt(-BigInt::from(u64::MAX)),
+        );
+        // resolve_type agrees with the produced value type.
+        let t8 = NegateFunc
+            .resolve_type(&[NullableExprType::non_null(DataType::UInt8)])
+            .unwrap();
+        assert_eq!(t8.data_type, DataType::Int64);
+        let t64 = NegateFunc
+            .resolve_type(&[NullableExprType::non_null(DataType::UInt64)])
+            .unwrap();
+        assert_eq!(t64.data_type, DataType::BigInt { width: None });
+    }
+
+    /// `min`/`max` reduce via the cross-numeric `compare_values`, so they already
+    /// accept narrow/unsigned/float32 operands and return the winning value
+    /// unchanged (no widening). Regression guard for that path.
+    #[test]
+    fn min_max_accept_narrow_unsigned_float32() {
+        // The winning operand is returned with its ORIGINAL narrow variant intact
+        // (no widening) — `assert_value_and_type` pins that via `data_type()`.
+        assert_value_and_type(
+            &eval(
+                &MinFunc,
+                smallvec::smallvec![Value::Int16(5), Value::UInt8(2), Value::Int32(9)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::UInt8(2),
+        );
+        assert_value_and_type(
+            &eval(
+                &MaxFunc,
+                smallvec::smallvec![Value::Float32(1.5), Value::Int32(3)],
+                &ctx(),
+            )
+            .unwrap(),
+            &Value::Int32(3),
+        );
+    }
+
     #[test]
     fn power_basic() {
         let f = PowerFunc;
@@ -1295,6 +1828,21 @@ mod tests {
         let f = SqrtFunc;
         let result = eval(&f, smallvec::smallvec![Value::Float64(9.0)], &ctx()).unwrap();
         assert_eq!(result, Value::Float64(3.0));
+    }
+
+    /// The float-domain builtins accept narrow/unsigned integer operands via the
+    /// shared `value_to_f64` — a source `Int32` column flows into `sqrt` without a
+    /// runtime `TypeMismatch`.
+    #[test]
+    fn sqrt_accepts_narrow_integer_operands() {
+        assert_eq!(
+            eval(&SqrtFunc, smallvec::smallvec![Value::Int32(4)], &ctx()).unwrap(),
+            Value::Float64(2.0)
+        );
+        assert_eq!(
+            eval(&SqrtFunc, smallvec::smallvec![Value::UInt16(9)], &ctx()).unwrap(),
+            Value::Float64(3.0)
+        );
     }
 
     // --- BigInt and Decimal tests ---

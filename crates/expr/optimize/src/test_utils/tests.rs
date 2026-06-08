@@ -3716,6 +3716,269 @@ fn typed_self_inverse_folds_to_zero() {
     }
 }
 
+// ---- Typed self-comparison folding -----------------------------------------
+
+#[test]
+fn typed_strict_self_inequality_folds_false() {
+    // `x > x` / `x < x` is false for every operand — folds to a constant false that
+    // matches the unreduced comparison on every sample row.
+    let schema = make_schema(&[("x", DataType::Int64, false)]);
+    for source in ["field(\"x\") > field(\"x\")", "field(\"x\") < field(\"x\")"] {
+        let typed = compile_typed(source, Some(&schema), None).unwrap();
+        assert!(
+            matches!(typed.node(typed.result()), OptNode::Const(_)),
+            "{source}: got {:?}",
+            typed.node(typed.result())
+        );
+        let untyped = compile_typed(source, None, None).unwrap();
+        for sample in [Value::Int64(0), Value::Int64(42), Value::Int64(-9)] {
+            assert_eq!(
+                eval_with_field(&typed, "x", sample.clone()).unwrap(),
+                Value::Bool(false),
+            );
+            assert_eq!(
+                eval_with_field(&untyped, "x", sample.clone()).unwrap(),
+                Value::Bool(false),
+            );
+        }
+    }
+}
+
+#[test]
+fn typed_self_equality_folds_for_non_float() {
+    // `x == x → true` and `x != x → false` for a non-float operand — sound even when
+    // nullable (`null == null` is true), so a nullable Int64 still folds.
+    for nullable in [false, true] {
+        let schema = make_schema(&[("x", DataType::Int64, nullable)]);
+        let eq = compile_typed("field(\"x\") == field(\"x\")", Some(&schema), None).unwrap();
+        assert!(
+            matches!(eq.node(eq.result()), OptNode::Const(_)),
+            "== nullable={nullable}: got {:?}",
+            eq.node(eq.result())
+        );
+        assert_eq!(
+            eval_with_field(&eq, "x", Value::Int64(7)).unwrap(),
+            Value::Bool(true)
+        );
+        let ne = compile_typed("field(\"x\") != field(\"x\")", Some(&schema), None).unwrap();
+        assert!(
+            matches!(ne.node(ne.result()), OptNode::Const(_)),
+            "!= nullable={nullable}: got {:?}",
+            ne.node(ne.result())
+        );
+        assert_eq!(
+            eval_with_field(&ne, "x", Value::Int64(7)).unwrap(),
+            Value::Bool(false)
+        );
+    }
+}
+
+#[test]
+fn typed_self_equality_skips_float() {
+    // Float self-equality is the canonical NaN test (`NaN == NaN` is false), so it
+    // must NOT fold to a constant — and it genuinely returns false for NaN.
+    let schema = make_schema(&[("x", DataType::Float64, false)]);
+    let program = compile_typed("field(\"x\") == field(\"x\")", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Call { .. }),
+        "float x == x must survive, got {:?}",
+        program.node(program.result())
+    );
+    assert_eq!(
+        eval_with_field(&program, "x", Value::Float64(f64::NAN)).unwrap(),
+        Value::Bool(false),
+    );
+}
+
+#[test]
+fn typed_self_ordering_or_equal_requires_non_null() {
+    // `x >= x` / `x <= x` return false on a null operand, so they fold to true only
+    // for a NON-NULL non-float operand; a nullable operand keeps the call.
+    let non_null = make_schema(&[("x", DataType::Int64, false)]);
+    for source in [
+        "field(\"x\") >= field(\"x\")",
+        "field(\"x\") <= field(\"x\")",
+    ] {
+        let program = compile_typed(source, Some(&non_null), None).unwrap();
+        assert!(
+            matches!(program.node(program.result()), OptNode::Const(_)),
+            "{source} (non-null): got {:?}",
+            program.node(program.result())
+        );
+        assert_eq!(
+            eval_with_field(&program, "x", Value::Int64(5)).unwrap(),
+            Value::Bool(true)
+        );
+    }
+    let nullable = make_schema(&[("x", DataType::Int64, true)]);
+    let program = compile_typed("field(\"x\") >= field(\"x\")", Some(&nullable), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Call { .. }),
+        "nullable x >= x keeps the call, got {:?}",
+        program.node(program.result())
+    );
+}
+
+#[test]
+fn typed_self_comparison_keeps_fallible_operand() {
+    // `x / y > x / y`: divide can raise (division by zero), so dropping the operand
+    // would drop the error — the fold must NOT fire.
+    // Covers all three fold paths that share the can_fail gate: the early `>`
+    // return, the non-float `==` arm, and the non-null `>=` arm.
+    let schema = make_schema(&[("x", DataType::Int64, false), ("y", DataType::Int64, false)]);
+    for op in [">", "==", ">="] {
+        let source = format!("(field(\"x\") / field(\"y\")) {op} (field(\"x\") / field(\"y\"))");
+        let program = compile_typed(&source, Some(&schema), None).unwrap();
+        assert!(
+            matches!(program.node(program.result()), OptNode::Call { .. }),
+            "{source}: fallible operand keeps the comparison, got {:?}",
+            program.node(program.result())
+        );
+    }
+}
+
+// ---- Typed unary integer reductions ----------------------------------------
+
+#[test]
+fn typed_is_nan_on_integer_folds_false() {
+    for dt in [
+        DataType::Int64,
+        DataType::UInt32,
+        DataType::BigInt { width: Some(40) },
+    ] {
+        let schema = make_schema(&[("x", dt.clone(), false)]);
+        let program = compile_typed("isNaN(field(\"x\"))", Some(&schema), None).unwrap();
+        assert!(
+            matches!(program.node(program.result()), OptNode::Const(_)),
+            "isNaN over {dt:?}: got {:?}",
+            program.node(program.result())
+        );
+    }
+    // Typed fold and the unreduced call agree (the unoptimized `isNaN(UInt32)`
+    // now evaluates cleanly → false), so the rewrite is value-preserving.
+    let schema = make_schema(&[("x", DataType::UInt32, false)]);
+    let typed = compile_typed("isNaN(field(\"x\"))", Some(&schema), None).unwrap();
+    let untyped = compile_typed("isNaN(field(\"x\"))", None, None).unwrap();
+    assert_eq!(
+        eval_with_field(&typed, "x", Value::UInt32(123)).unwrap(),
+        eval_with_field(&untyped, "x", Value::UInt32(123)).unwrap(),
+    );
+    assert_eq!(
+        eval_with_field(&typed, "x", Value::UInt32(123)).unwrap(),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn typed_is_infinite_folds_for_fixed_width_keeps_bigint() {
+    // Fixed-width int → always a finite f64 → false.
+    let fixed = make_schema(&[("x", DataType::Int64, false)]);
+    let folded = compile_typed("isInfinite(field(\"x\"))", Some(&fixed), None).unwrap();
+    assert!(
+        matches!(folded.node(folded.result()), OptNode::Const(_)),
+        "isInfinite(fixed int) folds, got {:?}",
+        folded.node(folded.result())
+    );
+    // Typed fold agrees with the unreduced call (which now evaluates cleanly).
+    let untyped = compile_typed("isInfinite(field(\"x\"))", None, None).unwrap();
+    assert_eq!(
+        eval_with_field(&folded, "x", Value::Int64(9)).unwrap(),
+        eval_with_field(&untyped, "x", Value::Int64(9)).unwrap(),
+    );
+    assert_eq!(
+        eval_with_field(&folded, "x", Value::Int64(9)).unwrap(),
+        Value::Bool(false)
+    );
+    // BigInt can overflow f64 to infinity, so it must NOT fold.
+    let big = make_schema(&[("x", DataType::BigInt { width: Some(80) }, false)]);
+    let kept = compile_typed("isInfinite(field(\"x\"))", Some(&big), None).unwrap();
+    assert!(
+        matches!(kept.node(kept.result()), OptNode::Call { .. }),
+        "isInfinite(BigInt) keeps the call, got {:?}",
+        kept.node(kept.result())
+    );
+}
+
+#[test]
+fn typed_is_nan_isinfinite_keep_nullable_operand() {
+    // isNaN/isInfinite drop their operand; `isNaN(null)` is null, not false, so a
+    // nullable operand keeps the call (the shared `is_droppable` gate). Both
+    // predicates share that gate, so both are pinned here.
+    let schema = make_schema(&[("x", DataType::Int64, true)]);
+    for source in ["isNaN(field(\"x\"))", "isInfinite(field(\"x\"))"] {
+        let program = compile_typed(source, Some(&schema), None).unwrap();
+        assert!(
+            matches!(program.node(program.result()), OptNode::Call { .. }),
+            "{source}: nullable operand keeps the call, got {:?}",
+            program.node(program.result())
+        );
+        assert_eq!(
+            eval_with_field(&program, "x", Value::Null).unwrap(),
+            Value::Null
+        );
+    }
+}
+
+#[test]
+fn typed_abs_on_unsigned_is_identity() {
+    // `abs(x)` for an unsigned integer is the identity (always non-negative); it
+    // strips to the bare field — and matches the UNREDUCED value on every row
+    // (`abs(UInt32)` now evaluates cleanly), so the rewrite is a pure optimization,
+    // not an error→value divergence. The `abs` no-null-gate is pinned via the
+    // nullable case (it keeps the operand, so it strips regardless of nullability).
+    for nullable in [false, true] {
+        let schema = make_schema(&[("x", DataType::UInt32, nullable)]);
+        let typed = compile_typed("abs(field(\"x\"))", Some(&schema), None).unwrap();
+        assert!(
+            matches!(typed.node(typed.result()), OptNode::SourceField(_)),
+            "abs(uint) strips to the field (nullable={nullable}), got {:?}",
+            typed.node(typed.result())
+        );
+        let untyped = compile_typed("abs(field(\"x\"))", None, None).unwrap();
+        assert_eq!(
+            eval_with_field(&typed, "x", Value::UInt32(42)).unwrap(),
+            eval_with_field(&untyped, "x", Value::UInt32(42)).unwrap(),
+            "typed and untyped abs(uint) agree (nullable={nullable})",
+        );
+        assert_eq!(
+            eval_with_field(&typed, "x", Value::UInt32(42)).unwrap(),
+            Value::UInt32(42)
+        );
+    }
+}
+
+#[test]
+fn typed_abs_keeps_signed_operand() {
+    // A signed operand can be negative, so `abs` is NOT the identity and survives.
+    let schema = make_schema(&[("x", DataType::Int64, false)]);
+    let program = compile_typed("abs(field(\"x\"))", Some(&schema), None).unwrap();
+    assert!(
+        matches!(program.node(program.result()), OptNode::Call { .. }),
+        "abs(signed) survives, got {:?}",
+        program.node(program.result())
+    );
+    assert_eq!(
+        eval_with_field(&program, "x", Value::Int64(-5)).unwrap(),
+        Value::Int64(5)
+    );
+}
+
+#[test]
+fn sqrt_of_constant_folds_to_value() {
+    // sqrt is pure and infallible at eval (negative → NaN, never an error), so a
+    // constant argument already const-folds in the untyped pass.
+    for (source, want) in [("sqrt(1)", 1.0_f64), ("sqrt(0)", 0.0_f64)] {
+        let program = compile_typed(source, None, None).unwrap();
+        let OptNode::Const(cid) = program.node(program.result()) else {
+            panic!(
+                "{source} must fold to a const, got {:?}",
+                program.node(program.result())
+            );
+        };
+        assert_eq!(program.constant(*cid), &Value::Float64(want), "{source}");
+    }
+}
+
 #[test]
 fn function_type_mismatch_surfaces_as_a_compile_error() {
     // The headline of the pass: a `Call` whose args are all known is fed to the

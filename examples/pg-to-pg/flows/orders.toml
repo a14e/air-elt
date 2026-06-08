@@ -1,0 +1,39 @@
+# Computed sink columns. Source `public.orders` carries
+# (id, first_name, last_name, price, qty, status, created_at); the sink
+# table `public.orders_enriched` adds derived columns produced by scripts.
+
+[flow.orders]
+source = "pg_src"
+sink = "pg_sink"
+storage = "pg_state"
+
+from = "public.orders"
+to = "public.orders_enriched"
+
+batch-limit = 500
+
+[flow.orders.mapping]
+# Plain rename / passthrough.
+id = "id"
+status = "status"
+
+# Long-form compute: per-row arithmetic, narrowed into a NUMERIC sink with
+# `truncate`, and a NULL-fallback `default`.
+total = { compute = "`price` * `qty`", truncate = true, default = 0 }
+
+[flow.orders.compute-mapping]
+# Shorthand: each value is a bare expression script. Backtick column refs
+# read naturally; `truncate = false`, `default = null`.
+full_name = "concat(`first_name`, ' ', `last_name`)"
+status_label = "if(`status` == 1, 'open', 'closed')"
+# `now()` is pinned to one timestamp per write batch (SQL NOW() semantics).
+ingested_at = "now()"
+
+[flow.orders.cursor]
+fields = ["id"]
+order = "asc"
+interval = "1s"
+
+[flow.orders.conflict]
+key = ["id"]
+strategy = "overwrite"

@@ -1,0 +1,26 @@
+[config]
+include = ["flows"]
+
+# Postgres → Postgres showcasing computed sink columns (`compute` scripts).
+# Computed columns run per row in the Transform; everything else (cursor,
+# conflict, plain renames) behaves exactly as in any other flow.
+
+[secrets]
+PG_SRC_URL = "postgres://postgres:postgres@localhost:5432/source"
+PG_SINK_URL = "postgres://postgres:postgres@localhost:5432/sink"
+PG_STATE_URL = "postgres://postgres:postgres@localhost:5432/state"
+
+[[sources]]
+name = "pg_src"
+type = "postgres"
+config = { url = "${PG_SRC_URL}" }
+
+[[sinks]]
+name = "pg_sink"
+type = "postgres"
+config = { url = "${PG_SINK_URL}" }
+
+[[storages]]
+name = "pg_state"
+type = "postgres"
+config = { url = "${PG_STATE_URL}" }

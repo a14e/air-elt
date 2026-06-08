@@ -830,3 +830,194 @@ net = "net"
     src_handle.pool.close().await;
     dst_handle.pool.close().await;
 }
+
+/// AIR-117 computed sink columns (pg → pg). Exercises the four lowering
+/// shapes end to end:
+///   * const-folded compute (`1 + 2`) → a literal column;
+///   * identity compute (`` `first_name` ``) → a plain `Take`;
+///   * arithmetic compute (`` `price_cents` * `qty` ``) with `truncate`
+///     into a NUMERIC sink;
+///   * string + conditional scripts via the `[compute-mapping]` shorthand;
+///   * `now()` is batch-stable — every row in the single tick shares one
+///     timestamp (SQL `NOW()` semantics).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_to_pg_compute_columns() {
+    let pg = pg_pool().await;
+
+    let src_schema = format!("{}_csrc", pg.schema);
+    let dst_schema = format!("{}_cdst", pg.schema);
+
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{dst_schema}\"").as_str())
+        .await
+        .unwrap();
+
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{src_schema}\".orders (
+                    id          BIGINT NOT NULL,
+                    first_name  TEXT NOT NULL,
+                    last_name   TEXT NOT NULL,
+                    price_cents INT NOT NULL,
+                    qty         INT NOT NULL,
+                    status      INT NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{dst_schema}\".orders_enriched (
+                    id           BIGINT,
+                    name_copy    TEXT,
+                    full_name    TEXT,
+                    total        NUMERIC(20, 0),
+                    status_label TEXT,
+                    const_tag    INT,
+                    ingested_at  TIMESTAMPTZ
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let insert = format!(
+        "INSERT INTO \"{src_schema}\".orders \
+         (id, first_name, last_name, price_cents, qty, status) \
+         VALUES ($1, $2, $3, $4, $5, $6)"
+    );
+    let fixtures: [(i64, &str, &str, i32, i32, i32); 3] = [
+        (1, "ann", "lee", 150, 2, 1),
+        (2, "bob", "kim", 99, 3, 0),
+        (3, "cy", "ng", 1000, 5, 1),
+    ];
+    for (id, first, last, price, qty, status) in fixtures {
+        sqlx::query(&insert)
+            .bind(id)
+            .bind(first)
+            .bind(last)
+            .bind(price)
+            .bind(qty)
+            .bind(status)
+            .execute(&pg.pool)
+            .await
+            .unwrap();
+    }
+
+    let pg_url = pg.url_with_search_path();
+    let config_toml = format!(
+        r#"
+[[sources]]
+name = "src"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[sinks]]
+name = "snk"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[storages]]
+name = "st"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[flow.orders]
+source = "src"
+sink = "snk"
+storage = "st"
+from = "{src_schema}.orders"
+to = "{dst_schema}.orders_enriched"
+batch-limit = 8
+
+cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
+
+[flow.orders.mapping]
+id = "id"
+# arithmetic on source columns widens to BigInt → NUMERIC sink (truncate).
+total = {{ compute = "`price_cents` * `qty`", truncate = true }}
+# const-folds to a literal column.
+const_tag = {{ compute = "1 + 2" }}
+
+[flow.orders.compute-mapping]
+# identity compute → a plain rename.
+name_copy = "`first_name`"
+full_name = "concat(`first_name`, ' ', `last_name`)"
+status_label = "if(`status` == 1, 'open', 'closed')"
+ingested_at = "now()"
+"#,
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let app = App::from_path(&config_path).expect("App::from_path");
+    // Bracket the run to assert the batch-pinned `now()` lands inside the
+    // real wall-clock window, not merely that all rows agree.
+    let before = Utc::now();
+    app.run_once().await.expect("run_once");
+    let after = Utc::now();
+
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        i64,
+        String,
+        String,
+        String,
+        String,
+        i32,
+        chrono::DateTime<Utc>,
+    )> = sqlx::query_as(&format!(
+        "SELECT id, name_copy, full_name, total::text, status_label, const_tag, ingested_at \
+         FROM \"{dst_schema}\".orders_enriched ORDER BY id"
+    ))
+    .fetch_all(&pg.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 3, "all rows reach the sink");
+
+    // identity compute → source column passthrough.
+    assert_eq!(rows[0].1, "ann");
+    assert_eq!(rows[1].1, "bob");
+    assert_eq!(rows[2].1, "cy");
+    // concat script.
+    assert_eq!(rows[0].2, "ann lee");
+    assert_eq!(rows[1].2, "bob kim");
+    assert_eq!(rows[2].2, "cy ng");
+    // arithmetic: price_cents * qty.
+    assert_eq!(rows[0].3, "300");
+    assert_eq!(rows[1].3, "297");
+    assert_eq!(rows[2].3, "5000");
+    // conditional script.
+    assert_eq!(rows[0].4, "open");
+    assert_eq!(rows[1].4, "closed");
+    assert_eq!(rows[2].4, "open");
+    // const-folded literal — same for every row.
+    assert!(
+        rows.iter().all(|r| r.5 == 3),
+        "const compute is 3 everywhere"
+    );
+    // now() is batch-stable: every row in the single tick shares one clock.
+    let ts0 = rows[0].6;
+    assert!(
+        rows.iter().all(|r| r.6 == ts0),
+        "now() must be identical across the batch (SQL NOW() semantics)"
+    );
+    assert!(
+        ts0 >= before && ts0 <= after,
+        "batch now() {ts0} must fall within the run window [{before}, {after}]"
+    );
+
+    pg.pool.close().await;
+}

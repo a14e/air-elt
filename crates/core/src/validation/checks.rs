@@ -24,6 +24,13 @@ pub fn check_mapping(
     mappings: &[DirectMapping],
 ) -> Result<(), ValidationError> {
     for m in mappings {
+        // Compute columns have no source `from` — they read their inputs
+        // from the script (already type-checked at compile time against the
+        // source schema). Sink-side compatibility is handled by
+        // `CompatibilityValidator`, so there is nothing structural here.
+        if m.compute.is_some() {
+            continue;
+        }
         let DirectMapping { from, to, .. } = m;
         let src_field = source_schema
             .find(from)
@@ -86,6 +93,11 @@ pub fn check_mapping_sources_exist(
     mappings: &[DirectMapping],
 ) -> Result<(), ValidationError> {
     for m in mappings {
+        // Compute columns read their inputs from the script, not a single
+        // `from` — skip the presence check (empty `from`).
+        if m.compute.is_some() {
+            continue;
+        }
         if source_schema.find(&m.from).is_none() {
             return Err(ValidationError::MissingField {
                 side: "source",
@@ -127,6 +139,7 @@ mod tests {
             truncate: false,
             default_literal: None,
             switch: None,
+            compute: None,
         }
     }
 

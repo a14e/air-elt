@@ -16,14 +16,49 @@ use air_elt_types::{Schema, Value};
 /// A compiled expression ready for per-row execution. Owns the optimizer's
 /// [`CompactProgram`] (the field-free arena IR) and binds source columns per row
 /// at evaluation time.
+#[derive(Debug)]
 pub struct RuntimeProgram {
     program: CompactProgram,
+    /// Distinct source columns the program reads by name (`field("c")` or
+    /// `fields("a,b")`), in first-seen order. Precomputed once in
+    /// [`Self::create`] so the Transform compiler can project exactly these
+    /// columns and resolve last-reference move semantics without re-walking
+    /// the arena. The wildcard `fields("*")` adds no names here — see
+    /// [`Self::reads_all_columns`].
+    needed_columns: Vec<String>,
 }
 
 impl RuntimeProgram {
     /// Wrap an optimized [`CompactProgram`] for per-row execution.
     pub fn create(program: CompactProgram) -> Self {
-        Self { program }
+        // Collect the distinct `field(...)` reads in first-seen order. The
+        // arena holds every node (statements' values + result), so one walk
+        // captures fields referenced anywhere in the program.
+        let mut needed_columns: Vec<String> = Vec::new();
+        for name in program.source_fields() {
+            if !needed_columns.iter().any(|c| c == name) {
+                needed_columns.push(name.to_owned());
+            }
+        }
+        Self {
+            program,
+            needed_columns,
+        }
+    }
+
+    /// The distinct source columns this program reads, in first-seen
+    /// order. Empty for a field-free (const) program. Borrowed — the list
+    /// is computed once at construction.
+    pub fn needed_columns(&self) -> &[String] {
+        &self.needed_columns
+    }
+
+    /// `true` when the program reads the whole row via `fields("*")`. Such a
+    /// program needs every source column projected (not just the named ones
+    /// in [`needed_columns`](Self::needed_columns)), so the Transform
+    /// compiler unions the full source schema into the read projection.
+    pub fn reads_all_columns(&self) -> bool {
+        self.program.reads_all_fields()
     }
 
     /// Evaluate a field-free program (no `field(...)` access) through the arena
@@ -358,6 +393,68 @@ mod tests {
         // ... and is not a constant value.
         assert!(!program.is_value());
         assert_eq!(program.as_value(), None);
+    }
+
+    #[test]
+    fn needed_columns_collects_distinct_fields_in_first_seen_order() {
+        let registry = FunctionRegistry::with_builtins();
+        let context = test_context();
+        // Two distinct fields → both, in first-seen order.
+        let program = compile("concat(`name`, toString(`age`))", &registry, &context);
+        assert_eq!(
+            program.needed_columns(),
+            &["name".to_string(), "age".into()]
+        );
+        // A field read twice collapses to one entry.
+        let program = compile("`age` + `age`", &registry, &context);
+        assert_eq!(program.needed_columns(), &["age".to_string()]);
+        // A const program reads no columns.
+        let program = compile("1 + 2", &registry, &context);
+        assert!(program.needed_columns().is_empty());
+        // A bare identity reads its one column.
+        let program = compile("`age`", &registry, &context);
+        assert_eq!(program.needed_columns(), &["age".to_string()]);
+    }
+
+    #[test]
+    fn needed_columns_includes_named_fields_selector() {
+        let registry = FunctionRegistry::with_builtins();
+        let context = test_context();
+        // `fields("a,b")` reads each named column, so both must be projected —
+        // a regression here silently reads them as `Null` at runtime.
+        let program = compile("fields(\"name,age\")", &registry, &context);
+        assert_eq!(
+            program.needed_columns(),
+            &["name".to_string(), "age".into()]
+        );
+        // The named form composes with bare `field` reads (deduped, ordered).
+        let program = compile(
+            "{\"a\" = `name`, \"b\" = fields(\"age\")}",
+            &registry,
+            &context,
+        );
+        assert_eq!(
+            program.needed_columns(),
+            &["name".to_string(), "age".into()]
+        );
+    }
+
+    #[test]
+    fn reads_all_columns_tracks_wildcard_fields() {
+        let registry = FunctionRegistry::with_builtins();
+        let context = test_context();
+        // `fields("*")` reads the whole row.
+        assert!(compile("fields(\"*\")", &registry, &context).reads_all_columns());
+        // Named / bare reads do not.
+        assert!(!compile("fields(\"name\")", &registry, &context).reads_all_columns());
+        assert!(!compile("`age`", &registry, &context).reads_all_columns());
+        assert!(!compile("1 + 2", &registry, &context).reads_all_columns());
+        // The wildcard adds no named columns (it is resolved via the schema).
+        assert!(
+            compile("fields(\"*\")", &registry, &context)
+                .needed_columns()
+                .is_empty()
+        );
     }
 
     #[test]

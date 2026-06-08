@@ -226,6 +226,11 @@ impl<T> Arena<T> {
         &self.items[start..end]
     }
 
+    /// Iterate every stored item in allocation order.
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.items.iter()
+    }
+
     /// Number of items currently stored.
     pub fn len(&self) -> usize {
         self.items.len()

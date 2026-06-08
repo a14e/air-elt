@@ -324,6 +324,37 @@ impl CompactProgram {
         self.result
     }
 
+    /// Every named source-column reference in the program, in node-arena
+    /// (execution) order. Covers both `field(<name>)` (a single
+    /// [`OptNode::SourceField`]) and the named form `fields("a,b")` (an
+    /// [`OptNode::Fields`] carrying [`FieldsSelector::Named`]) — the latter
+    /// reads each listed column, so those names must be projected too.
+    /// Names may repeat — the caller deduplicates. The wildcard
+    /// `fields("*")` carries no names; query it via [`Self::reads_all_fields`].
+    /// Used by the runtime layer to compute the set of source columns a
+    /// compute script reads.
+    pub fn source_fields(&self) -> impl Iterator<Item = &str> {
+        self.nodes.iter().flat_map(|node| {
+            let names: &[String] = match node {
+                OptNode::SourceField(name) => std::slice::from_ref(name),
+                OptNode::Fields(FieldsSelector::Named(names)) => names.as_slice(),
+                _ => &[],
+            };
+            names.iter().map(String::as_str)
+        })
+    }
+
+    /// `true` when the program reads the whole row via `fields("*")`
+    /// ([`FieldsSelector::All`]). Such a program needs every source column
+    /// projected, not just the ones named through `field`/`fields("named")`,
+    /// so the Transform compiler unions the full source schema into the read
+    /// projection.
+    pub fn reads_all_fields(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|node| matches!(node, OptNode::Fields(FieldsSelector::All)))
+    }
+
     /// Total number of nodes in the program (for diagnostics and tests).
     pub fn node_len(&self) -> usize {
         self.nodes.len()
