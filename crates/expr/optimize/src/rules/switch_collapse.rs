@@ -12,9 +12,9 @@
 use ahash::AHashSet;
 use air_elt_types::Key;
 
-use super::switch_build::is_pure;
 use super::{Rewrite, Rule, RuleCx};
 use crate::model::opt_expr::OptExpr;
+use crate::util::type_utils::is_pure;
 
 pub(crate) struct SwitchCollapse;
 

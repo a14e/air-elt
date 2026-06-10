@@ -316,16 +316,17 @@ impl<'a> ProgramEvaluator<'a> {
     ) -> Result<Value, EvalError> {
         let program = self.program;
         let input_refs = program.args(inputs);
-        let mut values = Vec::with_capacity(input_refs.len());
-        for input_ref in input_refs {
-            values.push(self.eval_node(*input_ref, depth)?);
-        }
-
-        // A single input keys on the value directly; two inputs form a composite
-        // key. An unkeyable value (null / non-keyable type) misses → default.
-        let key = if values.len() == 1 {
-            Key::from_value(&values[0])
+        // A single input (the common compiled shape) keys on the value directly
+        // — no Vec; two inputs form a composite key. An unkeyable value (null /
+        // non-keyable type) misses → default.
+        let key = if let [input_ref] = input_refs {
+            let value = self.eval_node(*input_ref, depth)?;
+            Key::from_value(&value)
         } else {
+            let mut values = Vec::with_capacity(input_refs.len());
+            for input_ref in input_refs {
+                values.push(self.eval_node(*input_ref, depth)?);
+            }
             Key::composite(values).ok()
         };
 
@@ -420,7 +421,12 @@ impl<'a> ProgramEvaluator<'a> {
         let mut rendered = String::new();
         for segment in program.args(segments) {
             let value = self.eval_node(*segment, depth)?;
-            rendered.push_str(&value_to_string(&value));
+            // Text (the dominant segment type) appends directly; the
+            // `value_to_string` path would clone it into an intermediate String.
+            match &value {
+                Value::Text(text) => rendered.push_str(text),
+                other => rendered.push_str(&value_to_string(other)),
+            }
             if rendered.len() > MAX_EXPR_STRING_BYTES {
                 return Err(EvalError::StringTooLarge {
                     len: rendered.len(),

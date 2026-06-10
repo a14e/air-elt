@@ -14,6 +14,10 @@ pub enum Token {
     // Identifiers
     Ident(String),
 
+    // Keywords (reserved — never lexed as identifiers)
+    If,
+    Else,
+
     // Operators
     Plus,
     Minus,

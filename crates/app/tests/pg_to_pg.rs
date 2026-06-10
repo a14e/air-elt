@@ -1021,3 +1021,145 @@ ingested_at = "now()"
 
     pg.pool.close().await;
 }
+
+/// AIR-34 / AIR-123 `if / else if / else` expression syntax with brace blocks
+/// (pg → pg). A multiline TOML `"""…"""` compute script classifies orders into
+/// a price tier via an `else if` chain, where each branch is a brace block that
+/// binds a name once (`amount` / `label`) over backtick column refs. This
+/// exercises the new surface form end to end: parse → optimize (Block/Bind
+/// lowering) → per-row Compute, with block-local scoping and laziness on the
+/// not-taken branches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_to_pg_compute_if_block() {
+    let pg = pg_pool().await;
+
+    let src_schema = format!("{}_ibsrc", pg.schema);
+    let dst_schema = format!("{}_ibdst", pg.schema);
+
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{dst_schema}\"").as_str())
+        .await
+        .unwrap();
+
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{src_schema}\".orders (
+                    id          BIGINT NOT NULL,
+                    price_cents INT NOT NULL,
+                    qty         INT NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{dst_schema}\".orders_tiered (
+                    id    BIGINT,
+                    tier  TEXT
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let insert =
+        format!("INSERT INTO \"{src_schema}\".orders (id, price_cents, qty) VALUES ($1, $2, $3)");
+    // total = price_cents * qty: 100, 2500, 12000.
+    let fixtures: [(i64, i32, i32); 3] = [(1, 50, 2), (2, 500, 5), (3, 2000, 6)];
+    for (id, price, qty) in fixtures {
+        sqlx::query(&insert)
+            .bind(id)
+            .bind(price)
+            .bind(qty)
+            .execute(&pg.pool)
+            .await
+            .unwrap();
+    }
+
+    let pg_url = pg.url_with_search_path();
+    // The compute script: each branch is a brace block binding `amount` from
+    // backtick column refs. The binding is field-dependent, so the optimizer
+    // cannot inline it away — the compiled per-row program keeps a real
+    // Block/Bind, exercising scoped registers at runtime. The `else if` chain
+    // folds to a flat multiIf; only the taken branch's block runs (laziness).
+    // The small branch returns an interpolated string reading the binding.
+    let config_toml = format!(
+        r#"
+[[sources]]
+name = "src"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[sinks]]
+name = "snk"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[storages]]
+name = "st"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[flow.orders]
+source = "src"
+sink = "snk"
+storage = "st"
+from = "{src_schema}.orders"
+to = "{dst_schema}.orders_tiered"
+batch-limit = 8
+
+cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
+
+[flow.orders.mapping]
+id = "id"
+
+[flow.orders.compute-mapping]
+tier = """
+if (`price_cents` * `qty` < 1000) {{
+  amount = `price_cents` * `qty`
+  "small:{{amount}}"
+}} else if (`price_cents` * `qty` < 5000) {{
+  amount = `price_cents` * `qty`
+  concat('medium:', toString(amount))
+}} else {{
+  amount = `price_cents` * `qty`
+  concat('large:', toString(amount / `qty`), 'x', toString(`qty`))
+}}
+"""
+"#,
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
+
+    let rows: Vec<(i64, String)> = sqlx::query_as(&format!(
+        "SELECT id, tier FROM \"{dst_schema}\".orders_tiered ORDER BY id"
+    ))
+    .fetch_all(&pg.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "small:100".to_string()),
+            (2, "medium:2500".to_string()),
+            (3, "large:2000x6".to_string()),
+        ]
+    );
+
+    pg.pool.close().await;
+}

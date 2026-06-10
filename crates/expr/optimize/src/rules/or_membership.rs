@@ -26,9 +26,10 @@ use ahash::AHashSet;
 use air_elt_expr_funcs::{FuncRef, FunctionRegistry};
 use air_elt_types::{Key, Value};
 
-use super::switch_build::{KeyExprs, SwitchEntries, clause_to_key, is_pure, parse_condition};
+use super::switch_build::{KeyExprs, SwitchEntries, clause_to_key, parse_condition};
 use super::{Rewrite, Rule, RuleCx};
 use crate::model::opt_expr::OptExpr;
+use crate::util::type_utils::is_pure;
 
 /// Minimum distinct membership entries for the table to pay off (strictly `> 5`).
 const MIN_MEMBERSHIP_ENTRIES: usize = 6;

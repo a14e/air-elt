@@ -11,22 +11,28 @@
 //!   (no NaN, no float-equality surprises);
 //! * **pure key expressions** — the switch evaluates `K` once, a `multiIf`
 //!   re-evaluates the condition per branch, so `K` must be deterministic;
-//! * **all-or-nothing** — any non-conforming branch leaves the `multiIf` intact.
+//! * **all-or-nothing** — any non-conforming branch leaves the `multiIf` intact;
+//! * **no block values** — a branch value containing an [`OptExpr::Block`] is
+//!   never lowered: the rewrite clones one value into several table entries, and
+//!   cloning a block would alias its register writes.
 //!
 //! An `or` of clauses expands to several table entries pointing at one branch;
 //! duplicate keys keep the first (preserving `multiIf` first-match order). The
-//! clause parser, the constant allow-list, the [`Key`] builder, and the purity
-//! walk are shared with [`or_membership`](super::or_membership) via
-//! [`switch_build`](super::switch_build).
+//! clause parser, the constant allow-list, and the [`Key`] builder are shared
+//! with [`or_membership`](super::or_membership) via
+//! [`switch_build`](super::switch_build); the purity walk is
+//! [`type_utils::is_pure`](crate::util::type_utils::is_pure).
 
 use ahash::AHashSet;
 use air_elt_expr_funcs::{FuncRef, FunctionRegistry};
 use air_elt_types::Key;
 
-use super::switch_build::{KeyExprs, SwitchEntries, clause_to_key, is_pure, parse_condition};
+use super::switch_build::{KeyExprs, SwitchEntries, clause_to_key, parse_condition};
 use super::{Rewrite, Rule, RuleCx};
 use crate::model::node_id::NodeCounter;
 use crate::model::opt_expr::OptExpr;
+use crate::util::block_scan::contains_block;
+use crate::util::type_utils::is_pure;
 
 /// Minimum branch count for the lookup table to pay off (strictly `> 5`).
 const MIN_SWITCH_BRANCHES: usize = 6;
@@ -100,6 +106,15 @@ fn try_lower(
     let mut seen: AHashSet<Key> = AHashSet::new();
 
     for (condition, value) in branches {
+        // A branch value is CLONED into one table entry per key it matches. A
+        // `Block` must never be duplicated — its register writes would alias
+        // (`reassign_ids` restamps node ids, not registers) — so any branch
+        // value carrying a block keeps the `multiIf` intact.
+        // TODO (deferred): lift this bail by restamping block registers on
+        // clone — needs the register allocator plumbed into the rules.
+        if contains_block(value) {
+            return None;
+        }
         let clauses = parse_condition(condition, equals)?;
         if clauses.is_empty() {
             return None;
@@ -125,6 +140,13 @@ fn try_lower(
     }
     // The switch evaluates each key expression exactly once.
     if !key_exprs.iter().all(|expr| is_pure(expr, registry)) {
+        return None;
+    }
+    // A surviving key expression is one clone of a clause operand whose other
+    // copies are dropped, so a block inside it cannot alias today — but only
+    // because block SSA registers defeat the cross-clause structural-equality
+    // check above. Keep the no-clone invariant local instead of emergent.
+    if key_exprs.iter().any(contains_block) {
         return None;
     }
     Some((key_exprs, table))

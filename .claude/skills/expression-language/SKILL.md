@@ -18,7 +18,11 @@ Two evaluation contexts:
 
 Literals: integer (`42`), float (`3.14`), bool (`true`/`false`), null (`null`), double-quoted string with interpolation (`"hello {expr}"`), single-quoted raw string (`'no interpolation'`).
 
-Variables: `x = expr` (assignment via `=`, separated by `;`).
+Variables: `x = expr` (assignment via `=`, separated by `;` or newlines).
+
+If-expressions: `if (cond) value else other` — JS/Kotlin-style expression form alongside the function form `if(cond, value, other)`. Always an expression yielding a value: `else` is mandatory (there is no statement-if) and the condition parens are required. `else if` chains fold to a flat `multiIf` at parse time, exactly like nested legacy `if(...)` chains; for brace-less branches the AST is byte-identical to the legacy form, and the two forms mix freely in one chain (`if (a) 1 else if(b, 2, 3)`, `if(a, 1, if (b) 2 else 3)`). The `else` branch is greedy — `1 + if (c) 2 else 3 + 4` ≡ `1 + (if (c) 2 else (3 + 4))` — and an if-expression is itself a valid operand (`1 + if (c) 2 else 3`). `if` and `else` are reserved keywords (`RESERVED_CONTROL_FLOW_NAMES`): `if = 5` and `else = 1` are parse errors.
+
+Branch blocks: a branch may be a brace block `{ x = expr; y = expr; result }` — zero or more `name = expr` bindings followed by a mandatory trailing result expression (`{ x = 1; }` is a parse error; there is no `return` keyword). A binding evaluates once at its binding point (same as top-level statements, including impure calls like `randomInt()`), is visible only inside its block and nested blocks, may shadow an outer name (the outer binding is unaffected after the block), and counts toward the program-wide `MAX_VARIABLES` limit (64). A not-taken branch — including its bindings and their failures — never evaluates. Block vs object literal is disambiguated **in branch position only**: `{}` → empty object; `{ "key" = ... }` (string-literal key) → object literal; anything else (identifier binding or expression) → block. Elsewhere `{` is always an object literal. A block whose result is an object needs nested braces: `if (c) { { "k" = 1 } } else ...`. Internals: blocks lower to the `OptExpr::Block` / `OptNode::Bind` IR, and branches containing blocks are excluded from Switch lowering (blocks are never cloned).
 
 Operators (in precedence order, low to high; binary operators are left-associative unless noted):
 - `||` logical OR
@@ -45,11 +49,12 @@ Comments: `#` starts a line comment that runs to the end of the line (a trailing
 
 The config loader determines what is an expression vs a plain string:
 - String starting with `identifier(` = full expression (parsed and evaluated).
+- String starting with `if (` = full expression (the if-expression form). Pre-existing limitation unchanged: an operator-first value like `1 + if (...)` is not auto-detected.
 - String containing unescaped `{expr}` = interpolation (each `{...}` segment is parsed).
 - `{{` escapes to a literal `{` in interpolation.
 - `$$` escapes `$` in `env_expand` (secret resolution layer, runs before expressions).
 
-Config format matters for expression quoting: in YAML, expressions need no outer quotes (YAML handles strings natively). In TOML, outer quotes are required because bare values are typed.
+Config format matters for expression quoting: in YAML, expressions need no outer quotes (YAML handles strings natively). In TOML, outer quotes are required because bare values are typed. Multiline scripts (e.g. if-expressions with blocks) work via TOML `"""..."""` strings or YAML block scalars — newlines already act as statement separators.
 
 ## Type system
 
@@ -73,7 +78,7 @@ Type algebra fixes a function's output `DataType` at type-check time (before eva
 - **String functions** return `Text` (`length`/`indexOf` → `Int64`; `startsWith`/`endsWith`/`contains` → `Bool`) and are **strict** — a non-text argument is a `TypeMismatch`, never silently stringified (`trim(1)`, `concat(x, 5)` are errors). Stringify explicitly with `toString`; interpolation (`"{expr}"`) renders any type via `value_to_string`, not through `concat`. The optimizer turns `concat(x, "")` / `concat(x)` into a `TypeAssert{String}`.
 - **Comparisons** return total **non-null `Bool`**: `==`/`!=` treat null as a value (`null==null`→true, so `x==null` is a real null test); `<`/`>`/`<=`/`>=` return `false` on any null operand. They never leak null into `&&`/`||`/`if`.
 - **`min`/`max`** skip NULL arguments (SQL semantics) and yield NULL only when *every* argument is NULL — so the result is nullable exactly when every argument is nullable (one non-null argument forces a non-null result). The optimizer exploits this: it drops NULL-literal arguments (`max(a, null, b)` → `max(a, b)`) and saturates against an integer operand's type bound (`max(x, TYPE_MAX)` → `TYPE_MAX`, `min(x, TYPE_MIN)` → `TYPE_MIN`).
-- **Casts** return their target type. **Conditionals** (`if`/`multiIf`/`ifNull`/`nullIf`, resolved in `type_resolver.rs`) take the first/value branch's type with per-form nullability; an `if`/`else if` chain folds to a flat `multiIf` at parse time (bounded by `MAX_AST_NODES`, not depth), and a large equality `multiIf` over 1–2 pure keys lowers to an O(1) `Switch`.
+- **Casts** return their target type. **Conditionals** (`if`/`multiIf`/`ifNull`/`nullIf`, resolved in `type_resolver.rs`) take the first/value branch's type with per-form nullability and **drop `int_bound`** (branch merge calls `NullableExprType::new`, so integer arithmetic on a conditional's result falls back to DataType-level bits — e.g. `if(...)+1` over Int64 promotes to BigInt); an `if`/`else if` chain — in either surface form, nested `if(...)` calls or `if (c) ... else if ...` expressions — folds to a flat `multiIf` at parse time (bounded by `MAX_AST_NODES`, not depth), and a large equality `multiIf` over 1–2 pure keys lowers to an O(1) `Switch`.
 
 Full promotion matrix, DataType fallbacks, size-aware `concat`, and exhaustive per-function rules: [references/type-algebra.md](references/type-algebra.md).
 

@@ -11,7 +11,7 @@ use ahash::{AHashMap, AHashSet};
 use air_elt_commons_arena::ArenaOverflow;
 use air_elt_expr_funcs::FunctionRegistry;
 use air_elt_expr_parse::model::{
-    ConditionalExpr, Expr, InterpolationSegment, LiteralValue, Program,
+    ConditionalExpr, Expr, InterpolationSegment, LiteralValue, Program, Statement,
 };
 use air_elt_expr_types::limits::MAX_EXPR_DEPTH;
 use air_elt_types::Value;
@@ -102,7 +102,68 @@ impl<'a> OptProgramConverter<'a> {
                 Box::new(self.lower_expr(inner)?),
             )),
             Expr::Fields(selector) => Ok(OptExpr::Fields(self.next_id(), selector.clone())),
+            Expr::Block { statements, result } => self.lower_block(statements, result),
         }
+    }
+
+    /// Lower a scoped-binding block (`{ name = expr; …; result }` in an
+    /// `if`-branch position). Mirrors [`Self::convert`]: each binding lowers
+    /// into a fresh SSA register and shadows its name for the remainder of the
+    /// block. On exit — success or error — the displaced name entries are
+    /// restored in reverse insertion order, so siblings and the outer scope see
+    /// the pre-block bindings again.
+    fn lower_block(
+        &mut self,
+        statements: &[Statement],
+        result: &Expr,
+    ) -> Result<OptExpr, OptimizeError> {
+        let id = self.next_id();
+        let mut displaced: Vec<(&str, Option<u16>)> = Vec::with_capacity(statements.len());
+        let lowered = self.lower_block_scope(statements, result, &mut displaced);
+
+        // Restore the scope map before propagating any error, so a failed block
+        // leaves the converter consistent for the caller's remaining siblings.
+        // Entries borrow the AST names; only a shadowed restore re-owns one.
+        for (name, previous) in displaced.into_iter().rev() {
+            match previous {
+                Some(register) => {
+                    self.name_to_register.insert(name.to_owned(), register);
+                }
+                None => {
+                    self.name_to_register.remove(name);
+                }
+            }
+        }
+
+        let (lowered_statements, lowered_result) = lowered?;
+        Ok(OptExpr::Block {
+            id,
+            statements: lowered_statements,
+            result: Box::new(lowered_result),
+        })
+    }
+
+    /// The scope-mutating part of block lowering: lower each binding, allocate
+    /// its register, record what its name displaced into `displaced` (pushed in
+    /// insertion order, even on a later error), then lower the result.
+    fn lower_block_scope<'s>(
+        &mut self,
+        statements: &'s [Statement],
+        result: &Expr,
+        displaced: &mut Vec<(&'s str, Option<u16>)>,
+    ) -> Result<(Vec<OptStatement>, OptExpr), OptimizeError> {
+        let mut lowered = Vec::with_capacity(statements.len());
+        for statement in statements {
+            let value = self.lower_expr(&statement.value)?;
+            let register = self.allocate_register()?;
+            lowered.push(OptStatement { register, value });
+            let previous = self
+                .name_to_register
+                .insert(statement.name.clone(), register);
+            displaced.push((&statement.name, previous));
+        }
+        let result = self.lower_expr(result)?;
+        Ok((lowered, result))
     }
 
     fn lower_variable(&self, name: &str) -> Result<OptExpr, OptimizeError> {

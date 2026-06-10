@@ -4,10 +4,11 @@
 //! and [`or_membership`](super::or_membership) (a bare `||`-chain of equality
 //! tests) read the SAME shape: a disjunction (`||`) of conjunctive (`&&`)
 //! `equals(K, const)` clauses over one or two pure key expressions `K`. This
-//! module owns that shape's parser, the constant allow-list, the [`Key`] builder,
-//! and the purity walk so the two rules agree on exactly what is switchable.
+//! module owns that shape's parser, the constant allow-list, and the [`Key`]
+//! builder so the two rules agree on exactly what is switchable (the purity
+//! gate is the shared [`type_utils::is_pure`](crate::util::type_utils::is_pure)).
 
-use air_elt_expr_funcs::{FuncRef, FunctionRegistry};
+use air_elt_expr_funcs::FuncRef;
 use air_elt_types::{Key, Value};
 
 use crate::model::opt_expr::OptExpr;
@@ -117,70 +118,4 @@ pub(super) fn is_switchable_const(value: &Value) -> bool {
             | Value::Bool(_)
             | Value::Uuid(_)
     )
-}
-
-/// Whether an expression is deterministic (no impure function), so the switch may
-/// evaluate it once instead of per branch.
-pub(super) fn is_pure(expr: &OptExpr, registry: &FunctionRegistry) -> bool {
-    match expr {
-        OptExpr::Const(..)
-        | OptExpr::Register(..)
-        | OptExpr::SourceField(..)
-        | OptExpr::Fields(..) => true,
-        OptExpr::Field(_, inner) => is_pure(inner, registry),
-        OptExpr::Call { func, args, .. } => {
-            registry.get_by_ref(*func).is_pure() && args.iter().all(|arg| is_pure(arg, registry))
-        }
-        OptExpr::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            is_pure(condition, registry)
-                && is_pure(then_branch, registry)
-                && is_pure(else_branch, registry)
-        }
-        OptExpr::MultiIf {
-            branches, default, ..
-        } => {
-            branches
-                .iter()
-                .all(|(condition, value)| is_pure(condition, registry) && is_pure(value, registry))
-                && is_pure(default, registry)
-        }
-        OptExpr::IfNull {
-            value, alternative, ..
-        } => is_pure(value, registry) && is_pure(alternative, registry),
-        OptExpr::NullIf {
-            value, sentinel, ..
-        } => is_pure(value, registry) && is_pure(sentinel, registry),
-        OptExpr::And { left, right, .. } | OptExpr::Or { left, right, .. } => {
-            is_pure(left, registry) && is_pure(right, registry)
-        }
-        OptExpr::Interpolation(_, segments) => {
-            segments.iter().all(|segment| is_pure(segment, registry))
-        }
-        OptExpr::Object(_, entries) => entries.iter().all(|(_, value)| is_pure(value, registry)),
-        OptExpr::Switch {
-            inputs,
-            table,
-            default,
-            ..
-        } => {
-            inputs.iter().all(|input| is_pure(input, registry))
-                && table.iter().all(|(_, value)| is_pure(value, registry))
-                && is_pure(default, registry)
-        }
-        // The assert itself is a pure type/null check; purity follows the operand.
-        OptExpr::TypeAssert { inner, .. } => is_pure(inner, registry),
-        OptExpr::Block {
-            statements, result, ..
-        } => {
-            statements
-                .iter()
-                .all(|statement| is_pure(&statement.value, registry))
-                && is_pure(result, registry)
-        }
-    }
 }

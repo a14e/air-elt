@@ -80,8 +80,54 @@ impl<'a> EvaluatorState<'a> {
             Expr::Conditional(conditional) => self.eval_conditional(conditional),
             Expr::Interpolation(segments) => self.eval_interpolation(segments),
             Expr::Object(entries) => self.eval_object(entries),
+            Expr::Block { statements, result } => self.eval_block(statements, result),
             Expr::Field(..) | Expr::Fields(..) => Err(ExprError::FieldOutsideTransform),
         }
+    }
+
+    /// Evaluate a scoped-binding block (`{ name = expr; …; result }` in an
+    /// `if`-branch position). Each binding evaluates once at its binding point
+    /// and shadows its name for the remainder of the block; after the result is
+    /// evaluated the displaced entries are restored in reverse insertion order
+    /// (fresh names removed). The restore runs on both the success and error
+    /// paths so the outer scope and sibling branches see the pre-block bindings
+    /// again. A binding lives in the same depth-guarded recursion as any other
+    /// expression — the guard is enforced by the `eval_conditional` arm that
+    /// reaches this block, mirroring the evaluator's existing pattern.
+    fn eval_block(&mut self, statements: &[Statement], result: &Expr) -> Result<Value, ExprError> {
+        let mut displaced: Vec<(&str, Option<Value>)> = Vec::with_capacity(statements.len());
+        let outcome = self.eval_block_scope(statements, result, &mut displaced);
+
+        // Entries borrow the AST names; only a shadowed restore re-owns one.
+        for (name, previous) in displaced.into_iter().rev() {
+            match previous {
+                Some(value) => {
+                    self.variables.insert(name.to_owned(), value);
+                }
+                None => {
+                    self.variables.remove(name);
+                }
+            }
+        }
+
+        outcome
+    }
+
+    /// The scope-mutating part of block evaluation: evaluate each binding,
+    /// install it into the variable map (recording the displaced entry in
+    /// insertion order, even on a later error), then evaluate the result.
+    fn eval_block_scope<'s>(
+        &mut self,
+        statements: &'s [Statement],
+        result: &Expr,
+        displaced: &mut Vec<(&'s str, Option<Value>)>,
+    ) -> Result<Value, ExprError> {
+        for statement in statements {
+            let value = self.eval_expr(&statement.value)?;
+            let previous = self.variables.insert(statement.name.clone(), value);
+            displaced.push((&statement.name, previous));
+        }
+        self.eval_expr(result)
     }
 
     fn eval_variable(&self, name: &str) -> Result<Value, ExprError> {
@@ -305,7 +351,12 @@ impl<'a> EvaluatorState<'a> {
                 InterpolationSegment::Text(s) => result.push_str(s),
                 InterpolationSegment::Expression(expr) => {
                     let value = self.eval_expr(expr)?;
-                    result.push_str(&value_to_string(&value));
+                    // Mirror the arena evaluator: append Text directly instead
+                    // of cloning it through `value_to_string`.
+                    match &value {
+                        Value::Text(text) => result.push_str(text),
+                        other => result.push_str(&value_to_string(other)),
+                    }
                 }
             }
             if result.len() > air_elt_expr_types::limits::MAX_EXPR_STRING_BYTES {
@@ -818,6 +869,125 @@ mod tests {
         assert_eq!(result, Value::Text("hello 3 world".to_string()));
     }
 
+    // --- if/else-if/else with brace blocks ------------------------------------
+
+    #[test]
+    fn block_then_branch_value() {
+        assert_eq!(
+            eval("if (true) { x = 2; x + 1 } else 0").unwrap(),
+            Value::Int64(3)
+        );
+    }
+
+    #[test]
+    fn block_else_branch_value() {
+        assert_eq!(
+            eval("if (false) 0 else { x = 5; x * 2 }").unwrap(),
+            Value::Int64(10)
+        );
+    }
+
+    #[test]
+    fn block_nested_blocks() {
+        assert_eq!(
+            eval("if (true) { x = 1; if (true) { y = 2; x + y } else 0 } else 9").unwrap(),
+            Value::Int64(3)
+        );
+    }
+
+    #[test]
+    fn block_else_if_chain() {
+        let source = "if (false) { a = 1; a } else if (true) { b = 2; b + 10 } else { c = 3; c }";
+        assert_eq!(eval(source).unwrap(), Value::Int64(12));
+    }
+
+    #[test]
+    fn block_laziness_else_not_evaluated() {
+        // The failing else-branch block (1 / 0) must never run when the
+        // condition is true.
+        assert_eq!(
+            eval("if (true) 1 else { x = 1 / 0; x }").unwrap(),
+            Value::Int64(1)
+        );
+    }
+
+    #[test]
+    fn block_laziness_then_not_evaluated() {
+        // The failing then-branch block must never run when the condition is
+        // false.
+        assert_eq!(
+            eval("if (false) { x = 1 / 0; x } else 1").unwrap(),
+            Value::Int64(1)
+        );
+    }
+
+    #[test]
+    fn block_shadowing_restores_outer() {
+        // Inner `x = 2` shadows the outer `x = 1` only inside the block; after
+        // the block `x` is 1 again, so `x + y` = 1 + 12 = 13.
+        let source = "x = 1; y = if (true) { x = 2; x + 10 } else 0; x + y";
+        assert_eq!(eval(source).unwrap(), Value::Int64(13));
+    }
+
+    #[test]
+    fn block_sibling_branches_same_name() {
+        // Each branch binds `n` in its own scope; the not-taken branch never
+        // runs, and neither name leaks out.
+        let source = "if (true) { n = 1; n } else { n = 2; n }";
+        assert_eq!(eval(source).unwrap(), Value::Int64(1));
+    }
+
+    #[test]
+    fn block_nested_shadowing() {
+        let source = "x = 1; if (true) { x = 2; if (true) { x = 3; x } else 0 } else 0";
+        assert_eq!(eval(source).unwrap(), Value::Int64(3));
+    }
+
+    #[test]
+    fn block_local_name_undefined_after_if() {
+        // `t` is block-local; referencing it after the if is an
+        // undefined-variable error.
+        let source = "y = if (true) { t = 5; t } else 0; t + y";
+        let err = eval(source).unwrap_err();
+        match err {
+            ExprError::UndefinedVariable { name } => assert_eq!(name, "t"),
+            other => panic!("expected UndefinedVariable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn or_over_non_bool_errors_on_both_paths() {
+        // Proptest counterexample (2026-06-10): `false || <non-bool>` must fail
+        // on the arena path exactly like the heap path. BranchPrune used to
+        // fold `false || x` to bare `x`, erasing the evaluator's "right
+        // operand must be Bool/Null" check; it now folds to TypeAssert{Bool}.
+        let registry = FunctionRegistry::with_builtins();
+        let context = test_context();
+        let cases = [
+            "false || 5",
+            "true && 'x'",
+            // The original minimized failing input: the inner if folds to an
+            // Int that lands as the right operand of `||`.
+            "if((max(0, 0) < ((2 < 0) || (if ((0 < 1)) { t = 0; (t + t) } else 0 < 0))), \
+             max(0, 0), 0)",
+        ];
+        for source in cases {
+            let program = Parser::create().parse_expression(source).unwrap();
+            let heap = evaluate(&program, &registry, &context).map_err(|_| ());
+            let arena = arena_eval(&program, &registry, &context);
+            assert!(heap.is_err(), "heap accepted `{source}`: {heap:?}");
+            assert!(arena.is_err(), "arena accepted `{source}`: {arena:?}");
+        }
+    }
+
+    #[test]
+    fn block_binding_evaluated_once() {
+        // Two reads of the same binding observe the same value; with an impure
+        // binding this also pins the single-evaluation contract.
+        let source = "if (true) { v = randomInt(0, 1000000); v == v } else false";
+        assert_eq!(eval(source).unwrap(), Value::Bool(true));
+    }
+
     // --- Differential oracle: heap (AST) evaluator vs arena evaluator ---------
     //
     // Production const / default / switch / patch evaluation runs through the
@@ -875,6 +1045,14 @@ mod tests {
                     .prop_map(|a| format!("objectGet({{\"k\" = {a}}}, \"k\")")),
                 (inner.clone(), inner.clone(), inner.clone())
                     .prop_map(|(a, b, c)| format!("if(({a} < {b}), {a}, {c})")),
+                // New if/else surface form: `if (cond) a else b`.
+                (inner.clone(), inner.clone(), inner.clone())
+                    .prop_map(|(a, b, c)| format!("if (({a} < {b})) {a} else {c}")),
+                // New if/else with a brace block in the then-branch: a block
+                // binds a name once and reuses it in its mandatory result.
+                (inner.clone(), inner.clone(), inner.clone()).prop_map(|(a, b, c)| format!(
+                    "if (({a} < {b})) {{ t = {a}; (t + t) }} else {c}"
+                )),
             ]
         })
     }

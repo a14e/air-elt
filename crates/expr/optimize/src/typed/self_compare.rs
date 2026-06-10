@@ -28,6 +28,10 @@
 //! test) — folding it would need an `isNaN`-based rewrite, parked for later.
 //! Constant operands never reach here: `equals(c, c)` already const-folds in the
 //! untyped pass.
+//!
+//! TODO (deferred, AIR-123): structural identity misses values that are equal
+//! only through register bindings (`x = e; e == x`); value numbering / CSE in
+//! the typed engine would generalize this rule.
 
 use air_elt_expr_funcs::{FuncRef, FunctionRegistry};
 use air_elt_types::Value;

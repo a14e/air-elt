@@ -101,6 +101,12 @@ mod tests {
     }
 
     #[test]
+    fn detects_if_expressions() {
+        assert!(is_expression("if (c) 1 else 2"));
+        assert!(is_expression("if (c) {\n x = 1; x\n} else 0"));
+    }
+
+    #[test]
     fn rejects_assignment_like_strings() {
         assert!(!is_expression("123 = 5"));
         assert!(!is_expression("= bad"));
