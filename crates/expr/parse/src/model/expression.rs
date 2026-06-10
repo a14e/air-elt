@@ -1,3 +1,5 @@
+use super::program::Statement;
+
 /// Expression AST node.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -26,6 +28,18 @@ pub enum Expr {
 
     /// Whole-body / named-fields JSON object: `fields("*")` or `fields("a,b,c")`.
     Fields(FieldsSelector),
+
+    /// Scoped binding block: `{ name = expr; …; result }`. Produced only in
+    /// branch position of an `if`-expression (`if (c) { … } else { … }`) — a
+    /// block is not a general expression form. Bindings evaluate once at the
+    /// binding point and live in a block-local scope that shadows outer names;
+    /// those semantics are implemented by the downstream crates (optimizer /
+    /// evaluator). A zero-statement block never appears here — the parser
+    /// desugars `{ expr }` to the bare result expression.
+    Block {
+        statements: Vec<Statement>,
+        result: Box<Expr>,
+    },
 }
 
 /// Selector for the `fields(...)` expression node.

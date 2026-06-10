@@ -174,6 +174,7 @@ Dedicated variants — use the right one instead of `RuntimeError::Other`. Wrap 
 - `air_elt_expr_runtime::patcher::ConfigExprPatcher` — trie-based TOML tree patcher for evaluating expressions at specified paths.
 - `air_elt_expr_runtime::evaluator::Evaluator` — standalone expression evaluator (replaces the removed `ExprValue.eval()`).
 - `air_elt_expr_runtime::type_resolver::TypeResolver` — compile-time type resolution for expressions.
+- **Walking `OptExpr` trees in the optimizer:** do not hand-roll an exhaustive child-recursion match. `crates/expr/optimize/src/util/visit.rs` owns the only two exhaustive child enumerations, all `ControlFlow`-based (callback returns `Continue(())` to keep walking, `Break(value)` to stop; the visitor propagates the break to the caller). Pick by recursion needs: `for_each_recursive{,_mut}` visits the whole subtree pre-order — use it for flat node predicates (any-scan via `.is_break()`: `contains_block`, `can_fail`; all-predicate via `.is_continue()`: `is_pure`; side-effect walks discard the result: `collect`, `count_fields`, `rewrite_fields`). `for_each_child{,_mut}` visits direct children only — use it when your pass drives its own recursion order or handles some variants itself (`constant_inliner`, `prune_blocks`). Walks that consume/rebuild nodes or do per-variant semantic work (rewrite drivers, type synthesis, compaction) stay explicit.
 - Public API in `expr/parse` and `expr/runtime` is intentionally minimal. Do not add public methods without justification.
 
 ## After changes

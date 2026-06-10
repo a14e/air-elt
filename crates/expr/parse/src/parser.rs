@@ -399,10 +399,12 @@ impl ParseState {
     }
 
     fn parse_call_expr(&mut self) -> Result<Expr, ExprError> {
+        if *self.peek() == Token::If {
+            return self.parse_if_expression();
+        }
         if let Token::Ident(name) = self.peek().clone() {
             if *self.peek_ahead(1) == Token::LParen {
                 match name.as_str() {
-                    "if" => return self.parse_if_conditional(),
                     "multiIf" => return self.parse_multi_if_conditional(),
                     "coalesce" => return self.parse_coalesce_conditional(),
                     "ifNull" => return self.parse_if_null_conditional(),
@@ -437,41 +439,93 @@ impl ParseState {
         self.parse_primary()
     }
 
-    /// Parse an `if` and any directly-chained `else if`s **iteratively**,
-    /// desugaring `if(c1, v1, if(c2, v2, …, default))` into a flat `multiIf`. A
-    /// lone `if` (whose else is not another `if(...)`) stays an `if`.
+    /// Parse an `if` in either surface form — the legacy function style
+    /// `if(cond, value, else)` or the expression style `if (cond) value else
+    /// other` — together with any directly-chained `else if`s, **iteratively**,
+    /// desugaring the whole chain into a flat `multiIf`. A lone `if` (whose else
+    /// is a plain branch, not another `if`) stays an `if`.
     ///
     /// Folding the chain here, instead of recursing through each nested `if`,
     /// means a long `if/else if` ladder costs no nesting depth and produces a flat
     /// node that every downstream pass walks iteratively — so thousands of
     /// branches parse, type-check, and evaluate without deep recursion. The result
     /// is identical in meaning to the nested form (and to what the optimizer's
-    /// conditional flattening would produce).
-    fn parse_if_conditional(&mut self) -> Result<Expr, ExprError> {
-        self.advance(); // consume "if"
-        self.advance(); // consume "("
+    /// conditional flattening would produce). The two surface forms mix freely
+    /// within one chain, and for non-block branches they produce identical ASTs.
+    fn parse_if_expression(&mut self) -> Result<Expr, ExprError> {
         let mut branches = Vec::new();
-        // Each `if(` opened owes a closing `)`; the whole chain shares one tail.
-        let mut open_parens = 1usize;
+        // Each legacy `if(` opened owes a closing `)`; the whole chain shares one
+        // tail. Expression-style links close their `(cond)` paren immediately.
+        let mut open_parens = 0usize;
+        // Whether the link whose else position we are at used the legacy form —
+        // a legacy else is a plain expression, an expression-style else is a
+        // branch (which may be a `{ … }` block).
+        let mut legacy_link;
 
         let default = loop {
+            self.advance(); // consume `if`
+            if *self.peek() != Token::LParen {
+                return Err(ExprError::Parse {
+                    position: self.pos,
+                    message: "expected '(' after 'if'".to_string(),
+                });
+            }
+            self.advance(); // consume '('
             let condition = self.parse_expr()?;
-            self.expect(&Token::Comma)?;
-            let value = self.parse_expr()?;
-            self.expect(&Token::Comma)?;
-            branches.push((condition, value));
 
-            // An else position of `if(...)` continues the chain — fold it in.
-            let chains = matches!(self.peek(), Token::Ident(name) if name.as_str() == "if")
-                && *self.peek_ahead(1) == Token::LParen;
-            if chains {
-                self.advance(); // consume "if"
-                self.advance(); // consume "("
-                open_parens += 1;
-                continue;
+            match self.peek().clone() {
+                // Legacy function form: `if(cond, value, else)`.
+                Token::Comma => {
+                    legacy_link = true;
+                    self.advance(); // consume ','
+                    let value = self.parse_expr()?;
+                    self.expect(&Token::Comma)?;
+                    branches.push((condition, value));
+                    open_parens += 1;
+
+                    // An else position holding `if` + `(` continues the chain
+                    // (in either surface form) — fold it in.
+                    if *self.peek() == Token::If && *self.peek_ahead(1) == Token::LParen {
+                        continue;
+                    }
+                }
+                // Expression form: `if (cond) branch else branch`.
+                Token::RParen => {
+                    legacy_link = false;
+                    self.advance(); // consume ')'
+                    let then_branch = self.parse_branch()?;
+                    if *self.peek() != Token::Else {
+                        return Err(ExprError::Parse {
+                            position: self.pos,
+                            message: "if-expressions require an 'else' branch".to_string(),
+                        });
+                    }
+                    self.advance(); // consume `else`
+                    branches.push((condition, then_branch));
+
+                    // `else if …` continues the chain (either surface form;
+                    // `parse_if_expression` itself rejects a missing '(').
+                    if *self.peek() == Token::If {
+                        continue;
+                    }
+                }
+                other => {
+                    return Err(ExprError::Parse {
+                        position: self.pos,
+                        message: format!(
+                            "expected ',' (function-style if) or ')' (if-expression) \
+                             after the condition, got {other:?}"
+                        ),
+                    });
+                }
             }
 
-            break self.parse_expr()?; // the final else branch
+            // The final else branch: a plain expression for the legacy form, a
+            // branch (expression or `{ … }` block) for the expression form.
+            if legacy_link {
+                break self.parse_expr()?;
+            }
+            break self.parse_branch()?;
         };
 
         for _ in 0..open_parens {
@@ -491,6 +545,58 @@ impl ParseState {
             branches,
             default: Box::new(default),
         }))
+    }
+
+    /// Parse one branch of an `if`-expression: either a `{ … }` scoped block or
+    /// a plain expression. A leading `{` is disambiguated against an object
+    /// literal by lookahead — `{}` and `{ "key" = … }` are objects (object keys
+    /// are string literals), anything else inside braces is a block.
+    fn parse_branch(&mut self) -> Result<Expr, ExprError> {
+        if *self.peek() == Token::LBrace {
+            let empty_object = *self.peek_ahead(1) == Token::RBrace;
+            let keyed_object = matches!(
+                self.peek_ahead(1),
+                Token::StringLit(_) | Token::RawStringLit(_)
+            ) && *self.peek_ahead(2) == Token::Eq;
+            if empty_object || keyed_object {
+                return self.parse_object();
+            }
+            return self.parse_block();
+        }
+        self.parse_expr()
+    }
+
+    /// Parse a `{ … }` scoped-binding block in branch position: zero or more
+    /// `name = expr` statements followed by a mandatory result expression.
+    /// Statement termination reuses [`parse_statement`](Self::parse_statement)
+    /// (`;` or a newline); block bindings count toward the program-wide
+    /// variable limit. A zero-statement block desugars to its bare result
+    /// expression — `{ expr }` never produces a `Block` node.
+    fn parse_block(&mut self) -> Result<Expr, ExprError> {
+        self.advance(); // consume '{'
+        self.count_node()?;
+
+        let mut statements = Vec::new();
+        while self.is_statement_start() {
+            statements.push(self.parse_statement()?);
+        }
+
+        if matches!(self.peek(), Token::RBrace | Token::Eof) {
+            return Err(ExprError::Parse {
+                position: self.pos,
+                message: "block must end with a result expression".to_string(),
+            });
+        }
+        let result = self.parse_expr()?;
+        self.expect(&Token::RBrace)?;
+
+        if statements.is_empty() {
+            return Ok(result);
+        }
+        Ok(Expr::Block {
+            statements,
+            result: Box::new(result),
+        })
     }
 
     fn parse_multi_if_conditional(&mut self) -> Result<Expr, ExprError> {
@@ -744,6 +850,19 @@ impl ParseState {
                 Ok(inner)
             }
             Token::LBrace => self.parse_object(),
+            // `if` is normally intercepted by `parse_call_expr`; both keyword
+            // arms exist so a stray keyword gets a targeted message instead of
+            // a generic "unexpected token".
+            Token::If => Err(ExprError::Parse {
+                position: self.pos,
+                message: "'if' is a reserved keyword and cannot be used as an identifier"
+                    .to_string(),
+            }),
+            Token::Else => Err(ExprError::Parse {
+                position: self.pos,
+                message: "'else' is a reserved keyword and cannot be used as an identifier"
+                    .to_string(),
+            }),
             _ => Err(ExprError::Parse {
                 position: self.pos,
                 message: format!("unexpected token: {token:?}"),
@@ -1954,5 +2073,290 @@ mod tests {
             msg.contains("expected newline or ';' after statement"),
             "unexpected error: {msg}"
         );
+    }
+
+    // --- if-expression (`if (c) a else b`) tests ---
+
+    /// Table-driven check that the expression form parses to the exact same AST
+    /// as its legacy function-form equivalent.
+    #[test]
+    fn if_expression_is_identical_to_legacy_form() {
+        let cases = [
+            // simple two-branch if
+            ("if (c) a else b", "if(c, a, b)"),
+            // zero-statement brace blocks desugar to the bare expression
+            ("if (c) { 1 } else { 2 }", "if(c, 1, 2)"),
+            // else-if chain folds to the same flat multiIf as the legacy chain
+            (
+                "if (a) 1 else if (b) 2 else if (d) 3 else 4",
+                "if(a, 1, if(b, 2, if(d, 3, 4)))",
+            ),
+            // mixed chains, both directions
+            ("if(a, 1, if (b) 2 else 3)", "if(a, 1, if(b, 2, 3))"),
+            ("if (a) 1 else if(b, 2, 3)", "if(a, 1, if(b, 2, 3))"),
+            // valid operand of a binary operator; the if binds as the right operand
+            ("1 + if (c) 2 else 3", "1 + if(c, 2, 3)"),
+            // multiline form (no newline tokens exist; line numbers only)
+            ("if (c)\n  1\nelse\n  2", "if(c, 1, 2)"),
+            ("if (a) 1\nelse if (b) 2\nelse 3", "if(a, 1, if(b, 2, 3))"),
+            // statement RHS
+            ("y = if (c) 1 else 2; y", "y = if(c, 1, 2); y"),
+            // greedy else branch (Kotlin semantics): `else` takes `3 * 4`
+            ("if (c) 2 else 3 * 4", "if(c, 2, 3 * 4)"),
+        ];
+        for (new_form, legacy_form) in cases {
+            assert_eq!(
+                parse(new_form).unwrap(),
+                parse(legacy_form).unwrap(),
+                "`{new_form}` must produce the same AST as `{legacy_form}`"
+            );
+        }
+    }
+
+    #[test]
+    fn if_expression_chain_folds_to_flat_multi_if() {
+        let program = parse("if (a) 1 else if (b) 2 else 3").unwrap();
+        assert_eq!(
+            program.result,
+            Expr::Conditional(ConditionalExpr::MultiIf {
+                branches: vec![
+                    (
+                        Expr::Variable("a".to_string()),
+                        Expr::Literal(LiteralValue::Int(1))
+                    ),
+                    (
+                        Expr::Variable("b".to_string()),
+                        Expr::Literal(LiteralValue::Int(2))
+                    ),
+                ],
+                default: Box::new(Expr::Literal(LiteralValue::Int(3))),
+            })
+        );
+    }
+
+    #[test]
+    fn if_expression_block_with_statements() {
+        let program = parse("if (c) { x = 1; x } else 0").unwrap();
+        assert_eq!(
+            program.result,
+            Expr::Conditional(ConditionalExpr::If {
+                condition: Box::new(Expr::Variable("c".to_string())),
+                then_branch: Box::new(Expr::Block {
+                    statements: vec![Statement {
+                        name: "x".to_string(),
+                        value: Expr::Literal(LiteralValue::Int(1)),
+                    }],
+                    result: Box::new(Expr::Variable("x".to_string())),
+                }),
+                else_branch: Box::new(Expr::Literal(LiteralValue::Int(0))),
+            })
+        );
+    }
+
+    #[test]
+    fn if_expression_block_as_else_branch_only() {
+        let program = parse("if (c) 1 else { x = 2\nx }").unwrap();
+        assert_eq!(
+            program.result,
+            Expr::Conditional(ConditionalExpr::If {
+                condition: Box::new(Expr::Variable("c".to_string())),
+                then_branch: Box::new(Expr::Literal(LiteralValue::Int(1))),
+                else_branch: Box::new(Expr::Block {
+                    statements: vec![Statement {
+                        name: "x".to_string(),
+                        value: Expr::Literal(LiteralValue::Int(2)),
+                    }],
+                    result: Box::new(Expr::Variable("x".to_string())),
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn if_expression_nested_blocks() {
+        // A block whose result is itself an if-expression with a block branch.
+        let program = parse("if (c) { y = 1; if (d) { z = 2; z } else y } else 0").unwrap();
+        let inner_if = Expr::Conditional(ConditionalExpr::If {
+            condition: Box::new(Expr::Variable("d".to_string())),
+            then_branch: Box::new(Expr::Block {
+                statements: vec![Statement {
+                    name: "z".to_string(),
+                    value: Expr::Literal(LiteralValue::Int(2)),
+                }],
+                result: Box::new(Expr::Variable("z".to_string())),
+            }),
+            else_branch: Box::new(Expr::Variable("y".to_string())),
+        });
+        assert_eq!(
+            program.result,
+            Expr::Conditional(ConditionalExpr::If {
+                condition: Box::new(Expr::Variable("c".to_string())),
+                then_branch: Box::new(Expr::Block {
+                    statements: vec![Statement {
+                        name: "y".to_string(),
+                        value: Expr::Literal(LiteralValue::Int(1)),
+                    }],
+                    result: Box::new(inner_if),
+                }),
+                else_branch: Box::new(Expr::Literal(LiteralValue::Int(0))),
+            })
+        );
+    }
+
+    #[test]
+    fn if_branch_braces_disambiguate_object_vs_block() {
+        // `{}` is an empty object literal, not a block.
+        let program = parse("if (c) {} else 1").unwrap();
+        assert_eq!(
+            program.result,
+            Expr::Conditional(ConditionalExpr::If {
+                condition: Box::new(Expr::Variable("c".to_string())),
+                then_branch: Box::new(Expr::Object(Vec::new())),
+                else_branch: Box::new(Expr::Literal(LiteralValue::Int(1))),
+            })
+        );
+
+        // A string-literal key followed by `=` makes it an object literal.
+        let program = parse("if (c) { \"k\" = 1 } else 1").unwrap();
+        assert_eq!(
+            program.result,
+            Expr::Conditional(ConditionalExpr::If {
+                condition: Box::new(Expr::Variable("c".to_string())),
+                then_branch: Box::new(Expr::Object(vec![(
+                    "k".to_string(),
+                    Expr::Literal(LiteralValue::Int(1)),
+                )])),
+                else_branch: Box::new(Expr::Literal(LiteralValue::Int(1))),
+            })
+        );
+
+        // An identifier binding makes it a block.
+        let program = parse("if (c) { x = 1; x } else 1").unwrap();
+        match program.result {
+            Expr::Conditional(ConditionalExpr::If { then_branch, .. }) => {
+                assert!(
+                    matches!(*then_branch, Expr::Block { .. }),
+                    "expected a Block branch, got {then_branch:?}"
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// Table-driven error cases for the if/else grammar.
+    #[test]
+    fn if_expression_error_cases() {
+        let cases = [
+            ("if (a) b", "if-expressions require an 'else' branch"),
+            // trailing junk after the then branch reads as a missing else
+            ("if (a) b c", "if-expressions require an 'else' branch"),
+            ("if c", "expected '(' after 'if'"),
+            ("if = 5", "expected '(' after 'if'"),
+            (
+                "if (c) { x = 1; } else 2",
+                "block must end with a result expression",
+            ),
+            ("else = 1", "'else' is a reserved keyword"),
+            ("else", "'else' is a reserved keyword"),
+            ("1 + else", "'else' is a reserved keyword"),
+            // a stray comma in branch position fails inside the branch parse
+            ("if (a) , b)", "unexpected token: Comma"),
+            // neither ',' nor ')' after the condition
+            (
+                "if (a 1, 2)",
+                "expected ',' (function-style if) or ')' (if-expression)",
+            ),
+            // a dangling expression after a complete if-expression
+            ("if (a) b else d c", "unexpected token after expression"),
+        ];
+        for (source, expected_fragment) in cases {
+            let error = parse(source).expect_err(source);
+            let message = format!("{error}");
+            assert!(
+                message.contains(expected_fragment),
+                "`{source}`: expected error containing {expected_fragment:?}, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_if_else_chain_stays_flat() {
+        // An expression-style `else if` ladder folds into one flat multiIf, so
+        // it parses far past MAX_EXPR_DEPTH — exactly like the legacy chain.
+        let cases = 1500;
+        let mut chain = String::with_capacity(cases * 24);
+        for n in 0..cases {
+            chain.push_str(&format!("if (x == {n}) {n} else "));
+        }
+        chain.push('0');
+        match parse(&chain) {
+            Ok(Program {
+                result: Expr::Conditional(ConditionalExpr::MultiIf { branches, .. }),
+                ..
+            }) => assert_eq!(branches.len(), cases, "the chain folds to one multiIf"),
+            other => panic!("expected a flat multiIf from the else-if ladder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_if_blocks_respect_depth_guard() {
+        // Each nesting level (an if inside a block inside an if …) charges the
+        // depth budget, so a deeply nested branch structure errors cleanly.
+        let depth = 1000;
+        let mut source = String::with_capacity(depth * 20);
+        for _ in 0..depth {
+            // Zero-statement blocks: they desugar away, but parsing them still
+            // charges the depth budget (no variable bindings, so the variable
+            // limit cannot fire first).
+            source.push_str("if (c) { ");
+        }
+        source.push('1');
+        for _ in 0..depth {
+            source.push_str(" } else 0");
+        }
+        match parse(&source) {
+            Err(ExprError::NestingTooDeep { max }) => assert_eq!(max, MAX_EXPR_DEPTH),
+            other => panic!("expected NestingTooDeep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_bindings_count_toward_variable_limit() {
+        let mut block_body = String::new();
+        for i in 0..=MAX_VARIABLES {
+            block_body.push_str(&format!("v{i} = 1; "));
+        }
+        let source = format!("if (c) {{ {block_body}1 }} else 0");
+        match parse(&source) {
+            Err(ExprError::TooManyVariables { count: _, max }) => assert_eq!(max, MAX_VARIABLES),
+            other => panic!("expected TooManyVariables, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpolation_segment_accepts_if_expression() {
+        // Interpolation segments reuse the expression parser, so the new
+        // syntax works inside `"{...}"` for free.
+        let program = parse("\"v={if (c) 1 else 2}\"").unwrap();
+        match &program.result {
+            Expr::Interpolation(segments) => {
+                assert_eq!(segments[0], InterpolationSegment::Text("v=".to_string()));
+                match &segments[1] {
+                    InterpolationSegment::Expression(expr) => assert_eq!(
+                        *expr,
+                        Expr::FunctionCall {
+                            name: "toString".to_string(),
+                            args: vec![Expr::Conditional(ConditionalExpr::If {
+                                condition: Box::new(Expr::Variable("c".to_string())),
+                                then_branch: Box::new(Expr::Literal(LiteralValue::Int(1))),
+                                else_branch: Box::new(Expr::Literal(LiteralValue::Int(2))),
+                            })],
+                        }
+                    ),
+                    other => panic!("expected Expression segment, got {other:?}"),
+                }
+            }
+            other => panic!("expected Interpolation, got {other:?}"),
+        }
     }
 }

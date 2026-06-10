@@ -307,6 +307,15 @@ total = { compute = "`price` * `qty`", truncate = true }
 # Backtick column refs read naturally here; truncate = false, default = null.
 full_name = "concat(`first`, ' ', `last`)"
 ingested_at = "now()"
+
+# multiline if-expression script (TOML """ string; newlines separate statements):
+tier = """
+if (`spend` > 1000) {
+  bonus = `spend` * 0.1
+  concat('gold:', toString(bonus))
+} else if (`spend` > 100) 'silver'
+else 'basic'
+"""
 ```
 
 Inside a script, source columns are read with `field("col")` or the backtick literal `` `col` `` (prefer the backtick in YAML — no inner quoting). `fields("a,b")` builds an object of the named columns; `fields("*")` builds an object of the whole row. Every column a script reads is auto-added to the source read projection — you do **not** list them under `from`. `fields("*")` pulls in the entire source schema (for Mongo, the sampled schema, since compute requires `validation.fields = true`), so the packed object carries every column the schema knows.

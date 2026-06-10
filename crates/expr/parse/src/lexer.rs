@@ -510,6 +510,8 @@ impl<'a> Lexer<'a> {
             "true" => Token::BoolLit(true),
             "false" => Token::BoolLit(false),
             "null" => Token::NullLit,
+            "if" => Token::If,
+            "else" => Token::Else,
             _ => Token::Ident(text.to_string()),
         };
         Ok(token)
@@ -790,6 +792,35 @@ mod tests {
             result,
             Err(ExprError::UnterminatedString { position: 0 })
         ));
+    }
+
+    #[test]
+    fn tokenize_if_else_keywords() {
+        assert_eq!(
+            tokens("if (a) 1 else 2"),
+            vec![
+                Token::If,
+                Token::LParen,
+                Token::Ident("a".to_string()),
+                Token::RParen,
+                Token::IntLit(1),
+                Token::Else,
+                Token::IntLit(2),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn keyword_prefixed_identifiers_stay_identifiers() {
+        // Only the exact words `if` / `else` are keywords.
+        for name in ["iffy", "elsewhere", "if_x", "_if"] {
+            assert_eq!(
+                tokens(name),
+                vec![Token::Ident(name.to_string()), Token::Eof],
+                "{name} must lex as a plain identifier"
+            );
+        }
     }
 
     #[test]

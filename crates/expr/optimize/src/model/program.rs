@@ -174,11 +174,10 @@ pub enum OptNode {
     /// enabling branch-local CSE and computation push-down. The register is a
     /// slot in the program-wide register file.
     ///
-    /// Reached only once a producer of the heap `Block` exists (the planned
-    /// CSE / push-down passes). Until then no `Block` is built, so compaction
-    /// never emits a `Bind` and the variant is `dead_code` — kept wired so the
-    /// evaluator and arena layout are ready when the passes land.
-    #[allow(dead_code)]
+    /// Produced by compacting the heap `Block` that the converter emits for
+    /// the brace-block branch syntax (`if (c) { x = e; …; result } else …`).
+    /// `Bind` nodes are never duplicated — a clone would alias the register
+    /// write (see the no-clone invariant on the heap `Block`).
     Bind {
         register: RegisterId,
         value: NodeRef,

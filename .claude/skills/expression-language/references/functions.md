@@ -14,6 +14,8 @@ All functions propagate null (return `Value::Null` if any argument is null) unle
 | `isNull` | `(any) -> Bool` | True if argument is null (never returns null) |
 | `isNotNull` | `(any) -> Bool` | True if argument is not null (never returns null) |
 
+`if` also has an expression surface form — `if (cond) value else other`, with `else if` chaining and `{ ... }` branch blocks — that parses to the same AST (chains fold to `multiIf`). See "Syntax" in [SKILL.md](../SKILL.md).
+
 ## String
 
 | Function | Signature | Description |

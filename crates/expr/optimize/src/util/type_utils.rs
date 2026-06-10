@@ -1,6 +1,8 @@
 //! Shared helpers for the typed rules: type lookups, the drop-safety gate, and
 //! numeric-constant predicates.
 
+use std::ops::ControlFlow;
+
 use air_elt_expr_funcs::FunctionRegistry;
 use air_elt_types::{DataType, Value};
 
@@ -8,6 +10,7 @@ use crate::model::opt_expr::OptExpr;
 use crate::model::program::TypeClass;
 use crate::typed::engine::TypedRuleCx;
 use crate::util::fallibility::can_fail;
+use crate::util::visit::for_each_recursive;
 
 /// Whether `node`'s evaluation can be DROPPED without changing observable
 /// behaviour: its type is statically known and non-null (so the original's
@@ -31,66 +34,13 @@ pub(crate) fn is_droppable(node: &OptExpr, cx: &TypedRuleCx) -> bool {
 /// `Fields`) are pure — a register is bound once per row, a field read is total
 /// and deterministic per row.
 pub(crate) fn is_pure(node: &OptExpr, registry: &FunctionRegistry) -> bool {
-    match node {
-        OptExpr::Const(..)
-        | OptExpr::Register(..)
-        | OptExpr::SourceField(..)
-        | OptExpr::Fields(..) => true,
-        OptExpr::Field(_, inner) => is_pure(inner, registry),
-        OptExpr::Call { func, args, .. } => {
-            registry.get_by_ref(*func).is_pure() && args.iter().all(|arg| is_pure(arg, registry))
+    let scan = for_each_recursive(node, &mut |node| match node {
+        OptExpr::Call { func, .. } if !registry.get_by_ref(*func).is_pure() => {
+            ControlFlow::Break(())
         }
-        OptExpr::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            is_pure(condition, registry)
-                && is_pure(then_branch, registry)
-                && is_pure(else_branch, registry)
-        }
-        OptExpr::MultiIf {
-            branches, default, ..
-        } => {
-            branches
-                .iter()
-                .all(|(condition, value)| is_pure(condition, registry) && is_pure(value, registry))
-                && is_pure(default, registry)
-        }
-        OptExpr::IfNull {
-            value, alternative, ..
-        } => is_pure(value, registry) && is_pure(alternative, registry),
-        OptExpr::NullIf {
-            value, sentinel, ..
-        } => is_pure(value, registry) && is_pure(sentinel, registry),
-        OptExpr::And { left, right, .. } | OptExpr::Or { left, right, .. } => {
-            is_pure(left, registry) && is_pure(right, registry)
-        }
-        OptExpr::Interpolation(_, segments) => {
-            segments.iter().all(|segment| is_pure(segment, registry))
-        }
-        OptExpr::Object(_, entries) => entries.iter().all(|(_, value)| is_pure(value, registry)),
-        OptExpr::Switch {
-            inputs,
-            table,
-            default,
-            ..
-        } => {
-            inputs.iter().all(|input| is_pure(input, registry))
-                && table.iter().all(|(_, value)| is_pure(value, registry))
-                && is_pure(default, registry)
-        }
-        OptExpr::TypeAssert { inner, .. } => is_pure(inner, registry),
-        OptExpr::Block {
-            statements, result, ..
-        } => {
-            statements
-                .iter()
-                .all(|statement| is_pure(&statement.value, registry))
-                && is_pure(result, registry)
-        }
-    }
+        _ => ControlFlow::Continue(()),
+    });
+    scan.is_continue()
 }
 
 /// Whether a [`DataType`] satisfies a [`TypeClass`] (the coarse class a

@@ -133,14 +133,15 @@ pub(crate) enum OptExpr {
     /// pushing a computation down into the branch that uses it). Registers stay
     /// in the program-wide `u16` space; the block only controls *when* they are
     /// written. Blocks are not cloned (their register writes would alias), so
-    /// [`reassign_ids`](OptExpr::reassign_ids) restamps only NodeIds, not registers.
+    /// [`reassign_ids`](OptExpr::reassign_ids) restamps only NodeIds, not
+    /// registers — a rule that copies one subtree into several surviving
+    /// positions must bail out when the subtree contains a `Block` (see
+    /// [`contains_block`](crate::util::block_scan::contains_block)).
     ///
-    /// The IR carries this variant ahead of its first producer: the planned
-    /// CSE / push-down passes will emit it. Until then no pass constructs a
-    /// `Block`, so it is `dead_code` — kept (with the match arms wired through
-    /// the model) so the lowering, compaction, and id machinery are ready when
-    /// the passes land.
-    #[allow(dead_code)]
+    /// Produced by the converter
+    /// ([`OptProgramConverter`](crate::engines::OptProgramConverter)) for the
+    /// brace-block branch syntax — `if (c) { x = e; …; result } else …` — and
+    /// available to the planned CSE / push-down passes as a future producer.
     Block {
         id: NodeId,
         statements: Vec<OptStatement>,

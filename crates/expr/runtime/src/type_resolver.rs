@@ -49,7 +49,7 @@ impl<'a> TypeCheckerState<'a> {
         Ok(())
     }
 
-    fn check_expr(&self, expr: &Expr) -> Result<NullableExprType, ExprError> {
+    fn check_expr(&mut self, expr: &Expr) -> Result<NullableExprType, ExprError> {
         match expr {
             Expr::Literal(literal) => Ok(self.check_literal(literal)),
             Expr::Variable(name) => self.check_variable(name),
@@ -57,8 +57,54 @@ impl<'a> TypeCheckerState<'a> {
             Expr::Conditional(conditional) => self.check_conditional(conditional),
             Expr::Interpolation(segments) => self.check_interpolation(segments),
             Expr::Object(entries) => self.check_object(entries),
+            Expr::Block { statements, result } => self.check_block(statements, result),
             Expr::Field(..) | Expr::Fields(..) => Err(ExprError::FieldOutsideTransform),
         }
+    }
+
+    /// Type-check a scoped-binding block: each binding's type shadows its name
+    /// in the type environment for the remainder of the block; the block's type
+    /// is the result type under that extended environment. After the result is
+    /// checked the displaced entries are restored in reverse insertion order
+    /// (on both success and error paths), so the outer scope and sibling
+    /// branches see the pre-block types again — mirroring the evaluator's
+    /// runtime scoping exactly.
+    fn check_block(
+        &mut self,
+        statements: &[Statement],
+        result: &Expr,
+    ) -> Result<NullableExprType, ExprError> {
+        let mut displaced: Vec<(&str, Option<NullableExprType>)> =
+            Vec::with_capacity(statements.len());
+        let outcome = self.check_block_scope(statements, result, &mut displaced);
+
+        // Entries borrow the AST names; only a shadowed restore re-owns one.
+        for (name, previous) in displaced.into_iter().rev() {
+            match previous {
+                Some(inferred_type) => {
+                    self.variables.insert(name.to_owned(), inferred_type);
+                }
+                None => {
+                    self.variables.remove(name);
+                }
+            }
+        }
+
+        outcome
+    }
+
+    fn check_block_scope<'s>(
+        &mut self,
+        statements: &'s [Statement],
+        result: &Expr,
+        displaced: &mut Vec<(&'s str, Option<NullableExprType>)>,
+    ) -> Result<NullableExprType, ExprError> {
+        for statement in statements {
+            let inferred_type = self.check_expr(&statement.value)?;
+            let previous = self.variables.insert(statement.name.clone(), inferred_type);
+            displaced.push((&statement.name, previous));
+        }
+        self.check_expr(result)
     }
 
     fn check_literal(&self, literal: &LiteralValue) -> NullableExprType {
@@ -90,7 +136,7 @@ impl<'a> TypeCheckerState<'a> {
     }
 
     fn check_function_call(
-        &self,
+        &mut self,
         name: &str,
         args: &[Expr],
     ) -> Result<NullableExprType, ExprError> {
@@ -106,7 +152,7 @@ impl<'a> TypeCheckerState<'a> {
     }
 
     fn check_conditional(
-        &self,
+        &mut self,
         conditional: &ConditionalExpr,
     ) -> Result<NullableExprType, ExprError> {
         match conditional {
@@ -169,7 +215,7 @@ impl<'a> TypeCheckerState<'a> {
     }
 
     fn check_interpolation(
-        &self,
+        &mut self,
         segments: &[InterpolationSegment],
     ) -> Result<NullableExprType, ExprError> {
         for segment in segments {
@@ -180,7 +226,7 @@ impl<'a> TypeCheckerState<'a> {
         Ok(NullableExprType::non_null(DataType::Text { size: None }))
     }
 
-    fn check_object(&self, entries: &[(String, Expr)]) -> Result<NullableExprType, ExprError> {
+    fn check_object(&mut self, entries: &[(String, Expr)]) -> Result<NullableExprType, ExprError> {
         for (_key, value_expr) in entries {
             self.check_expr(value_expr)?;
         }
@@ -413,5 +459,56 @@ mod tests {
         assert_eq!(result.data_type, DataType::Bool);
         assert!(!result.nullable);
         assert_eq!(result.int_bound, None);
+    }
+
+    #[test]
+    fn block_type_is_result_type() {
+        let result =
+            infer_expression_type("if (true) { x = 2; x + 1 } else 0", &registry()).unwrap();
+        assert_eq!(result.data_type, DataType::Int64);
+        assert!(!result.nullable);
+    }
+
+    #[test]
+    fn block_scoped_type_shadowing() {
+        // Outer `x` is Int; inside the block `x` is shadowed by Text. The block
+        // result `x` then resolves to Text; after the block the outer Int `x`
+        // is restored and concatenated (Int + Int) keeps the whole program
+        // type-checking.
+        let source = "x = 1; y = if (true) { x = 'hi'; length(x) } else 0; x + y";
+        let result = infer_expression_type(source, &registry()).unwrap();
+        // The block accepted Text for the shadowed `x` (`length` is Text-strict,
+        // so it would error if the outer Int leaked in); after the block the
+        // outer Int `x` is restored, so `x + y` type-checks as an integer.
+        // Exact type: `If` resolution drops `int_bound` (`NullableExprType::new`
+        // sets it to None), so the addition falls back to DataType-level bits
+        // (64 + 1) and promotes to BigInt.
+        assert!(matches!(result.data_type, DataType::BigInt { .. }));
+        assert!(!result.nullable);
+    }
+
+    #[test]
+    fn block_local_type_undefined_after_if() {
+        let source = "y = if (true) { t = 5; t } else 0; t + y";
+        let result = infer_expression_type(source, &registry());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ExprError::UndefinedVariable { name } if name == "t"));
+    }
+
+    #[test]
+    fn block_nullability_through_branches() {
+        // One branch yields a nullable value (null literal), so the if-type is
+        // nullable even though the other branch's block result is non-null.
+        let source = "if (true) { x = 1; x } else { y = null; y }";
+        let result = infer_expression_type(source, &registry()).unwrap();
+        assert!(result.nullable);
+    }
+
+    #[test]
+    fn block_non_null_branches_stay_non_null() {
+        let source = "if (true) { x = 1; x } else { y = 2; y }";
+        let result = infer_expression_type(source, &registry()).unwrap();
+        assert!(!result.nullable);
+        assert_eq!(result.data_type, DataType::Int64);
     }
 }

@@ -5,6 +5,15 @@
 //! already known when a later statement (or the result) is rewritten. This is a
 //! size-non-increasing program pass: it only replaces register reads with
 //! constants and removes bindings.
+//!
+//! [`OptExpr::Block`] bindings inline the same way, scoped naturally by SSA:
+//! registers are program-wide unique, so a constant bound inside a block can
+//! simply join the shared map — its register is only ever read within that
+//! block's subtree. A constant block binding is dropped from the block (a
+//! constant cannot fail, so no error is lost; an emptied block is collapsed by
+//! the register pruner that runs next).
+
+use std::ops::ControlFlow;
 
 use ahash::AHashMap;
 use air_elt_expr_funcs::FunctionRegistry;
@@ -13,7 +22,8 @@ use air_elt_types::Value;
 use super::engine::ProgramPass;
 use crate::model::node_id::NodeCounter;
 use crate::model::opt_expr::OptExpr;
-use crate::model::opt_program::OptProgram;
+use crate::model::opt_program::{OptProgram, OptStatement};
+use crate::util::visit::for_each_child_mut;
 
 pub(crate) struct ConstantInliner;
 
@@ -25,105 +35,60 @@ impl ProgramPass for ConstantInliner {
         node_counter: &NodeCounter,
     ) {
         let mut constants: AHashMap<u16, Value> = AHashMap::new();
-        let statements = std::mem::take(&mut program.statements);
-        let mut kept = Vec::with_capacity(statements.len());
-
-        for mut statement in statements {
-            substitute(&mut statement.value, &constants, node_counter);
-            if let OptExpr::Const(_, value) = &statement.value {
-                constants.insert(statement.register, value.clone());
-            } else {
-                kept.push(statement);
-            }
-        }
-
-        substitute(&mut program.result, &constants, node_counter);
-        program.statements = kept;
+        program
+            .statements
+            .retain_mut(|statement| inline_statement(statement, &mut constants, node_counter));
+        substitute(&mut program.result, &mut constants, node_counter);
     }
 }
 
-/// Replace `Register(r)` with `Const(v)` wherever a known constant applies.
-fn substitute(expr: &mut OptExpr, constants: &AHashMap<u16, Value>, node_counter: &NodeCounter) {
+/// Substitute known constants into one binding; if the binding itself is (or
+/// became) a constant, record it and report the statement as droppable.
+fn inline_statement(
+    statement: &mut OptStatement,
+    constants: &mut AHashMap<u16, Value>,
+    node_counter: &NodeCounter,
+) -> bool {
+    substitute(&mut statement.value, constants, node_counter);
+    if let OptExpr::Const(_, value) = &mut statement.value {
+        // The statement is dropped right after, so move the value out instead
+        // of cloning it (a Text/Json constant can be large).
+        let moved = std::mem::replace(value, Value::Null);
+        constants.insert(statement.register, moved);
+        false
+    } else {
+        true
+    }
+}
+
+/// Replace `Register(r)` with `Const(v)` wherever a known constant applies. The
+/// map is mutable because a block contributes its own constant bindings while
+/// it is walked (mirroring the program-level statement loop).
+fn substitute(
+    expr: &mut OptExpr,
+    constants: &mut AHashMap<u16, Value>,
+    node_counter: &NodeCounter,
+) {
     match expr {
         OptExpr::Register(_, register) => {
             if let Some(value) = constants.get(register) {
                 *expr = OptExpr::Const(node_counter.fresh_id(), value.clone());
             }
         }
-        OptExpr::Const(..) | OptExpr::SourceField(..) | OptExpr::Fields(..) => {}
-        OptExpr::Field(_, inner) => substitute(inner, constants, node_counter),
-        OptExpr::Call { args, .. } => {
-            for arg in args {
-                substitute(arg, constants, node_counter);
-            }
-        }
-        OptExpr::If {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            substitute(condition, constants, node_counter);
-            substitute(then_branch, constants, node_counter);
-            substitute(else_branch, constants, node_counter);
-        }
-        OptExpr::MultiIf {
-            branches, default, ..
-        } => {
-            for (condition, value) in branches {
-                substitute(condition, constants, node_counter);
-                substitute(value, constants, node_counter);
-            }
-            substitute(default, constants, node_counter);
-        }
-        OptExpr::IfNull {
-            value, alternative, ..
-        } => {
-            substitute(value, constants, node_counter);
-            substitute(alternative, constants, node_counter);
-        }
-        OptExpr::NullIf {
-            value, sentinel, ..
-        } => {
-            substitute(value, constants, node_counter);
-            substitute(sentinel, constants, node_counter);
-        }
-        OptExpr::And { left, right, .. } | OptExpr::Or { left, right, .. } => {
-            substitute(left, constants, node_counter);
-            substitute(right, constants, node_counter);
-        }
-        OptExpr::Interpolation(_, segments) => {
-            for segment in segments {
-                substitute(segment, constants, node_counter);
-            }
-        }
-        OptExpr::Object(_, entries) => {
-            for (_, value) in entries {
-                substitute(value, constants, node_counter);
-            }
-        }
-        OptExpr::Switch {
-            inputs,
-            table,
-            default,
-            ..
-        } => {
-            for input in inputs {
-                substitute(input, constants, node_counter);
-            }
-            for (_, value) in table {
-                substitute(value, constants, node_counter);
-            }
-            substitute(default, constants, node_counter);
-        }
-        OptExpr::TypeAssert { inner, .. } => substitute(inner, constants, node_counter),
         OptExpr::Block {
             statements, result, ..
         } => {
-            for statement in statements {
-                substitute(&mut statement.value, constants, node_counter);
-            }
+            // Mirror the program-level loop: dropping a constant binding is
+            // safe (a constant cannot fail) and SSA registers keep the shared
+            // map scope-correct.
+            statements.retain_mut(|statement| inline_statement(statement, constants, node_counter));
             substitute(result, constants, node_counter);
+        }
+        other => {
+            let _: ControlFlow<()> = for_each_child_mut(other, |child| {
+                substitute(child, constants, node_counter);
+                ControlFlow::Continue(())
+            });
         }
     }
 }

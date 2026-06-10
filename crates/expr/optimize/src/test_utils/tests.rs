@@ -386,9 +386,18 @@ fn prunes_multi_if_with_constant_conditions() {
 
 #[test]
 fn prunes_constant_and_or() {
+    // `true && x` keeps the evaluator's Bool/Null requirement on the surviving
+    // operand: `field("b")` has no provable type, so the fold wraps it in a
+    // TypeAssert{Bool} instead of yielding it bare (which would erase the
+    // runtime type error the unoptimized path raises for a non-bool field).
     assert_eq!(
         optimized_result("true && field(\"b\")"),
-        OptExpr::SourceField(NodeId::PLACEHOLDER, "b".to_string())
+        OptExpr::TypeAssert {
+            id: NodeId::PLACEHOLDER,
+            inner: Box::new(OptExpr::SourceField(NodeId::PLACEHOLDER, "b".to_string())),
+            expect: TypeClass::Bool,
+            on_present: AssertYield::Identity,
+        }
     );
     assert_eq!(
         optimized_result("false && field(\"b\")"),
@@ -2827,6 +2836,13 @@ fn value_expression() -> impl Strategy<Value = String> {
                 inner.clone(),
             )
                 .prop_map(|(a, b, c, t, e)| format!("if((({a} == {b}) && ({c} < {a})), {t}, {e})")),
+            // The brace-block branch form: a scoped binding read twice (nested
+            // blocks rebind the same name, exercising scope save/restore).
+            (inner.clone(), inner.clone(), inner.clone(), inner.clone()).prop_map(
+                |(a, b, t, e)| {
+                    format!("if (({a} < {b})) {{ v = {t}; (v + (v * {e})) }} else (-{e})")
+                }
+            ),
         ]
     })
 }
@@ -4026,4 +4042,452 @@ fn schemaless_with_sample_absent_field_is_unknown_not_an_error() {
     }]);
     let result = compile_typed("field(\"absent\")", Some(&sampled), None);
     assert!(result.is_ok(), "got {result:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Scoped-binding blocks (`if (c) { x = e; …; result } else …`).
+//
+// Phase C: the converter is the first real producer of `OptExpr::Block`, so
+// every pass arm that was wired ahead of time is exercised here against actual
+// block-carrying programs — lowering/scoping, rewrite rules inside blocks, the
+// second-pass inliner/pruner, dce, compaction to `Bind`, lazy evaluation, and
+// the switch-lowering no-clone guard.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn new_if_else_chain_lowers_identically_to_legacy() {
+    // The brace-free `if (c) v else if …` chain is pure syntax: after
+    // optimization it is structurally identical to the legacy `if(c, v, …)`
+    // function form.
+    assert_eq!(
+        optimized_result("if (field(\"c1\")) 1 else if (field(\"c2\")) 2 else 3"),
+        optimized_result("if(field(\"c1\"), 1, if(field(\"c2\"), 2, 3))"),
+    );
+}
+
+#[test]
+fn block_lowers_to_a_block_node_with_a_fresh_register() {
+    let registry = registry();
+    let context = context();
+    let program = optimize(
+        &parse(r#"if (field("c")) { x = field("a"); x } else 0"#),
+        &registry,
+        &context,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        program.register_count, 1,
+        "the block binding takes a register"
+    );
+    let OptExpr::If { then_branch, .. } = program.result else {
+        panic!("expected an if, got {:?}", program.result);
+    };
+    let OptExpr::Block {
+        statements, result, ..
+    } = *then_branch
+    else {
+        panic!("expected a Block branch, got {then_branch:?}");
+    };
+    assert_eq!(statements.len(), 1);
+    assert_eq!(
+        *result,
+        OptExpr::Register(NodeId::PLACEHOLDER, statements[0].register),
+        "the block result reads its own binding"
+    );
+}
+
+#[test]
+fn block_binding_is_not_visible_after_the_closing_brace() {
+    // `q` is block-scoped: the converter restores the name map on block exit,
+    // so the trailing read is an undefined variable.
+    let registry = registry();
+    let context = context();
+    let program = parse("y = if (true) { q = 1; q } else 0; q");
+    let result = optimize(&program, &registry, &context, false);
+    assert!(
+        matches!(result, Err(OptimizeError::UndefinedVariable { ref name }) if name == "q"),
+        "expected UndefinedVariable for q, got {result:?}"
+    );
+}
+
+#[test]
+fn block_shadowing_leaves_the_outer_binding_untouched() {
+    // The block rebinds `x` locally; the outer `x` is untouched afterwards.
+    let source = "x = 1; y = if (true) { x = 2; x + 10 } else 0; x + y";
+    assert_eq!(eval_unoptimized(source), Value::Int64(13));
+    assert_eq!(
+        optimized_result(source),
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(13))
+    );
+}
+
+#[test]
+fn sibling_blocks_shadow_the_same_name_independently() {
+    let source = "x = 5; a = if (false) { x = 1; x } else { x = 2; x }; x + a";
+    assert_eq!(eval_unoptimized(source), Value::Int64(7));
+    assert_eq!(
+        optimized_result(source),
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(7))
+    );
+}
+
+#[test]
+fn nested_blocks_shadow_and_restore_in_order() {
+    // The inner block rebinds `a`; the outer block's `a` is restored after the
+    // inner one closes: a=1, inner a=2 → b=20, outer a+b = 21.
+    let source = "if (true) { a = 1; b = if (true) { a = a + 1; a * 10 } else 0; a + b } else 0";
+    assert_eq!(eval_unoptimized(source), Value::Int64(21));
+    assert_eq!(
+        optimized_result(source),
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(21))
+    );
+}
+
+#[test]
+fn bind_in_an_untaken_branch_never_evaluates() {
+    // The unoptimized path keeps the conditional and the block: the compacted
+    // `Bind` for `x = 1 / 0` sits in the untaken else branch and must never
+    // run — block bindings are lazy, scoped to their branch.
+    let registry = registry();
+    let context = context();
+    let program = compile_unoptimized("if (true) 1 else { x = 1 / 0; x }");
+    let value = eval_const_program(&program, &registry, &context).unwrap();
+    assert_eq!(value, Value::Int64(1));
+}
+
+#[test]
+fn bind_in_the_taken_branch_executes_and_is_read_twice() {
+    assert_eq!(
+        eval_unoptimized("if (false) 0 else { x = 7; x + x }"),
+        Value::Int64(14)
+    );
+}
+
+#[test]
+fn const_folding_fires_inside_a_block_binding() {
+    // `1 + 2` folds within the block; the constant binding then inlines and the
+    // emptied block collapses to its result.
+    assert_eq!(
+        optimized_result(r#"if (field("c")) { x = 1 + 2; x } else 0"#),
+        optimized_result(r#"if(field("c"), 3, 0)"#),
+    );
+}
+
+#[test]
+fn constant_block_binding_inlines_into_its_scope() {
+    // `x = 3` inlines into both reads, `3 + 3` folds, the block collapses.
+    assert_eq!(
+        optimized_result(r#"if (field("c")) { x = 3; x + x } else 0"#),
+        optimized_result(r#"if(field("c"), 6, 0)"#),
+    );
+}
+
+#[test]
+fn prunes_unused_infallible_block_binding_and_collapses_the_block() {
+    // The unread `x` is infallible (`add`), so the block binding is dropped and
+    // the empty block collapses to its result.
+    assert_eq!(
+        optimized_result(r#"if (field("c")) { x = field("a") + 1; 2 } else 0"#),
+        optimized_result(r#"if(field("c"), 2, 0)"#),
+    );
+}
+
+#[test]
+fn keeps_unused_fallible_block_binding() {
+    // `divide` may fail; the block evaluates its bindings when reached, so the
+    // unread binding must survive to preserve the (lazy) error.
+    let result = optimized_result(r#"if (field("c")) { x = field("a") / field("b"); 2 } else 0"#);
+    let OptExpr::If { then_branch, .. } = result else {
+        panic!("expected an if, got {result:?}");
+    };
+    let OptExpr::Block { statements, .. } = *then_branch else {
+        panic!("expected a surviving Block, got {then_branch:?}");
+    };
+    assert_eq!(statements.len(), 1, "the fallible binding is kept");
+}
+
+#[test]
+fn branch_prune_keeps_the_taken_block_wholesale() {
+    // `if (true)` resolves to the then-block; the block (with its fallible,
+    // read binding) becomes the whole result.
+    let result =
+        optimized_result(r#"if (true) { x = field("a") / field("b"); x } else field("z")"#);
+    let OptExpr::Block {
+        statements, result, ..
+    } = result
+    else {
+        panic!("expected the taken Block, got {result:?}");
+    };
+    assert_eq!(statements.len(), 1);
+    assert_eq!(
+        *result,
+        OptExpr::Register(NodeId::PLACEHOLDER, statements[0].register)
+    );
+}
+
+#[test]
+fn branch_prune_discards_the_untaken_block_with_its_bindings() {
+    // The untaken block — including its erroring constant binding — is dropped
+    // wholesale; no ConstEval error escapes a dead branch.
+    assert_eq!(
+        optimized_result("if (false) { x = 1 / 0; x } else 7"),
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(7))
+    );
+}
+
+#[test]
+fn eager_block_binding_with_constant_error_fails_the_build() {
+    // `if (true)` makes the block always-reached, so its erroring constant
+    // binding is an eager position — the static check rejects it, mirroring the
+    // top-level `x = 1 / 0; 5` behaviour.
+    let registry = registry();
+    let context = context();
+    let program = parse("if (true) { x = 1 / 0; x } else 0");
+    let result = Optimizer::create(&registry, &context).compile(&program, None, None);
+    assert!(matches!(result, Err(OptimizeError::ConstEval { .. })));
+}
+
+#[test]
+fn lazy_block_binding_with_constant_error_compiles() {
+    // Behind a dynamic condition the block stays lazy, so the erroring constant
+    // binding defers to runtime.
+    let registry = registry();
+    let context = context();
+    let program = parse(r#"if (field("c")) { x = 1 / 0; x } else 0"#);
+    let compiled = Optimizer::create(&registry, &context).compile(&program, None, None);
+    assert!(compiled.is_ok(), "got {compiled:?}");
+}
+
+#[test]
+fn guard_propagation_reaches_inside_a_block() {
+    // `c == "yes"` pins `c` inside the then-block, so `upper(c)` folds to
+    // "YES"; the constant binding inlines and the block collapses.
+    let result =
+        optimized_result(r#"if (field("c") == "yes") { v = upper(field("c")); v } else "no""#);
+    let OptExpr::If { then_branch, .. } = result else {
+        panic!("expected an if, got {result:?}");
+    };
+    assert_eq!(
+        *then_branch,
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Text("YES".to_string()))
+    );
+}
+
+#[test]
+fn switch_lowering_bails_on_a_block_branch_value() {
+    // Cloning a branch value into the dispatch table would alias a block's
+    // register writes, so a block-carrying branch keeps the multiIf intact…
+    let mut block_branch = String::from("multiIf(");
+    let mut plain_branch = String::from("multiIf(");
+    let block_value = r#"if (field("c")) { v = field("y") + 1; v * v } else 0"#;
+    for index in 1..=6 {
+        let value = if index == 1 {
+            block_value.to_string()
+        } else {
+            format!("{index}0")
+        };
+        block_branch.push_str(&format!(r#"field("x") == {index}, {value}, "#));
+        plain_branch.push_str(&format!(r#"field("x") == {index}, {index}0, "#));
+    }
+    block_branch.push_str("0)");
+    plain_branch.push_str("0)");
+
+    match optimized_result(&block_branch) {
+        OptExpr::MultiIf { branches, .. } => assert_eq!(branches.len(), 6),
+        other => panic!("expected the multiIf kept, got {other:?}"),
+    }
+    // …while the identical shape without the block still lowers to a Switch.
+    assert!(matches!(
+        optimized_result(&plain_branch),
+        OptExpr::Switch { .. }
+    ));
+}
+
+#[test]
+fn short_circuit_fold_keeps_the_bool_check_on_the_surviving_operand() {
+    // `false || x` / `true && x` make the right operand the whole result, but
+    // the evaluator would still have required it to be Bool/Null. The fold
+    // must preserve that as a TypeAssert{Bool} when the operand's type is not
+    // provable, and the typed engine strips it when it is.
+    let asserted = optimized_result(r#"false || field("x")"#);
+    assert!(
+        matches!(
+            asserted,
+            OptExpr::TypeAssert {
+                expect: TypeClass::Bool,
+                ..
+            }
+        ),
+        "expected a Bool TypeAssert, got {asserted:?}"
+    );
+    let and_asserted = optimized_result(r#"true && field("x")"#);
+    assert!(matches!(
+        and_asserted,
+        OptExpr::TypeAssert {
+            expect: TypeClass::Bool,
+            ..
+        }
+    ));
+    // The typed engine (schema-present compiles only — `Optimizer::optimize`
+    // builds the typed rule set off `schema.map(...)`) strips the assert when
+    // the operand is provably Bool…
+    let schema = make_schema(&[("x", DataType::Int64, false)]);
+    let stripped = Optimizer::create(&registry(), &context())
+        .optimize(&parse(r#"false || (field("x") == 1)"#), true, Some(&schema))
+        .unwrap()
+        .result;
+    assert!(
+        !matches!(stripped, OptExpr::TypeAssert { .. }),
+        "expected the assert stripped over a comparison, got {stripped:?}"
+    );
+    // …and a constant Bool right operand folds bare.
+    assert_eq!(
+        optimized_result("false || true"),
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Bool(true))
+    );
+
+    // Runtime behavior matches the heap evaluator: Bool passes, non-Bool errors.
+    let program = compile_optimized(r#"false || field("x")"#);
+    assert_eq!(
+        eval_with_field(&program, "x", Value::Bool(true)).unwrap(),
+        Value::Bool(true)
+    );
+    assert!(eval_with_field(&program, "x", Value::Int64(5)).is_err());
+}
+
+#[test]
+fn switch_lowering_bails_on_a_block_key_expression() {
+    // A block inside the *key* expression must also keep the multiIf intact:
+    // the surviving key is a clone, and cloning a block would alias its
+    // register writes. Today the cross-clause structural-equality check already
+    // rejects blocks (fresh SSA registers never compare equal), but this test
+    // pins the outcome itself, not the mechanism — see the explicit
+    // `contains_block` guard on `key_exprs` in `switch_lower.rs`.
+    let key = r#"if (field("d")) { v = field("k"); v } else field("k")"#;
+    let mut block_key = String::from("multiIf(");
+    let mut plain_key = String::from("multiIf(");
+    for index in 1..=6 {
+        block_key.push_str(&format!("{key} == {index}, {index}0, "));
+        plain_key.push_str(&format!(r#"field("k") == {index}, {index}0, "#));
+    }
+    block_key.push_str("0)");
+    plain_key.push_str("0)");
+
+    match optimized_result(&block_key) {
+        OptExpr::MultiIf { branches, .. } => assert_eq!(branches.len(), 6),
+        other => panic!("expected the multiIf kept, got {other:?}"),
+    }
+    assert!(matches!(
+        optimized_result(&plain_key),
+        OptExpr::Switch { .. }
+    ));
+}
+
+#[test]
+fn compiled_impure_block_binding_evaluates_once() {
+    // The evaluate-once contract on the *compiled* path: the binding writes its
+    // register once per evaluation, so both reads observe the same draw. A
+    // broken implementation that re-evaluates the value per read would make
+    // `v == v` flaky (two independent draws collide with p = 1e-6).
+    let source = r#"if (field("c")) { v = randomInt(0, 1000000); v == v } else false"#;
+
+    // Guard against this test going vacuous: no rule folds `v == v` today, so
+    // the block must survive optimization. A future value-numbering identity
+    // (sound for non-float types only — NaN != NaN) would collapse it to
+    // `true` and prune the binding; if that lands, rework this test instead of
+    // letting it silently assert a constant.
+    match optimized_result(source) {
+        OptExpr::If { then_branch, .. } => {
+            assert!(matches!(*then_branch, OptExpr::Block { .. }))
+        }
+        other => panic!("expected an if with a surviving block, got {other:?}"),
+    }
+
+    let program = compile_optimized(source);
+    assert_eq!(
+        eval_with_field(&program, "c", Value::Bool(true)).unwrap(),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn optimized_block_program_evaluates_end_to_end() {
+    // Full pipeline over a surviving block: field-read hoisting, move
+    // annotation across `Bind`, arena evaluation. `field("x")` is read twice,
+    // so it hoists into a register feeding the block.
+    let program =
+        compile_optimized(r#"if (field("x") == 1) { v = field("x") + 10; v * v } else 0"#);
+    assert_eq!(
+        eval_with_field(&program, "x", Value::Int64(1)).unwrap(),
+        Value::Int64(121)
+    );
+    assert_eq!(
+        eval_with_field(&program, "x", Value::Int64(2)).unwrap(),
+        Value::Int64(0)
+    );
+}
+
+#[test]
+fn optimized_block_stays_lazy_at_runtime() {
+    // The fallible binding survives optimization inside the else-block and runs
+    // only when that branch is taken: x == 1 short-circuits past it, x == 0
+    // reaches it and raises the division error.
+    let program = compile_optimized(r#"if (field("x") == 1) 1 else { d = 1 / field("x"); d }"#);
+    assert_eq!(
+        eval_with_field(&program, "x", Value::Int64(1)).unwrap(),
+        Value::Int64(1)
+    );
+    assert!(eval_with_field(&program, "x", Value::Int64(0)).is_err());
+}
+
+#[test]
+fn block_purity_and_fallibility_follow_bindings_and_result() {
+    let registry = registry();
+    let context = context();
+    let lower = |source: &str| {
+        let program = optimize(&parse(source), &registry, &context, false).unwrap();
+        let OptExpr::If { then_branch, .. } = program.result else {
+            panic!("expected an if, got {:?}", program.result);
+        };
+        *then_branch
+    };
+
+    // A fallible binding makes the whole block fallible; `divide` is still pure.
+    let fallible = lower(r#"if (field("c")) { x = 1 / 2; x } else 0"#);
+    assert!(matches!(fallible, OptExpr::Block { .. }));
+    assert!(crate::util::fallibility::can_fail(&fallible, &registry));
+    assert!(crate::util::type_utils::is_pure(&fallible, &registry));
+
+    // An impure binding (random) makes the block impure.
+    let impure = lower(r#"if (field("c")) { x = randomInt(0, 10); x } else 0"#);
+    assert!(matches!(impure, OptExpr::Block { .. }));
+    assert!(!crate::util::type_utils::is_pure(&impure, &registry));
+
+    // Pure, infallible bindings + result: the block is pure and infallible.
+    let benign = lower(r#"if (field("c")) { x = field("a") + 1; x } else 0"#);
+    assert!(matches!(benign, OptExpr::Block { .. }));
+    assert!(!crate::util::fallibility::can_fail(&benign, &registry));
+    assert!(crate::util::type_utils::is_pure(&benign, &registry));
+}
+
+#[test]
+fn typed_path_types_block_programs() {
+    // The type checker threads block bindings through the register table: a
+    // well-typed block program compiles, and a type error inside a block is
+    // raised by the final strict pass even in a lazy branch.
+    let schema = make_schema(&[("c", DataType::Bool, false), ("n", DataType::Int32, false)]);
+    let ok = compile_typed(
+        r#"if (field("c")) { x = field("n") + 1; x + x } else 0"#,
+        Some(&schema),
+        None,
+    );
+    assert!(ok.is_ok(), "got {ok:?}");
+
+    let bad = compile_typed(
+        r#"if (field("c")) { x = trim(field("n")); x } else 'a'"#,
+        Some(&schema),
+        None,
+    );
+    assert!(bad.is_err(), "trim(Int32) inside a block must be rejected");
 }

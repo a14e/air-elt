@@ -35,5 +35,5 @@ pub const MAX_OBJECT_DEPTH: usize = 128;
 /// plus the `field`/`fields` source-reference grammar). These cannot be
 /// registered as regular functions.
 pub const RESERVED_CONTROL_FLOW_NAMES: &[&str] = &[
-    "if", "multiIf", "coalesce", "ifNull", "nullIf", "and", "or", "field", "fields",
+    "if", "else", "multiIf", "coalesce", "ifNull", "nullIf", "and", "or", "field", "fields",
 ];

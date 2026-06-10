@@ -3,17 +3,21 @@
 //! When a conditional's controlling value is constant, the branch that can
 //! never run is dropped. The boolean operators use the same three-valued
 //! (`true`/`false`/`null`) semantics as the heap evaluator, so the optimizer
-//! and the runtime always agree. These rules assume a well-typed program
-//! (conditions and boolean operands are `Bool`/`Null`), which the type-check
-//! pass guarantees. A `Switch` whose key inputs are all constant folds to the
-//! matched branch (or the default on a miss) — its key is built exactly as the
-//! evaluator builds it, so the dispatch is resolved at compile time.
+//! and the runtime always agree. These rules run BEFORE the type-check pass,
+//! so they cannot assume boolean operands: when a fold makes the right operand
+//! the whole result (`false || x`, `true && x`), the heap evaluator's "right
+//! operand must be Bool/Null" check is preserved as a `TypeAssert{Bool}`
+//! (stripped later by the typed engine when the operand is provably Bool). A
+//! `Switch` whose key inputs are all constant folds to the matched branch (or
+//! the default on a miss) — its key is built exactly as the evaluator builds
+//! it, so the dispatch is resolved at compile time.
 
 use air_elt_types::{Key, Value};
 
 use super::{Rewrite, Rule, RuleCx};
 use crate::model::node_id::NodeId;
-use crate::model::opt_expr::OptExpr;
+use crate::model::opt_expr::{AssertYield, OptExpr};
+use crate::model::program::TypeClass;
 
 pub(crate) struct BranchPrune;
 
@@ -224,7 +228,18 @@ impl BranchPrune {
                 cx.node_counter.fresh_id(),
                 Value::Bool(false),
             )),
-            Some(Value::Bool(true)) => Rewrite::Changed(*right),
+            // The right operand becomes the whole result, but the evaluator
+            // would still have required it to be Bool/Null — keep that check
+            // (a constant Bool/Null right passes it trivially and folds bare).
+            Some(Value::Bool(true)) => match right.as_const() {
+                Some(Value::Bool(_)) | Some(Value::Null) => Rewrite::Changed(*right),
+                _ => Rewrite::Changed(OptExpr::TypeAssert {
+                    id: cx.node_counter.fresh_id(),
+                    inner: right,
+                    expect: TypeClass::Bool,
+                    on_present: AssertYield::Identity,
+                }),
+            },
             Some(Value::Null) => match right.as_const() {
                 Some(Value::Bool(false)) => Rewrite::Changed(OptExpr::Const(
                     cx.node_counter.fresh_id(),
@@ -251,7 +266,17 @@ impl BranchPrune {
                 cx.node_counter.fresh_id(),
                 Value::Bool(true),
             )),
-            Some(Value::Bool(false)) => Rewrite::Changed(*right),
+            // Mirror of `prune_and`: preserve the Bool/Null requirement on the
+            // surviving right operand.
+            Some(Value::Bool(false)) => match right.as_const() {
+                Some(Value::Bool(_)) | Some(Value::Null) => Rewrite::Changed(*right),
+                _ => Rewrite::Changed(OptExpr::TypeAssert {
+                    id: cx.node_counter.fresh_id(),
+                    inner: right,
+                    expect: TypeClass::Bool,
+                    on_present: AssertYield::Identity,
+                }),
+            },
             Some(Value::Null) => match right.as_const() {
                 Some(Value::Bool(true)) => Rewrite::Changed(OptExpr::Const(
                     cx.node_counter.fresh_id(),

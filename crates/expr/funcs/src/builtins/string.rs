@@ -93,26 +93,34 @@ impl ExprFunction for ConcatFunc {
         args: &mut dyn ArgWindow,
         _context: &EvalContext,
     ) -> Result<Value, FuncError> {
-        // Only the FIRST argument is taken — its `String` buffer becomes the
-        // accumulator we push onto. Every later argument is read by reference:
-        // `push_str` only borrows it, so taking would needlessly clone a const
-        // separator (`'-'`, `' '`) or a non-last-use register on every row — the
-        // hot path for `hash(concat(...))` surrogate keys.
-        let first = args.take(0);
-        if first.is_null() {
-            return Ok(Value::Null);
-        }
-        let mut result = match first {
-            Value::Text(s) => s,
-            other => return Err(concat_type_mismatch(&other)),
-        };
-        for i in 1..args.len() {
+        // Pre-scan by reference: nulls and type errors surface before anything
+        // is taken, and the total size is known up front so the accumulator
+        // grows exactly once instead of doubling through `push_str` reallocs.
+        let mut total = 0usize;
+        for i in 0..args.len() {
             let val = args.read(i);
             if val.is_null() {
                 return Ok(Value::Null);
             }
             match val {
+                Value::Text(s) => total += s.len(),
+                other => return Err(concat_type_mismatch(other)),
+            }
+        }
+        // Only the FIRST argument is taken — its `String` buffer becomes the
+        // accumulator we push onto. Every later argument is read by reference:
+        // `push_str` only borrows it, so taking would needlessly clone a const
+        // separator (`'-'`, `' '`) or a non-last-use register on every row — the
+        // hot path for `hash(concat(...))` surrogate keys.
+        let mut result = match args.take(0) {
+            Value::Text(s) => s,
+            other => return Err(concat_type_mismatch(&other)),
+        };
+        result.reserve_exact(total - result.len());
+        for i in 1..args.len() {
+            match args.read(i) {
                 Value::Text(s) => result.push_str(s),
+                // Unreachable — the pre-scan validated every argument.
                 other => return Err(concat_type_mismatch(other)),
             }
         }
