@@ -2,7 +2,7 @@
 use air_elt_commons_pg::Dialect;
 use air_elt_commons_testing::cockroach::cockroach_pool;
 use air_elt_commons_testing::pg::pg_pool;
-use air_elt_core::model::{Batch, Row as CoreRow, WriteSpec};
+use air_elt_core::model::{Batch, ConfigWriteSpec, Row as CoreRow, WriteSpec};
 use air_elt_core::traits::Sink;
 use air_elt_core::types::{DataType, Value};
 use air_elt_sink_postgres::{PgSink, PgSinkConfig};
@@ -39,11 +39,19 @@ async fn write_batch_and_validate_access() {
         columns: vec!["id".into(), "label".into(), "at".into(), "payload".into()],
         table: format!("{}.events", handle.schema),
         conflict: None,
+        sink_options: toml::Table::new(),
     };
 
     sink.validate_access(&spec).await.expect("validate_access");
 
-    let schema = sink.describe_schema(&spec.table).await.expect("describe");
+    let schema = sink
+        .describe_schema(&ConfigWriteSpec {
+            table: spec.table.clone(),
+            conflict: None,
+            sink_options: toml::Table::new(),
+        })
+        .await
+        .expect("describe");
     assert_eq!(schema.find("id").unwrap().data_type, DataType::Int64);
     assert_eq!(schema.find("label").unwrap().data_type, DataType::text());
     assert_eq!(schema.find("at").unwrap().data_type, DataType::Timestamp);
@@ -146,6 +154,7 @@ async fn all_nulls_across_data_types() {
         columns: columns.clone(),
         table: format!("{}.null_matrix", handle.schema),
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
 
@@ -258,6 +267,7 @@ async fn all_types_non_null_round_trip() {
         columns: columns.clone(),
         table: format!("{}.all_vals", handle.schema),
         conflict: None,
+        sink_options: toml::Table::new(),
     };
 
     let ts = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
@@ -344,6 +354,7 @@ async fn cockroach_smoke_insert_and_read_back() {
         columns: vec!["id".into(), "label".into()],
         table: "smoke".into(),
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
 
@@ -403,6 +414,7 @@ async fn ip_types_round_trip() {
         columns,
         table: format!("{}.ip_vals", handle.schema),
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     let ctx = sink.build_context(&spec).await.expect("build_context");
 

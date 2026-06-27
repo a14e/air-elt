@@ -34,6 +34,7 @@ air-elt-sink-mongodb = { workspace = true }
 air-elt-storage-mongodb = { workspace = true }
 air-elt-sink-clickhouse = { workspace = true }
 air-elt-sink-questdb = { workspace = true }
+air-elt-sink-redis = { workspace = true }
 air-elt-expr-funcs = { workspace = true }
 air-elt-expr-runtime = { workspace = true }
 tokio = { workspace = true }
@@ -56,6 +57,7 @@ mongodb = { workspace = true }
 bson = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
+redis = { workspace = true }
 
 [lints]
 workspace = true

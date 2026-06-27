@@ -33,6 +33,7 @@ async fn null_double_and_text() {
         table: "bench_nullable_basic".to_string(),
         columns: vec!["ts".into(), "v".into(), "s".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -97,6 +98,7 @@ async fn null_binary() {
         table: "bench_nullable_binary".to_string(),
         columns: vec!["ts".into(), "payload".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -171,6 +173,7 @@ async fn nulls_for_long_uuid_symbol() {
             "keep".into(),
         ],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");

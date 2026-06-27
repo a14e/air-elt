@@ -9,7 +9,8 @@ use air_elt_commons_mysql::pool;
 use air_elt_commons_mysql::sink_bind::bind_value_separated;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::model::{
-    Batch, Row as CoreRow, RowOp, Schema, SchemaProvider, SinkCtx, WriteReport, WriteSpec,
+    Batch, ConfigWriteSpec, Row as CoreRow, RowOp, Schema, SchemaProvider, SinkCtx, WriteReport,
+    WriteSpec,
 };
 use air_elt_core::traits::Sink;
 use air_elt_core::types::{DataType, Value};
@@ -130,13 +131,13 @@ impl Sink for MySqlSink {
         Ok(())
     }
 
-    async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema> {
-        let schema = air_elt_commons_mysql::schema::fetch_schema(&self.pool, table).await?;
+    async fn describe_schema(&self, spec: &ConfigWriteSpec) -> RuntimeResult<Schema> {
+        let schema = air_elt_commons_mysql::schema::fetch_schema(&self.pool, &spec.table).await?;
         Ok(schema)
     }
 
     async fn build_context(&self, spec: &WriteSpec) -> RuntimeResult<Arc<dyn SinkCtx>> {
-        let schema = self.describe_schema(&spec.table).await?;
+        let schema = air_elt_commons_mysql::schema::fetch_schema(&self.pool, &spec.table).await?;
         let column_types: Vec<DataType> = spec
             .columns
             .iter()

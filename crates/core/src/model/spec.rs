@@ -148,6 +148,14 @@ pub struct WriteSpec {
     /// gates `Delete` row support: sinks reject Delete rows when this
     /// is `None` (no key to target).
     pub conflict: Option<crate::config::conflict::ConflictConfig>,
+    /// Per-flow sink-specific options coming from the developed form
+    /// `sink = { name = "...", <opts...> }` in the flow block. Bare
+    /// `sink = "name"` produces an empty table. Sinks that don't
+    /// recognise these options ignore them; sinks that do (e.g. the
+    /// forthcoming redis sink's `mode`) deserialize this into their own
+    /// typed struct in `build_context`. The sink mirror of
+    /// [`ReadSpec::source_options`].
+    pub sink_options: toml::Table,
 }
 
 /// Schema-independent half of [`ReadSpec`]. Carries everything that's
@@ -171,6 +179,7 @@ pub struct ConfigReadSpec {
 pub struct ConfigWriteSpec {
     pub table: String,
     pub conflict: Option<crate::config::conflict::ConflictConfig>,
+    pub sink_options: toml::Table,
 }
 
 #[cfg(test)]

@@ -33,6 +33,7 @@ async fn nullable_columns_round_trip_null_and_value() {
         table: "n_t".to_string(),
         columns: vec!["id".into(), "name".into(), "age".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");

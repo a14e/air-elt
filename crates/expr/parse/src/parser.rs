@@ -838,6 +838,11 @@ impl ParseState {
                 self.count_node()?;
                 Ok(Expr::Literal(LiteralValue::Null))
             }
+            Token::DurationLit(duration) => {
+                self.advance();
+                self.count_node()?;
+                Ok(Expr::Literal(LiteralValue::Interval(duration)))
+            }
             Token::Ident(name) => {
                 self.advance();
                 self.count_node()?;
@@ -993,6 +998,21 @@ mod tests {
                 name: "negate".to_string(),
                 args: vec![Expr::Literal(LiteralValue::Int(7))],
             }
+        );
+    }
+
+    #[test]
+    fn parse_duration_literal() {
+        use std::time::Duration;
+        let program = parse("10s").unwrap();
+        assert_eq!(
+            program.result,
+            Expr::Literal(LiteralValue::Interval(Duration::from_secs(10)))
+        );
+        let iso = parse("PT1H30M").unwrap();
+        assert_eq!(
+            iso.result,
+            Expr::Literal(LiteralValue::Interval(Duration::from_secs(5400)))
         );
     }
 

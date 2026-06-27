@@ -44,6 +44,7 @@ async fn writes_numeric_bigint_and_decimal() {
         columns: vec!["id".into(), "big".into(), "rate".into()],
         table: format!("{}.t", handle.schema),
         conflict: None,
+        sink_options: toml::Table::new(),
     };
 
     let big_str = "9876543210987654321098765";
@@ -95,6 +96,7 @@ async fn cockroach_writes_numeric_decimal() {
         columns: vec!["id".into(), "rate".into()],
         table: "rates".into(),
         conflict: None,
+        sink_options: toml::Table::new(),
     };
 
     let rate_str = "12345678.90";

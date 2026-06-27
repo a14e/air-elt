@@ -350,6 +350,30 @@ fn folds_nested_pure_calls() {
 }
 
 #[test]
+fn duration_literal_folds_to_interval_constant() {
+    use std::time::Duration;
+    // Compact human and ISO-8601 forms both lower to a constant interval.
+    assert_eq!(
+        optimized_result("10s"),
+        OptExpr::Const(
+            NodeId::PLACEHOLDER,
+            Value::Interval(Duration::from_secs(10))
+        )
+    );
+    assert_eq!(
+        optimized_result("1h30m"),
+        OptExpr::Const(
+            NodeId::PLACEHOLDER,
+            Value::Interval(Duration::from_secs(5400))
+        )
+    );
+    assert_eq!(
+        eval_unoptimized("PT1H30M"),
+        Value::Interval(Duration::from_secs(5400))
+    );
+}
+
+#[test]
 fn collapses_field_forms_to_source_field() {
     let expected = OptExpr::SourceField(NodeId::PLACEHOLDER, "x".to_string());
     assert_eq!(optimized_result("field(\"x\")"), expected);

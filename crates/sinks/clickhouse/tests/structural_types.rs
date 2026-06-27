@@ -211,6 +211,7 @@ async fn round_trip_nested_as_arrays() {
         table: "nested_t".to_string(),
         columns: vec!["id".into(), "items.label".into(), "items.qty".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -260,6 +261,7 @@ fn spec(table: &str, columns: &[&str]) -> WriteSpec {
         table: table.to_string(),
         columns: columns.iter().map(|c| c.to_string()).collect(),
         conflict: None,
+        sink_options: toml::Table::new(),
     }
 }
 

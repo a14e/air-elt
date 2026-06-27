@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used)]
 
 use air_elt_commons_testing::mariadb::mariadb_pool;
-use air_elt_core::model::{Batch, Row as CoreRow, WriteSpec};
+use air_elt_core::model::{Batch, ConfigWriteSpec, Row as CoreRow, WriteSpec};
 use air_elt_core::traits::Sink;
 use air_elt_core::types::{DataType, Value};
 use air_elt_sink_mysql::{MySqlSink, MySqlSinkConfig};
@@ -36,9 +36,17 @@ async fn writes_native_uuid_column_to_mariadb() {
         columns: vec!["id".into(), "ext".into()],
         table: format!("{}.accounts", handle.schema),
         conflict: None,
+        sink_options: Default::default(),
     };
 
-    let schema = sink.describe_schema(&spec.table).await.expect("describe");
+    let schema = sink
+        .describe_schema(&ConfigWriteSpec {
+            table: spec.table.clone(),
+            conflict: None,
+            sink_options: Default::default(),
+        })
+        .await
+        .expect("describe");
     assert_eq!(schema.find("ext").unwrap().data_type, DataType::Uuid);
 
     let known = Uuid::from_u128(0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00);

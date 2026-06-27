@@ -95,6 +95,7 @@ pull-images:
     {{ engine }} pull mirror.gcr.io/cockroachdb/cockroach:v25.1.0
     {{ engine }} pull mirror.gcr.io/clickhouse/clickhouse-server:24.8
     {{ engine }} pull mirror.gcr.io/questdb/questdb:8.2.3
+    {{ engine }} pull mirror.gcr.io/valkey/valkey:8.1.1
     {{ engine }} pull mirror.gcr.io/testcontainers/ryuk:0.11.0
 
 # ── Test ──────────────────────────────────────────────────────────────

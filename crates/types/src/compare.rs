@@ -79,6 +79,9 @@ pub fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
         (Value::Json(a), Value::Json(b)) => (a == b).then_some(Ordering::Equal),
         (Value::Object(a), Value::Object(b)) => (a == b).then_some(Ordering::Equal),
 
+        // Interval: total order on the underlying Duration.
+        (Value::Interval(a), Value::Interval(b)) => Some(a.cmp(b)),
+
         // Custom: delegate to DynValue (ordering first, equality fallback)
         (Value::Custom(a), Value::Custom(b)) => {
             if let Some(ord) = a.partial_cmp(&**b) {

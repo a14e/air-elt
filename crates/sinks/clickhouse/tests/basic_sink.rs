@@ -36,6 +36,7 @@ async fn round_trip_simple_columns() {
         table: "users".to_string(),
         columns: vec!["id".into(), "name".into(), "age".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -103,6 +104,7 @@ async fn validate_delete_access_is_default_ok_but_runner_skips_it() {
             key: vec!["id".into()],
             strategy: air_elt_core::config::conflict::ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
     // Default impl returns Ok(()) even though CH can't actually do
     // mutations. The validation pipeline gates this call on

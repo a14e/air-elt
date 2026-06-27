@@ -38,6 +38,7 @@ async fn pg_wire_chunks_large_batch_at_bind_param_cap() {
         table: "bench_pg_chunking".to_string(),
         columns: vec!["ts".into(), "a".into(), "b".into(), "c".into(), "d".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");

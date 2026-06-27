@@ -39,6 +39,7 @@ async fn write_batch_dry_run_skips_writes_then_real_run_commits() {
         columns: vec!["id".into(), "name".into()],
         table: format!("{}.dry_run_t", handle.schema),
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
 
@@ -114,6 +115,7 @@ async fn write_batch_dry_run_rejects_type_mismatch_server_side() {
         columns: vec!["id".into(), "name".into()],
         table: format!("{}.dry_run_neg_t", handle.schema),
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     let ctx = sink.build_context(&spec).await.expect("build_context");
 
@@ -183,6 +185,7 @@ async fn write_batch_dry_run_delete_rejects_type_mismatch_server_side() {
             key: vec!["id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
     let ctx = sink.build_context(&spec).await.expect("build_context");
 
@@ -272,6 +275,7 @@ async fn write_batch_dry_run_delete_preserves_then_real_run_deletes() {
             key: vec!["id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
     let ctx = sink.build_context(&spec).await.expect("build_context");
 
@@ -368,6 +372,7 @@ async fn write_batch_dry_run_rejects_bad_conflict_key_server_side() {
             key: vec!["name".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
     let ctx = sink.build_context(&spec).await.expect("build_context");
 

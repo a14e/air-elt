@@ -116,6 +116,9 @@ pub fn decode_column(row: &MySqlRow, index: usize, data_type: DataType) -> Runti
         // the same structural invariant.
         DataType::Object => unreachable!("mysql sources never produce Object types"),
         DataType::Union(_) => unreachable!("mysql sources never produce Union types"),
+        DataType::Interval => {
+            unreachable!("mysql sources never produce Interval (redis-only type)")
+        }
         DataType::Custom(_) => unreachable!(
             "DataType::Custom must be handled by the connector before reaching decode_column"
         ),
@@ -179,6 +182,9 @@ pub fn bind_cursor_value<'q>(
             unreachable!(
                 "Value::Object cannot appear in cursor values — it is not cursor-compatible"
             )
+        }
+        Value::Interval(_) => {
+            unreachable!("Value::Interval (redis-only type) is not cursor-compatible")
         }
         Value::Custom(_) => unreachable!(
             "Value::Custom must be handled by the connector before reaching bind_cursor_value"

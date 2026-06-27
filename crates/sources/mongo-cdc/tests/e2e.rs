@@ -438,6 +438,7 @@ async fn cdc_to_pg_sink_round_trip_with_inserts_and_deletes() {
             key: vec!["id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
     let sink_ctx = sink.build_context(&write_spec).await.expect("sink ctx");
 
@@ -598,6 +599,7 @@ async fn validate_delete_access_real_db_succeeds_for_owner() {
             key: vec!["id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
 
     sink.validate_delete_access(&spec)
@@ -653,6 +655,7 @@ async fn cdc_to_mysql_sink_round_trip_with_inserts_and_deletes() {
             key: vec!["id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
     let sink_ctx = sink.build_context(&write_spec).await.expect("sink ctx");
 
@@ -721,6 +724,7 @@ async fn cdc_to_mongo_sink_round_trip_with_inserts_and_deletes() {
             key: vec!["_id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
     let sink_ctx = sink.build_context(&write_spec).await.expect("sink ctx");
 
@@ -808,6 +812,7 @@ async fn validate_delete_access_pg_fails_for_role_without_delete_privilege() {
             key: vec!["id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
 
     sink.validate_access(&spec)
@@ -895,6 +900,7 @@ async fn validate_delete_access_mysql_fails_for_user_without_delete_privilege() 
             key: vec!["id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
 
     sink.validate_access(&spec).await.expect("INSERT path ok");

@@ -192,6 +192,11 @@ pub fn to_bson(v: &Value) -> RuntimeResult<Bson> {
             }
             Bson::Document(doc)
         }
+        Value::Interval(_) => {
+            return Err(RuntimeError::Other(
+                "Value::Interval (redis-only type) has no BSON encoding".to_string(),
+            ));
+        }
         Value::Custom(inner) => {
             let any = inner.as_any();
             if let Some(oid) = any.downcast_ref::<MongoObjectIdValue>() {

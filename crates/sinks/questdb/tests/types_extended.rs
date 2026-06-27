@@ -35,6 +35,7 @@ async fn binary_round_trip() {
         table: "bench_types_binary".to_string(),
         columns: vec!["ts".into(), "payload".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -107,6 +108,7 @@ async fn date_round_trip() {
         table: "bench_date".to_string(),
         columns: vec!["ts".into(), "d".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -184,6 +186,7 @@ async fn long256_round_trip() {
         table: "bench_long256".to_string(),
         columns: vec!["ts".into(), "v".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -263,6 +266,7 @@ async fn ipv4_round_trip() {
         table: "bench_ipv4".to_string(),
         columns: vec!["ts".into(), "ip".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -333,6 +337,7 @@ async fn geohash_round_trip() {
         table: "bench_geohash".to_string(),
         columns: vec!["ts".into(), "g".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");

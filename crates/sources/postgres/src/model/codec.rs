@@ -104,6 +104,9 @@ pub fn decode_column(row: &PgRow, index: usize, data_type: DataType) -> RuntimeR
         // `unreachable!` for the same invariant.
         DataType::Object => unreachable!("postgres sources never produce Object types"),
         DataType::Union(_) => unreachable!("postgres sources never produce Union types"),
+        DataType::Interval => {
+            unreachable!("postgres sources never produce Interval (redis-only type)")
+        }
         // HLL: the wire shape is a binary blob — sqlx decodes it as
         // `Vec<u8>` (sqlx has no native registration for the HLL type
         // OID, but `bytea`-shaped types decode fine through the binary
@@ -185,6 +188,9 @@ pub fn bind_cursor_value<'q>(
         }
         Value::UInt8(_) | Value::UInt16(_) | Value::UInt32(_) | Value::UInt64(_) => {
             unreachable!("postgres has no unsigned int columns; cursor cannot carry unsigned")
+        }
+        Value::Interval(_) => {
+            unreachable!("Value::Interval (redis-only type) is not cursor-compatible")
         }
         Value::Custom(c) => {
             // PG `inet` is cursor-compatible — wrap the IpNetwork

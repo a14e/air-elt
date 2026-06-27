@@ -25,6 +25,7 @@ mongodb = { workspace = true }
 bson = { workspace = true }
 sha2 = { workspace = true }
 reqwest = { workspace = true }
+redis = { workspace = true }
 
 [lints]
 workspace = true

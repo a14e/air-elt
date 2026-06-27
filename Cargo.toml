@@ -11,6 +11,7 @@ members = [
     "crates/commons/testing",
     "crates/commons/mongodb",
     "crates/commons/clickhouse",
+    "crates/commons/redis",
     "crates/sources/postgres",
     "crates/sources/mysql",
     "crates/sources/mongodb",
@@ -21,6 +22,7 @@ members = [
     "crates/sinks/clickhouse",
     "crates/commons/questdb",
     "crates/sinks/questdb",
+    "crates/sinks/redis",
     "crates/storages/postgres",
     "crates/storages/mysql",
     "crates/storages/mongodb",
@@ -35,7 +37,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -43,35 +45,37 @@ repository = "https://github.com/a14e/air-elt"
 authors = ["Air Elt contributors"]
 
 [workspace.dependencies]
-air-elt-core = { path = "crates/core", version = "0.1.5" }
-air-elt-types = { path = "crates/types", version = "0.1.5" }
-air-elt-commons = { path = "crates/commons/lib", version = "0.1.5" }
-air-elt-commons-caching = { path = "crates/commons/caching", version = "0.1.5" }
-air-elt-commons-arena = { path = "crates/commons/arena", version = "0.1.5" }
-air-elt-commons-pg = { path = "crates/commons/pg", version = "0.1.5" }
-air-elt-commons-mysql = { path = "crates/commons/mysql", version = "0.1.5" }
-air-elt-commons-testing = { path = "crates/commons/testing", version = "0.1.5" }
-air-elt-source-postgres = { path = "crates/sources/postgres", version = "0.1.5" }
-air-elt-source-mysql = { path = "crates/sources/mysql", version = "0.1.5" }
-air-elt-sink-postgres = { path = "crates/sinks/postgres", version = "0.1.5" }
-air-elt-sink-mysql = { path = "crates/sinks/mysql", version = "0.1.5" }
-air-elt-storage-postgres = { path = "crates/storages/postgres", version = "0.1.5" }
-air-elt-storage-mysql = { path = "crates/storages/mysql", version = "0.1.5" }
-air-elt-commons-mongodb = { path = "crates/commons/mongodb", version = "0.1.5" }
-air-elt-source-mongodb = { path = "crates/sources/mongodb", version = "0.1.5" }
-air-elt-source-mongo-cdc = { path = "crates/sources/mongo-cdc", version = "0.1.5" }
-air-elt-sink-mongodb = { path = "crates/sinks/mongodb", version = "0.1.5" }
-air-elt-storage-mongodb = { path = "crates/storages/mongodb", version = "0.1.5" }
-air-elt-commons-clickhouse = { path = "crates/commons/clickhouse", version = "0.1.5" }
-air-elt-sink-clickhouse = { path = "crates/sinks/clickhouse", version = "0.1.5" }
-air-elt-commons-questdb = { path = "crates/commons/questdb", version = "0.1.5" }
-air-elt-sink-questdb = { path = "crates/sinks/questdb", version = "0.1.5" }
-air-elt-monitoring = { path = "crates/monitoring", version = "0.1.5" }
-air-elt-expr-types = { path = "crates/expr/types", version = "0.1.5" }
-air-elt-expr-funcs = { path = "crates/expr/funcs", version = "0.1.5" }
-air-elt-expr-parse = { path = "crates/expr/parse", version = "0.1.5" }
-air-elt-expr-optimize = { path = "crates/expr/optimize", version = "0.1.5" }
-air-elt-expr-runtime = { path = "crates/expr/runtime", version = "0.1.5" }
+air-elt-core = { path = "crates/core", version = "0.1.6" }
+air-elt-types = { path = "crates/types", version = "0.1.6" }
+air-elt-commons = { path = "crates/commons/lib", version = "0.1.6" }
+air-elt-commons-caching = { path = "crates/commons/caching", version = "0.1.6" }
+air-elt-commons-arena = { path = "crates/commons/arena", version = "0.1.6" }
+air-elt-commons-pg = { path = "crates/commons/pg", version = "0.1.6" }
+air-elt-commons-mysql = { path = "crates/commons/mysql", version = "0.1.6" }
+air-elt-commons-testing = { path = "crates/commons/testing", version = "0.1.6" }
+air-elt-source-postgres = { path = "crates/sources/postgres", version = "0.1.6" }
+air-elt-source-mysql = { path = "crates/sources/mysql", version = "0.1.6" }
+air-elt-sink-postgres = { path = "crates/sinks/postgres", version = "0.1.6" }
+air-elt-sink-mysql = { path = "crates/sinks/mysql", version = "0.1.6" }
+air-elt-storage-postgres = { path = "crates/storages/postgres", version = "0.1.6" }
+air-elt-storage-mysql = { path = "crates/storages/mysql", version = "0.1.6" }
+air-elt-commons-mongodb = { path = "crates/commons/mongodb", version = "0.1.6" }
+air-elt-source-mongodb = { path = "crates/sources/mongodb", version = "0.1.6" }
+air-elt-source-mongo-cdc = { path = "crates/sources/mongo-cdc", version = "0.1.6" }
+air-elt-sink-mongodb = { path = "crates/sinks/mongodb", version = "0.1.6" }
+air-elt-storage-mongodb = { path = "crates/storages/mongodb", version = "0.1.6" }
+air-elt-commons-clickhouse = { path = "crates/commons/clickhouse", version = "0.1.6" }
+air-elt-sink-clickhouse = { path = "crates/sinks/clickhouse", version = "0.1.6" }
+air-elt-commons-questdb = { path = "crates/commons/questdb", version = "0.1.6" }
+air-elt-sink-questdb = { path = "crates/sinks/questdb", version = "0.1.6" }
+air-elt-commons-redis = { path = "crates/commons/redis", version = "0.1.6" }
+air-elt-sink-redis = { path = "crates/sinks/redis", version = "0.1.6" }
+air-elt-monitoring = { path = "crates/monitoring", version = "0.1.6" }
+air-elt-expr-types = { path = "crates/expr/types", version = "0.1.6" }
+air-elt-expr-funcs = { path = "crates/expr/funcs", version = "0.1.6" }
+air-elt-expr-parse = { path = "crates/expr/parse", version = "0.1.6" }
+air-elt-expr-optimize = { path = "crates/expr/optimize", version = "0.1.6" }
+air-elt-expr-runtime = { path = "crates/expr/runtime", version = "0.1.6" }
 
 aes = "0.8.4"
 ahash = "0.8.12"
@@ -91,6 +95,10 @@ ch_cityhash102 = "0.1.0"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 data-encoding = "2.9.0"
+# Standard async connection pool for redis/valkey. Wraps redis-rs
+# `MultiplexedConnection` with classic checkout/recycle semantics; its
+# `redis = "^1.0.3"` requirement unifies with the workspace-pinned redis.
+deadpool-redis = { version = "0.23.0", default-features = false, features = ["rt_tokio_1"] }
 encoding_rs = "0.8.35"
 futures = "0.3.32"
 gcm = "0.10.3"
@@ -111,12 +119,17 @@ prometheus = { version = "0.14.0", default-features = false }
 proptest = "1.5.0"
 quick-xml = "0.39.2"
 rand = "0.10.1"
+redis = { version = "1.2.4", default-features = false, features = ["aio", "tokio-comp", "tls-rustls", "tokio-rustls-comp"] }
 regex = "1.12.3"
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
 semver = "1.0.28"
 smallvec = "1.15.0"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
+# `preserve_order` keeps JSON object key order stable (insertion order),
+# which the redis sink relies on when serialising `Value::Object` payloads
+# (and bson enables it transitively anyway — declared explicitly so the
+# guarantee is owned, not incidental).
+serde_json = { version = "1.0.149", features = ["float_roundtrip", "preserve_order"] }
 serde_yaml = "=0.9.33"
 sha1 = "0.10.6"
 sha2 = "0.10.9"

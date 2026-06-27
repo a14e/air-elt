@@ -74,6 +74,7 @@ fn oltp_write_spec(table: &str) -> WriteSpec {
         table: table.to_string(),
         columns: OLTP_COLUMNS.iter().map(|c| (*c).to_string()).collect(),
         conflict: None,
+        sink_options: toml::Table::new(),
     }
 }
 

@@ -388,6 +388,7 @@ fn eval_literal(lit: &LiteralValue) -> Value {
         LiteralValue::Int(i) => Value::Int64(*i),
         LiteralValue::Float(f) => Value::Float64(*f),
         LiteralValue::String(s) => Value::Text(s.clone()),
+        LiteralValue::Interval(d) => Value::Interval(*d),
     }
 }
 
@@ -471,6 +472,19 @@ mod tests {
     #[test]
     fn literal_null() {
         assert_eq!(eval("null").unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn literal_duration() {
+        use std::time::Duration;
+        assert_eq!(
+            eval("10s").unwrap(),
+            Value::Interval(Duration::from_secs(10))
+        );
+        assert_eq!(
+            eval("1h30m").unwrap(),
+            Value::Interval(Duration::from_secs(5400))
+        );
     }
 
     #[test]

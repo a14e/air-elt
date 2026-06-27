@@ -1,0 +1,37 @@
+[package]
+name = "air-elt-commons-redis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Single consolidated integration-test binary (project convention): one
+# `tests/all.rs` that declares `mod`s for each test file, with `autotests`
+# off so cargo doesn't compile one binary per file.
+autotests = false
+
+[lib]
+doctest = false
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+[dependencies]
+air-elt-commons = { workspace = true }
+air-elt-monitoring = { workspace = true }
+deadpool-redis = { workspace = true }
+redis = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+air-elt-commons-testing = { workspace = true }
+# Brings the `PoolStatsReader` trait into scope so the pool e2e test can
+# assert through the same `read()` the monitoring collector calls.
+air-elt-monitoring = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

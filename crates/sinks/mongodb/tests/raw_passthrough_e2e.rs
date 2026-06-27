@@ -38,6 +38,7 @@ async fn raw_passthrough_writes_documents_verbatim() {
         columns: vec![ROOT_BODY_TARGET.to_string()],
         table: "raw_sink".into(),
         conflict: None,
+        sink_options: Default::default(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");

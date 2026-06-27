@@ -513,6 +513,48 @@ mod tests {
     }
 
     #[test]
+    fn interval_is_identity_only() {
+        // The load-bearing invariant behind every connector's Interval
+        // `unreachable!`/reject arm: Interval is compatible ONLY with itself,
+        // never converts to/from anything, on both the lossless and truncate
+        // matrices. A regression here turns those rejects into reachable code.
+        assert!(is_compatible(DataType::Interval, DataType::Interval));
+        assert!(is_compatible_with_truncate(
+            DataType::Interval,
+            DataType::Interval
+        ));
+        assert!(!is_narrowing(DataType::Interval, DataType::Interval));
+
+        let others = [
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Bool,
+            TEXT,
+            DataType::Json,
+            DataType::Timestamp,
+            DataType::Uuid,
+        ];
+        for other in others {
+            assert!(
+                !is_compatible(DataType::Interval, other.clone()),
+                "Interval → {other:?} must be rejected (lossless)"
+            );
+            assert!(
+                !is_compatible(other.clone(), DataType::Interval),
+                "{other:?} → Interval must be rejected (lossless)"
+            );
+            assert!(
+                !is_compatible_with_truncate(DataType::Interval, other.clone()),
+                "Interval → {other:?} must be rejected (truncate)"
+            );
+            assert!(
+                !is_compatible_with_truncate(other.clone(), DataType::Interval),
+                "{other:?} → Interval must be rejected (truncate)"
+            );
+        }
+    }
+
+    #[test]
     fn integer_widening_allowed() {
         assert!(is_compatible(DataType::Int16, DataType::Int32));
         assert!(is_compatible(DataType::Int16, DataType::Int64));
@@ -1526,6 +1568,7 @@ mod tests {
             Just(DataType::Ipv6),
             Just(DataType::Json),
             Just(DataType::Xml),
+            Just(DataType::Interval),
             prop::option::of(1u32..=64).prop_map(|w| DataType::BigInt { width: w }),
             (1u32..=38, 0u32..=18).prop_map(|(p, s)| DataType::Decimal {
                 precision: Some(p),

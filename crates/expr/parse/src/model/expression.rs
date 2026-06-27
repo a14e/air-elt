@@ -89,6 +89,9 @@ pub enum LiteralValue {
     Int(i64),
     Float(f64),
     String(String),
+    /// Time span, lexed from a duration literal (`10s`, `PT1H30M`).
+    /// Materialises as [`air_elt_types::Value::Interval`].
+    Interval(std::time::Duration),
 }
 
 /// A segment within an interpolated string.

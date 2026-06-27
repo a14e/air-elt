@@ -100,11 +100,52 @@ impl FlowSourceRef {
     }
 }
 
+/// Reference to a configured `[[sinks]]` instance from a flow block.
+///
+/// The sink mirror of [`FlowSourceRef`]. Two surface forms (deserialised
+/// via `#[serde(untagged)]`):
+///
+/// 1. Bare name: `sink = "myredis"` — no per-flow options. Every
+///    existing flow uses this form.
+/// 2. Developed form: `sink = { name = "myredis", mode = "kv" }` — extra
+///    keys flow into a free-form `toml::Table` that is pushed into
+///    [`WriteSpec::sink_options`] so a sink connector can deserialise its
+///    own typed shape in `build_context` (the forthcoming redis sink
+///    (AIR-5) will use this for `mode`). Unknown keys are NOT rejected
+///    here. Today no shipped sink consumes per-flow options, so `assemble`
+///    rejects the developed form on every sink kind except `redis`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum FlowSinkRef {
+    Bare(String),
+    Detailed {
+        name: String,
+        #[serde(flatten)]
+        options: toml::Table,
+    },
+}
+
+impl FlowSinkRef {
+    pub fn name(&self) -> &str {
+        match self {
+            FlowSinkRef::Bare(s) => s.as_str(),
+            FlowSinkRef::Detailed { name, .. } => name.as_str(),
+        }
+    }
+
+    pub fn options(&self) -> toml::Table {
+        match self {
+            FlowSinkRef::Bare(_) => toml::Table::new(),
+            FlowSinkRef::Detailed { options, .. } => options.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct FlowConfig {
     pub source: FlowSourceRef,
-    pub sink: String,
+    pub sink: FlowSinkRef,
     pub storage: String,
     pub from: String,
     pub to: String,
@@ -559,6 +600,125 @@ ingested_at = "now()"
         let (key, rhs) = flow.compute_mapping.iter().next().unwrap();
         assert_eq!(key, "ingested_at");
         assert!(matches!(rhs, MappingRhs::Short(s) if s == "now()"));
+    }
+
+    /// `sink` accepts both surface forms (the sink mirror of
+    /// `FlowSourceRef`): the bare string `sink = "k"` and the developed
+    /// table `sink = { name = "k", mode = "kv" }`. The bare form carries
+    /// no per-flow options; the developed form flattens every extra key
+    /// into `options()` so a sink connector can deserialise its own typed
+    /// shape (redis uses this for `mode`).
+    #[test]
+    fn flow_sink_ref_bare_and_developed_forms_deserialize() {
+        let toml_src = r#"
+[[sources]]
+name = "s"
+type = "postgres"
+
+[[sinks]]
+name = "bare_sink"
+type = "postgres"
+
+[[sinks]]
+name = "redis_sink"
+type = "redis"
+
+[[storages]]
+name = "st"
+type = "postgres"
+
+[flow.bare]
+source = "s"
+sink = "bare_sink"
+storage = "st"
+from = "t"
+to = "t"
+cursor = { fields = ["id"] }
+[flow.bare.mapping]
+id = "id"
+
+[flow.developed]
+source = "s"
+sink = { name = "redis_sink", mode = "kv" }
+storage = "st"
+from = "t"
+to = "users:"
+cursor = { fields = ["id"] }
+[flow.developed.mapping]
+id = "id"
+
+[flow.empty_developed]
+source = "s"
+sink = { name = "bare_sink" }
+storage = "st"
+from = "t"
+to = "t"
+cursor = { fields = ["id"] }
+[flow.empty_developed.mapping]
+id = "id"
+"#;
+        let cfg: RootConfig = toml::from_str(toml_src).unwrap();
+
+        // Bare form: name resolves, options are empty.
+        let bare = &cfg.flow["bare"];
+        assert!(matches!(bare.sink, FlowSinkRef::Bare(ref s) if s == "bare_sink"));
+        assert_eq!(bare.sink.name(), "bare_sink");
+        assert!(bare.sink.options().is_empty());
+
+        // Developed form: name resolves, the extra `mode` key lands in
+        // options() (the `name` key is consumed, not flattened in).
+        let developed = &cfg.flow["developed"];
+        assert_eq!(developed.sink.name(), "redis_sink");
+        let opts = developed.sink.options();
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts.get("mode").and_then(|v| v.as_str()), Some("kv"));
+        assert!(!opts.contains_key("name"));
+
+        // Developed form carrying NO extra keys must behave exactly like
+        // the bare form: empty options, so the assemble guard never fires
+        // and a non-consuming sink kind still accepts it. Locks the
+        // degenerate-options edge against a future refactor injecting a
+        // default key into the flattened table.
+        let empty_developed = &cfg.flow["empty_developed"];
+        assert_eq!(empty_developed.sink.name(), "bare_sink");
+        assert!(empty_developed.sink.options().is_empty());
+    }
+
+    /// `FlowSinkRef` round-trips through serde: serialise to a TOML value,
+    /// then deserialise that value back and confirm the surface form and
+    /// the recovered value agree. The bare form serialises to a plain
+    /// string (so every existing `sink = "..."` config is byte-stable);
+    /// the developed form to a table with the flattened options.
+    #[test]
+    fn flow_sink_ref_serialize_round_trips() {
+        // Bare → plain string → back to Bare.
+        let bare = FlowSinkRef::Bare("k".into());
+        let bare_toml = toml::Value::try_from(&bare).unwrap();
+        assert_eq!(bare_toml.as_str(), Some("k"));
+        let bare_back: FlowSinkRef = bare_toml.try_into().unwrap();
+        assert!(matches!(bare_back, FlowSinkRef::Bare(ref s) if s == "k"));
+        assert!(bare_back.options().is_empty());
+
+        // Developed → flattened table → back to Detailed with the same
+        // name and options.
+        let mut options = toml::Table::new();
+        options.insert("mode".into(), toml::Value::String("stream".into()));
+        let developed = FlowSinkRef::Detailed {
+            name: "k".into(),
+            options,
+        };
+        let developed_toml = toml::Value::try_from(&developed).unwrap();
+        let table = developed_toml.as_table().expect("developed → table");
+        assert_eq!(table.get("name").and_then(|v| v.as_str()), Some("k"));
+        assert_eq!(table.get("mode").and_then(|v| v.as_str()), Some("stream"));
+        let developed_back: FlowSinkRef = developed_toml.try_into().unwrap();
+        assert_eq!(developed_back.name(), "k");
+        let opts_back = developed_back.options();
+        assert_eq!(opts_back.len(), 1);
+        assert_eq!(
+            opts_back.get("mode").and_then(|v| v.as_str()),
+            Some("stream")
+        );
     }
 
     /// Operator-set `jitter` is passed through verbatim — including

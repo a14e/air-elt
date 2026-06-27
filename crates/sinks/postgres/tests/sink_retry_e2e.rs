@@ -55,6 +55,7 @@ async fn cockroach_retries_on_serialization_failure() {
             key: vec!["id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     });
     let ctx = sink.build_context(&spec).await.unwrap();
 

@@ -306,6 +306,7 @@ pub fn build_derived_plans_from_expanded(
         columns: expanded.write_columns(),
         table: flow.config_write_spec.table.clone(),
         conflict: flow.config_write_spec.conflict.clone(),
+        sink_options: flow.config_write_spec.sink_options.clone(),
     };
     // Attach the compute-eval context only when a `Compute` op is actually
     // emitted (const / identity lowerings need neither schema nor registry).
@@ -974,6 +975,7 @@ mod tests {
             config_write_spec: ConfigWriteSpec {
                 table: "t".into(),
                 conflict: None,
+                sink_options: toml::Table::new(),
             },
             interval: Duration::from_millis(10),
             jitter: Duration::ZERO,

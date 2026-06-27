@@ -30,7 +30,9 @@ use air_elt_commons_questdb::pool::{connect_pool, ping};
 use air_elt_commons_questdb::schema::{SchemaWithDesignated, fetch_schema};
 use air_elt_commons_questdb::types::is_questdb_native_kind;
 use air_elt_core::error::{ConfigError, RuntimeError, RuntimeResult, ValidationError};
-use air_elt_core::model::{Batch, Field, Schema, SchemaProvider, SinkCtx, WriteReport, WriteSpec};
+use air_elt_core::model::{
+    Batch, ConfigWriteSpec, Field, Schema, SchemaProvider, SinkCtx, WriteReport, WriteSpec,
+};
 use air_elt_core::traits::Sink;
 use air_elt_core::types::data_type::DataType;
 
@@ -203,8 +205,8 @@ impl Sink for QuestDbSink {
         Ok(())
     }
 
-    async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema> {
-        let schema = fetch_schema(&self.pool, table).await?;
+    async fn describe_schema(&self, spec: &ConfigWriteSpec) -> RuntimeResult<Schema> {
+        let schema = fetch_schema(&self.pool, &spec.table).await?;
         Ok(schema.schema)
     }
 
@@ -306,5 +308,7 @@ pub fn type_supported(dt: &DataType) -> bool {
         DataType::Ipv6 => false,
         DataType::Xml | DataType::Object | DataType::Union(_) => false,
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => false,
+        // Interval is a redis-only canonical type; QuestDB has no column for it.
+        DataType::Interval => false,
     }
 }

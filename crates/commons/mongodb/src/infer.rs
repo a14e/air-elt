@@ -279,6 +279,10 @@ impl TypeKind {
             DataType::Json | DataType::Object => TypeKind::Json,
             DataType::Xml => TypeKind::Xml,
             DataType::Union(_) => TypeKind::Union,
+            // Interval is a redis-only type; it is never inferred from a
+            // BSON document. Treat it as opaque so it never widens with
+            // anything if it somehow reaches the union-collapse path.
+            DataType::Interval => TypeKind::Custom(dt.clone()),
             DataType::Custom(_) => TypeKind::Custom(dt.clone()),
         }
     }

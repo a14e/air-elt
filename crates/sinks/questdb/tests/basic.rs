@@ -43,6 +43,7 @@ async fn basic_round_trip() {
             "uid".into(),
         ],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -126,6 +127,7 @@ async fn uuid_boundary_values_round_trip() {
         table: "bench_uuid_boundary".to_string(),
         columns: vec!["ts".into(), "uid".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");

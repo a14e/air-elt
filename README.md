@@ -115,6 +115,10 @@ env at load time, then from the `secrets` mapping.
 - **QuestDB** — sink (append-only, DDL-level `DEDUP UPSERT KEYS`).
 - **MongoDB** — source, sink, cursor storage.
 - **mongo-cdc** — source (change streams; emits inserts, updates, deletes).
+- **Redis / Valkey** — sink (five per-flow modes: `kv` / `kv-delete` /
+  `list` / `stream` / `pubsub`). At-least-once *send* to Redis — `kv` /
+  `kv-delete` are idempotent under retry, `list` / `stream` / `pubsub`
+  may duplicate. See `examples/pg-to-redis/`.
 
 ## Roadmap
 

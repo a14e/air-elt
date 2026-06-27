@@ -10,6 +10,10 @@ pub enum Token {
     FieldLit(String),
     BoolLit(bool),
     NullLit,
+    /// Duration literal — compact human form (`10s`, `1h30m`, `500ms`) or
+    /// ISO-8601 (`PT1H30M`). Parsed by the workspace-canonical
+    /// `air_elt_commons::interval::parse`.
+    DurationLit(std::time::Duration),
 
     // Identifiers
     Ident(String),

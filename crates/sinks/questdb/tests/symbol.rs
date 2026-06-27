@@ -35,6 +35,7 @@ async fn symbol_round_trip() {
         table: "bench_symbol".to_string(),
         columns: vec!["ts".into(), "sym".into(), "v".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -121,6 +122,7 @@ async fn symbol_with_special_chars_round_trip() {
         table: "bench_symbol_special".to_string(),
         columns: vec!["ts".into(), "sym".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");

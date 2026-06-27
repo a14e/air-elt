@@ -10,6 +10,7 @@ use air_elt_sink_mongodb::MongoSinkFactory;
 use air_elt_sink_mysql::MySqlSinkFactory;
 use air_elt_sink_postgres::PgSinkFactory;
 use air_elt_sink_questdb::QuestDbSinkFactory;
+use air_elt_sink_redis::RedisSinkFactory;
 use air_elt_source_mongo_cdc::MongoCdcSourceFactory;
 use air_elt_source_mongodb::MongoSourceFactory;
 use air_elt_source_mysql::MySqlSourceFactory;
@@ -50,6 +51,18 @@ pub fn build_registry() -> Registry {
     // in the mapping. INSERTs are chunked at `QDB_PG_MAX_BIND_PARAMS = 9_200`
     // to work around a QuestDB 8.2.3 pg-wire bug.
     registry.register_sink("questdb", Arc::new(QuestDbSinkFactory));
+    // Redis / Valkey — sink only. NOT schemaless: it returns a precise
+    // per-mode schema (key/value/ttl), so the type matrix type-checks the
+    // mapped columns; the required/optional column *set* the matrix can't
+    // express is enforced by the sink on top. Five per-flow modes via the
+    // developed sink form `sink = { name = "redis", mode = "kv|kv-delete|
+    // list|stream|pubsub" }`. Hard-rejects `[flow.<name>.conflict]` (redis
+    // is always last-write-wins / unconditional append). Writes ride a
+    // standard `deadpool-redis` connection pool; `max_connections` reports
+    // the pool size, sizing the assemble semaphore to one permit per
+    // connection (each flow-tick checks out one connection for its
+    // whole-batch pipeline).
+    registry.register_sink("redis", Arc::new(RedisSinkFactory));
     registry
 }
 

@@ -257,6 +257,7 @@ pub fn test_flow_named(
         config_write_spec: ConfigWriteSpec {
             table: "public.t".into(),
             conflict: None,
+            sink_options: toml::Table::new(),
         },
         interval: Duration::from_millis(10),
         jitter: Duration::ZERO,
@@ -291,6 +292,7 @@ pub fn test_flow_named(
             columns: vec!["id".into()],
             table: "public.t".into(),
             conflict: None,
+            sink_options: toml::Table::new(),
         },
     };
     FlowState::new(assembled, derived)

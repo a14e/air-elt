@@ -203,8 +203,18 @@ impl<'a> Lexer<'a> {
             b'"' => self.read_double_quoted_string(),
             b'\'' => self.read_single_quoted_string(),
             b'`' => self.read_field_literal(),
-            b'0' => self.read_number_or_hex(),
-            b'1'..=b'9' => self.read_number(),
+            b'0'..=b'9' => {
+                // A compact human duration (`10s`, `1h30m`) takes precedence
+                // over a bare number when a unit suffix immediately follows.
+                // Pure numbers (`10`, `3.14`) and hex (`0xFF`) fall through.
+                if let Some(duration) = self.try_read_human_duration() {
+                    Ok(Token::DurationLit(duration))
+                } else if b == b'0' {
+                    self.read_number_or_hex()
+                } else {
+                    self.read_number()
+                }
+            }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.read_ident_or_keyword(),
             _ => Err(ExprError::Parse {
                 position: self.pos,
@@ -512,10 +522,58 @@ impl<'a> Lexer<'a> {
             "null" => Token::NullLit,
             "if" => Token::If,
             "else" => Token::Else,
-            _ => Token::Ident(text.to_string()),
+            _ => {
+                // ISO-8601 duration literal (`PT1H30M`, `P1DT2H`, `P1W`).
+                // Heuristic: only words shaped `P`/`p` + (digit | `T`/`t`)
+                // are even tried, so ordinary identifiers like `Price` or
+                // `Point` never hit the parser. A run that does not parse as
+                // ISO falls back to a plain identifier.
+                match parse_iso_duration_ident(text) {
+                    Some(duration) => Token::DurationLit(duration),
+                    None => Token::Ident(text.to_string()),
+                }
+            }
         };
         Ok(token)
     }
+
+    /// Attempt to lex a compact human duration literal (`10s`, `1h30m`,
+    /// `500ms`) at the current position. A candidate is a contiguous run of
+    /// digits, `.`, and ASCII letters (no spaces) with at least one letter;
+    /// it is accepted only if [`air_elt_commons::interval::parse`] accepts
+    /// it. On a match `pos` advances past the literal; otherwise `pos` is
+    /// left untouched so the caller can fall back to numeric/hex lexing.
+    fn try_read_human_duration(&mut self) -> Option<std::time::Duration> {
+        let rest = &self.input[self.pos..];
+        // Greedy run of digits / `.` / ASCII letters with no spaces. Every
+        // matched byte is ASCII, so the byte length is a valid char boundary.
+        let run_len = rest
+            .bytes()
+            .take_while(|c| c.is_ascii_digit() || *c == b'.' || c.is_ascii_alphabetic())
+            .count();
+        let candidate = &rest[..run_len];
+        // Require at least one unit letter so bare numbers / floats / hex fall
+        // through to numeric lexing.
+        if !candidate.bytes().any(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+        let duration = air_elt_commons::interval::parse(candidate).ok()?;
+        self.pos += run_len;
+        Some(duration)
+    }
+}
+
+/// Parse an already-lexed identifier run as an ISO-8601 duration, but only
+/// when it is shaped like one (`P`/`p` followed by a digit or `T`/`t`).
+/// Returns `None` for ordinary identifiers so they stay identifiers.
+fn parse_iso_duration_ident(text: &str) -> Option<std::time::Duration> {
+    let bytes = text.as_bytes();
+    let looks_iso = matches!(bytes.first(), Some(b'P' | b'p'))
+        && matches!(bytes.get(1), Some(c) if c.is_ascii_digit() || *c == b'T' || *c == b't');
+    if !looks_iso {
+        return None;
+    }
+    air_elt_commons::interval::parse(text).ok()
 }
 
 #[cfg(test)]
@@ -709,6 +767,99 @@ mod tests {
     fn tokenize_hex_literals() {
         assert_eq!(tokens("0xFF"), vec![Token::IntLit(255), Token::Eof,]);
         assert_eq!(tokens("0x0F"), vec![Token::IntLit(15), Token::Eof,]);
+    }
+
+    #[test]
+    fn tokenize_human_duration_literals() {
+        use std::time::Duration;
+        assert_eq!(
+            tokens("10s"),
+            vec![Token::DurationLit(Duration::from_secs(10)), Token::Eof]
+        );
+        assert_eq!(
+            tokens("500ms"),
+            vec![Token::DurationLit(Duration::from_millis(500)), Token::Eof]
+        );
+        assert_eq!(
+            tokens("1h30m"),
+            vec![Token::DurationLit(Duration::from_secs(5400)), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn tokenize_iso_duration_literals() {
+        use std::time::Duration;
+        assert_eq!(
+            tokens("PT1H30M"),
+            vec![Token::DurationLit(Duration::from_secs(5400)), Token::Eof]
+        );
+        assert_eq!(
+            tokens("P1DT2H"),
+            vec![Token::DurationLit(Duration::from_secs(93_600)), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn duration_does_not_swallow_numbers_or_identifiers() {
+        // Bare numbers stay numbers; hex stays hex.
+        assert_eq!(tokens("10"), vec![Token::IntLit(10), Token::Eof]);
+        assert_eq!(tokens("3.14"), vec![Token::FloatLit(3.14), Token::Eof]);
+        assert_eq!(tokens("0xFF"), vec![Token::IntLit(255), Token::Eof]);
+        // `P`-words that are not ISO durations remain identifiers.
+        assert_eq!(
+            tokens("Price"),
+            vec![Token::Ident("Price".to_string()), Token::Eof]
+        );
+        assert_eq!(
+            tokens("Point"),
+            vec![Token::Ident("Point".to_string()), Token::Eof]
+        );
+        // Arithmetic with a spaced unit-like identifier is unaffected.
+        assert_eq!(
+            tokens("10 + 5"),
+            vec![Token::IntLit(10), Token::Plus, Token::IntLit(5), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn duration_fallback_when_candidate_is_not_a_valid_duration() {
+        // `interval::parse` rejects zero, so `0s` is NOT a duration — it falls
+        // through to numeric+identifier lexing (load-bearing: zero ttl is
+        // meaningless workspace-wide).
+        assert_eq!(
+            tokens("0s"),
+            vec![Token::IntLit(0), Token::Ident("s".to_string()), Token::Eof]
+        );
+        // Unknown unit → fall through cleanly, no panic.
+        assert_eq!(
+            tokens("10x"),
+            vec![Token::IntLit(10), Token::Ident("x".to_string()), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn duration_accepts_uppercase_unit() {
+        use std::time::Duration;
+        // `interval::parse` lowercases units, so `10S` lexes as a duration.
+        assert_eq!(
+            tokens("10S"),
+            vec![Token::DurationLit(Duration::from_secs(10)), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn duration_literal_mid_expression() {
+        use std::time::Duration;
+        // Guards against any `self.pos == 0` assumption in the duration scan.
+        assert_eq!(
+            tokens("1h + 30m"),
+            vec![
+                Token::DurationLit(Duration::from_secs(3600)),
+                Token::Plus,
+                Token::DurationLit(Duration::from_secs(1800)),
+                Token::Eof
+            ]
+        );
     }
 
     #[test]
