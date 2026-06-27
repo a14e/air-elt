@@ -1,0 +1,39 @@
+# Postgres `public.users` → Redis keys `users:{uid}`, each carrying a
+# JSON document with a 1-hour TTL.
+#
+# kv-mode columns: key (Text, required), value (Json, required),
+# ttl (Interval, optional).
+#   * `key` maps straight from the TEXT `uid` (also the cursor field) —
+#     it must resolve to Text at write time.
+#   * `value` is an object-literal compute → a JSON document.
+#   * `ttl` is a duration literal → an `Interval` → redis `PX` expiry.
+#
+# No `[conflict]` block: redis writes are always last-write-wins (SET);
+# the sink rejects a conflict block.
+
+[flow.users]
+source = "pg_src"
+sink = { name = "redis_sink", mode = "kv" }
+storage = "pg_state"
+
+from = "public.users"
+# Key prefix. Full key = `{to}{key}` = `users:{uid}` (no separator added
+# by the sink — the `:` lives here in `to`).
+to = "users:"
+
+batch-limit = 500
+
+[flow.users.mapping]
+# `key` is the redis key suffix.
+key = "uid"
+
+[flow.users.compute-mapping]
+# Object literal → JSON document. Backtick refs read source columns.
+value = '{ "name" = `name`, "age" = `age`, "ingested_at" = now() }'
+# Duration literal → Interval → `PX` (key expires after one hour).
+ttl = "1h"
+
+[flow.users.cursor]
+fields = ["uid"]
+order = "asc"
+interval = "1s"

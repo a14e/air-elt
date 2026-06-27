@@ -1,0 +1,37 @@
+[config]
+include = ["flows"]
+
+# Postgres → Redis/Valkey. The redis sink has a fixed per-mode schema: the
+# write mode is chosen per-flow via the developed `sink = { name, mode }`
+# form, and the per-mode column contract (key / value / ttl) — types are
+# matrix-checked, the required/optional set is enforced by the sink. `to`
+# is the redis key prefix — the full key is the plain concatenation
+# `{to}{key}` (the sink inserts no separator).
+#
+# Delivery is at-least-once *send to Redis* (not consumer delivery; Redis
+# itself may evict / drop). `kv` and `kv-delete` are idempotent under a
+# batch retry; `list` / `stream` / `pubsub` may duplicate.
+
+[secrets]
+PG_SRC_URL = "postgres://postgres:postgres@localhost:5432/source"
+REDIS_URL = "redis://localhost:6379"
+PG_STATE_URL = "postgres://postgres:postgres@localhost:5432/state"
+
+[[sources]]
+name = "pg_src"
+type = "postgres"
+config = { url = "${PG_SRC_URL}" }
+
+[[sinks]]
+name = "redis_sink"
+type = "redis"
+# `pool` is optional; shown here with the default size. `max-connections`
+# is the pool size (number of connections) and also sizes the runtime
+# concurrency semaphore for this sink. Optional timeouts: `connect-timeout`,
+# `acquire-timeout`, `recycle-timeout`.
+config = { url = "${REDIS_URL}", pool = { max-connections = 10 } }
+
+[[storages]]
+name = "pg_state"
+type = "postgres"
+config = { url = "${PG_STATE_URL}" }

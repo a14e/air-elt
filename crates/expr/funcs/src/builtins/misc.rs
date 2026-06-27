@@ -39,33 +39,10 @@ impl ExprFunction for TypeOfFunc {
         args: &mut dyn ArgWindow,
         _context: &EvalContext,
     ) -> Result<Value, FuncError> {
-        let type_name = match args.read(0) {
-            Value::Null => "Null".to_owned(),
-            Value::Bool(_) => "Bool".to_owned(),
-            Value::Int8(_) => "Int8".to_owned(),
-            Value::Int16(_) => "Int16".to_owned(),
-            Value::Int32(_) => "Int32".to_owned(),
-            Value::Int64(_) => "Int64".to_owned(),
-            Value::UInt8(_) => "UInt8".to_owned(),
-            Value::UInt16(_) => "UInt16".to_owned(),
-            Value::UInt32(_) => "UInt32".to_owned(),
-            Value::UInt64(_) => "UInt64".to_owned(),
-            Value::Float32(_) => "Float32".to_owned(),
-            Value::Float64(_) => "Float64".to_owned(),
-            Value::BigInt(_) => "BigInt".to_owned(),
-            Value::Decimal(_) => "Decimal".to_owned(),
-            Value::Text(_) => "Text".to_owned(),
-            Value::Bytes(_) => "Bytes".to_owned(),
-            Value::Date(_) => "Date".to_owned(),
-            Value::Timestamp(_) => "Timestamp".to_owned(),
-            Value::Uuid(_) => "Uuid".to_owned(),
-            Value::Ipv4(_) => "Ipv4".to_owned(),
-            Value::Ipv6(_) => "Ipv6".to_owned(),
-            Value::Json(_) => "Json".to_owned(),
-            Value::Object(_) => "Object".to_owned(),
-            Value::Custom(v) => v.dyn_type().kind().to_owned(),
-        };
-        Ok(Value::Text(type_name))
+        // Runtime type name comes from the canonical `Value::variant_name`
+        // (PascalCase tag, or a `Custom` value's real `DynType::kind()`),
+        // so `typeof` never re-derives the variant match locally.
+        Ok(Value::Text(args.read(0).variant_name()))
     }
 }
 

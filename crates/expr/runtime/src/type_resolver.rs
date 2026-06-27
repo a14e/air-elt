@@ -123,6 +123,7 @@ impl<'a> TypeCheckerState<'a> {
             LiteralValue::String(s) => NullableExprType::non_null(DataType::Text {
                 size: Some(s.len() as u32),
             }),
+            LiteralValue::Interval(_) => NullableExprType::non_null(DataType::Interval),
         }
     }
 

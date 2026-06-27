@@ -31,6 +31,7 @@ async fn missing_designated_timestamp_when_column_omitted() {
         table: "bench_missing_ts".to_string(),
         columns: vec!["v".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     let err = sink.validate_access(&spec).await.expect_err("must fail");
     match err {
@@ -81,6 +82,7 @@ async fn validate_access_surfaces_table_not_found() {
         table: "bench_never_existed".to_string(),
         columns: vec!["ts".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     let err = sink.validate_access(&spec).await.expect_err("must fail");
     // The schema-introspection step must surface a typed variant rather
@@ -128,6 +130,7 @@ async fn multi_timestamp_designated_correctly_identified() {
         table: "bench_multi_ts".to_string(),
         columns: vec!["created_at".into(), "v".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     let err = sink.validate_access(&spec).await.expect_err("must fail");
     match err {
@@ -171,6 +174,7 @@ async fn dry_run_does_not_persist_a_row() {
         table: "bench_dry_run_no_rows".to_string(),
         columns: vec!["ts".into(), "v".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
 
@@ -217,6 +221,7 @@ async fn dropped_table_surfaces_table_not_found() {
         table: "bench_dropped".to_string(),
         columns: vec!["ts".into(), "v".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     let err = sink.validate_access(&spec).await.expect_err("must fail");
     match err {

@@ -4,7 +4,7 @@
 
 use air_elt_commons_pg::types::{PgHllType, PgHllValue};
 use air_elt_commons_testing::pg::pg_pool;
-use air_elt_core::model::{Batch, ReadSpec, Row as CoreRow, WriteSpec};
+use air_elt_core::model::{Batch, ConfigWriteSpec, ReadSpec, Row as CoreRow, WriteSpec};
 use air_elt_core::traits::{Sink, Source};
 use air_elt_core::types::{DataType, DynType, Value};
 use air_elt_sink_postgres::{PgSink, PgSinkConfig};
@@ -68,9 +68,17 @@ async fn hll_round_trip_through_sink_and_source() {
         columns: vec!["id".into(), "sketch".into()],
         table: format!("{}.t", handle.schema),
         conflict: None,
+        sink_options: toml::Table::new(),
     };
 
-    let schema = sink.describe_schema(&spec.table).await.unwrap();
+    let schema = sink
+        .describe_schema(&ConfigWriteSpec {
+            table: spec.table.clone(),
+            conflict: None,
+            sink_options: toml::Table::new(),
+        })
+        .await
+        .unwrap();
     let sketch_field = schema.find("sketch").unwrap();
     match &sketch_field.data_type {
         DataType::Custom(t) => assert_eq!(t.kind(), "postgresql.hll"),

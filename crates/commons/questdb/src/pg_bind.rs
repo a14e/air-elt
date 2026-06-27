@@ -185,6 +185,11 @@ pub fn bind_value_separated_pg(
             chain.push_bind(j);
             Ok(())
         }
+        Value::Interval(_) => Err(BindError::UnsupportedType {
+            column: column.to_string(),
+            expected: format!("{dt}"),
+            got_kind: "Interval (redis-only type)".to_string(),
+        }),
         Value::Custom(b) => bind_custom(chain, column, dt, b.as_ref()),
     }
 }

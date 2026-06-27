@@ -52,6 +52,7 @@ pub fn bind_typed_null<'q>(
         // Object is handled as Json in connectors
         DataType::Object => query.bind::<Option<serde_json::Value>>(None),
         DataType::Union(_) => unreachable!("mysql sinks never carry Union types"),
+        DataType::Interval => unreachable!("mysql sinks never carry Interval (redis-only type)"),
         DataType::Custom(_) => unreachable!(
             "DataType::Custom must be handled by the connector before reaching null_bind"
         ),

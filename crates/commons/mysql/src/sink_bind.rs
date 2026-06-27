@@ -99,6 +99,9 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
                 sep.push_bind::<Option<String>>(None);
             }
             DataType::Union(_) => unreachable!("mysql sinks never carry Union types"),
+            DataType::Interval => {
+                unreachable!("mysql sinks never carry Interval (redis-only type)")
+            }
             DataType::Custom(_) => unreachable!(
                 "DataType::Custom must be handled by the connector before reaching sink_bind"
             ),
@@ -176,6 +179,9 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, MySql, &str>, v: &Value,
             let j = air_elt_core::types::json_encode::value_to_json(v)
                 .expect("Value::Object json encode must not fail after validation");
             sep.push_bind(j);
+        }
+        Value::Interval(_) => {
+            unreachable!("Value::Interval (redis-only type) cannot reach a mysql sink")
         }
         Value::Custom(_) => {
             unreachable!("Value::Custom must be handled by the connector before reaching sink_bind")

@@ -84,6 +84,7 @@ async fn javascript_round_trips_through_mongo_to_mongo() {
             key: vec!["_id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&write_spec)
         .await

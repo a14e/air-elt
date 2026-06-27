@@ -4,7 +4,8 @@ use async_trait::async_trait;
 
 use crate::error::RuntimeResult;
 use crate::model::{
-    Batch, CursorState, ReadSpec, Schema, SinkCtx, SourceCtx, WriteReport, WriteSpec,
+    Batch, ConfigWriteSpec, CursorState, ReadSpec, Schema, SinkCtx, SourceCtx, WriteReport,
+    WriteSpec,
 };
 use crate::types::DataType;
 
@@ -130,7 +131,13 @@ pub trait Sink: Send + Sync {
     async fn validate_delete_access(&self, _spec: &WriteSpec) -> RuntimeResult<()> {
         Ok(())
     }
-    async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema>;
+    /// Describe the sink's column schema. Takes the config-time write
+    /// descriptor (table + per-flow `sink_options`), NOT just the table
+    /// name, so a sink whose schema depends on per-flow options (the redis
+    /// sink, whose columns are fixed by `mode`) can return the exact
+    /// schema. Runs before mapping expansion, so it must not depend on the
+    /// (not-yet-known) mapped columns.
+    async fn describe_schema(&self, spec: &ConfigWriteSpec) -> RuntimeResult<Schema>;
     async fn build_context(&self, spec: &WriteSpec) -> RuntimeResult<Arc<dyn SinkCtx>>;
     async fn write_batch(
         &self,
@@ -169,15 +176,27 @@ pub trait Sink: Send + Sync {
         true
     }
 
-    /// Upper bound on concurrent uses of this sink's underlying
-    /// connection pool. See [`Source::max_connections`] for the full
-    /// rationale — the validation pipeline gates probes through a
-    /// per-sink `tokio::sync::Semaphore` sized to this value.
+    /// Number of underlying connections (pool size). See
+    /// [`Source::max_connections`] for the full rationale. The per-sink
+    /// concurrency semaphore is sized directly to this value — one permit
+    /// per connection, so it bounds concurrent flow-ticks by the number of
+    /// connections the sink's pool can hand out.
     ///
     /// Default is unbounded (`u32::MAX`). Connectors that own a
     /// connection pool MUST override.
     fn max_connections(&self) -> u32 {
         u32::MAX
+    }
+
+    /// `true` for sinks that consume per-flow options — the developed
+    /// `sink = { name, <options> }` form (today: the redis sink's `mode`).
+    /// The validation pipeline rejects the developed form on any sink that
+    /// returns `false`, so a stray or misplaced option fails loudly at
+    /// assemble instead of being silently dropped. Default `false` keeps
+    /// `core` connector-agnostic — capability lives on the trait, not as a
+    /// hardcoded kind string in the pipeline.
+    fn accepts_flow_options(&self) -> bool {
+        false
     }
 }
 

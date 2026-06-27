@@ -12,6 +12,7 @@ doctest = false
 [dependencies]
 air-elt-expr-types = { workspace = true }
 air-elt-types = { workspace = true }
+air-elt-commons = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }

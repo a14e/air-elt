@@ -1202,6 +1202,11 @@ fn format_value(val: &Value) -> String {
         Value::Custom(v) => v
             .to_json()
             .map_or_else(|_| format!("{v:?}"), |j| j.to_string()),
+        // `Duration`'s `Debug` single-unit human form (`10s`, `1.5s`), kept
+        // identical to `air_elt_types::value_to_string` for Interval. Compound
+        // inputs normalise (`1h30m` → `5400s`); not a round-trip of the
+        // authored literal.
+        Value::Interval(d) => format!("{d:?}"),
     }
 }
 
@@ -1210,6 +1215,23 @@ fn format_value(val: &Value) -> String {
 mod tests {
     use super::*;
     use crate::test_support::{ctx, eval};
+
+    #[test]
+    fn format_value_renders_interval_as_duration_debug_form() {
+        // Kept byte-identical to `air_elt_types::convert::value_to_string`'s
+        // Interval arm (the consistency contract noted at both sites): the
+        // single-unit `Duration` Debug form, not a round-trip of the
+        // authored literal.
+        use std::time::Duration;
+        assert_eq!(
+            format_value(&Value::Interval(Duration::from_secs(10))),
+            "10s"
+        );
+        assert_eq!(
+            format_value(&Value::Interval(Duration::from_millis(500))),
+            "500ms"
+        );
+    }
 
     #[test]
     fn concat_basic() {

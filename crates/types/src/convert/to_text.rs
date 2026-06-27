@@ -69,6 +69,13 @@ pub fn value_to_string(value: &Value) -> String {
             serde_json::Value::Object(map).to_string()
         }
         Value::Custom(inner) => custom_to_string(inner.as_ref()),
+        // `Duration`'s `Debug` single-unit human form (`10s`, `1.5s`, `500ms`).
+        // NOT a round-trip of the authored literal — compound inputs normalise
+        // (`1h30m` → `5400s`) and sub-millisecond values use `µs`/`ns`.
+        // `air_elt_types` cannot depend on `commons`, so `interval::to_iso` is
+        // unavailable here; Debug is the fallback (the expr `string()` builtin
+        // renders Interval the same way for consistency).
+        Value::Interval(inner) => format!("{inner:?}"),
     }
 }
 
@@ -125,6 +132,23 @@ mod tests {
         assert_eq!(value_to_string(&Value::Bool(true)), "true");
         assert_eq!(value_to_string(&Value::Text("hi".into())), "hi");
         assert_eq!(value_to_string(&Value::Float64(1.5)), "1.5");
+    }
+
+    #[test]
+    fn interval_renders_as_duration_debug_form() {
+        // The Interval arm renders via `Duration`'s Debug (single-unit
+        // form). This must stay byte-identical to the expr `format` /
+        // `toString` builtin (`expr/funcs/.../string.rs::format_value`);
+        // the assertion locks the canonical output both sites agree on.
+        use std::time::Duration;
+        assert_eq!(
+            value_to_string(&Value::Interval(Duration::from_secs(10))),
+            "10s"
+        );
+        assert_eq!(
+            value_to_string(&Value::Interval(Duration::from_millis(500))),
+            "500ms"
+        );
     }
 
     #[test]

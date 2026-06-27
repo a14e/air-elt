@@ -44,4 +44,5 @@ for-future-ignore-that
 
 .claude/worktrees
 .session-state.md
+/STATE.md
 

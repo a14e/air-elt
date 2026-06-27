@@ -63,6 +63,7 @@ async fn round_trip_all_custom_types() {
             "agg".into(),
         ],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");

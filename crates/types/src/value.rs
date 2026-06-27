@@ -62,6 +62,11 @@ pub enum Value {
     /// heterogeneous (any `Value` variant). Order matters for
     /// deterministic serialisation.
     Object(Vec<(String, Value)>),
+    /// Time span / duration ([`crate::DataType::Interval`]). Carried as a
+    /// `std::time::Duration`. Minimal by design: no conversion arms, never
+    /// a cursor/switch key, never JSON-encoded. Today it only types the
+    /// Redis sink `ttl` column; the sink reads the `Duration` directly.
+    Interval(std::time::Duration),
     /// Connector-specific opaque value. Cursor JSON storage admits
     /// this variant iff the underlying `DynType::cursor_compatible()`
     /// returns `true` AND the matching descriptor overrides
@@ -119,8 +124,51 @@ impl Value {
             Value::Ipv6(_) => Some(DataType::Ipv6),
             Value::Json(_) => Some(DataType::Json),
             Value::Object(_) => Some(DataType::Object),
+            Value::Interval(_) => Some(DataType::Interval),
             Value::Custom(v) => Some(DataType::Custom(v.dyn_type())),
         }
+    }
+
+    /// Runtime type name of this value — the PascalCase variant tag
+    /// (`"Int64"`, `"Json"`, …) or, for a connector-specific `Custom`
+    /// value, its real kind (`"mongodb.object_id"`) rather than a generic
+    /// `"Custom"`. This is the canonical home for a `Value`'s
+    /// self-description: `typeof` and sink type-error messages call it
+    /// instead of re-deriving the same exhaustive `match` locally.
+    /// Exhaustive on purpose: a new `Value` variant forces an update here
+    /// rather than silently formatting as something misleading.
+    pub fn variant_name(&self) -> String {
+        match self {
+            Value::Null => "Null",
+            Value::Bool(_) => "Bool",
+            Value::Int8(_) => "Int8",
+            Value::Int16(_) => "Int16",
+            Value::Int32(_) => "Int32",
+            Value::Int64(_) => "Int64",
+            Value::UInt8(_) => "UInt8",
+            Value::UInt16(_) => "UInt16",
+            Value::UInt32(_) => "UInt32",
+            Value::UInt64(_) => "UInt64",
+            Value::Float32(_) => "Float32",
+            Value::Float64(_) => "Float64",
+            Value::BigInt(_) => "BigInt",
+            Value::Decimal(_) => "Decimal",
+            Value::Text(_) => "Text",
+            Value::Bytes(_) => "Bytes",
+            Value::Date(_) => "Date",
+            Value::Timestamp(_) => "Timestamp",
+            Value::Uuid(_) => "Uuid",
+            Value::Ipv4(_) => "Ipv4",
+            Value::Ipv6(_) => "Ipv6",
+            Value::Json(_) => "Json",
+            Value::Object(_) => "Object",
+            Value::Interval(_) => "Interval",
+            // A connector-specific value names itself by its real kind, not
+            // a flat "Custom" — `DynType::kind()` borrows from a temporary
+            // `Box<dyn DynType>`, so this arm owns the string.
+            Value::Custom(v) => return v.dyn_type().kind().to_string(),
+        }
+        .to_string()
     }
 
     /// Convert to a TOML value. Returns `None` for types without a
@@ -131,6 +179,7 @@ impl Value {
             | Value::Json(_)
             | Value::Bytes(_)
             | Value::Object(_)
+            | Value::Interval(_)
             | Value::Custom(_) => None,
             Value::Bool(b) => Some(toml::Value::Boolean(*b)),
             Value::Int8(n) => Some(toml::Value::Integer(i64::from(*n))),
@@ -190,6 +239,7 @@ impl Clone for Value {
             Value::Ipv6(a) => Value::Ipv6(*a),
             Value::Json(j) => Value::Json(j.clone()),
             Value::Object(entries) => Value::Object(entries.clone()),
+            Value::Interval(d) => Value::Interval(*d),
             Value::Custom(v) => Value::Custom((**v).clone_box()),
         }
     }
@@ -279,6 +329,10 @@ impl Serialize for Value {
                     .collect();
                 emit(serializer, "object", &serde_json::Value::Object(json_map))
             }
+            // `std::time::Duration` serialises losslessly as `{secs, nanos}`.
+            // Intervals are never cursor fields, so this arm is here only to
+            // keep `Serialize` total (and to round-trip in tests).
+            Value::Interval(d) => emit(serializer, "interval", d),
             Value::Custom(inner) => {
                 let dt = inner.dyn_type();
                 if !dt.cursor_compatible() {
@@ -416,6 +470,7 @@ impl<'de> Visitor<'de> for ValueVisitor {
                     .map_err(de::Error::custom)
             }
             "json" => Ok(Value::Json(v)),
+            "interval" => decode(v).map(Value::Interval),
             "object" => {
                 let map = v
                     .as_object()
@@ -468,6 +523,7 @@ impl<'de> Visitor<'de> for ValueVisitor {
                     "ipv4",
                     "ipv6",
                     "json",
+                    "interval",
                 ],
             )),
         }
@@ -487,6 +543,43 @@ where
 mod tests {
     use super::*;
     use std::any::Any;
+
+    #[test]
+    fn interval_round_trips_and_reports_type() {
+        use std::time::Duration;
+        let v = Value::Interval(Duration::from_millis(1500));
+        assert_eq!(v.data_type(), Some(crate::DataType::Interval));
+        // Equality + total ordering on the underlying Duration.
+        assert_eq!(v, Value::Interval(Duration::from_millis(1500)));
+        assert_ne!(v, Value::Interval(Duration::from_secs(1)));
+        assert!(Value::Interval(Duration::from_secs(1)) < Value::Interval(Duration::from_secs(2)));
+        // Lossless serde round-trip (never a cursor, but Serialize is total).
+        let json = serde_json::to_value(&v).unwrap();
+        let back: Value = serde_json::from_value(json).unwrap();
+        assert_eq!(back, v);
+        // No TOML rendering, not key-projectable, not cursor-compatible.
+        assert!(v.to_toml().is_none());
+        assert!(crate::Key::from_value(&v).is_none());
+        assert!(!crate::DataType::Interval.cursor_compatible());
+    }
+
+    #[test]
+    fn variant_name_reports_stable_tags() {
+        assert_eq!(Value::Null.variant_name(), "Null");
+        assert_eq!(Value::Int64(7).variant_name(), "Int64");
+        assert_eq!(Value::Text("x".into()).variant_name(), "Text");
+        assert_eq!(Value::Json(serde_json::json!(1)).variant_name(), "Json");
+        assert_eq!(
+            Value::Interval(std::time::Duration::from_secs(1)).variant_name(),
+            "Interval"
+        );
+        assert_eq!(Value::Bool(true).variant_name(), "Bool");
+        // A Custom value names itself by its real kind, not a flat "Custom".
+        assert_eq!(
+            Value::Custom(Box::new(StubValue)).variant_name(),
+            "test.stub"
+        );
+    }
 
     #[test]
     fn null_round_trips() {
@@ -847,6 +940,7 @@ mod tests {
             ipv4_strategy,
             ipv6_strategy,
             json_strategy,
+            any::<u64>().prop_map(|ms| Value::Interval(std::time::Duration::from_millis(ms))),
         ]
     }
 
@@ -902,6 +996,7 @@ mod tests {
             Value::Ipv6(_) => prop_assert_eq!(got, Some(DataType::Ipv6)),
             Value::Json(_) => prop_assert_eq!(got, Some(DataType::Json)),
             Value::Object(_) => unreachable!("strategy excludes Object"),
+            Value::Interval(_) => prop_assert_eq!(got, Some(DataType::Interval)),
             Value::Custom(_) => unreachable!("strategy excludes Custom"),
         }
     }

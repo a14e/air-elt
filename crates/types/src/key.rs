@@ -80,6 +80,7 @@ fn canonicalise(value: Value) -> Result<Value, KeyError> {
         Value::Null => Err(KeyError::UnsupportedType("Null")),
         Value::Json(_) => Err(KeyError::UnsupportedType("Json")),
         Value::Object(_) => Err(KeyError::UnsupportedType("Object")),
+        Value::Interval(_) => Err(KeyError::UnsupportedType("Interval")),
         Value::Custom(ref c) => {
             if c.dyn_type().cursor_compatible() {
                 Ok(value)

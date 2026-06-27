@@ -39,6 +39,7 @@ async fn all_delete_batch_writes_zero_rows() {
         table: "bench_all_delete".to_string(),
         columns: vec!["ts".into(), "v".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -101,6 +102,7 @@ async fn empty_batch_writes_zero_rows() {
         table: "bench_empty_batch".to_string(),
         columns: vec!["ts".into(), "v".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -149,6 +151,7 @@ async fn conflict_rejected() {
             key: vec!["ts".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
     let err = sink.validate_access(&spec).await.expect_err("must fail");
     match err {
@@ -198,6 +201,7 @@ async fn wide_row_round_trip() {
         table: "bench_wide_row".to_string(),
         columns: columns.clone(),
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -284,6 +288,7 @@ async fn pg_single_row_chunk() {
         table: "bench_pg_single".to_string(),
         columns: vec!["ts".into(), "payload".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -354,6 +359,7 @@ async fn all_null_row_round_trip() {
         table: "bench_all_null_row".to_string(),
         columns: vec!["ts".into(), "a".into(), "b".into(), "c".into(), "d".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");

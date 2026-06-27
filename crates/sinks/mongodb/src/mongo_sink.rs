@@ -47,7 +47,9 @@ use air_elt_commons_mongodb::{bson_value, identifier, path};
 use air_elt_core::config::conflict::{ConflictConfig, ConflictStrategy};
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::mapping::FieldPath;
-use air_elt_core::model::{Batch, RowOp, Schema, SchemaProvider, SinkCtx, WriteReport, WriteSpec};
+use air_elt_core::model::{
+    Batch, ConfigWriteSpec, RowOp, Schema, SchemaProvider, SinkCtx, WriteReport, WriteSpec,
+};
 use air_elt_core::traits::Sink;
 use air_elt_core::types::Value;
 
@@ -262,7 +264,7 @@ impl Sink for MongoSink {
         .await
     }
 
-    async fn describe_schema(&self, _table: &str) -> RuntimeResult<Schema> {
+    async fn describe_schema(&self, _spec: &ConfigWriteSpec) -> RuntimeResult<Schema> {
         // Mongo collections have no authoritative schema. The runner
         // builds a permissive sink schema from the source's declared
         // types via `Sink::schemaless()`; we return a `Schemaless` schema
@@ -294,7 +296,7 @@ impl Sink for MongoSink {
         // `as_schema_provider()` does advertise it. (The validation
         // pipeline already takes the schemaless path for this sink and
         // derives the dst schema from the source side.)
-        let schema = self.describe_schema(&spec.table).await.ok();
+        let schema = Some(Schema::schemaless());
         Ok(Arc::new(MongoSinkCtx {
             column_paths,
             plan,

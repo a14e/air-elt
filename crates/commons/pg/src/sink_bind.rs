@@ -108,6 +108,9 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
                 unreachable!("postgres has no unsigned integer column types")
             }
             DataType::Union(_) => unreachable!("postgres sinks never carry Union types"),
+            DataType::Interval => {
+                unreachable!("postgres sinks never carry Interval (redis-only type)")
+            }
             // HLL NULL: bind a typed NULL Vec<u8> and tack on `::hll` so
             // the placeholder lands as `$N::hll`. sqlx cannot infer a
             // type for NULL, and PG itself will not accept an untyped
@@ -205,6 +208,13 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
                  produce UInt* (no native unsigned int columns), and the convert \
                  dispatcher rewrites every UInt → Int*/BigInt/Decimal mapping into \
                  the target variant before binding"
+            )
+        }
+        Value::Interval(_) => {
+            unreachable!(
+                "Value::Interval cannot reach a postgres sink: Interval is a \
+                 redis-only canonical type and the matrix rejects every \
+                 `* → Interval` pair except identity into a redis column"
             )
         }
         Value::Custom(v) => {

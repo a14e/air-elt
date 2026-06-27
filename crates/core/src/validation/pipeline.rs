@@ -88,14 +88,15 @@ pub async fn assemble(
         if !source_index.contains_key(source_name) {
             return Err(ValidationError::UnknownSource(source_name.to_string()));
         }
-        if !sink_index.contains_key(flow.sink.as_str()) {
-            return Err(ValidationError::UnknownSink(flow.sink.clone()));
+        let sink_name = flow.sink.name();
+        if !sink_index.contains_key(sink_name) {
+            return Err(ValidationError::UnknownSink(sink_name.to_string()));
         }
         if !storage_index.contains_key(flow.storage.as_str()) {
             return Err(ValidationError::UnknownStorage(flow.storage.clone()));
         }
         source_names.insert(source_name);
-        sink_names.insert(flow.sink.as_str());
+        sink_names.insert(sink_name);
         storage_names.insert(flow.storage.as_str());
     }
 
@@ -141,6 +142,9 @@ pub async fn assemble(
                     source: Box::new(e),
                 }
             })?);
+        // One permit per connection. The redis sink pipelines a whole
+        // batch onto one pooled connection per flow-tick, so the cap is the
+        // connection count.
         let max = built.max_connections();
         concurrency.register_sink(name, max);
         monitoring.set_lock_max(air_elt_monitoring::ComponentKind::Sink, name, max);
@@ -176,11 +180,12 @@ pub async fn assemble(
         info!(flow = %flow_name, "assembling flow");
 
         let source_name = flow.source.name();
+        let sink_name = flow.sink.name();
         let source_cfg = source_index[source_name];
         let source = sources[source_name].clone();
-        let sink = sinks[flow.sink.as_str()].clone();
+        let sink = sinks[sink_name].clone();
         let storage = storages[flow.storage.as_str()].clone();
-        let sink_cfg = sink_index[flow.sink.as_str()];
+        let sink_cfg = sink_index[sink_name];
         let storage_cfg = storage_index[flow.storage.as_str()];
 
         // Per-source-kind cursor.fields shape. Pull-based connectors
@@ -249,6 +254,33 @@ pub async fn assemble(
             }
         }
 
+        // Per-flow sink options (the developed `sink = { name, mode }`
+        // form) are only meaningful for sinks that consume them, which the
+        // sink declares via `Sink::accepts_flow_options()` (today: the
+        // redis sink, which reads `mode` from `WriteSpec.sink_options` in
+        // its `build_context`). Reject the developed form on any sink that
+        // doesn't, so a typo or misplaced option fails loudly instead of
+        // being silently dropped. Gating on the trait capability keeps this
+        // check connector-agnostic — no hardcoded kind string in `core`.
+        //
+        // This is deliberately STRICTER than the source side: there,
+        // `source_options` is threaded through unconditionally and a stray
+        // option on a non-consuming source is silently ignored, validated
+        // only inside the connector's `build_context` (mongo-cdc).
+        let sink_kind = sink_cfg.kind.as_str();
+        let sink_options = flow.sink.options();
+        if !sink_options.is_empty() && !sink.accepts_flow_options() {
+            return Err(ValidationError::AccessFailed {
+                component: "flow",
+                name: flow_name.clone(),
+                source: Box::new(RuntimeError::Other(format!(
+                    "flow {flow_name:?}: sink kind {sink_kind:?} does not accept per-flow sink \
+                     options — the developed `sink = {{ name, <options> }}` form is only supported \
+                     by sinks that consume them (e.g. `redis`)"
+                ))),
+            });
+        }
+
         let rules = mapping::build(flow).map_err(|e| ValidationError::AccessFailed {
             component: "mapping",
             name: flow_name.clone(),
@@ -269,6 +301,7 @@ pub async fn assemble(
         let config_write_spec = ConfigWriteSpec {
             table: flow.to.clone(),
             conflict: flow.conflict.clone(),
+            sink_options,
         };
 
         let interval = flow.cursor.interval;
@@ -310,7 +343,7 @@ pub async fn assemble(
             // no canonical lock order to maintain.
             lock_handle: concurrency.handle(
                 source_name,
-                flow.sink.as_str(),
+                sink_name,
                 flow.storage.as_str(),
                 monitoring,
             ),
@@ -318,7 +351,7 @@ pub async fn assemble(
                 flow: flow_name.clone(),
                 source_name: source_name.to_string(),
                 source_kind: source_cfg.kind.clone(),
-                sink_name: flow.sink.clone(),
+                sink_name: sink_name.to_string(),
                 sink_kind: sink_cfg.kind.clone(),
                 storage_name: flow.storage.clone(),
                 storage_kind: storage_cfg.kind.clone(),
@@ -483,7 +516,7 @@ async fn fetch_source_schema(flow: &AssembledFlow) -> Result<Schema, ValidationE
 
 async fn fetch_sink_schema(flow: &AssembledFlow) -> Result<Schema, ValidationError> {
     flow.sink
-        .describe_schema(&flow.config_write_spec.table)
+        .describe_schema(&flow.config_write_spec)
         .await
         .map_err(|e| ValidationError::AccessFailed {
             component: "sink:schema",
@@ -677,6 +710,7 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
         columns: expanded.write_columns(),
         table: flow.config_write_spec.table.clone(),
         conflict: flow.config_write_spec.conflict.clone(),
+        sink_options: flow.config_write_spec.sink_options.clone(),
     };
 
     // ---- access probes -----------------------------------------------
@@ -963,6 +997,7 @@ async fn validate_flow(flow: AssembledFlow) -> Result<FlowState, ValidationError
             columns: expanded.write_columns(),
             table: flow.config_write_spec.table.clone(),
             conflict: flow.config_write_spec.conflict.clone(),
+            sink_options: flow.config_write_spec.sink_options.clone(),
         };
         let body_data_type = flow.source.body_data_type();
         let transform = crate::transform::compile_to_transform(
@@ -1036,6 +1071,7 @@ mod tests {
             config_write_spec: ConfigWriteSpec {
                 table: "t".into(),
                 conflict: None,
+                sink_options: toml::Table::new(),
             },
             interval: Duration::from_millis(10),
             jitter: Duration::ZERO,

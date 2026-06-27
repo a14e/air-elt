@@ -16,7 +16,9 @@ Two evaluation contexts:
 
 ## Syntax
 
-Literals: integer (`42`), float (`3.14`), bool (`true`/`false`), null (`null`), double-quoted string with interpolation (`"hello {expr}"`), single-quoted raw string (`'no interpolation'`).
+Literals: integer (`42`), float (`3.14`), bool (`true`/`false`), null (`null`), double-quoted string with interpolation (`"hello {expr}"`), single-quoted raw string (`'no interpolation'`), duration (`10s`, `500ms`, `1h30m`, ISO-8601 `PT1H30M`).
+
+Duration literals yield `Value::Interval` (a `std::time::Duration`), type `DataType::Interval`. The lexer triggers on a digit immediately followed by a unit (no space — `3 days` is not a literal) or an ISO `P`/`p` prefix, and parses via `air_elt_commons::interval` (the workspace duration parser; no hand-rolled grammar). `Interval` is **minimal by design**: identity-only in the type matrix (no conversions to/from other types), never a cursor/switch key, never JSON-encoded. It exists to type the Redis sink `ttl` column (the sink reads the `Duration` directly); arithmetic over `Interval` is not defined.
 
 Variables: `x = expr` (assignment via `=`, separated by `;` or newlines).
 

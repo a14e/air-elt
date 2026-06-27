@@ -81,7 +81,7 @@ config = { url = "env('CH_URL')", database = "analytics", user = "env('CH_USER')
 | Field | Type | Required | Description |
 |-------|------|:--------:|-------------|
 | `name` | string | yes | Unique identifier |
-| `type` | string | yes | Connector kind (`"postgres"`, `"cockroachdb"`, `"mysql"`, `"mongodb"`, `"mongo-cdc"` (source only), `"clickhouse"` (sink only)) |
+| `type` | string | yes | Connector kind (`"postgres"`, `"cockroachdb"`, `"mysql"`, `"mongodb"`, `"mongo-cdc"` (source only), `"clickhouse"` (sink only), `"redis"` (sink only)) |
 | `config` | table | yes | Connector-specific config (see below) |
 
 ### Postgres / CockroachDB / MySQL connector config (`config = { ... }`)
@@ -152,6 +152,56 @@ INSERTs use the HTTP `RowBinary` format. Authentication is over standard CH `X-C
 - `clickhouse.aggregate.<fn>` (`AggregateFunction` / `SimpleAggregateFunction` states for `quantilesTDigest`, `quantilesDDSketch`, `uniq*`, etc.) — opaque bytes, CH↔CH only.
 
 **Structural composite types** (`Tuple`, `Array`, `Map`, `Nested`, `Point`, `Ring`, `Polygon`, `MultiPolygon`, …) are parsed as canonical `Json`. The CH server accepts JSON-encoded text for these via RowBinary; the round-trip is lossless.
+
+### Redis / Valkey sink config (`[[sinks]] type = "redis"`)
+
+Redis is **sink-only**. The per-mode columns (`key` / `value` / `ttl`) have **known canonical types**, so the validation matrix type-checks the mapped columns at config time (an `Int → key` or `Text → ttl` mapping fails at validate, not at runtime). What the matrix *can't* express — which columns each mode requires vs. allows — the sink enforces itself in `validate_access` / `build_context`. `[flow.<name>.conflict]` is **rejected** — redis writes are always last-write-wins (`SET`) or unconditional appends; there is nothing to arbitrate. Writes go over a standard `deadpool-redis` connection pool (one connection per checkout; a whole-batch pipeline rides one connection in a single round-trip); the URL and pool live on the connector, the write **mode** is per-flow.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | string | required | Connection URL. `redis://` (plaintext) or `rediss://` (TLS). |
+| `pool` | table | `{}` | Connection-pool tunables (all optional). See below. |
+
+`config = { url, pool = { ... } }` pool sub-fields (kebab-case):
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max-connections` | u32 | 10 | Pool size — number of connections, capped at 100. Also sizes the runtime concurrency semaphore for this sink (one permit per connection). |
+| `connect-timeout` | Duration | `"5s"` | TCP connect timeout for dialing a new connection (deadpool `create`). |
+| `acquire-timeout` | Duration | `"10s"` | Max wait for a free connection when the pool is saturated (deadpool `wait`). |
+| `recycle-timeout` | Duration | `"5s"` | Bound on the health-check (`PING`) run when an idle connection is re-checked out (deadpool `recycle`). |
+
+**Per-flow `mode`** — every referencing flow uses the developed sink form `sink = { name = "...", mode = "..." }` (mirror of the `mongo-cdc` source mode). Bare `sink = "redis_sink"` defaults to `kv`. The `mode` fixes the redis command and the required/optional mapped sink columns (resolved by **name** — `key`, `value`, `ttl`):
+
+| `mode` | columns | command |
+|--------|---------|---------|
+| `kv` | `key` (Text, req), `value` (Json, req), `ttl` (Interval, **opt**) | `SET {to}{key} {json} [PX ttl]` |
+| `kv-delete` | `key` (Text, req) | `DEL {to}{key}` (issued per row regardless of `RowOp`) |
+| `list` | `value` (Json, req), `key` (Text, **opt**) | `RPUSH {to}{key?} {json}` (no `key` → list `{to}`) |
+| `stream` | `key` (Text, req), `value` (Json, req) | `XADD {to}{key} * data {json}` |
+| `pubsub` | `value` (Json, req), `key` (Text, **opt**) | `PUBLISH {to}{key?} {json}` (no `key` → channel `{to}`) |
+
+Authoring: `value` is an object-literal compute (`{ "k" = `+"`col`"+` }` → `Value::Object` → JSON); `ttl` is a duration literal (`"10s"`, `"1h30m"` → `Value::Interval` → `PX` milliseconds). `key` must resolve to `Text` at write time (a null key errors for required-key modes; for optional-key modes it falls back to the bare `{to}`). The full redis key is the **plain concatenation `{to}{key}`** — the sink inserts no separator; put any `:` into `to` (`to = "users:"`) or the computed `key`.
+
+```toml
+[flow.users]
+source = "pg_src"
+sink = { name = "redis_sink", mode = "kv" }
+storage = "pg_state"
+from = "public.users"
+to = "users:"                      # full key = users:{key}
+[flow.users.mapping]
+key = "uid"                        # TEXT cursor column → redis key suffix
+[flow.users.compute-mapping]
+value = '{ "name" = `name`, "age" = `age` }'   # object literal → JSON
+ttl = "1h"                         # duration literal → Interval → PX
+[flow.users.cursor]
+fields = ["uid"]                   # cursor field must appear in mapping.from
+order = "asc"
+interval = "1s"
+```
+
+**Delivery semantics:** at-least-once **send to Redis** — not consumer delivery; Redis itself may evict/drop. `kv` / `kv-delete` are idempotent under a batch retry; `list` / `stream` / `pubsub` may **duplicate** (the runner re-delivers a failed batch). A whole batch is pipelined in one round-trip; a server error on any command fails the batch.
 
 ### `mongo-cdc` source config (`[[sources]] type = "mongo-cdc"`)
 

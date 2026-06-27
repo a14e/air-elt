@@ -184,6 +184,7 @@ async fn round_trip_aggregate_states_through_sink() {
             table: sink_table.clone(),
             columns: vec!["state".into()],
             conflict: None,
+            sink_options: toml::Table::new(),
         };
         sink.validate_access(&spec)
             .await

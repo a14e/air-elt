@@ -94,6 +94,15 @@ fn encode_value_at_depth(v: &Value, depth: usize) -> Result<serde_json::Value, J
             serde_json::Value::Object(map)
         }
         Value::Custom(c) => c.to_json()?,
+        // Intervals have no canonical JSON form (deliberately minimal — no
+        // conversions). They only ever type the Redis sink `ttl` column,
+        // which the sink reads directly; an interval nested inside a
+        // JSON-bound value is an authoring error, surfaced here.
+        Value::Interval(_) => {
+            return Err(JsonEncodeError::Variant(
+                "interval has no JSON encoding rule".to_string(),
+            ));
+        }
     };
     Ok(out)
 }

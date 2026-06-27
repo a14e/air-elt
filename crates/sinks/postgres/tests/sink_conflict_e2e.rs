@@ -65,6 +65,7 @@ fn spec(
             key: vec!["id".into()],
             strategy,
         }),
+        sink_options: toml::Table::new(),
     }
 }
 
@@ -161,6 +162,7 @@ async fn cockroach_overwrite_single_key_via_on_conflict_do_update() {
             key: vec!["id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
     let ctx = sink.build_context(&s).await.expect("build_context");
 
@@ -207,6 +209,7 @@ async fn cockroach_overwrite_two_key_uses_on_conflict() {
             key: vec!["a".into(), "b".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
     let ctx = sink.build_context(&s).await.unwrap();
 
@@ -256,6 +259,7 @@ async fn cockroach_ignore_does_nothing() {
             key: vec!["id".into()],
             strategy: ConflictStrategy::Ignore,
         }),
+        sink_options: toml::Table::new(),
     };
     let ctx = sink.build_context(&s).await.unwrap();
 
@@ -306,6 +310,7 @@ async fn cockroach_pk_only_table_overwrite_falls_back_to_do_nothing() {
             key: vec!["id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: toml::Table::new(),
     };
     let ctx = sink.build_context(&s).await.unwrap();
 

@@ -332,15 +332,15 @@ fn switch_cases(switch: &SwitchTable) -> Vec<SwitchCase> {
 mod tests {
     use super::*;
     use crate::config::model::{
-        CursorConfig, CursorOrder, FlowConfig, FlowSourceRef, MappingEntry, MappingMap, MappingRhs,
-        SwitchTable,
+        CursorConfig, CursorOrder, FlowConfig, FlowSinkRef, FlowSourceRef, MappingEntry,
+        MappingMap, MappingRhs, SwitchTable,
     };
 
     fn flow_with(entries: Vec<(&str, MappingRhs)>) -> FlowConfig {
         let mapping = MappingMap(entries.into_iter().map(|(k, v)| (k.into(), v)).collect());
         FlowConfig {
             source: FlowSourceRef::Bare("s".into()),
-            sink: "k".into(),
+            sink: FlowSinkRef::Bare("k".into()),
             storage: "st".into(),
             from: "t".into(),
             to: "t".into(),

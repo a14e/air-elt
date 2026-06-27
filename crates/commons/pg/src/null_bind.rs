@@ -68,6 +68,10 @@ pub fn bind_typed_null<'q>(
         // Object is handled as Json in connectors
         DataType::Object => query.bind::<Option<serde_json::Value>>(None),
         DataType::Union(_) => unreachable!("postgres sinks never carry Union types"),
+        // Interval is a redis-only canonical type; a PG sink never declares
+        // an Interval column, and the matrix rejects `* → Interval` for any
+        // other pair, so this null-bind path is never reached.
+        DataType::Interval => unreachable!("postgres sinks never carry Interval (redis-only type)"),
         // HLL: bind a typed NULL `Vec<u8>` (matches the `bytea`-shaped
         // wire encoding sqlx uses for HLL bytes). The `::hll` cast is
         // emitted by the SQL template builder rather than here — this

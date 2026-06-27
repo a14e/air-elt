@@ -143,6 +143,8 @@ jobs:
       AIR_ELT_TEST_CLICKHOUSE_URL: "http://localhost:8123"
       # QuestDB pg-wire (sole transport). Port 8812 maps to host 8812.
       AIR_ELT_TEST_QUESTDB_URL: "postgres://admin:quest@localhost:8812/qdb"
+      # Valkey (redis-compatible) for the redis sink + its connection pool.
+      AIR_ELT_TEST_VALKEY_URL: "redis://localhost:6379"
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -285,6 +287,33 @@ jobs:
           done
           echo "questdb did not become ready in 60s"
           docker logs questdb || true
+          exit 1
+      - name: Verify Valkey image tag matches commons-testing
+        # The image tag below MUST match
+        # `air_elt_commons_testing::valkey::VALKEY_IMAGE_TAG`. Fail fast on
+        # drift instead of waiting for a test to fail at runtime.
+        run: |
+          set -euo pipefail
+          grep -q 'mirror.gcr.io/valkey/valkey:8.1.1' \
+            crates/commons/testing/src/valkey.rs
+          grep -q 'mirror.gcr.io/valkey/valkey:8.1.1' \
+            .github/workflows/ci.yml
+      - name: Start Valkey single-node
+        # Valkey speaks the redis protocol on 6379. Image tag MUST match
+        # `air_elt_commons_testing::valkey::VALKEY_IMAGE_TAG` — the
+        # commons-testing module is the source of truth.
+        run: |
+          set -euo pipefail
+          docker run -d --name valkey -p 6379:6379 \
+            mirror.gcr.io/valkey/valkey:8.1.1
+          for i in $(seq 1 60); do
+            if [ "$(docker exec valkey valkey-cli ping 2>/dev/null)" = "PONG" ]; then
+              echo "valkey ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "valkey did not become ready in 60s"
+          docker logs valkey || true
           exit 1
       - name: Cache CI tools
         id: cache-test-tools

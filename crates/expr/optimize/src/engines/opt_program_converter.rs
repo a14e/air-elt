@@ -281,5 +281,6 @@ fn literal_to_value(literal: &LiteralValue) -> Value {
         LiteralValue::Int(integer) => Value::Int64(*integer),
         LiteralValue::Float(float) => Value::Float64(*float),
         LiteralValue::String(string) => Value::Text(string.clone()),
+        LiteralValue::Interval(duration) => Value::Interval(*duration),
     }
 }

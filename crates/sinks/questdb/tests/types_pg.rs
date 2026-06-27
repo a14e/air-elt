@@ -52,6 +52,7 @@ async fn bool_round_trip() {
         table: "bench_bool".to_string(),
         columns: vec!["ts".into(), "b".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -120,6 +121,7 @@ async fn int8_round_trip() {
         table: "bench_int8".to_string(),
         columns: vec!["ts".into(), "v".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -186,6 +188,7 @@ async fn int16_round_trip() {
         table: "bench_int16".to_string(),
         columns: vec!["ts".into(), "v".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -251,6 +254,7 @@ async fn float32_round_trip() {
         table: "bench_float32".to_string(),
         columns: vec!["ts".into(), "v".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -306,6 +310,7 @@ async fn char_round_trip() {
         table: "bench_char".to_string(),
         columns: vec!["ts".into(), "c".into()],
         conflict: None,
+        sink_options: toml::Table::new(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");

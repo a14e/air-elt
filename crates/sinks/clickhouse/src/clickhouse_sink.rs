@@ -11,7 +11,7 @@ use air_elt_commons_clickhouse::row_binary::encode_value;
 use air_elt_commons_clickhouse::schema::fetch_schema;
 use air_elt_core::error::{RuntimeError, RuntimeResult};
 use air_elt_core::model::{
-    Batch, Field, RowOp, Schema, SchemaProvider, SinkCtx, WriteReport, WriteSpec,
+    Batch, ConfigWriteSpec, Field, RowOp, Schema, SchemaProvider, SinkCtx, WriteReport, WriteSpec,
 };
 use air_elt_core::traits::Sink;
 
@@ -114,14 +114,16 @@ impl Sink for ChSink {
         Ok(())
     }
 
-    async fn describe_schema(&self, table: &str) -> RuntimeResult<Schema> {
-        fetch_schema(&self.client, table)
+    async fn describe_schema(&self, spec: &ConfigWriteSpec) -> RuntimeResult<Schema> {
+        fetch_schema(&self.client, &spec.table)
             .await
             .map_err(RuntimeError::backend)
     }
 
     async fn build_context(&self, spec: &WriteSpec) -> RuntimeResult<Arc<dyn SinkCtx>> {
-        let schema = self.describe_schema(&spec.table).await?;
+        let schema = fetch_schema(&self.client, &spec.table)
+            .await
+            .map_err(RuntimeError::backend)?;
         let mut columns: Vec<Field> = Vec::with_capacity(spec.columns.len());
         for c in &spec.columns {
             let f = schema

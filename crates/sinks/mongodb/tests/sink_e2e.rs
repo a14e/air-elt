@@ -34,6 +34,7 @@ async fn insert_and_upsert_with_dot_notation() {
             key: vec!["_id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: Default::default(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -104,6 +105,7 @@ async fn write_object_id_lands_as_bson_object_id() {
             key: vec!["_id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: Default::default(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -155,6 +157,7 @@ async fn write_javascript_code_round_trip() {
             key: vec!["_id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: Default::default(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");

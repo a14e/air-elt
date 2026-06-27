@@ -33,6 +33,7 @@ async fn round_trip_overwrite(sink: MongoSink, db: &str, client: &mongodb::Clien
             key: vec!["_id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: Default::default(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -116,6 +117,7 @@ async fn round_trip_overwrite_compound_key(sink: MongoSink, db: &str, client: &m
             key: vec!["tenant".into(), "addr.city".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: Default::default(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -190,6 +192,7 @@ async fn bulk_write_object_id_lands_as_bson_object_id() {
             key: vec!["_id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: Default::default(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");

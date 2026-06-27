@@ -52,11 +52,20 @@ fn parse_iso(raw: &str, s: &str) -> Result<Duration, IntervalError> {
     if total_secs <= 0.0 {
         return Err(err(raw, "duration is zero"));
     }
-    if !total_secs.is_finite() || total_secs > u64::MAX as f64 {
+    from_secs_checked(raw, total_secs)
+}
+
+/// Build a `Duration` from fractional seconds, rejecting non-finite or
+/// out-of-range values with an `IntervalError` instead of panicking inside
+/// `Duration::from_secs_f64` (which aborts on `NaN`/`inf`/overflow). Used by
+/// every fractional-second arm so the guard cannot drift apart. Critical
+/// because the expression-language duration lexer routes arbitrary,
+/// untrusted source through `parse`.
+fn from_secs_checked(raw: &str, secs: f64) -> Result<Duration, IntervalError> {
+    if !secs.is_finite() || secs < 0.0 || secs > u64::MAX as f64 {
         return Err(err(raw, "overflow"));
     }
-
-    Ok(Duration::from_secs_f64(total_secs))
+    Ok(Duration::from_secs_f64(secs))
 }
 
 const UNIT_ORDER_D: u8 = 5;
@@ -102,11 +111,11 @@ fn parse_human(raw: &str, s: &str) -> Result<Duration, IntervalError> {
         let (order, dur) = match unit.to_ascii_lowercase().as_str() {
             "ms" | "millis" | "millisecond" | "milliseconds" => {
                 let n = parse_f64(raw, num_str)?;
-                (UNIT_ORDER_MS, Duration::from_secs_f64(n / 1000.0))
+                (UNIT_ORDER_MS, from_secs_checked(raw, n / 1000.0)?)
             }
             "s" | "sec" | "second" | "seconds" | "" => {
                 let n = parse_f64(raw, num_str)?;
-                (UNIT_ORDER_S, Duration::from_secs_f64(n))
+                (UNIT_ORDER_S, from_secs_checked(raw, n)?)
             }
             "m" | "min" | "minute" | "minutes" => {
                 let n = parse_u64(raw, num_str)?;
@@ -376,6 +385,22 @@ mod tests {
     fn overflow_rejected() {
         assert!(parse("999999999999999999d").is_err());
         assert!(parse("PT999999999999999999H").is_err());
+    }
+
+    /// The fractional-second arms (`s`, `ms`) must reject non-finite / oversized
+    /// magnitudes with an error instead of panicking inside
+    /// `Duration::from_secs_f64`. This path is now reachable from arbitrary
+    /// expression-language duration literals, so a panic here would unwind the
+    /// (fallible) parser. See `from_secs_checked`.
+    #[test]
+    fn fractional_second_overflow_rejected_not_panic() {
+        // 310 digits → f64 parses to +inf.
+        let inf_secs = "9".repeat(310);
+        assert!(parse(&format!("{inf_secs}s")).is_err());
+        assert!(parse(&format!("{inf_secs}ms")).is_err());
+        // Finite f64 that still exceeds Duration's range (~1.8e19 s).
+        assert!(parse("100000000000000000000s").is_err());
+        assert!(parse("100000000000000000000000ms").is_err());
     }
 
     #[test]

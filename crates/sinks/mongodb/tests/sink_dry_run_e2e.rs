@@ -39,6 +39,7 @@ async fn write_batch_dry_run_skips_writes_then_real_run_commits() {
             key: vec!["_id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: Default::default(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -102,6 +103,7 @@ async fn raw_passthrough_dry_run_skips_writes() {
         columns: vec![ROOT_BODY_TARGET.to_string()],
         table: "dry_run_raw".into(),
         conflict: None,
+        sink_options: Default::default(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
@@ -235,6 +237,7 @@ async fn dry_run_delete_validates_per_row_key_encoding() {
             key: vec!["_id".into()],
             strategy: ConflictStrategy::Overwrite,
         }),
+        sink_options: Default::default(),
     };
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
