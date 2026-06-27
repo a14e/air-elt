@@ -79,6 +79,7 @@ impl RuleSet {
             Box::new(const_fold::ConstFold),
             Box::new(const_fold::InterpolationFold),
             Box::new(const_fold::ObjectFold),
+            Box::new(const_fold::ArrayFold),
             Box::new(object_access::ObjectAccessFold),
             Box::new(flatten_conditionals::FlattenConditionals),
             Box::new(dce::BranchPrune),

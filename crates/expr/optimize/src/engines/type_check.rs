@@ -191,6 +191,34 @@ impl<'a> TypeChecker<'a> {
                 }
                 Ok(Some(NullableExprType::non_null(DataType::Object)))
             }
+            OptExpr::Array(_, elements) => {
+                let mut element_nullable = false;
+                let mut element: Option<Box<DataType>> = None;
+                for item in elements {
+                    let Some(item_type) = self.type_of(item)? else {
+                        // Unknown element (tolerant pass) — conservatively nullable.
+                        element_nullable = true;
+                        continue;
+                    };
+                    element_nullable = element_nullable || item_type.nullable;
+                    // A literal null contributes nullability, not a concrete element
+                    // type (a null literal types as nullable `Bool` by convention).
+                    if matches!(item, OptExpr::Const(_, value) if value.is_null()) {
+                        continue;
+                    }
+                    let item_data_type = item_type.materialized_data_type();
+                    let joined = air_elt_expr_funcs::array_element_join(
+                        &element,
+                        &Some(Box::new(item_data_type)),
+                    )?;
+                    element = joined.map(Box::new);
+                }
+                Ok(Some(NullableExprType::array(
+                    element.map(|boxed| *boxed),
+                    element_nullable,
+                    false,
+                )))
+            }
             OptExpr::Switch {
                 inputs,
                 table,

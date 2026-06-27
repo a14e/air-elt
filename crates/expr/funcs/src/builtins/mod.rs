@@ -1,5 +1,6 @@
 pub mod arg_extract;
 pub mod arithmetic;
+pub mod array;
 pub mod bitwise;
 pub mod bytes;
 pub mod cast;

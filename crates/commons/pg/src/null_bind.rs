@@ -67,6 +67,11 @@ pub fn bind_typed_null<'q>(
         // before any bind happens.
         // Object is handled as Json in connectors
         DataType::Object => query.bind::<Option<serde_json::Value>>(None),
+        // Native array NULL: bind `None::<Vec<Option<NativeT>>>` for the
+        // element type so the wire OID is the matching array OID. Without
+        // the right element type sqlx would emit the wrong array OID and
+        // PG would reject the typed NULL against the column.
+        DataType::Array { element, .. } => bind_typed_null_array(query, element.as_deref()),
         DataType::Union(_) => unreachable!("postgres sinks never carry Union types"),
         // Interval is a redis-only canonical type; a PG sink never declares
         // an Interval column, and the matrix rejects `* → Interval` for any
@@ -92,5 +97,45 @@ pub fn bind_typed_null<'q>(
         DataType::Custom(_) => unreachable!(
             "DataType::Custom must be handled by the connector before reaching null_bind"
         ),
+    }
+}
+
+/// Bind a typed NULL for a native PG array column, choosing the
+/// `Vec<Option<NativeT>>` whose element OID matches `element`.
+///
+/// `element == None` means the array element type is empty/unknown — only
+/// the expression / source layer produces that shape; a PG *column* always
+/// declares a concrete element. We bind a `text[]` NULL as the
+/// universally-castable fallback so an unexpected unknown-element column
+/// still lands a valid NULL rather than panicking.
+fn bind_typed_null_array<'q>(
+    query: Query<'q, Postgres, PgArguments>,
+    element: Option<&DataType>,
+) -> Query<'q, Postgres, PgArguments> {
+    match element {
+        Some(DataType::Bool) => query.bind::<Option<Vec<Option<bool>>>>(None),
+        // Postgres has no int1 type; bind int1 elements as int2[] (i16).
+        Some(DataType::Int8 | DataType::Int16) => query.bind::<Option<Vec<Option<i16>>>>(None),
+        Some(DataType::Int32) => query.bind::<Option<Vec<Option<i32>>>>(None),
+        Some(DataType::Int64) => query.bind::<Option<Vec<Option<i64>>>>(None),
+        Some(DataType::Float32) => query.bind::<Option<Vec<Option<f32>>>>(None),
+        Some(DataType::Float64) => query.bind::<Option<Vec<Option<f64>>>>(None),
+        Some(DataType::Text { .. }) => query.bind::<Option<Vec<Option<String>>>>(None),
+        Some(DataType::Date) => query.bind::<Option<Vec<Option<NaiveDate>>>>(None),
+        Some(DataType::Timestamp) => query.bind::<Option<Vec<Option<DateTime<Utc>>>>>(None),
+        Some(DataType::Uuid) => query.bind::<Option<Vec<Option<Uuid>>>>(None),
+        // numeric[] — BigInt and Decimal both map to the `numeric` OID.
+        Some(DataType::BigInt { .. } | DataType::Decimal { .. }) => {
+            query.bind::<Option<Vec<Option<BigDecimal>>>>(None)
+        }
+        // Fallback for the unknown-element case (see fn docstring).
+        None => query.bind::<Option<Vec<Option<String>>>>(None),
+        // Any other element type was rejected by the native-type mapper
+        // (`PgType::is_array_element`), so a PG array column never declares
+        // it. Reaching here means a non-PG-derived array type slipped past
+        // validation — a structural bug, not a runtime data shape.
+        Some(other) => {
+            unreachable!("postgres array column declared unsupported element type {other:?}")
+        }
     }
 }

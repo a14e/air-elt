@@ -57,6 +57,7 @@ impl<'a> TypeCheckerState<'a> {
             Expr::Conditional(conditional) => self.check_conditional(conditional),
             Expr::Interpolation(segments) => self.check_interpolation(segments),
             Expr::Object(entries) => self.check_object(entries),
+            Expr::Array(elements) => self.check_array(elements),
             Expr::Block { statements, result } => self.check_block(statements, result),
             Expr::Field(..) | Expr::Fields(..) => Err(ExprError::FieldOutsideTransform),
         }
@@ -233,6 +234,31 @@ impl<'a> TypeCheckerState<'a> {
         }
         Ok(NullableExprType::non_null(DataType::Object))
     }
+
+    /// Type-check an array literal: unify the element types into a single
+    /// element type (numeric widening via the matrix; incompatible mix is a
+    /// `TypeMismatch`), and mark the element nullable if any element is. A
+    /// literal `null` element contributes nullability but no concrete type.
+    fn check_array(&mut self, elements: &[Expr]) -> Result<NullableExprType, ExprError> {
+        let mut element_nullable = false;
+        let mut element: Option<Box<DataType>> = None;
+        for item in elements {
+            let item_type = self.check_expr(item)?;
+            element_nullable = element_nullable || item_type.nullable;
+            if matches!(item, Expr::Literal(LiteralValue::Null)) {
+                continue;
+            }
+            let item_data_type = item_type.materialized_data_type();
+            let joined =
+                air_elt_expr_funcs::array_element_join(&element, &Some(Box::new(item_data_type)))?;
+            element = joined.map(Box::new);
+        }
+        Ok(NullableExprType::array(
+            element.map(|boxed| *boxed),
+            element_nullable,
+            false,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +359,54 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ExprError::UndefinedVariable { .. }));
+    }
+
+    #[test]
+    fn array_literal_element_type_and_nullability() {
+        // Homogeneous int literals → non-null element.
+        let result = infer_expression_type("[1, 2, 3]", &registry()).unwrap();
+        assert!(matches!(
+            result.data_type,
+            DataType::Array {
+                element_nullable: false,
+                ..
+            }
+        ));
+        // A `null` element contributes nullability but not a concrete type, so
+        // the element stays Int (not corrupted to Bool by the null literal).
+        let result = infer_expression_type("[1, null, 3]", &registry()).unwrap();
+        match result.data_type {
+            DataType::Array {
+                element,
+                element_nullable,
+            } => {
+                assert!(element_nullable);
+                assert!(matches!(
+                    element.as_deref(),
+                    Some(DataType::Int8 | DataType::Int64)
+                ));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_literal_incompatible_elements_type_mismatch() {
+        // [1, "a"] cannot unify Int with Text → compile-time error.
+        let result = infer_expression_type("[1, \"a\"]", &registry());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn empty_array_literal_has_unknown_element() {
+        let result = infer_expression_type("[]", &registry()).unwrap();
+        assert_eq!(
+            result.data_type,
+            DataType::Array {
+                element: None,
+                element_nullable: false,
+            }
+        );
     }
 
     #[test]
@@ -476,10 +550,10 @@ mod tests {
         // result `x` then resolves to Text; after the block the outer Int `x`
         // is restored and concatenated (Int + Int) keeps the whole program
         // type-checking.
-        let source = "x = 1; y = if (true) { x = 'hi'; length(x) } else 0; x + y";
+        let source = "x = 1; y = if (true) { x = 'hi'; len(x) } else 0; x + y";
         let result = infer_expression_type(source, &registry()).unwrap();
-        // The block accepted Text for the shadowed `x` (`length` is Text-strict,
-        // so it would error if the outer Int leaked in); after the block the
+        // The block accepted Text for the shadowed `x` (`len` rejects scalar
+        // ints, so it would error if the outer Int leaked in); after the block the
         // outer Int `x` is restored, so `x + y` type-checks as an integer.
         // Exact type: `If` resolution drops `int_bound` (`NullableExprType::new`
         // sets it to None), so the addition falls back to DataType-level bits

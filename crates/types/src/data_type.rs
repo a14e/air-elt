@@ -83,6 +83,20 @@ pub enum DataType {
     /// always strings, values can be any type. Serialisable to JSON, BSON,
     /// or string representation.
     Object,
+    /// Homogeneous ordered list. The element type lives on the *type*,
+    /// not the value, so it is fixed at compile time and erased at the
+    /// sink boundary (Java-style generics): `element = None` means
+    /// empty/unknown (`[]`) and unifies with any concrete element type.
+    /// `element_nullable` records whether elements may be `Null`; it must
+    /// live here (not only on the expr-layer `NullableExprType`) because
+    /// ClickHouse distinguishes `Array(T)` from `Array(Nullable(T))` and
+    /// that distinction has to survive to the sink, where only the
+    /// canonical `DataType` is available. The runtime payload is
+    /// [`crate::Value::Array`]. Not cursor/switch/dedup-compatible.
+    Array {
+        element: Option<Box<DataType>>,
+        element_nullable: bool,
+    },
     /// Time span / duration. The value is carried as `std::time::Duration`
     /// in `Value::Interval`. Authored in configs as a duration literal
     /// (`10s`, `1h30m`, `PT1H30M`). Deliberately minimal: it has no
@@ -143,6 +157,7 @@ impl DataType {
             | DataType::Xml
             | DataType::Object
             | DataType::Interval
+            | DataType::Array { .. }
             | DataType::Union(_) => false,
             DataType::Custom(t) => t.cursor_compatible(),
             _ => true,
@@ -258,6 +273,13 @@ impl Hash for DataType {
             }
             DataType::Text { size } | DataType::Bytes { size } => size.hash(state),
             DataType::Union(vs) => vs.hash(state),
+            DataType::Array {
+                element,
+                element_nullable,
+            } => {
+                element.hash(state);
+                element_nullable.hash(state);
+            }
             DataType::Custom(t) => t.hash(state),
         }
     }
@@ -292,6 +314,18 @@ impl Ord for DataType {
             (DataType::Text { size: a }, DataType::Text { size: b }) => a.cmp(b),
             (DataType::Bytes { size: a }, DataType::Bytes { size: b }) => a.cmp(b),
             (DataType::Union(a), DataType::Union(b)) => a.cmp(b),
+            (
+                DataType::Array {
+                    element: left_element,
+                    element_nullable: left_nullable,
+                },
+                DataType::Array {
+                    element: right_element,
+                    element_nullable: right_nullable,
+                },
+            ) => left_element
+                .cmp(right_element)
+                .then(left_nullable.cmp(right_nullable)),
             (DataType::Custom(a), DataType::Custom(b)) => a.cmp(b),
             // Unit variants — equal once their discriminant matches.
             _ => Ordering::Equal,
@@ -330,6 +364,7 @@ fn variant_order(d: &DataType) -> u8 {
         DataType::Union(_) => 23,
         DataType::Custom(_) => 24,
         DataType::Interval => 25,
+        DataType::Array { .. } => 26,
     }
 }
 
@@ -373,6 +408,20 @@ impl std::fmt::Display for DataType {
             DataType::Json => f.write_str("json"),
             DataType::Xml => f.write_str("xml"),
             DataType::Object => f.write_str("object"),
+            DataType::Array {
+                element,
+                element_nullable,
+            } => {
+                f.write_str("array<")?;
+                match element {
+                    Some(e) => write!(f, "{e}")?,
+                    None => f.write_str("?")?,
+                }
+                if *element_nullable {
+                    f.write_str("?")?;
+                }
+                f.write_str(">")
+            }
             DataType::Interval => f.write_str("interval"),
             DataType::Union(vs) => {
                 f.write_str("union<")?;
@@ -463,6 +512,20 @@ impl Serialize for DataType {
                 m.serialize_entry("union", vs)?;
                 m.end()
             }
+            DataType::Array {
+                element,
+                element_nullable,
+            } => {
+                let mut m = serializer.serialize_map(Some(1))?;
+                m.serialize_entry(
+                    "array",
+                    &ArrayPayloadRef {
+                        element: element.as_deref(),
+                        element_nullable: *element_nullable,
+                    },
+                )?;
+                m.end()
+            }
             DataType::Custom(t) => {
                 let mut m = serializer.serialize_map(Some(1))?;
                 m.serialize_entry("custom", &CustomPayload { kind: t.kind() })?;
@@ -491,6 +554,23 @@ struct SizePayload {
 #[derive(Serialize)]
 struct CustomPayload<'a> {
     kind: &'a str,
+}
+
+/// Borrowing payload for `DataType::Array` serialization. `element` is
+/// flattened from `Option<Box<DataType>>` to `Option<&DataType>` via
+/// `as_deref` so the boxed element serializes inline.
+#[derive(Serialize)]
+struct ArrayPayloadRef<'a> {
+    element: Option<&'a DataType>,
+    element_nullable: bool,
+}
+
+/// Owned mirror of [`ArrayPayloadRef`] for deserialization; the element
+/// is re-boxed into the enum variant afterwards.
+#[derive(Deserialize)]
+struct ArrayPayloadOwned {
+    element: Option<DataType>,
+    element_nullable: bool,
 }
 
 impl<'de> Deserialize<'de> for DataType {
@@ -564,6 +644,7 @@ impl<'de> Visitor<'de> for DataTypeVisitor {
                     "object",
                     "interval",
                     "union",
+                    "array",
                 ],
             )),
         }
@@ -601,6 +682,13 @@ impl<'de> Visitor<'de> for DataTypeVisitor {
                 let vs: Vec<DataType> = map.next_value()?;
                 Ok(DataType::Union(vs))
             }
+            "array" => {
+                let p: ArrayPayloadOwned = map.next_value()?;
+                Ok(DataType::Array {
+                    element: p.element.map(Box::new),
+                    element_nullable: p.element_nullable,
+                })
+            }
             "custom" => Err(de::Error::custom(
                 "DataType::Custom cannot be deserialized — \
                  connector-specific types have no global registry; \
@@ -608,7 +696,7 @@ impl<'de> Visitor<'de> for DataTypeVisitor {
             )),
             other => Err(de::Error::unknown_variant(
                 other,
-                &["big_int", "decimal", "text", "bytes", "union"],
+                &["big_int", "decimal", "text", "bytes", "union", "array"],
             )),
         }
     }
@@ -775,6 +863,29 @@ mod tests {
                 DataType::Union(vec![DataType::Int32, DataType::Int64]),
                 serde_json::json!({"union": ["int32", "int64"]}),
             ),
+            (
+                DataType::Array {
+                    element: Some(Box::new(DataType::Int32)),
+                    element_nullable: false,
+                },
+                serde_json::json!({"array": {"element": "int32", "element_nullable": false}}),
+            ),
+            (
+                DataType::Array {
+                    element: Some(Box::new(DataType::Text { size: None })),
+                    element_nullable: true,
+                },
+                serde_json::json!(
+                    {"array": {"element": {"text": {"size": null}}, "element_nullable": true}}
+                ),
+            ),
+            (
+                DataType::Array {
+                    element: None,
+                    element_nullable: false,
+                },
+                serde_json::json!({"array": {"element": null, "element_nullable": false}}),
+            ),
         ];
         for (variant, expected) in cases {
             let got = serde_json::to_value(&variant).unwrap();
@@ -817,6 +928,13 @@ mod tests {
         assert!(!DataType::Json.cursor_compatible());
         assert!(!DataType::Xml.cursor_compatible());
         assert!(!DataType::Union(vec![DataType::Int32, DataType::Int64]).cursor_compatible());
+        assert!(
+            !DataType::Array {
+                element: Some(Box::new(DataType::Int32)),
+                element_nullable: false,
+            }
+            .cursor_compatible()
+        );
     }
 
     #[test]
@@ -1000,6 +1118,18 @@ mod tests {
             }),
             prop::option::of(1u32..=1024).prop_map(|sz| DataType::Text { size: sz }),
             prop::option::of(1u32..=1024).prop_map(|sz| DataType::Bytes { size: sz }),
+            (
+                prop::option::of(prop_oneof![
+                    Just(DataType::Int32),
+                    Just(DataType::Float64),
+                    Just(DataType::Text { size: None }),
+                ]),
+                any::<bool>(),
+            )
+                .prop_map(|(element, element_nullable)| DataType::Array {
+                    element: element.map(Box::new),
+                    element_nullable,
+                }),
         ]
     }
 
@@ -1012,7 +1142,10 @@ mod tests {
 
     #[test_strategy::proptest(ProptestConfig::with_cases(512))]
     fn cursor_compatible_classification(#[strategy(any_simple_data_type())] t: DataType) {
-        let expected = !matches!(t, DataType::Json | DataType::Xml | DataType::Interval);
+        let expected = !matches!(
+            t,
+            DataType::Json | DataType::Xml | DataType::Interval | DataType::Array { .. }
+        );
         prop_assert_eq!(t.cursor_compatible(), expected);
     }
 

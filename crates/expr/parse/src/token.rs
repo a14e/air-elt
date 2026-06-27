@@ -21,6 +21,8 @@ pub enum Token {
     // Keywords (reserved — never lexed as identifiers)
     If,
     Else,
+    /// Membership operator keyword `in` (`x in arr`). Desugars to `contains`.
+    In,
 
     // Operators
     Plus,
@@ -54,8 +56,11 @@ pub enum Token {
     RParen,
     LBrace,
     RBrace,
+    LBracket, // [ (array literal, subscript)
+    RBracket, // ]
     Comma,
-    Eq, // = (for assignment and object literals)
+    Colon, // : (slice bound separator inside `[a:b]`)
+    Eq,    // = (for assignment and object literals)
     Semicolon,
 
     // End

@@ -190,8 +190,55 @@ pub fn bind_value_separated_pg(
             expected: format!("{dt}"),
             got_kind: "Interval (redis-only type)".to_string(),
         }),
+        Value::Array(items) => bind_double_array(chain, column, dt, items),
         Value::Custom(b) => bind_custom(chain, column, dt, b.as_ref()),
     }
+}
+
+/// Bind a `Value::Array` as a QuestDB `DOUBLE[]` (pg array OID 1022,
+/// `_float8`). QuestDB stores arrays of `DOUBLE` only and elements are
+/// always non-null doubles, so this path accepts exactly a
+/// `DataType::Array { element: Some(Float64), .. }` column whose elements
+/// are non-null `Float64`s. Anything else — a different element type, a
+/// multi-dimensional array, a `Null` element, or a non-double element —
+/// is rejected via [`BindError::UnsupportedType`]. sqlx encodes the
+/// `Vec<f64>` in binary as `_float8`, which is the exact wire shape
+/// QuestDB expects for a `DOUBLE[]` column.
+fn bind_double_array(
+    chain: &mut Separated<'_, '_, Postgres, &str>,
+    column: &str,
+    dt: &DataType,
+    items: &[Value],
+) -> Result<(), BindError> {
+    let is_double_array = matches!(
+        dt,
+        DataType::Array { element: Some(element), .. } if **element == DataType::Float64
+    );
+    if !is_double_array {
+        return Err(BindError::UnsupportedType {
+            column: column.to_string(),
+            expected: format!("{dt}"),
+            got_kind: "Array (QuestDB writes only 1-D DOUBLE[] natively)".to_string(),
+        });
+    }
+    let mut doubles: Vec<f64> = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Value::Float64(f) => doubles.push(*f),
+            other => {
+                return Err(BindError::UnsupportedType {
+                    column: column.to_string(),
+                    expected: format!("{dt}"),
+                    got_kind: format!(
+                        "Array element {} (QuestDB DOUBLE[] elements must be non-null doubles)",
+                        other.variant_name()
+                    ),
+                });
+            }
+        }
+    }
+    chain.push_bind(doubles);
+    Ok(())
 }
 
 fn bind_custom(
@@ -265,6 +312,12 @@ fn bind_null(
         }
         DataType::Ipv4 => {
             chain.push_bind::<Option<String>>(None);
+        }
+        DataType::Array {
+            element: Some(element),
+            ..
+        } if **element == DataType::Float64 => {
+            chain.push_bind::<Option<Vec<f64>>>(None);
         }
         DataType::Custom(t) if is_questdb_native_kind(t.kind()) => {
             chain.push_bind::<Option<String>>(None);
@@ -405,6 +458,82 @@ mod tests {
             &Value::Null,
         )
         .unwrap();
+    }
+
+    /// A `DOUBLE[]` column with non-null `Float64` elements binds as a
+    /// `Vec<f64>` (pg `_float8`) — exactly the wire shape QuestDB expects.
+    #[test]
+    fn binds_double_array() {
+        let dt = DataType::Array {
+            element: Some(Box::new(DataType::Float64)),
+            element_nullable: false,
+        };
+        let f = field("arr", dt, false);
+        let v = Value::Array(vec![Value::Float64(1.0), Value::Float64(2.5)]);
+        run_bind(&f, &v).unwrap();
+    }
+
+    /// An empty `DOUBLE[]` still binds (`Vec<f64>` of length zero).
+    #[test]
+    fn binds_empty_double_array() {
+        let dt = DataType::Array {
+            element: Some(Box::new(DataType::Float64)),
+            element_nullable: false,
+        };
+        let f = field("arr", dt, false);
+        run_bind(&f, &Value::Array(Vec::new())).unwrap();
+    }
+
+    /// A NULL value for a `DOUBLE[]` column binds as `Option::<Vec<f64>>::None`.
+    #[test]
+    fn binds_null_for_double_array() {
+        let dt = DataType::Array {
+            element: Some(Box::new(DataType::Float64)),
+            element_nullable: false,
+        };
+        let f = field("arr", dt, true);
+        run_bind(&f, &Value::Null).unwrap();
+    }
+
+    /// A `Value::Array` against a non-double-array column is rejected:
+    /// QuestDB only stores 1-D `DOUBLE[]`.
+    #[test]
+    fn rejects_array_for_non_double_array_column() {
+        let dt = DataType::Array {
+            element: Some(Box::new(DataType::Int64)),
+            element_nullable: false,
+        };
+        let f = field("arr", dt, false);
+        let v = Value::Array(vec![Value::Int64(1)]);
+        let err = run_bind(&f, &v).unwrap_err();
+        assert!(matches!(err, BindError::UnsupportedType { .. }));
+    }
+
+    /// A `DOUBLE[]` column whose array carries a non-double / null element
+    /// is rejected — QuestDB DOUBLE[] elements must be non-null doubles.
+    #[test]
+    fn rejects_double_array_with_non_double_or_null_element() {
+        let dt = DataType::Array {
+            element: Some(Box::new(DataType::Float64)),
+            element_nullable: false,
+        };
+        let f = field("arr", dt, false);
+        for bad in [
+            Value::Array(vec![Value::Float64(1.0), Value::Int64(2)]),
+            Value::Array(vec![Value::Float64(1.0), Value::Null]),
+            Value::Array(vec![Value::Text("x".to_string())]),
+        ] {
+            let err = run_bind(&f, &bad).unwrap_err();
+            match err {
+                BindError::UnsupportedType { got_kind, .. } => {
+                    assert!(
+                        got_kind.starts_with("Array element"),
+                        "got_kind should name the offending element, got {got_kind}"
+                    );
+                }
+                other => panic!("expected UnsupportedType, got {other:?}"),
+            }
+        }
     }
 
     #[test]

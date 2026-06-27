@@ -10,7 +10,7 @@ use air_elt_core::types::DataType;
 
 use super::types::{PgHllType, PgInetType};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PgType {
     Bool,
     Int2,
@@ -46,6 +46,16 @@ pub enum PgType {
     /// the pipeline; conversions to canonical `Ipv4` / `Ipv6` drop the
     /// mask under operator `truncate=true` opt-in.
     Inet,
+    /// Native PG array of a primitive element (`int4[]`, `text[]`,
+    /// `timestamptz[]`, …). PG reports the column either as `T[]`
+    /// (`data_type`) or as the internal `_T` name (`udt_name`, e.g.
+    /// `_int4`). Restricted to primitive, bindable element types — a
+    /// nested array (`int4[][]` / `__int4`) or a non-primitive element
+    /// resolves to `None` (unsupported) so it falls through to the
+    /// connector's unsupported-type error rather than producing an
+    /// `Array(Array(..))` we cannot bind. Maps to canonical
+    /// [`DataType::Array`].
+    Array(Box<PgType>),
 }
 
 impl PgType {
@@ -55,8 +65,21 @@ impl PgType {
     /// timestamps — they silently shift when the session `TimeZone` GUC
     /// changes. Operators must migrate to `timestamptz`. Explicit tz-aware
     /// transforms can be reintroduced once the `transform` feature lands.
+    ///
+    /// Native array columns are recognised in both forms PG introspection
+    /// produces: the `T[]` shape from the `data_type` column and the
+    /// internal `_T` shape from the `udt_name` column. The element type is
+    /// resolved through the same scalar table and must be a primitive we
+    /// can bind — nested arrays and non-primitive elements are rejected.
     pub fn parse(name: &str) -> Option<Self> {
         let norm = name.trim().to_ascii_lowercase();
+        if let Some(element_name) = array_element_name(&norm) {
+            let element = PgType::parse(element_name)?;
+            if !element.is_array_element() {
+                return None;
+            }
+            return Some(PgType::Array(Box::new(element)));
+        }
         let result = match norm.as_str() {
             "bool" | "boolean" => PgType::Bool,
             "int2" | "smallint" => PgType::Int2,
@@ -89,6 +112,46 @@ impl PgType {
         };
         Some(result)
     }
+
+    /// Whether this type may serve as a native PG array element. Restricted
+    /// to the primitives the binder/decoder can encode as `Vec<Option<T>>`.
+    /// Excludes `bytea` (no `Vec<Option<Vec<u8>>>` array codec wired in),
+    /// `xml`/`hll`/`inet`/`json`/`jsonb` (each needs a dedicated cast or
+    /// codec the array path does not carry), and arrays themselves
+    /// (nested arrays are unsupported).
+    fn is_array_element(&self) -> bool {
+        matches!(
+            self,
+            PgType::Bool
+                | PgType::Int2
+                | PgType::Int4
+                | PgType::Int8
+                | PgType::Float4
+                | PgType::Float8
+                | PgType::Text
+                | PgType::Varchar
+                | PgType::Bpchar
+                | PgType::Date
+                | PgType::TimestampTz
+                | PgType::Uuid
+                | PgType::Numeric
+        )
+    }
+}
+
+/// Extract the element type-name from a native PG array spelling, or `None`
+/// when `name` is not an array. Handles the two introspection forms:
+/// * `data_type` column: `<element>[]` (a single trailing `[]`; a multi-dim
+///   `<element>[][]` leaves an inner `[]` that fails to re-parse, so nested
+///   arrays correctly resolve to unsupported).
+/// * `udt_name` column: `_<element>` (single leading underscore; the
+///   double-underscore `__<element>` of a nested array leaves a leading
+///   underscore that fails to re-parse).
+fn array_element_name(name: &str) -> Option<&str> {
+    if let Some(element) = name.strip_suffix("[]") {
+        return Some(element.trim());
+    }
+    name.strip_prefix('_')
 }
 
 /// Map a PG type to the canonical `DataType`.
@@ -143,6 +206,18 @@ pub fn to_internal(
         PgType::Xml => DataType::Xml,
         PgType::Hll => DataType::Custom(Box::new(PgHllType)),
         PgType::Inet => DataType::Custom(Box::new(PgInetType)),
+        // Native array: map the element through the same table. PG reports
+        // the element's length / precision / scale modifiers on the array
+        // column row, so the same args apply to the element conversion.
+        // PG arrays always permit NULL elements, hence `element_nullable`.
+        PgType::Array(element) => {
+            let element_type =
+                to_internal(*element, char_max_length, numeric_precision, numeric_scale);
+            DataType::Array {
+                element: Some(Box::new(element_type)),
+                element_nullable: true,
+            }
+        }
     }
 }
 
@@ -235,6 +310,76 @@ mod tests {
                 scale: None
             }
         );
+    }
+
+    #[test]
+    fn array_parses_from_both_introspection_forms() {
+        // `data_type` column form
+        assert_eq!(
+            PgType::parse("int4[]"),
+            Some(PgType::Array(Box::new(PgType::Int4)))
+        );
+        assert_eq!(
+            PgType::parse("text[]"),
+            Some(PgType::Array(Box::new(PgType::Text)))
+        );
+        // `udt_name` column form
+        assert_eq!(
+            PgType::parse("_int4"),
+            Some(PgType::Array(Box::new(PgType::Int4)))
+        );
+        assert_eq!(
+            PgType::parse("_timestamptz"),
+            Some(PgType::Array(Box::new(PgType::TimestampTz)))
+        );
+        assert_eq!(
+            PgType::parse("_numeric"),
+            Some(PgType::Array(Box::new(PgType::Numeric)))
+        );
+    }
+
+    #[test]
+    fn array_maps_to_data_type_array_with_nullable_elements() {
+        assert_eq!(
+            to_internal(PgType::Array(Box::new(PgType::Int4)), None, None, None),
+            DataType::Array {
+                element: Some(Box::new(DataType::Int32)),
+                element_nullable: true,
+            }
+        );
+        // numeric element carries its precision/scale through
+        assert_eq!(
+            to_internal(
+                PgType::Array(Box::new(PgType::Numeric)),
+                None,
+                Some(10),
+                Some(2)
+            ),
+            DataType::Array {
+                element: Some(Box::new(DataType::Decimal {
+                    precision: Some(10),
+                    scale: Some(2),
+                })),
+                element_nullable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn nested_array_is_unsupported() {
+        // Multi-dimensional arrays are not bindable; both spellings reject.
+        assert!(PgType::parse("int4[][]").is_none());
+        assert!(PgType::parse("__int4").is_none());
+    }
+
+    #[test]
+    fn array_of_unsupported_element_is_none() {
+        // `bytea[]` / `json[]` / `inet[]` have no array codec wired in.
+        assert!(PgType::parse("bytea[]").is_none());
+        assert!(PgType::parse("_bytea").is_none());
+        assert!(PgType::parse("json[]").is_none());
+        assert!(PgType::parse("_inet").is_none());
+        assert!(PgType::parse("xml[]").is_none());
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod signature;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use arithmetic_utils::array_element_join;
 pub use cache::ExprCaches;
 pub use error::FuncError;
 pub use registry::{FuncRef, FunctionRegistry};

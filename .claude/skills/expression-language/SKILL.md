@@ -32,7 +32,7 @@ Operators (in precedence order, low to high; binary operators are left-associati
 - `|` bitwise OR
 - `^` bitwise XOR
 - `&` bitwise AND
-- `==`, `!=`, `<`, `>`, `<=`, `>=` comparison — **non-associative** (`a < b < c` is a parse error; parenthesize)
+- `==`, `!=`, `<`, `>`, `<=`, `>=`, `in` comparison/membership — **non-associative** (`a < b < c` and `a in b in c` are parse errors; parenthesize). `x in arr` desugars to `contains(arr, x)` (note the swapped operands). `in` is a **reserved keyword** — `in = 5` is a parse error.
 - `<<`, `>>` shift
 - `+`, `-` additive
 - `*`, `/`, `%` multiplicative
@@ -42,10 +42,22 @@ Operators (in precedence order, low to high; binary operators are left-associati
 The parser is precedence-climbing (one `PrattOperator` table in `pratt_operator.rs`), so deeply nested expressions stay shallow on the native stack and the depth guard (`MAX_EXPR_DEPTH`) returns a clean error instead of overflowing.
 
 Function calls: `name(arg1, arg2, ...)`.
-Object literals: `{ "key" = expr, "other" = expr }`. An object literal evaluates to a `Value::Object` (ordered key/value list, type `DataType::Object`) — the only producer of `Value::Object` in the language, and what the `object*` functions consume. Values keep their canonical types (an `Int64` field stays `Int64`, not a JSON number). A repeated key is a **compile-time error** (rejected in the optimizer's converter, before const-folding can collapse the literal). Arrays have no `Value` variant — a nested array value is carried as `Value::Json(Array)`.
+Object literals: `{ "key" = expr, "other" = expr }`. An object literal evaluates to a `Value::Object` (ordered key/value list, type `DataType::Object`) — the only producer of `Value::Object` in the language, and what the `object*` functions consume. Values keep their canonical types (an `Int64` field stays `Int64`, not a JSON number). A repeated key is a **compile-time error** (rejected in the optimizer's converter, before const-folding can collapse the literal).
+
+Array literals: `[a, b, c]` / `[]` (trailing comma allowed). Evaluates to `Value::Array` (type `DataType::Array`). See **Arrays** below.
 String interpolation: `"prefix {expr} suffix"`.
 
 Comments: `#` starts a line comment that runs to the end of the line (a trailing comment on a statement or a whole comment line). The newline is preserved, so a comment never merges two statements. A `#` inside a string literal (`'a # b'`, `"#fff"`) is a literal character, not a comment — only top-level expression source (and `{...}` interpolation segments) treats `#` as a comment.
+
+## Arrays
+
+The array type is **Java-style generic**: the element type is fixed at compile time, the container is dynamic at runtime, and the element type is erased to a marker at the sink boundary. `DataType::Array { element: Option<Box<DataType>>, element_nullable }` with runtime payload `Value::Array(Vec<Value>)`. The empty literal `[]` has unknown element type (`element = None`) and unifies with any concrete element; a literal `null` element contributes nullability but not a concrete type. **`element_nullable` lives in `DataType`** (not only on the expr-layer `NullableExprType`) so the `Array(T)` vs `Array(Nullable(T))` distinction survives to a sink that sees only the canonical `DataType` (ClickHouse needs it). Arrays are not cursor / switch / dedup / conflict keys (`Key::from_value` rejects them); `MAX_ARRAY_LEN` (100 000) caps concatenation. PG always reports array elements as nullable, so to feed a non-null-element sink (`Array(Int32)`, QuestDB `DOUBLE[]`) either set `truncate=true` (drops `Null` members at conversion) or use `filterNotNull` (explicit, lossless type collapse) — see [type-algebra.md](references/type-algebra.md).
+
+**Syntax** (all parser-level desugarings into builtins — `crates/expr/parse/src/parser.rs`):
+- Literal: `[a, b, c]` / `[]`.
+- Strict index: `x[i]` → `element(x, i)`. Negative indices count from the end; out of bounds is a **runtime error** (not null).
+- Slice: `x[a:b]` / `x[a:]` / `x[:b]` / `x[:]` → `slice(x, a, b)` (an omitted bound becomes a `null` literal = open). Python clamp semantics: negative bounds offset from the end, bounds clamp into range, `start ≥ end` yields empty. A second `:` (slice step) is unsupported. Works on `Text` (by char) and `Bytes` (by byte) too.
+- Membership: `x in arr` → `contains(arr, x)`.
 
 ## Detection rules
 
@@ -68,7 +80,9 @@ Config format matters for expression quoting: in YAML, expressions need no outer
 - Non-integer types carry `int_bound = None`.
 - Materialization picks the smallest `DataType` that fits the bound (Int8/16/32/64 or BigInt).
 
-`Value` implements cross-numeric `PartialEq` and `PartialOrd` via `compare::values_equal` and `compare::compare_values` -- `Int8(5) == Int64(5)` is true, `Int64(3) < BigInt(10)` works. Null==Null returns true for equality. Json/Object use structural equality. Ipv4 and Ipv6 support cross-comparison (v4 maps to v6). NaN comparisons follow IEEE 754 (NaN != NaN).
+`Value::Array(Vec<Value>)` is the runtime array payload (type `DataType::Array { element, element_nullable }`); the element type is a compile-time fact on the *type*, erased at the sink boundary (see **Arrays** above). Element equality is cross-numeric (`array_contains` / `array_position` use `values_equal`, so an `Int32` needle matches an `Int64` element).
+
+`Value` implements cross-numeric `PartialEq` and `PartialOrd` via `compare::values_equal` and `compare::compare_values` -- `Int8(5) == Int64(5)` is true, `Int64(3) < BigInt(10)` works. Null==Null returns true for equality. Json/Object/Array use structural equality. Ipv4 and Ipv6 support cross-comparison (v4 maps to v6). NaN comparisons follow IEEE 754 (NaN != NaN).
 
 `Key` newtype (in `crates/types/src/key.rs`) wraps `SmallVec<[Value; 2]>` for switch dispatch, batch dedup, and cursor comparison. Unlike `Value`, `Key` has total ordering (`Ord`) and total equality (`Eq`) -- NaN == NaN by design so keys are deterministic. Construction rejects Null/Json/Object and canonicalises representation (small ints promote to Int64, Float32 widens to Float64).
 
@@ -77,7 +91,8 @@ Config format matters for expression quoting: in YAML, expressions need no outer
 Type algebra fixes a function's output `DataType` at type-check time (before evaluation), in `crates/expr/funcs/src/arithmetic_utils.rs` and each `resolve_type`. The load-bearing rules:
 
 - **Arithmetic** promotes by `int_bound` bit-width (add/sub `max+1`, mul `a+b`, div `a`, mod `min`), staying `Int64` until bits exceed 64 then `BigInt{width}`; mixed int/float → `Float64`, anything with `Decimal` → `Decimal`. `negate`/`abs` preserve type; `ceil`/`floor`/`round`/`sign` → `Int64`; `power`/`sqrt` → `Float64`. `power` (`**`) always evaluates as `Float64`; the optimizer reduces only the exact float identities `x ** 1 → x` and `x ** 0 → 1.0` (the latter gated on a non-null, infallible base), and deliberately leaves `x ** 2`/`x ** 3` as `power` calls because `powf` is not portably bit-equal to repeated multiplication.
-- **String functions** return `Text` (`length`/`indexOf` → `Int64`; `startsWith`/`endsWith`/`contains` → `Bool`) and are **strict** — a non-text argument is a `TypeMismatch`, never silently stringified (`trim(1)`, `concat(x, 5)` are errors). Stringify explicitly with `toString`; interpolation (`"{expr}"`) renders any type via `value_to_string`, not through `concat`. The optimizer turns `concat(x, "")` / `concat(x)` into a `TypeAssert{String}`.
+- **String functions** return `Text` (`indexOf` → `Int64`; `startsWith`/`endsWith`/`contains` → `Bool`) and are **strict** — a non-text argument is a `TypeMismatch`, never silently stringified (`trim(1)`, `concat(x, 5)` are errors). Stringify explicitly with `toString`; interpolation (`"{expr}"`) renders any type via `value_to_string`, not through `concat`. The optimizer turns `concat(x, "")` / `concat(x)` into a `TypeAssert{String}`.
+- **Array element unification** (`array_element_join` in `arithmetic_utils.rs`) fixes the element type when arrays combine (`+` / `concat`): identical types collapse; an unknown side (`[]` → `None`) yields the other; otherwise the two must be matrix-compatible (numeric widening, …) and the wider type wins; incompatible → `TypeMismatch`. Polymorphic builtins (`len`, `slice`, `element`, `contains`, `indexOf`, `reverse`, `concat`, `+`) resolve their array output type from the element. `len` on a scalar is a **compile-time** error; on a JSON scalar a runtime error.
 - **Comparisons** return total **non-null `Bool`**: `==`/`!=` treat null as a value (`null==null`→true, so `x==null` is a real null test); `<`/`>`/`<=`/`>=` return `false` on any null operand. They never leak null into `&&`/`||`/`if`.
 - **`min`/`max`** skip NULL arguments (SQL semantics) and yield NULL only when *every* argument is NULL — so the result is nullable exactly when every argument is nullable (one non-null argument forces a non-null result). The optimizer exploits this: it drops NULL-literal arguments (`max(a, null, b)` → `max(a, b)`) and saturates against an integer operand's type bound (`max(x, TYPE_MAX)` → `TYPE_MAX`, `min(x, TYPE_MIN)` → `TYPE_MIN`).
 - **Casts** return their target type. **Conditionals** (`if`/`multiIf`/`ifNull`/`nullIf`, resolved in `type_resolver.rs`) take the first/value branch's type with per-form nullability and **drop `int_bound`** (branch merge calls `NullableExprType::new`, so integer arithmetic on a conditional's result falls back to DataType-level bits — e.g. `if(...)+1` over Int64 promotes to BigInt); an `if`/`else if` chain — in either surface form, nested `if(...)` calls or `if (c) ... else if ...` expressions — folds to a flat `multiIf` at parse time (bounded by `MAX_AST_NODES`, not depth), and a large equality `multiIf` over 1–2 pure keys lowers to an O(1) `Switch`.
@@ -91,23 +106,26 @@ All functions are registered as static items implementing `ExprFunction`. Brief 
 | Category | Functions |
 |---|---|
 | Conditional | `if`, `multiIf`, `ifNull`, `nullIf`, `coalesce`, `isNull`, `isNotNull` |
-| String | `concat`, `length`, `substring`, `charAt`, `upper`, `lower`, `trim`, `replace`, `startsWith`, `endsWith`, `contains`, `indexOf`, `format`, `toString`, `reverse`, `repeat`, `leftPad`, `rightPad` |
+| String | `concat`, `charAt`, `upper`, `lower`, `trim`, `replace`, `startsWith`, `endsWith`, `contains`, `indexOf`, `format`, `toString`, `reverse`, `repeat`, `leftPad`, `rightPad`, `split` |
+| Array | `len`, `slice`, `element`, `arrayGet`, `join`, `isEmpty`, `filterNotNull` (+ polymorphic `contains`, `indexOf`, `reverse`, `concat`, `+`) |
 | Arithmetic | `add`, `subtract`, `multiply`, `divide`, `modulo`, `negate`, `abs`, `ceil`, `floor`, `round`, `min`, `max`, `sign`, `power`, `sqrt` |
 | Math | trig, hyperbolic, logarithmic, constants, special (`erf`, `gamma`, `lambertW`, `beta`) |
 | Comparison | `equals`, `notEquals`, `greater`, `less`, `greaterOrEquals`, `lessOrEquals` |
 | Logical | `and`, `or`, `not` |
 | Cast | `toStringCast`, `toInt8`..`toInt64`, `toUInt8`..`toUInt64`, `toFloat32`, `toFloat64`, `toBool`, `toDate`, `toTimestamp`, `toUuid`, `toBigInt`, `toDecimal` |
 | Datetime | `now`, `today`, extraction (`second`..`year`, `dayOfWeek`, `dayOfYear`), conversion (`toSeconds`, `toMillis`, `fromSeconds`, `fromMillis`), arithmetic (`addDays`..`addYears`, `subtractDays`..`subtractYears`), `dateDiff`, `formatDateTime` |
-| Bytes | `byteLength`, `byteAt`, `byteSlice`, `bytesFromHex`, `bytesFromBase64`, `bytesFromUtf8`, `hex`, `base64`, `base64Url`, `bytesEqual`, `urlEncode`, `urlDecode` |
+| Bytes | `byteLength`, `byteAt`, `bytesFromHex`, `bytesFromBase64`, `bytesFromUtf8`, `hex`, `base64`, `base64Url`, `bytesEqual`, `urlEncode`, `urlDecode` |
 | Encoding | `encode`, `decode`, `encodeText`, `decodeText` |
 | Crypto | `md5`, `sha1`, `sha256`, `sha512`, `xxHash64`, `xxHash32`, `cityHash64`, `hmac` |
-| JSON | `parseJson`, `toJson`, `jsPath`, `jsPathString`, `jsPathInt`, `jsPathFloat`, `jsPathBool`, `jsonLength` |
-| Object | `objectLength`, `objectKeys`, `objectValues`, `objectHasKey`, `objectGet` |
+| JSON | `parseJson`, `toJson`, `jsPath`, `jsPathString`, `jsPathInt`, `jsPathFloat`, `jsPathBool` |
+| Object | `objectKeys`, `objectValues`, `objectHasKey`, `objectGet` |
 | Regex | `regexMatch`, `regexReplace` |
 | Random | `randomUuid`, `randomInt`, `randomFloat`, `randomAlphanumeric`, `randomHex`, `randomBytes`, `randomChoice` |
 | Bitwise | `bitAnd`, `bitOr`, `bitXor`, `bitNot`, `bitShiftLeft`, `bitShiftRight`, `bitCount` |
 | Env | `env` (1 or 2 args) |
 | Misc | `typeof` |
+
+**Removed (replaced by the polymorphic Array builtins):** `length`, `objectLength`, `jsonLength` → `len`; `substring`, `byteSlice` → `slice`. `byteLength` stays.
 
 ## Crate structure
 

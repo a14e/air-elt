@@ -25,6 +25,11 @@ pub const MAX_BIGINT_WIDTH: u32 = 1_024;
 /// Maximum byte length for string values produced by expression evaluation.
 pub const MAX_EXPR_STRING_BYTES: usize = 1_048_576;
 
+/// Maximum number of elements in an array value produced by expression
+/// evaluation. Bounds `concat` / `add`-array concatenation so a runaway
+/// expression cannot allocate an unbounded list.
+pub const MAX_ARRAY_LEN: usize = 100_000;
+
 /// Maximum byte length for expression source files.
 pub const MAX_EXPR_FILE_BYTES: usize = 1_048_576;
 

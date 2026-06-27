@@ -237,6 +237,13 @@ impl<'a> TypedRewriteDriver<'a> {
                     .map(|s| self.rewrite(s, map, changed))
                     .collect(),
             ),
+            OptExpr::Array(id, elements) => OptExpr::Array(
+                id,
+                elements
+                    .into_iter()
+                    .map(|element| self.rewrite(element, map, changed))
+                    .collect(),
+            ),
             OptExpr::Object(id, entries) => OptExpr::Object(
                 id,
                 entries

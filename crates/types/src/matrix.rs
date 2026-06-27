@@ -195,6 +195,31 @@ pub fn is_compatible(source_t: DataType, sink_t: DataType) -> bool {
         // Object → Text (unbounded): serialize as JSON string
         (Object, Text { size: None }) => true,
 
+        // Array → Json / unbounded Text: serialise as a JSON array. The
+        // sink driver writes it into a jsonb/json/text column. Native
+        // array sinks (PG `T[]`, CH `Array(T)`, QuestDB `DOUBLE[]`) match
+        // the `Array → Array` arm below.
+        (Array { .. }, Json) => true,
+        (Array { .. }, Text { size: None }) => true,
+        // Array → Array: element type and element-nullability must be
+        // compatible (recursively). An empty/unknown element is a wildcard.
+        (
+            Array {
+                element: source_element,
+                element_nullable: source_nullable,
+            },
+            Array {
+                element: sink_element,
+                element_nullable: sink_nullable,
+            },
+        ) => array_element_compatible(
+            &source_element,
+            source_nullable,
+            &sink_element,
+            sink_nullable,
+            false,
+        ),
+
         // Any scalar / binary / temporal value renders losslessly to an
         // UNBOUNDED text sink via its canonical string form (Bytes → hex,
         // Timestamp → RFC 3339, numbers → decimal, Bool → true/false, …). The
@@ -338,6 +363,27 @@ pub fn is_compatible_with_truncate(source_t: DataType, sink_t: DataType) -> bool
         (Json, Object) => true,
         // Object → Text(n) with truncate: serialize as JSON, may exceed size
         (Object, Text { size: Some(_) }) => true,
+        // Array → bounded Text(n) with truncate: the JSON rendering may
+        // exceed `n`. (Unbounded `Array → Text(None)` and `Array → Json`
+        // are lossless, handled by the super-relation short-circuit.)
+        (Array { .. }, Text { size: Some(_) }) => true,
+        // Array → Array with element narrowing unlocked by truncate.
+        (
+            Array {
+                element: source_element,
+                element_nullable: source_nullable,
+            },
+            Array {
+                element: sink_element,
+                element_nullable: sink_nullable,
+            },
+        ) => array_element_compatible(
+            &source_element,
+            source_nullable,
+            &sink_element,
+            sink_nullable,
+            true,
+        ),
         // Any scalar / binary / temporal → bounded Text(n): the canonical
         // rendering may exceed `n`, so the cut needs `truncate` consent.
         // (Unbounded `* → Text(None)` is lossless in `is_compatible` above.)
@@ -420,6 +466,38 @@ fn fits_size(source: Option<u32>, sink: Option<u32>) -> bool {
     }
 }
 
+/// `Array` element compatibility for the `(Array, Array)` matrix arms.
+///
+/// A nullable source element landing in a non-nullable sink element needs
+/// consent: lossless rejects it, but `truncate` opts in — the conversion
+/// then drops the `Null` members (see `convert/dispatch.rs`), the same
+/// "I accept the loss" contract as every other truncate narrowing.
+/// An empty/unknown element on either side is a wildcard: `[]`
+/// (`element = None`) fits any concrete sink, and a sink with an unknown
+/// element accepts anything. Concrete element pairs delegate to the scalar
+/// matrix (`is_compatible` / `is_compatible_with_truncate`).
+fn array_element_compatible(
+    source_element: &Option<Box<DataType>>,
+    source_nullable: bool,
+    sink_element: &Option<Box<DataType>>,
+    sink_nullable: bool,
+    truncate: bool,
+) -> bool {
+    if source_nullable && !sink_nullable && !truncate {
+        return false;
+    }
+    match (source_element, sink_element) {
+        (None, _) | (_, None) => true,
+        (Some(source), Some(sink)) => {
+            if truncate {
+                is_compatible_with_truncate((**source).clone(), (**sink).clone())
+            } else {
+                is_compatible((**source).clone(), (**sink).clone())
+            }
+        }
+    }
+}
+
 pub fn is_narrowing(source_t: DataType, sink_t: DataType) -> bool {
     use DataType::*;
     // Union: narrowing iff every variant is narrowing into the sink.
@@ -453,6 +531,33 @@ pub fn is_narrowing(source_t: DataType, sink_t: DataType) -> bool {
     // hint rather than `UnsupportedCast`.
     if matches!((&source_t, &sink_t), (Decimal { .. }, Float64 | Float32)) {
         return true;
+    }
+    // Array → Array narrowing. Dropping a nullable source element into a
+    // non-null sink element is narrowing (the `Null` members are cut under
+    // truncate; see `array_element_compatible`). Otherwise it narrows iff the
+    // element type narrows — giving the validator the "enable truncate" hint
+    // for e.g. `Array<Int64> → Array<Int32>` rather than a generic
+    // unsupported-cast error.
+    if let (
+        Array {
+            element: source_element,
+            element_nullable: source_nullable,
+        },
+        Array {
+            element: sink_element,
+            element_nullable: sink_nullable,
+        },
+    ) = (&source_t, &sink_t)
+    {
+        if *source_nullable && !*sink_nullable {
+            return true;
+        }
+        return match (source_element, sink_element) {
+            (Some(source_element), Some(sink_element)) => {
+                is_narrowing((**source_element).clone(), (**sink_element).clone())
+            }
+            _ => false,
+        };
     }
     matches!(
         (source_t, sink_t),
@@ -1224,6 +1329,87 @@ mod tests {
     fn narrowing_distinct_unrelated_pair_returns_false() {
         assert!(!is_narrowing(DataType::Json, DataType::Bool));
         assert!(!is_narrowing(DataType::Date, DataType::Timestamp));
+    }
+
+    // ---- Array matrix coverage -------------------------------------
+
+    fn arr(element: Option<DataType>, element_nullable: bool) -> DataType {
+        DataType::Array {
+            element: element.map(Box::new),
+            element_nullable,
+        }
+    }
+
+    #[test]
+    fn array_to_json_and_unbounded_text_lossless() {
+        assert!(is_compatible(
+            arr(Some(DataType::Int32), false),
+            DataType::Json
+        ));
+        assert!(is_compatible(
+            arr(Some(DataType::Text { size: None }), true),
+            TEXT
+        ));
+        // Bounded text needs truncate consent.
+        assert!(!is_compatible(arr(Some(DataType::Int32), false), text(5)));
+        assert!(is_compatible_with_truncate(
+            arr(Some(DataType::Int32), false),
+            text(5)
+        ));
+    }
+
+    #[test]
+    fn array_identity_and_element_widening() {
+        let i32_arr = arr(Some(DataType::Int32), false);
+        assert!(is_compatible(i32_arr.clone(), i32_arr));
+        // Element widening Int8 → Int64.
+        assert!(is_compatible(
+            arr(Some(DataType::Int8), false),
+            arr(Some(DataType::Int64), false)
+        ));
+    }
+
+    #[test]
+    fn array_element_narrowing_needs_truncate() {
+        let src = arr(Some(DataType::Int64), false);
+        let dst = arr(Some(DataType::Int32), false);
+        assert!(!is_compatible(src.clone(), dst.clone()));
+        assert!(is_compatible_with_truncate(src.clone(), dst.clone()));
+        assert!(is_narrowing(src, dst));
+    }
+
+    #[test]
+    fn array_element_nullability_rules() {
+        // nullable element → non-null element: rejected losslessly, but
+        // `truncate` opts in (the NULL members are dropped at conversion), so
+        // it is classified as narrowing.
+        let nullable_src = arr(Some(DataType::Int32), true);
+        let non_null_dst = arr(Some(DataType::Int32), false);
+        assert!(!is_compatible(nullable_src.clone(), non_null_dst.clone()));
+        assert!(is_compatible_with_truncate(
+            nullable_src.clone(),
+            non_null_dst.clone()
+        ));
+        assert!(is_narrowing(nullable_src, non_null_dst));
+        // Same when the sink element type is unknown (wildcard) but non-null.
+        assert!(is_compatible_with_truncate(
+            arr(Some(DataType::Int32), true),
+            arr(None, false)
+        ));
+        // non-null element → nullable element: allowed (widening).
+        assert!(is_compatible(
+            arr(Some(DataType::Int32), false),
+            arr(Some(DataType::Int32), true)
+        ));
+    }
+
+    #[test]
+    fn array_empty_element_is_wildcard() {
+        // `[]` (element None) fits any concrete element array.
+        assert!(is_compatible(
+            arr(None, false),
+            arr(Some(DataType::Int32), false)
+        ));
     }
 
     // ---- Union (Mongo heterogeneous source field) ------------------

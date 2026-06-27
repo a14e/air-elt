@@ -6,8 +6,9 @@
 //! the user's table definition, not by the sink.
 //!
 //! All writes go over QuestDB's Postgres-wire surface. Each INSERT is
-//! chunked to stay under QuestDB 8.2.3's `parameterCount=-2` bug at
-//! ~9_300 bound parameters — see [`crate::pg_writer::QDB_PG_MAX_BIND_PARAMS`].
+//! chunked to a conservative per-statement cap that also stayed under
+//! QuestDB 8.2.x's `parameterCount=-2` bug at ~9_300 bound parameters —
+//! see [`crate::pg_writer::QDB_PG_MAX_BIND_PARAMS`].
 //!
 //! ## WAL-apply visibility
 //!
@@ -301,6 +302,13 @@ pub fn type_supported(dt: &DataType) -> bool {
         | DataType::Ipv4
         | DataType::Json => true,
         DataType::Custom(t) => is_questdb_native_kind(t.kind()),
+        // QuestDB stores arrays of DOUBLE only — a 1-D `DOUBLE[]` maps to
+        // `Array { element: Some(Float64), .. }`. Any other element type
+        // (and multi-dimensional arrays, which never parse to this shape)
+        // is not natively writable.
+        DataType::Array { element, .. } => {
+            matches!(element, Some(inner) if **inner == DataType::Float64)
+        }
         // BigInt/Decimal need an explicit truncate to Float64 in the
         // mapping; raw BigInt/Decimal cannot land in a QuestDB column.
         DataType::BigInt { .. } | DataType::Decimal { .. } => false,

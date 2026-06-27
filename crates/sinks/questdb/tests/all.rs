@@ -1,3 +1,4 @@
+mod arrays;
 mod basic;
 mod corner_cases;
 mod errors;

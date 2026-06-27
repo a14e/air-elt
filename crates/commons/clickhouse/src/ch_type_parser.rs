@@ -344,12 +344,25 @@ impl<'a> Parser<'a> {
                     kind,
                 })))
             }
+            // `Array(<primitive>)` / `Array(Nullable(<primitive>))` map onto
+            // the canonical `DataType::Array`, so the value travels as a
+            // `Value::Array` through the conversion matrix and the RowBinary
+            // encoder. Non-primitive element types (Tuple / Nested /
+            // Array-of-Array / Map / aggregate / CH custom scalars) keep the
+            // `Custom(ChArrayType)` carrier with its JSON pivot.
             "Array" => {
                 let (inner, nullable) = self.parse_single_type_arg("Array")?;
-                Ok(DataType::Custom(Box::new(ChArrayType {
-                    element: inner,
-                    element_nullable: nullable,
-                })))
+                if is_canonical_array_element(&inner) {
+                    Ok(DataType::Array {
+                        element: Some(Box::new(inner)),
+                        element_nullable: nullable,
+                    })
+                } else {
+                    Ok(DataType::Custom(Box::new(ChArrayType {
+                        element: inner,
+                        element_nullable: nullable,
+                    })))
+                }
             }
             "Map" => {
                 let ((key, key_nullable), (value, value_nullable)) =
@@ -748,6 +761,37 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Whether a parsed `Array` element type is a canonical scalar that the
+/// conversion matrix and the RowBinary encoder handle directly as a
+/// `Value::Array` member. Composite shapes (`Array` / `Tuple` / `Map`) and
+/// CH custom carriers (Int128, FixedString, Enum, aggregate state, …) stay
+/// on the `Custom(ChArrayType)` path with its JSON pivot, so they are
+/// excluded here.
+fn is_canonical_array_element(element: &DataType) -> bool {
+    matches!(
+        element,
+        DataType::Bool
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Text { .. }
+            | DataType::Bytes { .. }
+            | DataType::Date
+            | DataType::Timestamp
+            | DataType::Uuid
+            | DataType::Ipv4
+            | DataType::Ipv6
+            | DataType::Decimal { .. }
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -915,16 +959,6 @@ mod tests {
 
     #[test]
     fn composites_parse_to_custom_types() {
-        // Array(String) → Custom(ChArrayType { element: Text })
-        let arr = parse("Array(String)").data_type;
-        match &arr {
-            DataType::Custom(t) => {
-                assert_eq!(t.kind(), "clickhouse.array");
-                assert_eq!(t.display(), "Array(text)");
-            }
-            _ => panic!("expected Custom, got {arr:?}"),
-        }
-
         // Map(String, Array(UInt64)) → nested custom types
         let map = parse("Map(String, Array(UInt64))").data_type;
         match &map {
@@ -976,18 +1010,6 @@ mod tests {
 
     #[test]
     fn nullable_inside_composites() {
-        // Array(Nullable(Int32)) — element_nullable = true
-        let arr = parse("Array(Nullable(Int32))").data_type;
-        match &arr {
-            DataType::Custom(t) => {
-                assert_eq!(t.kind(), "clickhouse.array");
-                let arr_ty = t.as_any().downcast_ref::<ChArrayType>().unwrap();
-                assert!(arr_ty.element_nullable);
-                assert_eq!(arr_ty.element, DataType::Int32);
-            }
-            _ => panic!("expected Custom(Array), got {arr:?}"),
-        }
-
         // Map(String, Nullable(Int32)) — value_nullable = true
         let map = parse("Map(String, Nullable(Int32))").data_type;
         match &map {
@@ -1022,6 +1044,57 @@ mod tests {
                 assert!(!tup_ty.fields[1].1);
             }
             _ => panic!("expected Custom(Tuple), got {named_tup:?}"),
+        }
+    }
+
+    #[test]
+    fn array_of_primitive_maps_to_canonical() {
+        // Array(Int32) → canonical DataType::Array { element: Int32 }.
+        let arr = parse("Array(Int32)").data_type;
+        assert_eq!(
+            arr,
+            DataType::Array {
+                element: Some(Box::new(DataType::Int32)),
+                element_nullable: false,
+            }
+        );
+
+        // Array(Nullable(String)) → canonical, element_nullable = true.
+        let nullable = parse("Array(Nullable(String))").data_type;
+        assert_eq!(
+            nullable,
+            DataType::Array {
+                element: Some(Box::new(DataType::Text { size: None })),
+                element_nullable: true,
+            }
+        );
+
+        // Array(String) → canonical String element.
+        let strings = parse("Array(String)").data_type;
+        assert_eq!(
+            strings,
+            DataType::Array {
+                element: Some(Box::new(DataType::Text { size: None })),
+                element_nullable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn array_of_non_primitive_keeps_custom_carrier() {
+        // Array(Tuple(...)) is not a primitive element — stays on the
+        // Custom(ChArrayType) JSON-pivot path.
+        let nested = parse("Array(Tuple(Int32, String))").data_type;
+        match &nested {
+            DataType::Custom(t) => assert_eq!(t.kind(), "clickhouse.array"),
+            _ => panic!("expected Custom(Array), got {nested:?}"),
+        }
+
+        // Array(Array(Int32)) — element is itself an array, not a scalar.
+        let array_of_array = parse("Array(Array(Int32))").data_type;
+        match &array_of_array {
+            DataType::Custom(t) => assert_eq!(t.kind(), "clickhouse.array"),
+            _ => panic!("expected Custom(Array), got {array_of_array:?}"),
         }
     }
 

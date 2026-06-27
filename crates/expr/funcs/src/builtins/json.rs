@@ -14,7 +14,6 @@ static JS_PATH_STRING: JsPathStringFunc = JsPathStringFunc;
 static JS_PATH_INT: JsPathIntFunc = JsPathIntFunc;
 static JS_PATH_FLOAT: JsPathFloatFunc = JsPathFloatFunc;
 static JS_PATH_BOOL: JsPathBoolFunc = JsPathBoolFunc;
-static JSON_LENGTH: JsonLengthFunc = JsonLengthFunc;
 
 pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&PARSE_JSON);
@@ -24,7 +23,6 @@ pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&JS_PATH_INT);
     registry.register(&JS_PATH_FLOAT);
     registry.register(&JS_PATH_BOOL);
-    registry.register(&JSON_LENGTH);
 }
 
 /// Warms / validates a constant path argument (index 1) through the cache.
@@ -480,62 +478,6 @@ impl ExprFunction for JsPathBoolFunc {
     }
 }
 
-struct JsonLengthFunc;
-
-impl ExprFunction for JsonLengthFunc {
-    fn is_pure(&self) -> bool {
-        true
-    }
-
-    fn name(&self) -> &str {
-        "jsonLength"
-    }
-
-    fn min_args(&self) -> usize {
-        1
-    }
-
-    fn max_args(&self) -> Option<usize> {
-        Some(1)
-    }
-
-    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
-    }
-
-    fn evaluate(
-        &self,
-        args: &mut dyn ArgWindow,
-        _context: &EvalContext,
-    ) -> Result<Value, FuncError> {
-        let val = args.read(0);
-        if val.is_null() {
-            return Ok(Value::Null);
-        }
-        let json = match val {
-            Value::Json(j) => j,
-            other => {
-                return Err(FuncError::TypeMismatch {
-                    function: "jsonLength".to_owned(),
-                    expected: "Json".to_owned(),
-                    actual: format!("{:?}", other.data_type()),
-                });
-            }
-        };
-        let len = match json {
-            serde_json::Value::Array(arr) => arr.len() as i64,
-            serde_json::Value::Object(map) => map.len() as i64,
-            _ => {
-                return Err(FuncError::EvalFailed {
-                    function: "jsonLength".to_owned(),
-                    reason: "expected array or object".to_owned(),
-                });
-            }
-        };
-        Ok(Value::Int64(len))
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -689,37 +631,6 @@ mod tests {
             &ctx(),
         )
         .unwrap();
-        assert_eq!(result, Value::Null);
-    }
-
-    #[test]
-    fn json_length_array() {
-        let f = JsonLengthFunc;
-        let json = Value::Json(serde_json::json!([1, 2, 3]));
-        let result = eval(&f, smallvec::smallvec![json], &ctx()).unwrap();
-        assert_eq!(result, Value::Int64(3));
-    }
-
-    #[test]
-    fn json_length_object() {
-        let f = JsonLengthFunc;
-        let json = Value::Json(serde_json::json!({"a": 1, "b": 2}));
-        let result = eval(&f, smallvec::smallvec![json], &ctx()).unwrap();
-        assert_eq!(result, Value::Int64(2));
-    }
-
-    #[test]
-    fn json_length_scalar_error() {
-        let f = JsonLengthFunc;
-        let json = Value::Json(serde_json::json!(42));
-        let result = eval(&f, smallvec::smallvec![json], &ctx());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn json_length_null_propagation() {
-        let f = JsonLengthFunc;
-        let result = eval(&f, smallvec::smallvec![Value::Null], &ctx()).unwrap();
         assert_eq!(result, Value::Null);
     }
 

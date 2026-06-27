@@ -1,8 +1,9 @@
 //! QuestDB sink — pg-wire writer.
 //!
 //! All writes go through QuestDB's Postgres-wire surface. INSERTs are
-//! chunked to stay under QuestDB 8.2.3's `parameterCount=-2` bug at
-//! ~9_300 bound params; see [`pg_writer::QDB_PG_MAX_BIND_PARAMS`].
+//! chunked to a conservative per-statement cap that also stayed under
+//! QuestDB 8.2.x's `parameterCount=-2` bug at ~9_300 bound params;
+//! see [`pg_writer::QDB_PG_MAX_BIND_PARAMS`].
 //!
 //! ## WAL-apply visibility
 //!

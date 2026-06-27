@@ -68,6 +68,15 @@ pub fn value_to_string(value: &Value) -> String {
                 .collect();
             serde_json::Value::Object(map).to_string()
         }
+        Value::Array(items) => {
+            // Mirrors the `Object` arm: render as a JSON array, best-effort
+            // per element (a field that fails to encode renders as `null`).
+            let array: Vec<serde_json::Value> = items
+                .iter()
+                .map(|item| value_to_json(item).unwrap_or(serde_json::Value::Null))
+                .collect();
+            serde_json::Value::Array(array).to_string()
+        }
         Value::Custom(inner) => custom_to_string(inner.as_ref()),
         // `Duration`'s `Debug` single-unit human form (`10s`, `1.5s`, `500ms`).
         // NOT a round-trip of the authored literal — compound inputs normalise

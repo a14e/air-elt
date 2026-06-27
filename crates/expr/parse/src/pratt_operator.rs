@@ -29,6 +29,10 @@ enum NodeBuilder {
     Or,
     /// Logical `&&` — short-circuit, lowered to [`ConditionalExpr::And`].
     And,
+    /// Membership `in`: `x in y` desugars to `contains(y, x)` — operands
+    /// swapped so the container is the first argument (matching the
+    /// `contains(container, element)` builtin shape).
+    In,
     /// Every other operator desugars to a named function call (`add`, `equals`, …).
     Function(&'static str),
 }
@@ -99,6 +103,9 @@ impl PrattOperator {
             Token::Slash => (NodeBuilder::Function("divide"), 9, Associativity::Left),
             Token::Percent => (NodeBuilder::Function("modulo"), 9, Associativity::Left),
             Token::Power => (NodeBuilder::Function("power"), 10, Associativity::Right),
+            // Membership shares comparison precedence and is non-associative
+            // (`a in b in c` must be parenthesised), matching `==` / `<`.
+            Token::In => (NodeBuilder::In, 6, Associativity::NonAssociative),
             _ => return None,
         };
         Some(PrattOperator {
@@ -136,6 +143,10 @@ impl PrattOperator {
                 left: Box::new(left),
                 right: Box::new(right),
             }),
+            NodeBuilder::In => Expr::FunctionCall {
+                name: "contains".to_string(),
+                args: vec![right, left],
+            },
             NodeBuilder::Function(name) => Expr::FunctionCall {
                 name: name.to_string(),
                 args: vec![left, right],

@@ -232,6 +232,13 @@ impl<'a> GuardPropagation<'a> {
                     .map(|segment| self.propagate(segment, env))
                     .collect(),
             ),
+            OptExpr::Array(id, elements) => OptExpr::Array(
+                id,
+                elements
+                    .into_iter()
+                    .map(|element| self.propagate(element, env))
+                    .collect(),
+            ),
             OptExpr::Object(id, entries) => OptExpr::Object(
                 id,
                 entries

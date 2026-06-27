@@ -123,3 +123,34 @@ impl Rule for ObjectFold {
         ))
     }
 }
+
+pub(crate) struct ArrayFold;
+
+impl Rule for ArrayFold {
+    fn apply(&self, node: OptExpr, cx: &RuleCx) -> Rewrite {
+        let OptExpr::Array(id, elements) = node else {
+            return Rewrite::Same(node);
+        };
+
+        // Pre-scan: bail without building the vector if any element is non-constant.
+        if !elements
+            .iter()
+            .all(|element| matches!(element, OptExpr::Const(..)))
+        {
+            return Rewrite::Same(OptExpr::Array(id, elements));
+        }
+
+        let mut values = Vec::with_capacity(elements.len());
+        for element in &elements {
+            let OptExpr::Const(_, constant) = element else {
+                continue; // pre-scanned: every element is constant
+            };
+            values.push(constant.clone());
+        }
+
+        Rewrite::Changed(OptExpr::Const(
+            cx.node_counter.fresh_id(),
+            Value::Array(values),
+        ))
+    }
+}

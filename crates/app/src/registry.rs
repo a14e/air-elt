@@ -49,7 +49,8 @@ pub fn build_registry() -> Registry {
     // because QuestDB dedup is DDL-level (`DEDUP UPSERT KEYS(...)`).
     // `validate_access` requires the designated timestamp column to appear
     // in the mapping. INSERTs are chunked at `QDB_PG_MAX_BIND_PARAMS = 9_200`
-    // to work around a QuestDB 8.2.3 pg-wire bug.
+    // — a conservative cap that also avoided a QuestDB 8.2.x pg-wire
+    // bound-parameter bug.
     registry.register_sink("questdb", Arc::new(QuestDbSinkFactory));
     // Redis / Valkey — sink only. NOT schemaless: it returns a precise
     // per-mode schema (key/value/ttl), so the type matrix type-checks the

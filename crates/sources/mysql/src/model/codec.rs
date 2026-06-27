@@ -119,6 +119,10 @@ pub fn decode_column(row: &MySqlRow, index: usize, data_type: DataType) -> Runti
         DataType::Interval => {
             unreachable!("mysql sources never produce Interval (redis-only type)")
         }
+        // MySQL has no native array column type; `mysql_type` never maps
+        // a native column to `DataType::Array`, so a source schema never
+        // carries it. Mirrors the `Object`/`Union` unreachable arms.
+        DataType::Array { .. } => unreachable!("mysql sources never produce Array types"),
         DataType::Custom(_) => unreachable!(
             "DataType::Custom must be handled by the connector before reaching decode_column"
         ),
@@ -185,6 +189,11 @@ pub fn bind_cursor_value<'q>(
         }
         Value::Interval(_) => {
             unreachable!("Value::Interval (redis-only type) is not cursor-compatible")
+        }
+        Value::Array(_) => {
+            unreachable!(
+                "Value::Array cannot appear in cursor values — it is not cursor-compatible"
+            )
         }
         Value::Custom(_) => unreachable!(
             "Value::Custom must be handled by the connector before reaching bind_cursor_value"

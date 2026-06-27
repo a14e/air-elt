@@ -399,3 +399,273 @@ addr = {{ from = "addr", truncate = true }}
     pg.pool.close().await;
     qdb.pool.close().await;
 }
+
+/// Native QuestDB `DOUBLE[]` end-to-end (AIR-124). A computed array column
+/// `[a, b, c]` over three `NOT NULL` `double precision` source columns
+/// yields a non-null-element `Array<Float64>` — exactly what QuestDB's
+/// `DOUBLE[]` accepts. (A PG `double precision[]` source column cannot
+/// target it: PG always reports array elements as nullable, and the type
+/// matrix forbids a nullable element landing in QuestDB's non-null
+/// `DOUBLE[]`.) Exercises the expression-language array literal through the
+/// Transform and the sink's `bind_double_array` pg-wire path live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_to_questdb_double_array() {
+    let pg = pg_pool().await;
+    let qdb = questdb_pool().await.expect("questdb pool");
+
+    let src_schema = format!("{}_qdb_arr", pg.schema);
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{src_schema}\".sensor (
+                    ts TIMESTAMPTZ PRIMARY KEY,
+                    a  DOUBLE PRECISION NOT NULL,
+                    b  DOUBLE PRECISION NOT NULL,
+                    c  DOUBLE PRECISION NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let base = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+    for i in 0_i64..3 {
+        let ts = base + chrono::Duration::seconds(i);
+        sqlx::query(&format!(
+            "INSERT INTO \"{src_schema}\".sensor (ts, a, b, c) VALUES ($1, $2, $3, $4)"
+        ))
+        .bind(ts)
+        .bind(1.0_f64 + i as f64)
+        .bind(2.0_f64 + i as f64)
+        .bind(3.0_f64 + i as f64)
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+    }
+
+    qdb.drop_table("sensor_qdb").await;
+    qdb.exec(
+        "CREATE TABLE sensor_qdb (
+            ts       TIMESTAMP,
+            readings DOUBLE[]
+         ) TIMESTAMP(ts) PARTITION BY DAY;",
+    )
+    .await
+    .unwrap();
+
+    let pg_url = pg.url_with_search_path();
+    let qdb_url = &qdb.url;
+    let config_yaml = format!(
+        r#"
+sources:
+  - name: src
+    type: postgres
+    config:
+      url: "{pg_url}"
+
+sinks:
+  - name: snk
+    type: questdb
+    config:
+      url: "{qdb_url}"
+
+storages:
+  - name: st
+    type: postgres
+    config:
+      url: "{pg_url}"
+
+flow:
+  sensor:
+    source: src
+    sink: snk
+    storage: st
+    from: "{src_schema}.sensor"
+    to: "sensor_qdb"
+    batch-limit: 2
+
+    mapping:
+      ts: ts
+      readings:
+        compute: "[`a`, `b`, `c`]"
+
+    cursor:
+      fields: [ts]
+      order: asc
+      interval: "100ms"
+"#
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yml");
+    std::fs::write(&config_path, &config_yaml).unwrap();
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
+
+    let mut row_count: i64 = 0;
+    for _ in 0..50 {
+        let row = sqlx::query("SELECT count() AS n FROM sensor_qdb")
+            .fetch_one(&qdb.pool)
+            .await
+            .unwrap();
+        row_count = row.try_get::<i64, _>("n").expect("count decode");
+        if row_count == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(row_count, 3, "expected 3 rows in QuestDB");
+
+    let rows = sqlx::query("SELECT readings FROM sensor_qdb ORDER BY ts ASC")
+        .fetch_all(&qdb.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].get::<Vec<f64>, _>("readings"), vec![1.0, 2.0, 3.0]);
+    assert_eq!(rows[1].get::<Vec<f64>, _>("readings"), vec![2.0, 3.0, 4.0]);
+    assert_eq!(rows[2].get::<Vec<f64>, _>("readings"), vec![3.0, 4.0, 5.0]);
+
+    qdb.drop_table("sensor_qdb").await;
+    qdb.pool.close().await;
+    pg.pool.close().await;
+}
+
+/// Native PG `double precision[]` → QuestDB `DOUBLE[]` via `truncate=true`
+/// (AIR-124 follow-up). PG always reports array elements as nullable and
+/// QuestDB `DOUBLE[]` elements are non-null; `truncate` opts into dropping
+/// the NULL members at conversion. A source array `[1.0, NULL, 3.0]` lands
+/// as `[1.0, 3.0]`, and an all-NULL array collapses to empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_to_questdb_native_double_array_truncate() {
+    let pg = pg_pool().await;
+    let qdb = questdb_pool().await.expect("questdb pool");
+
+    let src_schema = format!("{}_qdb_narr", pg.schema);
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{src_schema}\".sensor (
+                    ts       TIMESTAMPTZ PRIMARY KEY,
+                    readings DOUBLE PRECISION[] NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let base = chrono::Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap();
+    let samples: [Vec<Option<f64>>; 3] = [
+        vec![Some(1.0), None, Some(3.0)], // NULL member dropped under truncate
+        vec![Some(10.0), Some(20.0)],     // no nulls
+        vec![None, None],                 // all-null → empty
+    ];
+    for (i, vals) in samples.iter().enumerate() {
+        let ts = base + chrono::Duration::seconds(i as i64);
+        sqlx::query(&format!(
+            "INSERT INTO \"{src_schema}\".sensor (ts, readings) VALUES ($1, $2)"
+        ))
+        .bind(ts)
+        .bind(vals)
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+    }
+
+    qdb.drop_table("sensor_qdb_narr").await;
+    qdb.exec(
+        "CREATE TABLE sensor_qdb_narr (
+            ts       TIMESTAMP,
+            readings DOUBLE[]
+         ) TIMESTAMP(ts) PARTITION BY DAY;",
+    )
+    .await
+    .unwrap();
+
+    let pg_url = pg.url_with_search_path();
+    let qdb_url = &qdb.url;
+    let config_yaml = format!(
+        r#"
+sources:
+  - name: src
+    type: postgres
+    config:
+      url: "{pg_url}"
+
+sinks:
+  - name: snk
+    type: questdb
+    config:
+      url: "{qdb_url}"
+
+storages:
+  - name: st
+    type: postgres
+    config:
+      url: "{pg_url}"
+
+flow:
+  sensor:
+    source: src
+    sink: snk
+    storage: st
+    from: "{src_schema}.sensor"
+    to: "sensor_qdb_narr"
+    batch-limit: 2
+
+    mapping:
+      ts: ts
+      readings:
+        from: readings
+        truncate: true
+
+    cursor:
+      fields: [ts]
+      order: asc
+      interval: "100ms"
+"#
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yml");
+    std::fs::write(&config_path, &config_yaml).unwrap();
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
+
+    let mut row_count: i64 = 0;
+    for _ in 0..50 {
+        let row = sqlx::query("SELECT count() AS n FROM sensor_qdb_narr")
+            .fetch_one(&qdb.pool)
+            .await
+            .unwrap();
+        row_count = row.try_get::<i64, _>("n").expect("count decode");
+        if row_count == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(row_count, 3, "expected 3 rows in QuestDB");
+
+    let rows = sqlx::query("SELECT readings FROM sensor_qdb_narr ORDER BY ts ASC")
+        .fetch_all(&qdb.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    // NULL members dropped under truncate; all-null collapses to empty.
+    assert_eq!(rows[0].get::<Vec<f64>, _>("readings"), vec![1.0, 3.0]);
+    assert_eq!(rows[1].get::<Vec<f64>, _>("readings"), vec![10.0, 20.0]);
+    assert!(rows[2].get::<Vec<f64>, _>("readings").is_empty());
+
+    qdb.drop_table("sensor_qdb_narr").await;
+    qdb.pool.close().await;
+    pg.pool.close().await;
+}

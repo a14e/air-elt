@@ -13,9 +13,10 @@
 //! when its key is not the one read. Each rewrite therefore fires only when the
 //! values it would drop are infallible. The matched value of an `objectGet` hit
 //! is returned (and thus still evaluated), so only the *other* entries gate that
-//! case; a miss / `objectLength` / `objectHasKey` drops every value, so all must
+//! case; a miss / `len` / `objectHasKey` drops every value, so all must
 //! be infallible. Object literals never carry duplicate keys (the converter
-//! rejects them), so a key matches at most one entry.
+//! rejects them), so a key matches at most one entry. `len` also folds over a
+//! literal array (element count) under the same fallibility gate.
 
 use air_elt_expr_funcs::FuncRef;
 use air_elt_types::Value;
@@ -32,14 +33,18 @@ impl Rule for ObjectAccessFold {
         let OptExpr::Call { id, func, args } = node else {
             return Rewrite::Same(node);
         };
-        // Only an object-access call over a literal object first argument.
-        if !matches!(args.first(), Some(OptExpr::Object(_, _))) {
+        // Only a collection-access call over a literal object/array first
+        // argument. `objectGet`/`objectHasKey` are object-specific; `len` is
+        // polymorphic and folds over both literal kinds.
+        let first_is_object = matches!(args.first(), Some(OptExpr::Object(_, _)));
+        let first_is_array = matches!(args.first(), Some(OptExpr::Array(_, _)));
+        if !first_is_object && !first_is_array {
             return Rewrite::Same(OptExpr::Call { id, func, args });
         }
         match cx.registry.get_by_ref(func).name() {
-            "objectGet" => fold_object_get(id, func, args, cx),
-            "objectHasKey" => fold_object_has_key(id, func, args, cx),
-            "objectLength" => fold_object_length(id, func, args, cx),
+            "objectGet" if first_is_object => fold_object_get(id, func, args, cx),
+            "objectHasKey" if first_is_object => fold_object_has_key(id, func, args, cx),
+            "len" => fold_len(id, func, args, cx),
             _ => Rewrite::Same(OptExpr::Call { id, func, args }),
         }
     }
@@ -121,17 +126,34 @@ fn fold_object_has_key(id: NodeId, func: FuncRef, args: Vec<OptExpr>, cx: &RuleC
     ))
 }
 
-fn fold_object_length(id: NodeId, func: FuncRef, args: Vec<OptExpr>, cx: &RuleCx) -> Rewrite {
-    let entries = object_entries(&args);
-    if entries
-        .iter()
-        .any(|(_, value)| can_fail(value, cx.registry))
-    {
-        return Rewrite::Same(OptExpr::Call { id, func, args });
-    }
-    let length = entries.len() as i64;
+/// Fold `len(<literal object|array>)` to the static element count. Sound only
+/// when no dropped value can fail — building the collection evaluates every
+/// value eagerly, so a fallible value must still be evaluated even though `len`
+/// ignores the contents.
+fn fold_len(id: NodeId, func: FuncRef, args: Vec<OptExpr>, cx: &RuleCx) -> Rewrite {
+    let length = match args.first() {
+        Some(OptExpr::Object(_, entries)) => {
+            if entries
+                .iter()
+                .any(|(_, value)| can_fail(value, cx.registry))
+            {
+                return Rewrite::Same(OptExpr::Call { id, func, args });
+            }
+            entries.len()
+        }
+        Some(OptExpr::Array(_, elements)) => {
+            if elements
+                .iter()
+                .any(|element| can_fail(element, cx.registry))
+            {
+                return Rewrite::Same(OptExpr::Call { id, func, args });
+            }
+            elements.len()
+        }
+        _ => return Rewrite::Same(OptExpr::Call { id, func, args }),
+    };
     Rewrite::Changed(OptExpr::Const(
         cx.node_counter.fresh_id(),
-        Value::Int64(length),
+        Value::Int64(length as i64),
     ))
 }

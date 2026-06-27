@@ -1163,3 +1163,185 @@ if (`price_cents` * `qty` < 1000) {{
 
     pg.pool.close().await;
 }
+
+/// Native PG array round-trip through the full App pipeline (AIR-124).
+/// The source reads `int4[]` / `text[]` — including NULL elements, empty
+/// arrays, and whole-column NULLs — and the sink writes them back natively.
+/// A computed `[id, id]` column lands in a `bigint[]` sink column. PG array
+/// elements are always nullable, so the native columns target
+/// nullable-element sink columns; the computed array has non-null elements
+/// and fits a sink column of either element nullability.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_to_pg_arrays() {
+    let pg = pg_pool().await;
+
+    let src_schema = format!("{}_arrsrc", pg.schema);
+    let dst_schema = format!("{}_arrdst", pg.schema);
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{dst_schema}\"").as_str())
+        .await
+        .unwrap();
+
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{src_schema}\".arr_rows (
+                    id     BIGINT PRIMARY KEY,
+                    tags   INT[],
+                    labels TEXT[]
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                "CREATE TABLE \"{dst_schema}\".arr_rows (
+                    id      BIGINT,
+                    tags    INT[],
+                    labels  TEXT[],
+                    id_pair BIGINT[]
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let insert =
+        format!("INSERT INTO \"{src_schema}\".arr_rows (id, tags, labels) VALUES ($1, $2, $3)");
+    // 1 — plain arrays.
+    sqlx::query(&insert)
+        .bind(1_i64)
+        .bind(vec![Some(10_i32), Some(20), Some(30)])
+        .bind(vec![Some("a".to_string()), Some("b".to_string())])
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+    // 2 — NULL elements inside the arrays.
+    sqlx::query(&insert)
+        .bind(2_i64)
+        .bind(vec![None, Some(5_i32)])
+        .bind(vec![Some("x".to_string()), None])
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+    // 3 — empty arrays.
+    sqlx::query(&insert)
+        .bind(3_i64)
+        .bind(Vec::<Option<i32>>::new())
+        .bind(Vec::<Option<String>>::new())
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+    // 4 — whole-column NULL arrays.
+    sqlx::query(&insert)
+        .bind(4_i64)
+        .bind(Option::<Vec<Option<i32>>>::None)
+        .bind(Option::<Vec<Option<String>>>::None)
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+
+    let pg_url = pg.url_with_search_path();
+    let config_toml = format!(
+        r#"
+[[sources]]
+name = "src"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[sinks]]
+name = "snk"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[[storages]]
+name = "st"
+type = "postgres"
+config = {{ url = "{pg_url}" }}
+
+[flow.arr]
+source = "src"
+sink = "snk"
+storage = "st"
+from = "{src_schema}.arr_rows"
+to = "{dst_schema}.arr_rows"
+batch-limit = 8
+cursor = {{ fields = ["id"], order = "asc", interval = "100ms" }}
+
+[flow.arr.mapping]
+id = "id"
+tags = "tags"
+labels = "labels"
+id_pair = {{ compute = "[`id`, `id`]" }}
+"#
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
+
+    let rows = sqlx::query(&format!(
+        "SELECT id, tags, labels, id_pair FROM \"{dst_schema}\".arr_rows ORDER BY id"
+    ))
+    .fetch_all(&pg.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 4);
+
+    // Row 1 — plain arrays + computed pair.
+    assert_eq!(
+        rows[0].get::<Option<Vec<Option<i32>>>, _>("tags"),
+        Some(vec![Some(10), Some(20), Some(30)])
+    );
+    assert_eq!(
+        rows[0].get::<Option<Vec<Option<String>>>, _>("labels"),
+        Some(vec![Some("a".to_string()), Some("b".to_string())])
+    );
+    assert_eq!(
+        rows[0].get::<Option<Vec<i64>>, _>("id_pair"),
+        Some(vec![1, 1])
+    );
+
+    // Row 2 — NULL elements survive the round-trip.
+    assert_eq!(
+        rows[1].get::<Option<Vec<Option<i32>>>, _>("tags"),
+        Some(vec![None, Some(5)])
+    );
+    assert_eq!(
+        rows[1].get::<Option<Vec<Option<String>>>, _>("labels"),
+        Some(vec![Some("x".to_string()), None])
+    );
+
+    // Row 3 — empty arrays.
+    assert_eq!(
+        rows[2].get::<Option<Vec<Option<i32>>>, _>("tags"),
+        Some(vec![])
+    );
+    assert_eq!(
+        rows[2].get::<Option<Vec<Option<String>>>, _>("labels"),
+        Some(vec![])
+    );
+
+    // Row 4 — whole-column NULLs; the computed array is still produced.
+    assert_eq!(rows[3].get::<Option<Vec<Option<i32>>>, _>("tags"), None);
+    assert_eq!(
+        rows[3].get::<Option<Vec<Option<String>>>, _>("labels"),
+        None
+    );
+    assert_eq!(
+        rows[3].get::<Option<Vec<i64>>, _>("id_pair"),
+        Some(vec![4, 4])
+    );
+
+    pg.pool.close().await;
+}

@@ -93,6 +93,9 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
             DataType::Json | DataType::Object => {
                 sep.push_bind::<Option<serde_json::Value>>(None);
             }
+            DataType::Array { element, .. } => {
+                push_typed_null_array(sep, element.as_deref());
+            }
             DataType::BigInt { .. } | DataType::Decimal { .. } => {
                 sep.push_bind::<Option<BigDecimal>>(None);
             }
@@ -202,6 +205,19 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
                 .expect("Value::Object json encode must not fail after validation");
             sep.push_bind(j);
         }
+        Value::Array(items) => {
+            // Dispatch on the sink column's *element* type, not the runtime
+            // values: an empty array carries no element to inspect, and the
+            // column's declared element OID is the binding target. PG arrays
+            // permit NULL elements, so every cell is `Option<NativeT>`.
+            let element = match dt {
+                DataType::Array { element, .. } => element.as_deref(),
+                // Validation routes a `Value::Array` only into an array
+                // column. A mismatch is a structural bug.
+                other => unreachable!("Value::Array bound against non-array column type {other:?}"),
+            };
+            push_array(sep, items, element);
+        }
         Value::UInt8(_) | Value::UInt16(_) | Value::UInt32(_) | Value::UInt64(_) => {
             unreachable!(
                 "unsigned values cannot reach a postgres sink: pg schemas never \
@@ -241,6 +257,142 @@ pub fn bind_value_separated(sep: &mut Separated<'_, '_, Postgres, &str>, v: &Val
             }
         }
     }
+}
+
+/// Collect a canonical element list into `Vec<Option<NativeT>>` and bind it
+/// as a PG array. `Value::Null` elements become `None`; non-null elements
+/// are projected through `extract`. The element dispatch is on the sink
+/// column's declared element type (`element`), not the runtime values, so an
+/// empty array still binds with the correct array OID.
+fn push_array(
+    sep: &mut Separated<'_, '_, Postgres, &str>,
+    items: &[Value],
+    element: Option<&DataType>,
+) {
+    match element {
+        Some(DataType::Bool) => {
+            sep.push_bind(collect_array(items, |v| match v {
+                Value::Bool(b) => *b,
+                other => unreachable!("expected Bool array element, got {other:?}"),
+            }));
+        }
+        // Postgres has no int1; Int8 elements widen to int2[] (i16).
+        Some(DataType::Int8 | DataType::Int16) => {
+            sep.push_bind(collect_array(items, |v| match v {
+                Value::Int8(n) => i16::from(*n),
+                Value::Int16(n) => *n,
+                other => unreachable!("expected Int16 array element, got {other:?}"),
+            }));
+        }
+        Some(DataType::Int32) => {
+            sep.push_bind(collect_array(items, |v| match v {
+                Value::Int32(n) => *n,
+                other => unreachable!("expected Int32 array element, got {other:?}"),
+            }));
+        }
+        Some(DataType::Int64) => {
+            sep.push_bind(collect_array(items, |v| match v {
+                Value::Int64(n) => *n,
+                other => unreachable!("expected Int64 array element, got {other:?}"),
+            }));
+        }
+        Some(DataType::Float32) => {
+            sep.push_bind(collect_array(items, |v| match v {
+                Value::Float32(n) => *n,
+                other => unreachable!("expected Float32 array element, got {other:?}"),
+            }));
+        }
+        Some(DataType::Float64) => {
+            sep.push_bind(collect_array(items, |v| match v {
+                Value::Float64(n) => *n,
+                other => unreachable!("expected Float64 array element, got {other:?}"),
+            }));
+        }
+        Some(DataType::Text { .. }) => {
+            sep.push_bind(collect_array(items, |v| match v {
+                Value::Text(s) => s.clone(),
+                other => unreachable!("expected Text array element, got {other:?}"),
+            }));
+        }
+        Some(DataType::Date) => {
+            sep.push_bind(collect_array(items, |v| match v {
+                Value::Date(d) => *d,
+                other => unreachable!("expected Date array element, got {other:?}"),
+            }));
+        }
+        Some(DataType::Timestamp) => {
+            sep.push_bind(collect_array(items, |v| match v {
+                Value::Timestamp(ts) => *ts,
+                other => unreachable!("expected Timestamp array element, got {other:?}"),
+            }));
+        }
+        Some(DataType::Uuid) => {
+            sep.push_bind(collect_array(items, |v| match v {
+                Value::Uuid(u) => *u,
+                other => unreachable!("expected Uuid array element, got {other:?}"),
+            }));
+        }
+        // numeric[]: both BigInt and Decimal map to the `numeric` OID via
+        // BigDecimal — BigInt lifts to scale 0.
+        Some(DataType::BigInt { .. } | DataType::Decimal { .. }) => {
+            sep.push_bind(collect_array(items, |v| match v {
+                Value::BigInt(b) => BigDecimal::new(b.clone(), 0),
+                Value::Decimal(d) => d.clone(),
+                other => unreachable!("expected numeric array element, got {other:?}"),
+            }));
+        }
+        // The native-type mapper (`PgType::is_array_element`) rejects every
+        // other element type, so a PG array column never declares one. An
+        // unknown-element array (`element == None`) likewise cannot be a PG
+        // column. Reaching here is a structural bug.
+        None => unreachable!("postgres array column has no concrete element type"),
+        Some(other) => {
+            unreachable!("postgres array column declared unsupported element type {other:?}")
+        }
+    }
+}
+
+/// Map a canonical element list to `Vec<Option<NativeT>>`, turning
+/// `Value::Null` into `None` and projecting every other element through
+/// `extract`.
+fn collect_array<NativeT>(
+    items: &[Value],
+    extract: impl Fn(&Value) -> NativeT,
+) -> Vec<Option<NativeT>> {
+    items
+        .iter()
+        .map(|item| match item {
+            Value::Null => None,
+            other => Some(extract(other)),
+        })
+        .collect()
+}
+
+/// Bind a typed NULL array for the sink column's element type. Mirrors
+/// `push_array`'s element dispatch so the NULL carries the matching array
+/// OID. See `null_bind::bind_typed_null_array` for the rationale.
+fn push_typed_null_array(sep: &mut Separated<'_, '_, Postgres, &str>, element: Option<&DataType>) {
+    match element {
+        Some(DataType::Bool) => sep.push_bind::<Option<Vec<Option<bool>>>>(None),
+        Some(DataType::Int8 | DataType::Int16) => sep.push_bind::<Option<Vec<Option<i16>>>>(None),
+        Some(DataType::Int32) => sep.push_bind::<Option<Vec<Option<i32>>>>(None),
+        Some(DataType::Int64) => sep.push_bind::<Option<Vec<Option<i64>>>>(None),
+        Some(DataType::Float32) => sep.push_bind::<Option<Vec<Option<f32>>>>(None),
+        Some(DataType::Float64) => sep.push_bind::<Option<Vec<Option<f64>>>>(None),
+        Some(DataType::Text { .. }) => sep.push_bind::<Option<Vec<Option<String>>>>(None),
+        Some(DataType::Date) => sep.push_bind::<Option<Vec<Option<NaiveDate>>>>(None),
+        Some(DataType::Timestamp) => sep.push_bind::<Option<Vec<Option<DateTime<Utc>>>>>(None),
+        Some(DataType::Uuid) => sep.push_bind::<Option<Vec<Option<Uuid>>>>(None),
+        Some(DataType::BigInt { .. } | DataType::Decimal { .. }) => {
+            sep.push_bind::<Option<Vec<Option<BigDecimal>>>>(None)
+        }
+        // Unknown element: bind a text[] NULL as the universally-castable
+        // fallback (a PG column always declares a concrete element).
+        None => sep.push_bind::<Option<Vec<Option<String>>>>(None),
+        Some(other) => {
+            unreachable!("postgres array column declared unsupported element type {other:?}")
+        }
+    };
 }
 
 #[cfg(test)]
@@ -327,5 +479,67 @@ mod tests {
         let v = Value::Custom(Box::new(StubValue));
         let dt = DataType::Custom(Box::new(StubType));
         bind_value_separated(&mut sep, &v, &dt);
+    }
+
+    fn array_type(element: DataType) -> DataType {
+        DataType::Array {
+            element: Some(Box::new(element)),
+            element_nullable: true,
+        }
+    }
+
+    /// Bind `value` against `dt` and return the rendered SQL fragment so the
+    /// test can assert a single placeholder was emitted (one `push_bind`).
+    fn render(value: &Value, dt: &DataType) -> String {
+        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new("SELECT ");
+        let mut sep = qb.separated(", ");
+        bind_value_separated(&mut sep, value, dt);
+        qb.sql().to_string()
+    }
+
+    #[test]
+    fn binds_int_array_as_single_placeholder() {
+        let value = Value::Array(vec![Value::Int32(1), Value::Null, Value::Int32(3)]);
+        let dt = array_type(DataType::Int32);
+        assert_eq!(render(&value, &dt), "SELECT $1");
+    }
+
+    #[test]
+    fn binds_text_array_with_nulls() {
+        let value = Value::Array(vec![Value::Text("a".into()), Value::Null]);
+        let dt = array_type(DataType::Text { size: None });
+        assert_eq!(render(&value, &dt), "SELECT $1");
+    }
+
+    #[test]
+    fn binds_empty_array_via_declared_element() {
+        // An empty array carries no element to inspect — dispatch must
+        // come from the declared column element type, not the values.
+        let value = Value::Array(vec![]);
+        let dt = array_type(DataType::Int64);
+        assert_eq!(render(&value, &dt), "SELECT $1");
+    }
+
+    #[test]
+    fn binds_typed_null_array() {
+        // A whole-array NULL still emits the typed-NULL placeholder.
+        let dt = array_type(DataType::Uuid);
+        assert_eq!(render(&Value::Null, &dt), "SELECT $1");
+    }
+
+    #[test]
+    fn binds_numeric_array_for_bigint_and_decimal_elements() {
+        let value = Value::Array(vec![Value::Int64(1)]);
+        // Int64 elements map to int8[]; BigInt/Decimal map to numeric[].
+        let bigint = array_type(DataType::BigInt { width: None });
+        let decimal = array_type(DataType::Decimal {
+            precision: None,
+            scale: None,
+        });
+        let bigint_value = Value::Array(vec![Value::BigInt(1.into())]);
+        let decimal_value = Value::Array(vec![Value::Decimal("1.5".parse().unwrap())]);
+        assert_eq!(render(&value, &array_type(DataType::Int64)), "SELECT $1");
+        assert_eq!(render(&bigint_value, &bigint), "SELECT $1");
+        assert_eq!(render(&decimal_value, &decimal), "SELECT $1");
     }
 }

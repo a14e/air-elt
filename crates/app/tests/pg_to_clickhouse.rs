@@ -587,3 +587,149 @@ addr = {{ from = "addr", truncate = true }}
 
     pg.pool.close().await;
 }
+
+/// Native ClickHouse array writes (AIR-124). PG `int4[]` (nullable
+/// elements) → CH `Array(Nullable(Int32))` exercises the native array
+/// read+write path including a NULL element and an empty array. A computed
+/// `[count, count]` column → CH `Array(Int32)` proves a non-null
+/// expression-language array lands in CH's non-null element type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_to_clickhouse_arrays() {
+    let pg = pg_pool().await;
+    let ch = clickhouse_handle().await;
+
+    let src_schema = format!("{}_arrsrc", pg.schema);
+    pg.pool
+        .execute(format!("CREATE SCHEMA \"{src_schema}\"").as_str())
+        .await
+        .unwrap();
+    pg.pool
+        .execute(
+            format!(
+                // CH array columns are non-null at the column level
+                // (`Array(Nullable(T))` makes only the *elements* nullable),
+                // so the source array column must be NOT NULL to match.
+                "CREATE TABLE \"{src_schema}\".events (
+                    id    BIGINT PRIMARY KEY,
+                    tags  INT[] NOT NULL,
+                    count INT NOT NULL
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let insert =
+        format!("INSERT INTO \"{src_schema}\".events (id, tags, count) VALUES ($1, $2, $3)");
+    // 1 — plain array, 2 — NULL element, 3 — empty array.
+    sqlx::query(&insert)
+        .bind(1_i64)
+        .bind(vec![Some(10_i32), Some(20)])
+        .bind(5_i32)
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+    sqlx::query(&insert)
+        .bind(2_i64)
+        .bind(vec![Some(30_i32), None])
+        .bind(7_i32)
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+    sqlx::query(&insert)
+        .bind(3_i64)
+        .bind(Vec::<Option<i32>>::new())
+        .bind(9_i32)
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+
+    ch.exec(
+        "CREATE TABLE arr_events (
+            id    Int64,
+            tags  Array(Nullable(Int32)),
+            pair  Array(Int32),
+            clean Array(Int32)
+        ) ENGINE = MergeTree() ORDER BY id",
+    )
+    .await
+    .unwrap();
+
+    let pg_url = pg.url_with_search_path();
+    let ch_url = &ch.url;
+    #[allow(unsafe_code)]
+    // Why: set_var is unsafe in edition 2024 due to potential read races.
+    // Single-threaded test setup, no concurrent readers.
+    unsafe {
+        std::env::set_var("AIR_ELT_TEST_CH_URL", ch_url);
+    }
+
+    let config_yaml = format!(
+        r#"
+sources:
+  - name: src
+    type: postgres
+    config:
+      url: "{pg_url}"
+
+sinks:
+  - name: snk
+    type: clickhouse
+    config:
+      url: env('AIR_ELT_TEST_CH_URL')
+      database: "{ch_db}"
+      user: "default"
+      password: ""
+
+storages:
+  - name: st
+    type: postgres
+    config:
+      url: "{pg_url}"
+
+flow:
+  events:
+    source: src
+    sink: snk
+    storage: st
+    from: "{src_schema}.events"
+    to: "arr_events"
+    batch-limit: 3
+
+    mapping:
+      id: id
+      tags: tags
+      pair:
+        compute: "[`count`, `count`]"
+      clean:
+        compute: "filterNotNull(`tags`)"
+
+    cursor:
+      fields: [id]
+      order: asc
+      interval: "100ms"
+"#,
+        ch_db = ch.database,
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yml");
+    std::fs::write(&config_path, &config_yaml).unwrap();
+    let app = App::from_path(&config_path).expect("App::from_path");
+    app.run_once().await.expect("run_once");
+
+    let body = ch
+        .exec("SELECT id, tags, pair, clean FROM arr_events ORDER BY id FORMAT TabSeparated")
+        .await
+        .unwrap();
+    let rows: Vec<&str> = body.trim().split('\n').collect();
+    assert_eq!(rows.len(), 3, "expected 3 rows in CH: {body}");
+    // `clean` = filterNotNull(tags): the NULL member in row 2 is dropped, and
+    // the resulting non-null element type matches CH `Array(Int32)` losslessly.
+    assert_eq!(rows[0], "1\t[10,20]\t[5,5]\t[10,20]");
+    assert_eq!(rows[1], "2\t[30,NULL]\t[7,7]\t[30]");
+    assert_eq!(rows[2], "3\t[]\t[9,9]\t[]");
+
+    pg.pool.close().await;
+}

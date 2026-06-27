@@ -93,6 +93,13 @@ fn encode_value_at_depth(v: &Value, depth: usize) -> Result<serde_json::Value, J
             }
             serde_json::Value::Object(map)
         }
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(encode_value_at_depth(item, depth + 1)?);
+            }
+            serde_json::Value::Array(out)
+        }
         Value::Custom(c) => c.to_json()?,
         // Intervals have no canonical JSON form (deliberately minimal — no
         // conversions). They only ever type the Redis sink `ttl` column,
@@ -228,6 +235,11 @@ mod tests {
                 Value::Json(json!({"k": [1, 2, 3]})),
                 json!({"k": [1, 2, 3]}),
             ),
+            (
+                Value::Array(vec![Value::Int64(1), Value::Text("a".into())]),
+                json!([1, "a"]),
+            ),
+            (Value::Array(vec![]), json!([])),
         ];
         for (v, expected) in cases {
             let got = value_to_json(&v).unwrap();
