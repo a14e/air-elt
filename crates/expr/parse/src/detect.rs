@@ -21,7 +21,13 @@ pub fn is_expression(s: &str) -> bool {
 }
 
 fn statement_looks_like_expression(stmt: &str) -> bool {
-    let Some(stop) = stmt.find(['(', '=']) else {
+    // An array literal starts with `[` (`[1, 2, 3]`).
+    if stmt.starts_with('[') {
+        return true;
+    }
+    // `(` / `=` mark a call or assignment; `[` marks a subscript on a
+    // leading identifier (`arr[0]`, `field("x")[0]` already matches via `(`).
+    let Some(stop) = stmt.find(['(', '=', '[']) else {
         return false;
     };
     if stop == 0 {

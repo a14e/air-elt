@@ -146,6 +146,10 @@ pub enum OptNode {
     /// with `values[i]`). Each key is a [`KeyId`] into the deduplicated key
     /// pool; resolve it with [`CompactProgram::key_name`].
     Object { keys: KeySlice, values: ArgSlice },
+    /// Array literal: a run of element value nodes (mirrors `Interpolation`'s
+    /// shape — no keys, unlike `Object`). Runtime payload is
+    /// [`air_elt_types::Value::Array`].
+    Array(ArgSlice),
     /// Constant-key dispatch: evaluate `inputs` (1–2 nodes) into a [`Key`], look
     /// it up in the side table `table`, and run the matched branch or `default`.
     Switch {

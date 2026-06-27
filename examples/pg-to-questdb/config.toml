@@ -2,7 +2,8 @@
 include = ["flows"]
 
 # Postgres → QuestDB over pg-wire. The QuestDB sink chunks each INSERT
-# at 9_200 bound parameters to stay below an upstream QuestDB 8.2.3 bug.
+# at 9_200 bound parameters — a conservative per-statement cap that also
+# stayed below an upstream QuestDB 8.2.x pg-wire bound-parameter bug.
 
 [secrets]
 PG_SRC_URL = "postgres://postgres:postgres@localhost:5432/source"

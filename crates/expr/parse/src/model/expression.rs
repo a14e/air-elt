@@ -21,6 +21,10 @@ pub enum Expr {
     /// Object literal: { "key" = expr, ... }
     Object(Vec<(String, Expr)>),
 
+    /// Array literal: `[a, b, c]` (possibly empty `[]`). Each element keeps its
+    /// own `Expr`; the element type is resolved and unified at type-check time.
+    Array(Vec<Expr>),
+
     /// Source column reference: `field(<expr>)` or the backtick shorthand `` `name` ``.
     /// The inner expression must (after optimization) fold to a constant string
     /// column name. It carries an arbitrary inner `Expr` for now.

@@ -197,6 +197,9 @@ impl<'a> RewriteDriver<'a> {
             OptExpr::Interpolation(id, segments) => {
                 OptExpr::Interpolation(id, segments.into_iter().map(|s| recurse(self, s)).collect())
             }
+            OptExpr::Array(id, elements) => {
+                OptExpr::Array(id, elements.into_iter().map(|e| recurse(self, e)).collect())
+            }
             OptExpr::Object(id, entries) => OptExpr::Object(
                 id,
                 entries

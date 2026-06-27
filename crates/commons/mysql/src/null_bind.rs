@@ -53,6 +53,13 @@ pub fn bind_typed_null<'q>(
         DataType::Object => query.bind::<Option<serde_json::Value>>(None),
         DataType::Union(_) => unreachable!("mysql sinks never carry Union types"),
         DataType::Interval => unreachable!("mysql sinks never carry Interval (redis-only type)"),
+        // MySQL has no native array column type. Arrays reach a MySQL
+        // sink already converted to Json/Text by the Transform layer,
+        // and `mysql_type` never maps a native column to
+        // `DataType::Array`, so a `DataType::Array` here is unreachable.
+        DataType::Array { .. } => {
+            unreachable!("mysql sinks never carry Array (converted to Json/Text by Transform)")
+        }
         DataType::Custom(_) => unreachable!(
             "DataType::Custom must be handled by the connector before reaching null_bind"
         ),

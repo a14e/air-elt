@@ -1,5 +1,6 @@
 use air_elt_commons_arena::{ArenaOverflow, SlicePushError};
 use air_elt_expr_funcs::FuncError;
+use air_elt_expr_types::error::ExprTypeError;
 use thiserror::Error;
 
 /// Errors raised while lowering, optimizing, or compacting an expression
@@ -19,6 +20,11 @@ pub enum OptimizeError {
     /// Resolving a function name (and arity) against the registry failed.
     #[error(transparent)]
     Function(#[from] FuncError),
+
+    /// An array literal's element types failed to unify into a single element
+    /// type (an incompatible mix, e.g. `[1, "a"]`).
+    #[error(transparent)]
+    Type(#[from] ExprTypeError),
 
     /// A fully-constant subexpression in an always-evaluated (eager) position
     /// failed to evaluate at compile time (e.g. `1 / 0`). A constant that

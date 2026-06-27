@@ -14,6 +14,11 @@
 //! * `GEOHASH(Nb)` / `GEOHASH(Nc)` — `N` bits of dictionary-encoded
 //!   geohash. Both width units accepted: a `c` (character) width converts
 //!   into bits by `bits = chars * 5`. Bit range enforced at `1..=60`.
+//! * `DOUBLE[]` — 1-D array of `DOUBLE`. QuestDB stores arrays of
+//!   `DOUBLE` only, so this is the single array form recognised; it maps
+//!   to `DataType::Array { element: Some(Float64), element_nullable: false }`.
+//!   Multi-dimensional (`DOUBLE[][]`) and non-double element arrays stay
+//!   unsupported.
 //!
 //! Unknown types are rejected with [`ParseError::Unknown`] so the sink
 //! can surface a clear "unsupported QuestDB type" error to the operator.
@@ -59,6 +64,16 @@ pub fn parse_type(input: &str) -> Result<DataType, ParseError> {
     // `SYMBOL` followed by whitespace or end-of-string.
     if head == "SYMBOL" || head.starts_with("SYMBOL ") {
         return Ok(DataType::Custom(Box::new(QuestDbSymbolType)));
+    }
+
+    // QuestDB arrays are restricted to `DOUBLE` elements. The only
+    // bracket form we recognise is a 1-D `DOUBLE[]`; multi-dimensional
+    // (`DOUBLE[][]`) and any non-double element array stay unsupported.
+    if head == "DOUBLE[]" {
+        return Ok(DataType::Array {
+            element: Some(Box::new(DataType::Float64)),
+            element_nullable: false,
+        });
     }
 
     // GEOHASH(Nb) / GEOHASH(Nc) — parse the bit width.
@@ -291,6 +306,35 @@ mod tests {
         assert!(matches!(
             parse_type("GEOHASH(61b)"),
             Err(ParseError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn double_array_to_float64_array() {
+        let parsed = parse("DOUBLE[]");
+        match parsed {
+            DataType::Array {
+                element,
+                element_nullable,
+            } => {
+                assert_eq!(element.as_deref(), Some(&DataType::Float64));
+                assert!(!element_nullable, "QuestDB DOUBLE[] elements are non-null");
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_dimensional_and_non_double_arrays_rejected() {
+        // Multi-dimensional DOUBLE arrays are out of scope.
+        assert!(matches!(
+            parse_type("DOUBLE[][]"),
+            Err(ParseError::Unknown { .. })
+        ));
+        // QuestDB stores arrays of DOUBLE only — no other element type.
+        assert!(matches!(
+            parse_type("LONG[]"),
+            Err(ParseError::Unknown { .. })
         ));
     }
 

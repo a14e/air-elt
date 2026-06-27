@@ -1,3 +1,4 @@
+mod array_e2e;
 mod hll_e2e;
 mod sink_conflict_e2e;
 mod sink_decimal_e2e;

@@ -209,6 +209,7 @@ impl<'a> ProgramEvaluator<'a> {
             OptNode::Or { left, right } => self.eval_or(*left, *right, next),
             OptNode::Interpolation(segments) => self.eval_interpolation(*segments, next),
             OptNode::Object { keys, values } => self.eval_object(*keys, *values, next),
+            OptNode::Array(values) => self.eval_array(*values, next),
             OptNode::Switch {
                 inputs,
                 table,
@@ -452,6 +453,16 @@ impl<'a> ProgramEvaluator<'a> {
             fields.push((program.key_name(*key_id).to_string(), evaluated));
         }
         Ok(Value::Object(fields))
+    }
+
+    fn eval_array(&mut self, values: ArgSlice, depth: usize) -> Result<Value, EvalError> {
+        let program = self.program;
+        let value_refs = program.args(values);
+        let mut elements = Vec::with_capacity(value_refs.len());
+        for value_ref in value_refs {
+            elements.push(self.eval_node(*value_ref, depth)?);
+        }
+        Ok(Value::Array(elements))
     }
 }
 

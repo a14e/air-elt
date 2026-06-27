@@ -105,6 +105,11 @@ pub(crate) enum OptExpr {
     Interpolation(NodeId, Vec<OptExpr>),
     /// Object literal: ordered `(key, value)` pairs.
     Object(NodeId, Vec<(String, OptExpr)>),
+    /// Array literal: an ordered run of element expressions. Mirrors
+    /// [`OptExpr::Interpolation`]'s shape (`NodeId` + `Vec<OptExpr>`, no keys);
+    /// element types are unified at type-check, the runtime payload is
+    /// [`air_elt_types::Value::Array`].
+    Array(NodeId, Vec<OptExpr>),
     /// A constant-key dispatch table — the lowered form of a large `multiIf`
     /// whose branches all test 1–2 pure key expressions for equality against
     /// allow-listed constants. `inputs` holds the 1–2 key expressions; `table`
@@ -244,6 +249,7 @@ impl PartialEq for OptExpr {
             ) => la == lb && ra == rb,
             (OptExpr::Interpolation(_, a), OptExpr::Interpolation(_, b)) => a == b,
             (OptExpr::Object(_, a), OptExpr::Object(_, b)) => a == b,
+            (OptExpr::Array(_, a), OptExpr::Array(_, b)) => a == b,
             (
                 OptExpr::Switch {
                     inputs: ia,
@@ -318,6 +324,7 @@ impl OptExpr {
             | OptExpr::Fields(id, _)
             | OptExpr::Interpolation(id, _)
             | OptExpr::Object(id, _)
+            | OptExpr::Array(id, _)
             | OptExpr::Call { id, .. }
             | OptExpr::If { id, .. }
             | OptExpr::MultiIf { id, .. }
@@ -410,6 +417,12 @@ impl OptExpr {
                     value.reassign_ids(counter);
                 }
             }
+            OptExpr::Array(id, elements) => {
+                *id = counter.fresh_id();
+                for element in elements {
+                    element.reassign_ids(counter);
+                }
+            }
             OptExpr::Switch {
                 id,
                 inputs,
@@ -496,6 +509,7 @@ impl OptExpr {
             }
             OptExpr::Interpolation(_, segments) => segments.iter().map(OptExpr::node_count).sum(),
             OptExpr::Object(_, entries) => entries.iter().map(|(_, v)| v.node_count()).sum(),
+            OptExpr::Array(_, elements) => elements.iter().map(OptExpr::node_count).sum(),
             OptExpr::Switch {
                 inputs,
                 table,

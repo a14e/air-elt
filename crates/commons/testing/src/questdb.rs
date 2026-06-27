@@ -5,7 +5,7 @@
 //! 1. If `AIR_ELT_TEST_QUESTDB_URL` is set, connect directly. CI uses
 //!    this mode.
 //! 2. Otherwise launch a fresh QuestDB container via testcontainers using
-//!    the pinned image `questdb/questdb:8.2.3`. The container is labelled
+//!    the pinned image `questdb/questdb:9.4.3`. The container is labelled
 //!    with the current ryuk session so it's shared across every test
 //!    process of one cargo invocation and reaped automatically.
 
@@ -31,7 +31,7 @@ use crate::ryuk;
 /// Must match `.github/workflows/ci.yml`'s docker run for the questdb
 /// service. A CI step grep-asserts this exact string appears in the
 /// workflow file so drift between the two surfaces fails fast.
-pub const QUESTDB_IMAGE_TAG: &str = "mirror.gcr.io/questdb/questdb:8.2.3";
+pub const QUESTDB_IMAGE_TAG: &str = "mirror.gcr.io/questdb/questdb:9.4.3";
 
 const URL_VAR: &str = "AIR_ELT_TEST_QUESTDB_URL";
 
@@ -40,8 +40,9 @@ const KIND_LABEL_VALUE: &str = "questdb";
 
 const QUESTDB_PG_PORT: u16 = 8812;
 
-/// QuestDB default superuser / password / database — fixed by the image
-/// (no env knobs in 8.2.3 community).
+/// QuestDB's default pg-wire superuser / password / database. The test
+/// handle connects with these image defaults rather than overriding them
+/// via `QDB_PG_*` env vars.
 const QUESTDB_USER: &str = "admin";
 const QUESTDB_PASSWORD: &str = "quest";
 const QUESTDB_DATABASE: &str = "qdb";
@@ -181,9 +182,9 @@ async fn start_container() -> Result<Arc<ContainerAsync<GenericImage>>, BoxError
             })?;
     let image = GenericImage::new(image_repo, image_tag)
         .with_exposed_port(ContainerPort::Tcp(QUESTDB_PG_PORT))
-        // QuestDB 8.2.3 logs the pg-wire listener readiness as
-        // `A pg-server listening on 0.0.0.0:8812 ...`. Earlier images
-        // used `Server is ready`; 8.2.3 drops that line entirely.
+        // QuestDB 9.4.3 logs the pg-wire listener readiness as
+        // `A pg-server listening on 0.0.0.0:8812 ...` (unchanged since the
+        // 8.x line; very old images used `Server is ready`).
         // Match the listener log — it fires once the pg port is bound
         // and accepting connections, which is exactly what
         // `wait_for_pg_ready` then probes.
@@ -280,14 +281,15 @@ mod tests {
         assert_eq!(redact_url(raw), raw);
     }
 
-    // Pinned to 8.2.3: earlier versions (notably 8.1.1) mis-type extended-protocol
-    // bind parameters as STRING for every non-STRING/non-LONG column, causing
-    // validate_access dry-run probes to fail with "inconvertible types".
+    // Pinned to 9.4.3: native 1-D `DOUBLE[]` arrays require QuestDB >= 9.0.0
+    // (the array type and its binary pg-wire encoding landed in 9.0), and the
+    // pre-8.2 extended-protocol bind-parameter mis-typing (every non-STRING/
+    // non-LONG column probed as STRING → "inconvertible types") is long fixed.
     #[test]
     fn image_tag_pinned() {
         assert!(
-            QUESTDB_IMAGE_TAG.ends_with("questdb/questdb:8.2.3"),
-            "QuestDB image tag must end with questdb/questdb:8.2.3, got: {QUESTDB_IMAGE_TAG}"
+            QUESTDB_IMAGE_TAG.ends_with("questdb/questdb:9.4.3"),
+            "QuestDB image tag must end with questdb/questdb:9.4.3, got: {QUESTDB_IMAGE_TAG}"
         );
     }
 }

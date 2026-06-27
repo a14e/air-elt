@@ -2,6 +2,7 @@ use crate::registry::FunctionRegistry;
 
 pub fn register_builtins(registry: &mut FunctionRegistry) {
     super::arithmetic::register(registry);
+    super::array::register(registry);
     super::bitwise::register(registry);
     super::bytes::register(registry);
     super::cast::register(registry);

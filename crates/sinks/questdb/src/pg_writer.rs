@@ -1,17 +1,18 @@
 //! pg-wire writer with bind-param chunking.
 //!
-//! QuestDB 8.2.3 pg-wire returns `invalid parameter count [parameterCount=-2]`
+//! QuestDB 8.2.x pg-wire returned `invalid parameter count [parameterCount=-2]`
 //! at roughly 9,300 bound parameters per statement — well below Postgres'
 //! `u16::MAX` limit. We cap each statement at [`QDB_PG_MAX_BIND_PARAMS`]
-//! bound params; `rows_per_chunk = QDB_PG_MAX_BIND_PARAMS / columns.len()`.
+//! bound params (a conservative bound retained on 9.x);
+//! `rows_per_chunk = QDB_PG_MAX_BIND_PARAMS / columns.len()`.
 //!
 //! QuestDB pg-wire auto-commits each statement server-side, so the
 //! production write path issues each chunk directly against the pool.
 //! The dry-run path emits a single
-//! `INSERT INTO <t> (...) SELECT $1,...,$N WHERE 1=0` statement — the
-//! planner walks the column list, type-checks each bind, and the
-//! `WHERE 1=0` short-circuits to zero rows. No transaction, no rollback
-//! risk against QuestDB's async WAL apply.
+//! `INSERT INTO <t> (...) SELECT $1,...,$N FROM long_sequence(0)` statement —
+//! the planner walks the column list, type-checks each bind, and ranges over
+//! `long_sequence(0)` (zero rows) so no row reaches the writer. No
+//! transaction, no rollback risk against QuestDB's async WAL apply.
 
 use chrono::{NaiveDate, Utc};
 use sqlx::{PgPool, Postgres, QueryBuilder};
@@ -29,9 +30,9 @@ use air_elt_core::types::data_type::DataType;
 
 use crate::sql_statements::{dry_run_sql_pg, insert_sql_pg};
 
-/// Empirical safe limit for QuestDB 8.2.3 pg-wire bound-param counts.
-/// 9_200 keeps us under the `parameterCount=-2` overflow observed at
-/// ~9_300 — see the bench notes in the AIR-38 plan.
+/// Conservative per-statement cap for QuestDB pg-wire bound-param counts.
+/// 9_200 keeps us under the `parameterCount=-2` overflow observed on
+/// QuestDB 8.2.x at ~9_300 — see the bench notes in the AIR-38 plan.
 pub const QDB_PG_MAX_BIND_PARAMS: usize = 9_200;
 
 /// Immutable per-flow plan for the pg-wire writer.
@@ -106,11 +107,11 @@ impl PgWriter {
 
     /// Probe the planner + bind path with a single never-produces-a-row
     /// statement. Emits
-    /// `INSERT INTO <t> (...) SELECT $1, $2, ..., $N WHERE 1=0` — the
-    /// planner walks the column list, type-checks each bind parameter,
-    /// validates table+column existence and permissions, then evaluates
-    /// `WHERE 1=0` which short-circuits to zero rows. No transaction, no
-    /// rollback risk against QuestDB's async WAL apply.
+    /// `INSERT INTO <t> (...) SELECT $1, $2, ..., $N FROM long_sequence(0)` —
+    /// the planner walks the column list, type-checks each bind parameter,
+    /// validates table+column existence and permissions, then ranges over
+    /// `long_sequence(0)` (zero rows). No transaction, no rollback risk
+    /// against QuestDB's async WAL apply.
     pub async fn dry_run(&self) -> RuntimeResult<()> {
         if self.plan.columns.is_empty() {
             return Ok(());
@@ -134,6 +135,14 @@ impl PgWriter {
             for field in &self.plan.columns {
                 let dummy = dry_run_dummy_value(field);
                 bind_value_separated_pg(&mut sep, field, &dummy).map_err(RuntimeError::from)?;
+                // QuestDB infers a bare `$N` projection parameter as `unknown`
+                // and — unlike the scalar arms — has no implicit
+                // `unknown -> DOUBLE[]` cast, so the probe must declare the
+                // array type explicitly. The real `INSERT ... VALUES` path
+                // binds straight to the target column and needs no cast.
+                if is_double_array(&field.data_type) {
+                    sep.push_unseparated("::DOUBLE[]");
+                }
             }
         }
         qb.push(" FROM long_sequence(0)");
@@ -182,6 +191,15 @@ fn bind_chunk(
     }
 }
 
+/// Whether a canonical type is QuestDB's only native array shape, 1-D
+/// `DOUBLE[]` (`type_supported` rejects every other element type upstream).
+fn is_double_array(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Array { element: Some(element), .. } if **element == DataType::Float64
+    )
+}
+
 /// Pick a safe non-NULL placeholder value matching the field's canonical
 /// type. Used by the dry-run probe to exercise the planner's type-check on
 /// every column — NULL bypasses pg's bind-time type inference so we send
@@ -204,6 +222,14 @@ fn dry_run_dummy_value(field: &Field) -> Value {
         DataType::Uuid => Value::Uuid(Uuid::nil()),
         DataType::Ipv4 => Value::Ipv4(std::net::Ipv4Addr::LOCALHOST),
         DataType::Json => Value::Json(serde_json::Value::Null),
+        // QuestDB writes only 1-D `DOUBLE[]`; emit a single-element double
+        // array so the planner type-checks the `_float8` bind. Any other
+        // array element type was already rejected by `type_supported`, so
+        // it falls through to the `Null` arm below.
+        DataType::Array {
+            element: Some(element),
+            ..
+        } if **element == DataType::Float64 => Value::Array(vec![Value::Float64(0.0)]),
         DataType::Custom(t) => dummy_custom_value(t.as_ref()),
         // Unsupported types reach here only as Null because `type_supported`
         // already rejected them at validate_access; emit Null to keep the

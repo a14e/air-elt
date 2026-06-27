@@ -128,10 +128,77 @@ pub fn decode_column(row: &PgRow, index: usize, data_type: DataType) -> RuntimeR
                 Some(net) => Ok(Value::Custom(Box::new(PgInetValue(net)))),
             }
         }
+        // Native array column: decode `Vec<Option<NativeT>>` for the
+        // element type and rebuild a `Value::Array` of canonical elements.
+        // A NULL array column yields `Value::Null`; a NULL element yields
+        // `Value::Null` inside the array (PG arrays permit NULL elements).
+        DataType::Array { element, .. } => decode_array(row, index, element.as_deref()),
         DataType::Custom(t) => Err(RuntimeError::Other(format!(
             "postgres source has no decoder for custom type {kind:?}",
             kind = t.kind()
         ))),
+    }
+}
+
+/// Decode a native PG array column into `Value::Array`. Dispatches on the
+/// declared element type (from the pre-computed schema) and reads
+/// `Vec<Option<NativeT>>`, mapping each cell to a canonical `Value`
+/// (`None` → `Value::Null`).
+fn decode_array(row: &PgRow, index: usize, element: Option<&DataType>) -> RuntimeResult<Value> {
+    match element {
+        Some(DataType::Bool) => decode_array_with(row, index, |b: bool| Value::Bool(b)),
+        Some(DataType::Int16) => decode_array_with(row, index, |n: i16| Value::Int16(n)),
+        Some(DataType::Int32) => decode_array_with(row, index, |n: i32| Value::Int32(n)),
+        Some(DataType::Int64) => decode_array_with(row, index, |n: i64| Value::Int64(n)),
+        Some(DataType::Float32) => decode_array_with(row, index, |n: f32| Value::Float32(n)),
+        Some(DataType::Float64) => decode_array_with(row, index, |n: f64| Value::Float64(n)),
+        Some(DataType::Text { .. }) => decode_array_with(row, index, Value::Text),
+        Some(DataType::Date) => decode_array_with(row, index, |d: NaiveDate| Value::Date(d)),
+        Some(DataType::Timestamp) => {
+            decode_array_with(row, index, |ts: DateTime<Utc>| Value::Timestamp(ts))
+        }
+        Some(DataType::Uuid) => decode_array_with(row, index, |u: Uuid| Value::Uuid(u)),
+        // numeric[] surfaces as `BigDecimal`. A `numeric(p, 0)` array maps
+        // canonically to BigInt; everything else stays Decimal. The schema
+        // already resolved the element variant, so honour it here.
+        Some(DataType::BigInt { .. }) => decode_array_with(row, index, |d: BigDecimal| {
+            let (mantissa, _) = d.with_scale(0).into_bigint_and_exponent();
+            Value::BigInt(mantissa)
+        }),
+        Some(DataType::Decimal { .. }) => {
+            decode_array_with(row, index, |d: BigDecimal| Value::Decimal(d))
+        }
+        // The pg schema introspector only ever produces array columns with
+        // the element types above (`PgType::is_array_element`). Any other
+        // element — or an unknown element on a real column — is a structural
+        // bug in introspection, not a runtime data shape.
+        other => Err(RuntimeError::Other(format!(
+            "postgres source has no array decoder for element type {other:?}"
+        ))),
+    }
+}
+
+/// Read a `Vec<Option<NativeT>>` array column and map each element to a
+/// canonical `Value` via `to_value` (`None` → `Value::Null`). A NULL array
+/// column itself yields `Value::Null`.
+fn decode_array_with<'r, NativeT>(
+    row: &'r PgRow,
+    index: usize,
+    to_value: impl Fn(NativeT) -> Value,
+) -> RuntimeResult<Value>
+where
+    NativeT: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
+    Vec<Option<NativeT>>: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
+{
+    match nullable::<Vec<Option<NativeT>>>(row, index)? {
+        None => Ok(Value::Null),
+        Some(items) => {
+            let values = items
+                .into_iter()
+                .map(|item| item.map(&to_value).unwrap_or(Value::Null))
+                .collect();
+            Ok(Value::Array(values))
+        }
     }
 }
 
@@ -191,6 +258,9 @@ pub fn bind_cursor_value<'q>(
         }
         Value::Interval(_) => {
             unreachable!("Value::Interval (redis-only type) is not cursor-compatible")
+        }
+        Value::Array(_) => {
+            unreachable!("Value::Array is not cursor-compatible (rejected by Key)")
         }
         Value::Custom(c) => {
             // PG `inet` is cursor-compatible — wrap the IpNetwork

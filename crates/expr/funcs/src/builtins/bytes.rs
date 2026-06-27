@@ -9,7 +9,6 @@ use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
 static BYTE_LENGTH: ByteLengthFunc = ByteLengthFunc;
 static BYTE_AT: ByteAtFunc = ByteAtFunc;
-static BYTE_SLICE: ByteSliceFunc = ByteSliceFunc;
 static BYTES_FROM_HEX: BytesFromHexFunc = BytesFromHexFunc;
 static BYTES_FROM_BASE64: BytesFromBase64Func = BytesFromBase64Func;
 static BYTES_FROM_UTF8: BytesFromUtf8Func = BytesFromUtf8Func;
@@ -23,7 +22,6 @@ static URL_DECODE: UrlDecodeFunc = UrlDecodeFunc;
 pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&BYTE_LENGTH);
     registry.register(&BYTE_AT);
-    registry.register(&BYTE_SLICE);
     registry.register(&BYTES_FROM_HEX);
     registry.register(&BYTES_FROM_BASE64);
     registry.register(&BYTES_FROM_UTF8);
@@ -154,75 +152,6 @@ impl ExprFunction for ByteAtFunc {
             Some(&b) => Ok(Value::Int64(i64::from(b))),
             None => Ok(Value::Null),
         }
-    }
-}
-
-// --- byteSlice ---
-
-struct ByteSliceFunc;
-
-impl ExprFunction for ByteSliceFunc {
-    fn is_pure(&self) -> bool {
-        true
-    }
-
-    fn name(&self) -> &str {
-        "byteSlice"
-    }
-
-    fn min_args(&self) -> usize {
-        2
-    }
-
-    fn max_args(&self) -> Option<usize> {
-        Some(3)
-    }
-
-    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        validate_bytes_arg("byteSlice", &args[0].data_type)?;
-        let nullable = args.iter().any(|a| a.nullable);
-        Ok(NullableExprType::new(
-            DataType::Bytes { size: None },
-            nullable,
-        ))
-    }
-
-    fn evaluate(
-        &self,
-        args: &mut dyn ArgWindow,
-        _context: &EvalContext,
-    ) -> Result<Value, FuncError> {
-        let has_len = args.len() == 3;
-        if args.read(0).is_null() || args.read(1).is_null() {
-            return Ok(Value::Null);
-        }
-        if has_len && args.read(2).is_null() {
-            return Ok(Value::Null);
-        }
-
-        let start = extract_int64_ref(args.read(1), "byteSlice")?;
-        let max_len = if has_len {
-            Some(extract_int64_ref(args.read(2), "byteSlice")?)
-        } else {
-            None
-        };
-        let bytes = extract_bytes_ref(args.read(0), "byteSlice")?;
-
-        let start = if start < 0 { 0usize } else { start as usize };
-
-        if start >= bytes.len() {
-            return Ok(Value::Bytes(Vec::new()));
-        }
-
-        let end = match max_len {
-            Some(len) => {
-                let len = if len < 0 { 0usize } else { len as usize };
-                start.saturating_add(len).min(bytes.len())
-            }
-            None => bytes.len(),
-        };
-
-        Ok(Value::Bytes(bytes[start..end].to_vec()))
     }
 }
 
@@ -784,43 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn byte_slice_with_length() {
-        let result = eval(
-            &ByteSliceFunc,
-            smallvec::smallvec![
-                Value::Bytes(vec![1, 2, 3, 4, 5]),
-                Value::Int64(1),
-                Value::Int64(3),
-            ],
-            &ctx(),
-        )
-        .unwrap();
-        assert_eq!(result, Value::Bytes(vec![2, 3, 4]));
-    }
-
-    #[test]
-    fn byte_slice_without_length() {
-        let result = eval(
-            &ByteSliceFunc,
-            smallvec::smallvec![Value::Bytes(vec![1, 2, 3, 4, 5]), Value::Int64(2)],
-            &ctx(),
-        )
-        .unwrap();
-        assert_eq!(result, Value::Bytes(vec![3, 4, 5]));
-    }
-
-    #[test]
-    fn byte_slice_start_beyond_end() {
-        let result = eval(
-            &ByteSliceFunc,
-            smallvec::smallvec![Value::Bytes(vec![1, 2, 3]), Value::Int64(10)],
-            &ctx(),
-        )
-        .unwrap();
-        assert_eq!(result, Value::Bytes(vec![]));
-    }
-
-    #[test]
     fn bytes_from_utf8_basic() {
         let result = eval(
             &BytesFromUtf8Func,
@@ -870,17 +762,6 @@ mod tests {
         let result = eval(
             &BytesEqualFunc,
             smallvec::smallvec![Value::Bytes(vec![1, 2, 3]), Value::Null],
-            &ctx(),
-        )
-        .unwrap();
-        assert_eq!(result, Value::Null);
-    }
-
-    #[test]
-    fn null_propagation_byte_slice() {
-        let result = eval(
-            &ByteSliceFunc,
-            smallvec::smallvec![Value::Null, Value::Int64(0)],
             &ctx(),
         )
         .unwrap();

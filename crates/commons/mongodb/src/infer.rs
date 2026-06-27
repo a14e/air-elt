@@ -276,7 +276,13 @@ impl TypeKind {
             DataType::Date => TypeKind::Date,
             DataType::Timestamp => TypeKind::Timestamp,
             DataType::Decimal { .. } => TypeKind::Decimal,
-            DataType::Json | DataType::Object => TypeKind::Json,
+            // Mongo read maps `Bson::Array` -> `DataType::Json` (see
+            // `infer_type`), so an inferred `DataType::Array` is not
+            // produced here today. The arm is required for
+            // exhaustiveness; bucket it with Json/Object so a future
+            // array-typed observation widens the same way (both are
+            // structural document-shaped types).
+            DataType::Json | DataType::Object | DataType::Array { .. } => TypeKind::Json,
             DataType::Xml => TypeKind::Xml,
             DataType::Union(_) => TypeKind::Union,
             // Interval is a redis-only type; it is never inferred from a

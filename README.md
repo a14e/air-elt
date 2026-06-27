@@ -209,11 +209,12 @@ Startup cost (not in the table above): `gen.py` (sub-second),
 the state DB (~1 s).
 
 QuestDB is supported as a third sink kind in the generator
-(`sinks.questdb.count`). The scaffold pins the QDB image to **8.2.3**:
-earlier versions (notably 8.1.1) mis-type extended-protocol bind
-parameters as STRING for every non-STRING/non-LONG column, which makes
-Air Elt's `validate_access` dry-run probe fail with a cryptic
-"inconvertible types" error. The regression is covered by
+(`sinks.questdb.count`). The scaffold pins the QDB image to **9.4.3**
+(native 1-D `DOUBLE[]` arrays require QuestDB >= 9.0). A much older
+regression — 8.1.1 mis-typing extended-protocol bind parameters as
+STRING for every non-STRING/non-LONG column, which made Air Elt's
+`validate_access` dry-run probe fail with a cryptic "inconvertible
+types" error — was fixed back in 8.2.3 and stays covered by
 `crates/sinks/questdb/tests/oltp_twelve_columns.rs` against the
 12-column OLTP shape so a future image bump cannot silently regress.
 

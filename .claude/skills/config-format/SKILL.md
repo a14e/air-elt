@@ -48,6 +48,7 @@ Examples:
 - `default = "concat(env('PREFIX'), '_suffix')"`
 - `default = "if(isNull(env('OPT')), 'none', env('OPT'))"`
 - `default = { "key" = "env('X')", "ts" = "now()" }`
+- `default = "[1, 2, 3]"` (array literal expression) — for an array-typed sink column. TOML/YAML native arrays in a config expression position also lower to `Expr::Array` (`Parser::parse_toml`), so `default = [1, 2, 3]` works too.
 
 ### Component config expressions
 

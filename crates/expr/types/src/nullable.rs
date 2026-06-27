@@ -49,6 +49,23 @@ impl NullableExprType {
         }
     }
 
+    /// Build an array type. `element` is the (optional) element data type —
+    /// `None` for an empty/unknown element (`[]`) — and `element_nullable`
+    /// records whether elements may be `Null`. Both live inside
+    /// [`DataType::Array`], so they survive materialization (the element
+    /// type is erased only at the expr/`int_bound` layer, never on the
+    /// `DataType`). `nullable` is whether the array value itself may be null.
+    pub fn array(element: Option<DataType>, element_nullable: bool, nullable: bool) -> Self {
+        Self {
+            data_type: DataType::Array {
+                element: element.map(Box::new),
+                element_nullable,
+            },
+            nullable,
+            int_bound: None,
+        }
+    }
+
     pub fn display_name(&self) -> String {
         let name = format!("{}", self.data_type);
         if self.nullable {
@@ -76,5 +93,44 @@ impl NullableExprType {
 impl From<DataType> for NullableExprType {
     fn from(dt: DataType) -> Self {
         Self::non_null(dt)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn array_constructor_carries_element_in_data_type() {
+        let t = NullableExprType::array(Some(DataType::Int64), true, false);
+        assert!(!t.nullable);
+        assert_eq!(t.int_bound, None);
+        assert_eq!(
+            t.data_type,
+            DataType::Array {
+                element: Some(Box::new(DataType::Int64)),
+                element_nullable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn array_materializes_to_itself_element_preserved() {
+        // `int_bound` is None for arrays, so materialization clones the
+        // `DataType::Array` — the element type survives to the sink.
+        let t = NullableExprType::array(Some(DataType::Float64), false, false);
+        assert_eq!(t.materialized_data_type(), t.data_type);
+    }
+
+    #[test]
+    fn empty_array_has_no_element() {
+        let t = NullableExprType::array(None, false, false);
+        assert_eq!(
+            t.data_type,
+            DataType::Array {
+                element: None,
+                element_nullable: false,
+            }
+        );
     }
 }

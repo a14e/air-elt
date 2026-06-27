@@ -97,6 +97,7 @@ impl<'a> OptProgramConverter<'a> {
             Expr::Conditional(conditional) => self.lower_conditional(conditional),
             Expr::Interpolation(segments) => self.lower_interpolation(segments),
             Expr::Object(entries) => self.lower_object(entries),
+            Expr::Array(elements) => self.lower_array(elements),
             Expr::Field(inner) => Ok(OptExpr::Field(
                 self.next_id(),
                 Box::new(self.lower_expr(inner)?),
@@ -218,6 +219,14 @@ impl<'a> OptProgramConverter<'a> {
             .map(|(key, value)| Ok((key.clone(), self.lower_expr(value)?)))
             .collect::<Result<Vec<_>, OptimizeError>>()?;
         Ok(OptExpr::Object(self.next_id(), lowered))
+    }
+
+    fn lower_array(&mut self, elements: &[Expr]) -> Result<OptExpr, OptimizeError> {
+        let lowered = elements
+            .iter()
+            .map(|element| self.lower_expr(element))
+            .collect::<Result<Vec<_>, OptimizeError>>()?;
+        Ok(OptExpr::Array(self.next_id(), lowered))
     }
 
     fn lower_conditional(

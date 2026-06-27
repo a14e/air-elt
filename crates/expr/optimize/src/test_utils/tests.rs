@@ -1827,8 +1827,65 @@ fn object_literal_is_consumable_by_object_builtins() {
         Value::Int64(2)
     );
     assert_eq!(
-        eval_unoptimized("objectLength({\"a\" = 1, \"b\" = 2})"),
+        eval_unoptimized("len({\"a\" = 1, \"b\" = 2})"),
         Value::Int64(2)
+    );
+}
+
+#[test]
+fn array_literal_index_evaluates_end_to_end() {
+    // Full lower → compact → eval path: literal array, then strict index.
+    assert_eq!(eval_unoptimized("[10, 20, 30][1]"), Value::Int64(20));
+}
+
+#[test]
+fn array_concat_evaluates_end_to_end() {
+    assert_eq!(
+        eval_unoptimized("[1] + [2, 3]"),
+        Value::Array(vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)])
+    );
+}
+
+#[test]
+fn array_slice_evaluates_end_to_end() {
+    assert_eq!(
+        eval_unoptimized("[1, 2, 3, 4][1:3]"),
+        Value::Array(vec![Value::Int64(2), Value::Int64(3)])
+    );
+}
+
+#[test]
+fn in_operator_membership_evaluates_end_to_end() {
+    assert_eq!(eval_unoptimized("2 in [1, 2, 3]"), Value::Bool(true));
+    assert_eq!(eval_unoptimized("5 in [1, 2, 3]"), Value::Bool(false));
+}
+
+#[test]
+fn const_array_len_folds_end_to_end() {
+    assert_eq!(
+        optimized_result("len([1, 2, 3])"),
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(3))
+    );
+}
+
+#[test]
+fn array_incompatible_dynamic_elements_rejected_by_optimizer() {
+    // `[now(), 1]` does not const-fold (now() is not compile-time-foldable), so
+    // the optimizer's `synthesize` array arm runs and rejects the Timestamp/Int
+    // element mix via `array_element_join`. An expected output triggers the
+    // strict type pass (compute columns always have a sink type).
+    let expected = ExpectedOutput {
+        data_type: DataType::Json,
+        truncate: false,
+    };
+    let result = Optimizer::create(&registry(), &context()).compile(
+        &parse("[now(), 1]"),
+        None,
+        Some(&expected),
+    );
+    assert!(
+        result.is_err(),
+        "incompatible dynamic array elements must fail type-check, got {result:?}"
     );
 }
 
@@ -1861,10 +1918,18 @@ fn object_get_miss_folds_to_null() {
 }
 
 #[test]
-fn object_length_folds_to_count() {
+fn len_over_object_literal_folds_to_count() {
     assert_eq!(
-        optimized_result("objectLength({\"k\" = field(\"x\"), \"j\" = field(\"y\")})"),
+        optimized_result("len({\"k\" = field(\"x\"), \"j\" = field(\"y\")})"),
         OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(2))
+    );
+}
+
+#[test]
+fn len_over_array_literal_folds_to_count() {
+    assert_eq!(
+        optimized_result("len([field(\"x\"), field(\"y\"), field(\"z\")])"),
+        OptExpr::Const(NodeId::PLACEHOLDER, Value::Int64(3))
     );
 }
 
@@ -1895,13 +1960,22 @@ fn object_get_keeps_call_when_a_dropped_sibling_can_fail() {
 }
 
 #[test]
-fn object_length_keeps_call_when_a_value_can_fail() {
+fn len_over_object_keeps_call_when_a_value_can_fail() {
     // A fallible value must still be evaluated; folding to the static count would
     // discard its potential error, so the call stays.
-    let result = optimized_result("objectLength({\"k\" = field(\"y\") / field(\"z\")})");
+    let result = optimized_result("len({\"k\" = field(\"y\") / field(\"z\")})");
     assert!(
         matches!(result, OptExpr::Call { .. }),
         "fallible value must block the length fold, got {result:?}"
+    );
+}
+
+#[test]
+fn len_over_array_keeps_call_when_an_element_can_fail() {
+    let result = optimized_result("len([field(\"y\") / field(\"z\")])");
+    assert!(
+        matches!(result, OptExpr::Call { .. }),
+        "fallible element must block the length fold, got {result:?}"
     );
 }
 

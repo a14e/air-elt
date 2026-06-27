@@ -121,6 +121,8 @@ impl<'a> StaticCheckEngine<'a> {
             }
             // Every interpolation segment is rendered.
             OptExpr::Interpolation(_, segments) => self.walk_all(segments, eager),
+            // Every array element is evaluated.
+            OptExpr::Array(_, elements) => self.walk_all(elements, eager),
             // Every object value is evaluated.
             OptExpr::Object(_, entries) => {
                 for (_, value) in entries {

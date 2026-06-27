@@ -257,9 +257,9 @@ jobs:
         # fast on drift instead of waiting for a test to fail at runtime.
         run: |
           set -euo pipefail
-          grep -q 'mirror.gcr.io/questdb/questdb:8.2.3' \
+          grep -q 'mirror.gcr.io/questdb/questdb:9.4.3' \
             crates/commons/testing/src/questdb.rs
-          grep -q 'mirror.gcr.io/questdb/questdb:8.2.3' \
+          grep -q 'mirror.gcr.io/questdb/questdb:9.4.3' \
             .github/workflows/ci.yml
       - name: Install postgresql-client for the QuestDB readiness probe
         # ubuntu-latest does not ship `psql` by default. The QuestDB image
@@ -277,7 +277,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run -d --name questdb -p 8812:8812 \
-            mirror.gcr.io/questdb/questdb:8.2.3
+            mirror.gcr.io/questdb/questdb:9.4.3
           for i in $(seq 1 60); do
             if PGPASSWORD=quest psql -h localhost -p 8812 -U admin -d qdb \
                 -c 'SELECT 1' >/dev/null 2>&1; then

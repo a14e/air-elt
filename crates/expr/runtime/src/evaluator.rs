@@ -80,6 +80,7 @@ impl<'a> EvaluatorState<'a> {
             Expr::Conditional(conditional) => self.eval_conditional(conditional),
             Expr::Interpolation(segments) => self.eval_interpolation(segments),
             Expr::Object(entries) => self.eval_object(entries),
+            Expr::Array(elements) => self.eval_array(elements),
             Expr::Block { statements, result } => self.eval_block(statements, result),
             Expr::Field(..) | Expr::Fields(..) => Err(ExprError::FieldOutsideTransform),
         }
@@ -378,6 +379,14 @@ impl<'a> EvaluatorState<'a> {
             fields.push((key.clone(), value));
         }
         Ok(Value::Object(fields))
+    }
+
+    fn eval_array(&mut self, elements: &[Expr]) -> Result<Value, ExprError> {
+        let mut values = Vec::with_capacity(elements.len());
+        for element in elements {
+            values.push(self.eval_expr(element)?);
+        }
+        Ok(Value::Array(values))
     }
 }
 
@@ -1112,7 +1121,7 @@ mod tests {
             Just("concat(v, upper(v))"),
             Just("concat(upper(v), v)"),
             Just("concat(v, concat(v, v))"),
-            Just("substring(v, 0, 1)"),
+            Just("slice(v, 0, 1)"),
         ];
         (bound, shape).prop_map(|(bound, shape)| format!("v = {bound}; {shape}"))
     }

@@ -5,14 +5,12 @@ use crate::error::FuncError;
 use crate::registry::FunctionRegistry;
 use crate::signature::{ArgWindow, EvalContext, ExprFunction};
 
-static OBJECT_LENGTH: ObjectLengthFunc = ObjectLengthFunc;
 static OBJECT_KEYS: ObjectKeysFunc = ObjectKeysFunc;
 static OBJECT_VALUES: ObjectValuesFunc = ObjectValuesFunc;
 static OBJECT_HAS_KEY: ObjectHasKeyFunc = ObjectHasKeyFunc;
 static OBJECT_GET: ObjectGetFunc = ObjectGetFunc;
 
 pub fn register(registry: &mut FunctionRegistry) {
-    registry.register(&OBJECT_LENGTH);
     registry.register(&OBJECT_KEYS);
     registry.register(&OBJECT_VALUES);
     registry.register(&OBJECT_HAS_KEY);
@@ -52,43 +50,6 @@ fn extract_text_ref<'a>(val: &'a Value, func_name: &str) -> Result<&'a str, Func
             expected: "Text".to_owned(),
             actual: format!("{:?}", other.data_type()),
         }),
-    }
-}
-
-struct ObjectLengthFunc;
-
-impl ExprFunction for ObjectLengthFunc {
-    fn is_pure(&self) -> bool {
-        true
-    }
-
-    fn name(&self) -> &str {
-        "objectLength"
-    }
-
-    fn min_args(&self) -> usize {
-        1
-    }
-
-    fn max_args(&self) -> Option<usize> {
-        Some(1)
-    }
-
-    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        Ok(NullableExprType::new(DataType::Int64, args[0].nullable))
-    }
-
-    fn evaluate(
-        &self,
-        args: &mut dyn ArgWindow,
-        _context: &EvalContext,
-    ) -> Result<Value, FuncError> {
-        let val = args.read(0);
-        if val.is_null() {
-            return Ok(Value::Null);
-        }
-        let entries = extract_object_ref(val, "objectLength")?;
-        Ok(Value::Int64(entries.len() as i64))
     }
 }
 
@@ -279,20 +240,6 @@ mod tests {
             ("age".to_owned(), Value::Int64(30)),
             ("active".to_owned(), Value::Bool(true)),
         ])
-    }
-
-    #[test]
-    fn object_length_basic() {
-        let f = ObjectLengthFunc;
-        let result = eval(&f, smallvec::smallvec![sample_object()], &ctx()).unwrap();
-        assert_eq!(result, Value::Int64(3));
-    }
-
-    #[test]
-    fn object_length_null_propagation() {
-        let f = ObjectLengthFunc;
-        let result = eval(&f, smallvec::smallvec![Value::Null], &ctx()).unwrap();
-        assert_eq!(result, Value::Null);
     }
 
     #[test]

@@ -13,8 +13,6 @@ fn text_size(dt: &DataType) -> Option<u32> {
 }
 
 static CONCAT: ConcatFunc = ConcatFunc;
-static LENGTH: LengthFunc = LengthFunc;
-static SUBSTRING: SubstringFunc = SubstringFunc;
 static CHAR_AT: CharAtFunc = CharAtFunc;
 static UPPER: UpperFunc = UpperFunc;
 static LOWER: LowerFunc = LowerFunc;
@@ -33,8 +31,6 @@ static RIGHT_PAD: RightPadFunc = RightPadFunc;
 
 pub fn register(registry: &mut FunctionRegistry) {
     registry.register(&CONCAT);
-    registry.register(&LENGTH);
-    registry.register(&SUBSTRING);
     registry.register(&CHAR_AT);
     registry.register(&UPPER);
     registry.register(&LOWER);
@@ -72,11 +68,20 @@ impl ExprFunction for ConcatFunc {
     }
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        // `concat` is strict: every argument must be textual. There is no
-        // implicit string coercion in expressions — `concat(x, "")` is therefore
-        // a string type-check on `x`, not a stringification (use `toString` for
-        // that). Interpolation renders any type, but it does not route through
-        // `concat`.
+        // Array overload: when every argument is an array, concatenate into a
+        // single array (element types joined via the shared matrix helper).
+        if args
+            .iter()
+            .all(|a| matches!(a.data_type, DataType::Array { .. }))
+        {
+            return concat_arrays_resolve_type(args);
+        }
+        // `concat` is otherwise strict: every argument must be textual. There is
+        // no implicit string coercion in expressions — `concat(x, "")` is
+        // therefore a string type-check on `x`, not a stringification (use
+        // `toString` for that). Interpolation renders any type, but it does not
+        // route through `concat`. A mix of Text and Array falls through to the
+        // text validator, which rejects the Array argument as a TypeMismatch.
         for arg in args {
             validate_text_arg("concat", &arg.data_type)?;
         }
@@ -93,6 +98,11 @@ impl ExprFunction for ConcatFunc {
         args: &mut dyn ArgWindow,
         _context: &EvalContext,
     ) -> Result<Value, FuncError> {
+        // Array overload: every argument is an array → concatenate (bounded by
+        // MAX_ARRAY_LEN). A `null` argument propagates Null.
+        if matches!(args.read(0), Value::Array(_)) {
+            return concat_arrays_eval(args);
+        }
         // Pre-scan by reference: nulls and type errors surface before anything
         // is taken, and the total size is known up front so the accumulator
         // grows exactly once instead of doubling through `push_str` reallocs.
@@ -128,175 +138,85 @@ impl ExprFunction for ConcatFunc {
     }
 }
 
+/// `resolve_type` for the all-array `concat` overload: fold the element types
+/// through the shared matrix join, propagating element nullability.
+fn concat_arrays_resolve_type(args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
+    let nullable = args.iter().any(|a| a.nullable);
+    let mut element: Option<Box<DataType>> = None;
+    let mut element_nullable = false;
+    for arg in args {
+        if let DataType::Array {
+            element: arg_element,
+            element_nullable: arg_element_nullable,
+        } = &arg.data_type
+        {
+            element_nullable = element_nullable || *arg_element_nullable;
+            let joined = crate::arithmetic_utils::array_element_join(&element, arg_element)
+                .map_err(|e| FuncError::TypeMismatch {
+                    function: "concat".to_owned(),
+                    expected: "arrays with compatible element types".to_owned(),
+                    actual: e.to_string(),
+                })?;
+            element = joined.map(Box::new);
+        }
+    }
+    Ok(NullableExprType {
+        data_type: DataType::Array {
+            element,
+            element_nullable,
+        },
+        nullable,
+        int_bound: None,
+    })
+}
+
+/// `evaluate` for the all-array `concat` overload: concatenate every array
+/// argument, propagating Null and enforcing `MAX_ARRAY_LEN`.
+fn concat_arrays_eval(args: &mut dyn ArgWindow) -> Result<Value, FuncError> {
+    for i in 0..args.len() {
+        if args.read(i).is_null() {
+            return Ok(Value::Null);
+        }
+    }
+    let mut result: Vec<Value> = match args.take(0) {
+        Value::Array(items) => items,
+        other => return Err(concat_array_mismatch(&other)),
+    };
+    for i in 1..args.len() {
+        match args.take(i) {
+            Value::Array(items) => {
+                let total = result.len().saturating_add(items.len());
+                if total > air_elt_expr_types::limits::MAX_ARRAY_LEN {
+                    return Err(FuncError::InvalidArgument {
+                        function: "concat".to_owned(),
+                        message: format!(
+                            "array length {total} exceeds maximum {}",
+                            air_elt_expr_types::limits::MAX_ARRAY_LEN
+                        ),
+                    });
+                }
+                result.extend(items);
+            }
+            other => return Err(concat_array_mismatch(&other)),
+        }
+    }
+    Ok(Value::Array(result))
+}
+
+fn concat_array_mismatch(value: &Value) -> FuncError {
+    FuncError::TypeMismatch {
+        function: "concat".to_owned(),
+        expected: "Array".to_owned(),
+        actual: format!("{:?}", value.data_type()),
+    }
+}
+
 /// The strict-`concat` type error for a non-text, non-null argument.
 fn concat_type_mismatch(value: &Value) -> FuncError {
     FuncError::TypeMismatch {
         function: "concat".to_owned(),
         expected: "Text".to_owned(),
         actual: format!("{:?}", value.data_type()),
-    }
-}
-
-struct LengthFunc;
-
-impl ExprFunction for LengthFunc {
-    fn is_pure(&self) -> bool {
-        true
-    }
-
-    fn name(&self) -> &str {
-        "length"
-    }
-
-    fn min_args(&self) -> usize {
-        1
-    }
-
-    fn max_args(&self) -> Option<usize> {
-        Some(1)
-    }
-
-    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        validate_text_arg("length", &args[0].data_type)?;
-        let int_bound =
-            text_size(&args[0].data_type).map(|s| 64 - (s as u64).leading_zeros() as u8);
-        Ok(NullableExprType {
-            data_type: DataType::Int64,
-            nullable: args[0].nullable,
-            int_bound,
-        })
-    }
-
-    fn evaluate(
-        &self,
-        args: &mut dyn ArgWindow,
-        _context: &EvalContext,
-    ) -> Result<Value, FuncError> {
-        match args.read(0) {
-            Value::Null => Ok(Value::Null),
-            Value::Text(s) => Ok(Value::Int64(s.chars().count() as i64)),
-            other => Err(FuncError::TypeMismatch {
-                function: "length".to_owned(),
-                expected: "Text".to_owned(),
-                actual: format!("{:?}", other.data_type()),
-            }),
-        }
-    }
-}
-
-struct SubstringFunc;
-
-impl ExprFunction for SubstringFunc {
-    fn is_pure(&self) -> bool {
-        true
-    }
-
-    fn name(&self) -> &str {
-        "substring"
-    }
-
-    fn min_args(&self) -> usize {
-        2
-    }
-
-    fn max_args(&self) -> Option<usize> {
-        Some(3)
-    }
-
-    fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        validate_text_arg("substring", &args[0].data_type)?;
-        let nullable = args.iter().any(|a| a.nullable);
-        let size = text_size(&args[0].data_type);
-        Ok(NullableExprType::new(DataType::Text { size }, nullable))
-    }
-
-    fn evaluate(
-        &self,
-        args: &mut dyn ArgWindow,
-        _context: &EvalContext,
-    ) -> Result<Value, FuncError> {
-        let len_val = if args.len() == 3 {
-            Some(args.take(2))
-        } else {
-            None
-        };
-        let start_val = args.take(1);
-        let s_val = args.take(0);
-
-        if s_val.is_null() || start_val.is_null() {
-            return Ok(Value::Null);
-        }
-        if let Some(ref lv) = len_val {
-            if lv.is_null() {
-                return Ok(Value::Null);
-            }
-        }
-
-        let mut s = match s_val {
-            Value::Text(s) => s,
-            other => {
-                return Err(FuncError::TypeMismatch {
-                    function: "substring".to_owned(),
-                    expected: "Text".to_owned(),
-                    actual: format!("{:?}", other.data_type()),
-                });
-            }
-        };
-        let start = match start_val {
-            Value::Int64(n) => n as usize,
-            other => {
-                return Err(FuncError::TypeMismatch {
-                    function: "substring".to_owned(),
-                    expected: "Int64".to_owned(),
-                    actual: format!("{:?}", other.data_type()),
-                });
-            }
-        };
-        let max_len = match len_val {
-            Some(Value::Int64(n)) => Some(n as usize),
-            Some(other) => {
-                return Err(FuncError::TypeMismatch {
-                    function: "substring".to_owned(),
-                    expected: "Int64".to_owned(),
-                    actual: format!("{:?}", other.data_type()),
-                });
-            }
-            None => None,
-        };
-
-        if max_len == Some(0) {
-            return Ok(Value::Text(String::new()));
-        }
-
-        let char_count = s.chars().count();
-        if start >= char_count {
-            return Ok(Value::Text(String::new()));
-        }
-
-        let end_char = match max_len {
-            Some(len) => (start + len).min(char_count),
-            None => char_count,
-        };
-
-        let byte_start = s
-            .char_indices()
-            .nth(start)
-            .map(|(i, _)| i)
-            .unwrap_or(s.len());
-        let byte_end = s
-            .char_indices()
-            .nth(end_char)
-            .map(|(i, _)| i)
-            .unwrap_or(s.len());
-
-        if byte_start == 0 {
-            s.truncate(byte_end);
-            Ok(Value::Text(s))
-        } else {
-            s.drain(..byte_start);
-            s.truncate(byte_end - byte_start);
-            Ok(Value::Text(s))
-        }
     }
 }
 
@@ -687,14 +607,43 @@ impl ExprFunction for ContainsFunc {
         args: &mut dyn ArgWindow,
         _context: &EvalContext,
     ) -> Result<Value, FuncError> {
-        let haystack = args.read(0);
         let needle = args.read(1);
+        let haystack = args.read(0);
         if haystack.is_null() || needle.is_null() {
             return Ok(Value::Null);
         }
-        let s = extract_text_ref(haystack, "contains")?;
-        let n = extract_text_ref(needle, "contains")?;
-        Ok(Value::Bool(s.contains(n)))
+        // Polymorphic membership / substring / has-key test, matching the
+        // `x in y` desugaring (`contains(y, x)`).
+        match haystack {
+            Value::Text(s) => {
+                let n = extract_text_ref(needle, "contains")?;
+                Ok(Value::Bool(s.contains(n)))
+            }
+            Value::Array(items) => Ok(Value::Bool(crate::builtins::array::array_contains(
+                items, needle,
+            ))),
+            Value::Object(entries) => {
+                let key = extract_text_ref(needle, "contains")?;
+                Ok(Value::Bool(entries.iter().any(|(k, _)| k == key)))
+            }
+            Value::Json(serde_json::Value::Array(arr)) => {
+                let target =
+                    air_elt_types::value_to_json(needle).map_err(|e| FuncError::EvalFailed {
+                        function: "contains".to_owned(),
+                        reason: e.to_string(),
+                    })?;
+                Ok(Value::Bool(arr.contains(&target)))
+            }
+            Value::Json(serde_json::Value::Object(map)) => {
+                let key = extract_text_ref(needle, "contains")?;
+                Ok(Value::Bool(map.contains_key(key)))
+            }
+            other => Err(FuncError::TypeMismatch {
+                function: "contains".to_owned(),
+                expected: "Text, Array, Object or Json".to_owned(),
+                actual: format!("{:?}", other.data_type()),
+            }),
+        }
     }
 }
 
@@ -733,19 +682,34 @@ impl ExprFunction for IndexOfFunc {
         args: &mut dyn ArgWindow,
         _context: &EvalContext,
     ) -> Result<Value, FuncError> {
-        let haystack = args.read(0);
         let needle = args.read(1);
+        let haystack = args.read(0);
         if haystack.is_null() || needle.is_null() {
             return Ok(Value::Null);
         }
-        let s = extract_text_ref(haystack, "indexOf")?;
-        let n = extract_text_ref(needle, "indexOf")?;
-        match s.find(n) {
-            Some(byte_pos) => {
-                let char_pos = s[..byte_pos].chars().count();
-                Ok(Value::Int64(char_pos as i64))
+        // Array overload: 0-based position of the first element equal to the
+        // needle (via the cross-numeric `values_equal`), else -1. Text keeps
+        // the existing substring char-offset behaviour.
+        match haystack {
+            Value::Array(items) => match crate::builtins::array::array_position(items, needle) {
+                Some(position) => Ok(Value::Int64(position as i64)),
+                None => Ok(Value::Int64(-1)),
+            },
+            Value::Text(s) => {
+                let n = extract_text_ref(needle, "indexOf")?;
+                match s.find(n) {
+                    Some(byte_pos) => {
+                        let char_pos = s[..byte_pos].chars().count();
+                        Ok(Value::Int64(char_pos as i64))
+                    }
+                    None => Ok(Value::Int64(-1)),
+                }
             }
-            None => Ok(Value::Int64(-1)),
+            other => Err(FuncError::TypeMismatch {
+                function: "indexOf".to_owned(),
+                expected: "Text or Array".to_owned(),
+                actual: format!("{:?}", other.data_type()),
+            }),
         }
     }
 }
@@ -878,12 +842,19 @@ impl ExprFunction for ReverseFunc {
     }
 
     fn resolve_type(&self, args: &[NullableExprType]) -> Result<NullableExprType, FuncError> {
-        validate_text_arg("reverse", &args[0].data_type)?;
-        let size = text_size(&args[0].data_type);
-        Ok(NullableExprType::new(
-            DataType::Text { size },
-            args[0].nullable,
-        ))
+        // Polymorphic: returns the same type as the input. Text reverses chars,
+        // Array reverses elements.
+        match &args[0].data_type {
+            DataType::Text { .. } | DataType::Array { .. } => Ok(NullableExprType::new(
+                args[0].data_type.clone(),
+                args[0].nullable,
+            )),
+            other => Err(FuncError::TypeMismatch {
+                function: "reverse".to_owned(),
+                expected: "Text or Array".to_owned(),
+                actual: format!("{other}"),
+            }),
+        }
     }
 
     fn evaluate(
@@ -891,18 +862,21 @@ impl ExprFunction for ReverseFunc {
         args: &mut dyn ArgWindow,
         _context: &EvalContext,
     ) -> Result<Value, FuncError> {
-        let val = args.read(0);
-        if val.is_null() {
+        if args.read(0).is_null() {
             return Ok(Value::Null);
         }
-        match val {
+        match args.take(0) {
             Value::Text(s) => {
                 let reversed: String = s.chars().rev().collect();
                 Ok(Value::Text(reversed))
             }
+            Value::Array(mut items) => {
+                items.reverse();
+                Ok(Value::Array(items))
+            }
             other => Err(FuncError::TypeMismatch {
                 function: "reverse".to_owned(),
-                expected: "Text".to_owned(),
+                expected: "Text or Array".to_owned(),
                 actual: format!("{:?}", other.data_type()),
             }),
         }
@@ -1199,6 +1173,15 @@ fn format_value(val: &Value) -> String {
                 .collect();
             serde_json::Value::Object(map).to_string()
         }
+        Value::Array(items) => {
+            // Mirrors the `Object` arm and `air_elt_types::value_to_string`:
+            // render as a JSON array, best-effort per element.
+            let array: Vec<serde_json::Value> = items
+                .iter()
+                .map(|item| air_elt_types::value_to_json(item).unwrap_or(serde_json::Value::Null))
+                .collect();
+            serde_json::Value::Array(array).to_string()
+        }
         Value::Custom(v) => v
             .to_json()
             .map_or_else(|_| format!("{v:?}"), |j| j.to_string()),
@@ -1317,61 +1300,6 @@ mod tests {
     }
 
     #[test]
-    fn length_utf8() {
-        let f = LengthFunc;
-        let result = eval(&f, smallvec::smallvec![Value::Text("hello".into())], &ctx()).unwrap();
-        assert_eq!(result, Value::Int64(5));
-
-        let result = eval(
-            &f,
-            smallvec::smallvec![Value::Text("\u{1F600}abc".into())],
-            &ctx(),
-        )
-        .unwrap();
-        assert_eq!(result, Value::Int64(4));
-    }
-
-    #[test]
-    fn substring_basic() {
-        let f = SubstringFunc;
-        let result = eval(
-            &f,
-            smallvec::smallvec![
-                Value::Text("hello world".into()),
-                Value::Int64(6),
-                Value::Int64(5),
-            ],
-            &ctx(),
-        )
-        .unwrap();
-        assert_eq!(result, Value::Text("world".into()));
-    }
-
-    #[test]
-    fn substring_no_length() {
-        let f = SubstringFunc;
-        let result = eval(
-            &f,
-            smallvec::smallvec![Value::Text("hello world".into()), Value::Int64(6)],
-            &ctx(),
-        )
-        .unwrap();
-        assert_eq!(result, Value::Text("world".into()));
-    }
-
-    #[test]
-    fn substring_out_of_bounds() {
-        let f = SubstringFunc;
-        let result = eval(
-            &f,
-            smallvec::smallvec![Value::Text("hi".into()), Value::Int64(10)],
-            &ctx(),
-        )
-        .unwrap();
-        assert_eq!(result, Value::Text(String::new()));
-    }
-
-    #[test]
     fn char_at_basic() {
         let f = CharAtFunc;
         let result = eval(
@@ -1474,6 +1402,142 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
+    fn contains_array_membership() {
+        // `x in arr` desugars to `contains(arr, x)`. Cross-numeric equality:
+        // Int32(2) matches Int64(2).
+        let f = ContainsFunc;
+        let array = Value::Array(vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)]);
+        assert_eq!(
+            eval(
+                &f,
+                smallvec::smallvec![array.clone(), Value::Int32(2)],
+                &ctx()
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval(&f, smallvec::smallvec![array, Value::Int64(9)], &ctx()).unwrap(),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn contains_object_has_key() {
+        let f = ContainsFunc;
+        let object = Value::Object(vec![("a".to_owned(), Value::Int64(1))]);
+        assert_eq!(
+            eval(
+                &f,
+                smallvec::smallvec![object.clone(), Value::Text("a".to_owned())],
+                &ctx()
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval(
+                &f,
+                smallvec::smallvec![object, Value::Text("missing".to_owned())],
+                &ctx()
+            )
+            .unwrap(),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn index_of_array_overload() {
+        let f = IndexOfFunc;
+        let array = Value::Array(vec![Value::Int64(10), Value::Int64(20), Value::Int64(30)]);
+        assert_eq!(
+            eval(
+                &f,
+                smallvec::smallvec![array.clone(), Value::Int64(20)],
+                &ctx()
+            )
+            .unwrap(),
+            Value::Int64(1)
+        );
+        assert_eq!(
+            eval(&f, smallvec::smallvec![array, Value::Int64(99)], &ctx()).unwrap(),
+            Value::Int64(-1)
+        );
+    }
+
+    #[test]
+    fn reverse_array() {
+        let f = ReverseFunc;
+        let array = Value::Array(vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)]);
+        assert_eq!(
+            eval(&f, smallvec::smallvec![array], &ctx()).unwrap(),
+            Value::Array(vec![Value::Int64(3), Value::Int64(2), Value::Int64(1)])
+        );
+    }
+
+    #[test]
+    fn concat_array_overload() {
+        let f = ConcatFunc;
+        let result = eval(
+            &f,
+            smallvec::smallvec![
+                Value::Array(vec![Value::Int64(1), Value::Int64(2)]),
+                Value::Array(vec![Value::Int64(3)]),
+            ],
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            Value::Array(vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)])
+        );
+    }
+
+    #[test]
+    fn concat_array_element_type_join() {
+        // Int32 array + Int64 array → element type Int64 via the matrix join.
+        let f = ConcatFunc;
+        let args = [
+            NullableExprType::array(Some(DataType::Int32), false, false),
+            NullableExprType::array(Some(DataType::Int64), false, false),
+        ];
+        let resolved = f.resolve_type(&args).unwrap();
+        assert_eq!(
+            resolved.data_type,
+            DataType::Array {
+                element: Some(Box::new(DataType::Int64)),
+                element_nullable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn concat_array_incompatible_element_type_mismatch() {
+        let f = ConcatFunc;
+        let args = [
+            NullableExprType::array(Some(DataType::Int64), false, false),
+            NullableExprType::array(Some(DataType::Date), false, false),
+        ];
+        assert!(matches!(
+            f.resolve_type(&args),
+            Err(FuncError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn concat_mixed_text_array_type_mismatch() {
+        let f = ConcatFunc;
+        let args = [
+            NullableExprType::new(DataType::Text { size: None }, false),
+            NullableExprType::array(Some(DataType::Int64), false, false),
+        ];
+        assert!(matches!(
+            f.resolve_type(&args),
+            Err(FuncError::TypeMismatch { .. })
+        ));
     }
 
     #[test]
@@ -1672,31 +1736,6 @@ mod tests {
             ptr_before, ptr_after,
             "toString should pass through Text without cloning"
         );
-    }
-
-    #[test]
-    fn substring_from_start_no_new_allocation() {
-        // substring(s, 0, n) should reuse the buffer (truncate in place)
-        let input = Value::Text("hello world".to_owned());
-        let ptr_before = match &input {
-            Value::Text(s) => s.as_ptr(),
-            _ => unreachable!(),
-        };
-        let result = eval(
-            &SUBSTRING,
-            smallvec::smallvec![input, Value::Int64(0), Value::Int64(5)],
-            &ctx(),
-        )
-        .unwrap();
-        let ptr_after = match &result {
-            Value::Text(s) => s.as_ptr(),
-            _ => unreachable!(),
-        };
-        assert_eq!(
-            ptr_before, ptr_after,
-            "substring from 0 should reuse buffer"
-        );
-        assert_eq!(result, Value::Text("hello".to_owned()));
     }
 
     #[test]

@@ -7,10 +7,10 @@
 //!  3. Reads the value back via a direct SQL query.
 //!  4. Asserts that CH received the correct values.
 //!
-//! Array/Map/Tuple go through the Custom(Ch*Type) / Custom(Ch*Value)
-//! path added for AIR-22/AIR-23.
+//! Array(<primitive>) goes through the canonical `DataType::Array` /
+//! `Value::Array` path (AIR-124); Map/Tuple and non-primitive arrays go
+//! through the Custom(Ch*Type) / Custom(Ch*Value) path (AIR-22/AIR-23).
 
-use air_elt_commons_clickhouse::types::array::ChArrayValue;
 use air_elt_commons_clickhouse::types::map::ChMapValue;
 use air_elt_commons_clickhouse::types::tuple::ChTupleValue;
 use air_elt_commons_testing::clickhouse::clickhouse_handle;
@@ -31,15 +31,13 @@ async fn round_trip_array_int32() {
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
 
-    let elem_type = air_elt_core::types::data_type::DataType::Int32;
+    // `Array(Int32)` resolves to the canonical `DataType::Array`, so the
+    // value travels as `Value::Array` (not the Custom carrier).
     let batch = Batch {
         rows: vec![Row {
             values: vec![
                 Value::UInt64(1),
-                Value::Custom(Box::new(ChArrayValue {
-                    element_type: elem_type,
-                    elements: vec![Value::Int32(10), Value::Int32(20), Value::Int32(30)],
-                })),
+                Value::Array(vec![Value::Int32(10), Value::Int32(20), Value::Int32(30)]),
             ],
             body: None,
             op: RowOp::Upsert,
@@ -75,13 +73,7 @@ async fn round_trip_empty_array() {
 
     let batch = Batch {
         rows: vec![Row {
-            values: vec![
-                Value::UInt64(1),
-                Value::Custom(Box::new(ChArrayValue {
-                    element_type: air_elt_core::types::data_type::DataType::Int32,
-                    elements: vec![],
-                })),
-            ],
+            values: vec![Value::UInt64(1), Value::Array(vec![])],
             body: None,
             op: RowOp::Upsert,
         }],
@@ -216,18 +208,15 @@ async fn round_trip_nested_as_arrays() {
     sink.validate_access(&spec).await.expect("validate_access");
     let ctx = sink.build_context(&spec).await.expect("build_context");
 
+    // The Nested sub-columns `items.label Array(String)` and
+    // `items.qty Array(Int32)` are primitive arrays → canonical
+    // `DataType::Array`, so each value travels as a `Value::Array`.
     let batch = Batch {
         rows: vec![Row {
             values: vec![
                 Value::UInt64(1),
-                Value::Custom(Box::new(ChArrayValue {
-                    element_type: air_elt_core::types::data_type::DataType::Text { size: None },
-                    elements: vec![Value::Text("a".into()), Value::Text("b".into())],
-                })),
-                Value::Custom(Box::new(ChArrayValue {
-                    element_type: air_elt_core::types::data_type::DataType::Int32,
-                    elements: vec![Value::Int32(1), Value::Int32(2)],
-                })),
+                Value::Array(vec![Value::Text("a".into()), Value::Text("b".into())]),
+                Value::Array(vec![Value::Int32(1), Value::Int32(2)]),
             ],
             body: None,
             op: RowOp::Upsert,

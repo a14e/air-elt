@@ -124,9 +124,21 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
                 Ok(Token::RBrace)
             }
+            b'[' => {
+                self.pos += 1;
+                Ok(Token::LBracket)
+            }
+            b']' => {
+                self.pos += 1;
+                Ok(Token::RBracket)
+            }
             b',' => {
                 self.pos += 1;
                 Ok(Token::Comma)
+            }
+            b':' => {
+                self.pos += 1;
+                Ok(Token::Colon)
             }
             b';' => {
                 self.pos += 1;
@@ -522,6 +534,7 @@ impl<'a> Lexer<'a> {
             "null" => Token::NullLit,
             "if" => Token::If,
             "else" => Token::Else,
+            "in" => Token::In,
             _ => {
                 // ISO-8601 duration literal (`PT1H30M`, `P1DT2H`, `P1W`).
                 // Heuristic: only words shaped `P`/`p` + (digit | `T`/`t`)

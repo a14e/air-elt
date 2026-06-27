@@ -288,6 +288,37 @@ fn encode_typed(
             }
             _ => mismatch(column, dt, value),
         },
+        // Canonical `Array(<primitive>)` — shares the RowBinary framing of
+        // the Custom `ChArrayType` path: a VarUInt element count followed
+        // by each element. `Array(Nullable(T))` (`element_nullable`) writes
+        // a 1-byte NULL flag before every element, exactly as CH expects.
+        // The schema-declared element type is the source of truth for the
+        // per-element encoding; a `None` element type only exists for an
+        // empty/unknown array, so a non-empty array with no element type is
+        // a schema bug rather than something to silently drop.
+        DataType::Array {
+            element,
+            element_nullable,
+        } => match value {
+            Value::Array(items) => {
+                write_var_uint(out, items.len() as u64);
+                let Some(element_type) = element else {
+                    if items.is_empty() {
+                        return Ok(());
+                    }
+                    return Err(EncodeError::Mismatch {
+                        column: column.to_string(),
+                        expected: "Array with a known element type".to_string(),
+                        got: "Array with unknown element type",
+                    });
+                };
+                for item in items {
+                    encode_typed_nullable(out, column, element_type, item, *element_nullable)?;
+                }
+                Ok(())
+            }
+            _ => mismatch(column, dt, value),
+        },
         DataType::Custom(t) => match t.kind() {
             ChFixedStringType::KIND => match value {
                 Value::Custom(b) => {
@@ -729,6 +760,7 @@ fn value_variant(v: &Value) -> &'static str {
         Value::Ipv6(_) => "Ipv6",
         Value::Json(_) => "Json",
         Value::Object(_) => "Object",
+        Value::Array(_) => "Array",
         Value::Interval(_) => "Interval",
         Value::Custom(_) => "Custom",
     }
@@ -1169,6 +1201,108 @@ mod tests {
         assert_eq!(out[3], 7);
         assert_eq!(out[6], 0);
         assert_eq!(out.len(), 1 + 1 + 1 + 4);
+    }
+
+    // ---- Canonical Value::Array vs Custom ChArrayValue --------------------
+    // The canonical `DataType::Array` + `Value::Array` path must reuse the
+    // exact RowBinary framing of the legacy Custom `ChArrayType` path. These
+    // tests pin that by encoding the same data both ways and asserting the
+    // byte streams are identical.
+
+    #[test]
+    fn canonical_array_matches_custom_array_encoding() {
+        let elements = vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)];
+
+        let canonical_dt = DataType::Array {
+            element: Some(Box::new(DataType::Int32)),
+            element_nullable: false,
+        };
+        let mut canonical_out = Vec::new();
+        encode_value(
+            &mut canonical_out,
+            &field("a", canonical_dt, false),
+            &Value::Array(elements.clone()),
+        )
+        .unwrap();
+
+        let custom_dt = DataType::Custom(Box::new(ChArrayType {
+            element: DataType::Int32,
+            element_nullable: false,
+        }));
+        let custom_val = Value::Custom(Box::new(ChArrayValue {
+            element_type: DataType::Int32,
+            elements,
+        }));
+        let mut custom_out = Vec::new();
+        encode_value(&mut custom_out, &field("a", custom_dt, false), &custom_val).unwrap();
+
+        assert_eq!(canonical_out, custom_out);
+        // VarUInt length 3, then three i32 LE cells.
+        assert_eq!(canonical_out[0], 3);
+        assert_eq!(canonical_out.len(), 1 + 3 * 4);
+    }
+
+    #[test]
+    fn canonical_array_nullable_matches_custom_array_encoding() {
+        let elements = vec![Value::Null, Value::Int32(7)];
+
+        let canonical_dt = DataType::Array {
+            element: Some(Box::new(DataType::Int32)),
+            element_nullable: true,
+        };
+        let mut canonical_out = Vec::new();
+        encode_value(
+            &mut canonical_out,
+            &field("a", canonical_dt, false),
+            &Value::Array(elements.clone()),
+        )
+        .unwrap();
+
+        let custom_dt = DataType::Custom(Box::new(ChArrayType {
+            element: DataType::Int32,
+            element_nullable: true,
+        }));
+        let custom_val = Value::Custom(Box::new(ChArrayValue {
+            element_type: DataType::Int32,
+            elements,
+        }));
+        let mut custom_out = Vec::new();
+        encode_value(&mut custom_out, &field("a", custom_dt, false), &custom_val).unwrap();
+
+        assert_eq!(canonical_out, custom_out);
+        // length 2, NULL flag 0x01, then NOT-NULL flag 0x00 + i32 LE 7.
+        assert_eq!(canonical_out, vec![2, 1, 0, 7, 0, 0, 0]);
+    }
+
+    #[test]
+    fn canonical_array_empty_with_none_element_encodes_zero_length() {
+        // An empty array whose element type is unknown (`None`) still
+        // encodes as a bare VarUInt length of zero.
+        let dt = DataType::Array {
+            element: None,
+            element_nullable: false,
+        };
+        let mut out = Vec::new();
+        encode_value(&mut out, &field("a", dt, false), &Value::Array(vec![])).unwrap();
+        assert_eq!(out, vec![0]);
+    }
+
+    #[test]
+    fn canonical_array_non_empty_with_none_element_errors() {
+        // A non-empty array with no declared element type cannot be encoded
+        // — there is no per-element type to drive the cell encoder.
+        let dt = DataType::Array {
+            element: None,
+            element_nullable: false,
+        };
+        let mut out = Vec::new();
+        let err = encode_value(
+            &mut out,
+            &field("a", dt, false),
+            &Value::Array(vec![Value::Int32(1)]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EncodeError::Mismatch { .. }));
     }
 
     #[test]

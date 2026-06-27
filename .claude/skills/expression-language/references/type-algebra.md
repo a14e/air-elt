@@ -16,12 +16,37 @@ When both operands carry `int_bound`, bit-level rules apply: add/subtract = `max
 | any int | BigInt | BigInt |
 | Decimal | any numeric | Decimal{precision:None, scale:None} |
 | Text | Text | `concat_result_type`: sums sizes when both bounded, else unbounded |
+| Array | Array | `array_element_join` on the element types (see below); `+` concatenates |
 
 Unary: `negate`/`abs` preserve the input type. `ceil`/`floor`/`round`/`sign` return `Int64`. `power`/`sqrt` return `Float64`.
 
+## Array element unification (`array_element_join`)
+
+When two arrays combine (`+`, `concat`), the result element type is computed from the two element types in `crates/expr/funcs/src/arithmetic_utils.rs`:
+
+- a `None` side (the unknown element of `[]`) yields the other side; both `None` → `None`;
+- identical element types collapse to themselves;
+- otherwise the two must be mutually compatible via `air_elt_types::matrix::is_compatible` (numeric widening, UUID↔text/bytes, …) — the wider source type wins; an incompatible pair is a `TypeMismatch`.
+
+A literal `null` element contributes nullability (`element_nullable`) but not a concrete element type. `[]` carries `element = None` (unknown) and unifies with any concrete element. Polymorphic builtins resolve their array output from the element type: `len`/`isEmpty` → `Int64`/`Bool`; `slice`/`reverse` → the same array type; `element`/`arrayGet`/`indexOf`/`contains` → element type / `Int64` / `Bool`; `filterNotNull` → the same element type with `element_nullable = false`. `len` on a scalar `DataType` is a compile-time `TypeMismatch`.
+
+## Array element nullability
+
+`element_nullable` is a separate axis from the element type. A **nullable** source element into a **non-null** sink element is admitted only under `truncate=true`, which drops the `Null` members at conversion (`is_compatible` rejects it; `is_narrowing` reports it so the validator gives the "enable truncate" hint). A non-null element into a nullable sink is always allowed (widening). `filterNotNull(arr)` is the explicit, lossless alternative — it removes the `Null` members and collapses the element type to non-null, so a nullable-element source feeds a non-null-element sink (`Array(Int32)`, QuestDB `DOUBLE[]`) with no `truncate` flag. PostgreSQL always reports array elements as nullable, so these are the two ways its arrays reach a non-null-element sink.
+
+## Array sinks
+
+The element type is erased to a marker at the sink boundary; only the canonical `DataType::Array` reaches the sink, which is why `element_nullable` lives on `DataType` (so `Array(T)` vs `Array(Nullable(T))` survives).
+
+- **PostgreSQL / CockroachDB**: native primitive-element arrays (`int[]`, `text[]`, …) — read **and** write; nested / non-primitive element arrays are rejected by the type matrix.
+- **ClickHouse**: native `Array(T)` and `Array(Nullable(T))` write (RowBinary). A non-empty array with no known element type is rejected.
+- **QuestDB**: native `DOUBLE[]` write only (Float64 elements; any other element type rejected).
+- **MySQL / MongoDB / non-native columns**: arrays fall back to JSON/Text via the Transform — a `DataType::Array` never reaches a MySQL sink. Exception: the **Mongo** sink writes a native `Bson::Array` (each element encoded canonically).
+- Arrays are **never** cursor / switch / dedup / conflict keys (`Key::from_value` rejects `Value::Array`).
+
 ## String functions
 
-All return `Text{size:None}` (unbounded). Exceptions: `length`/`indexOf` return `Int64`; `startsWith`/`endsWith`/`contains` return `Bool`. Size-aware algebra (e.g. `concat(Text(5), Text(5))` returning `Text(10)`) exists in `concat_result_type` but is not wired through `ConcatFunc.resolve_type` yet.
+All return `Text{size:None}` (unbounded). Exceptions: `indexOf` returns `Int64`; `startsWith`/`endsWith`/`contains` return `Bool`; `split` returns `Array<Text>`. Size-aware algebra (e.g. `concat(Text(5), Text(5))` returning `Text(10)`) exists in `concat_result_type` but is not wired through `ConcatFunc.resolve_type` yet. (`len` is in the Array category — see below.)
 
 **Strictness — no implicit string coercion.** String functions reject non-text arguments with a `TypeMismatch`; they do **not** stringify silently. `trim(1)`, `concat(x, 5)` are type errors. `concat` is strict in both `resolve_type` and `evaluate` (text args only; null still propagates to `Null`). To turn a non-text value into a string, call `toString` explicitly. String interpolation (`"{expr}"`) is the one stringify-everywhere context: each segment renders via the canonical `value_to_string` regardless of type — it does not route through `concat`. A consequence the optimizer exploits: `concat(x, "")` / `concat(x)` is a pure string type-check on `x`, lowered to a `TypeAssert{String}`.
 

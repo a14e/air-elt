@@ -18,11 +18,11 @@ All functions propagate null (return `Value::Null` if any argument is null) unle
 
 ## String
 
+For character/byte length use `len` (Array category); for substring extraction use `slice` (Array category). `substring`, `byteSlice`, and `length` were removed in favour of those polymorphic builtins.
+
 | Function | Signature | Description |
 |---|---|---|
-| `concat` | `(Text...) -> Text` | Concatenate all arguments (variadic, auto-formats non-text) |
-| `length` | `(Text) -> Int64` | Character count |
-| `substring` | `(Text, Int64, Int64?) -> Text` | Extract substring (start, optional length) |
+| `concat` | `(Text...) -> Text` \| `(Array...) -> Array` | Concatenate all arguments. **Polymorphic**: all-Text → text concat (strict, no coercion); all-Array → array concat with element-type unification (see Array). |
 | `charAt` | `(Text, Int64) -> Text?` | Character at index (null if out of bounds) |
 | `upper` | `(Text) -> Text` | Uppercase |
 | `lower` | `(Text) -> Text` | Lowercase |
@@ -30,14 +30,31 @@ All functions propagate null (return `Value::Null` if any argument is null) unle
 | `replace` | `(Text, Text, Text) -> Text` | Replace all occurrences |
 | `startsWith` | `(Text, Text) -> Bool` | True if string starts with prefix |
 | `endsWith` | `(Text, Text) -> Bool` | True if string ends with suffix |
-| `contains` | `(Text, Text) -> Bool` | True if string contains substring |
-| `indexOf` | `(Text, Text) -> Int64` | Index of substring (-1 if not found) |
+| `contains` | `(Text, Text) -> Bool` \| `(Array, T) -> Bool` \| `(Object/Json, Text) -> Bool` | **Polymorphic** membership: substring in Text, element in Array (cross-numeric `values_equal`), key in Object/Json. `x in arr` desugars to `contains(arr, x)`. |
+| `indexOf` | `(Text, Text) -> Int64` \| `(Array, T) -> Int64` | **Polymorphic**: 0-based index of substring / first matching array element (-1 if not found) |
 | `format` | `(Text, any...) -> Text` | Format string with positional `{0}`, `{1}` placeholders |
 | `toString` | `(any) -> Text` | Convert any value to its text representation |
-| `reverse` | `(Text) -> Text` | Reverse characters |
+| `reverse` | `(Text) -> Text` \| `(Array) -> Array` | **Polymorphic**: reverse chars (Text) or elements (Array); returns the same type |
 | `repeat` | `(Text, Int64) -> Text` | Repeat string N times |
 | `leftPad` | `(Text, Int64, Text?) -> Text` | Pad left to target length |
 | `rightPad` | `(Text, Int64, Text?) -> Text` | Pad right to target length |
+| `split` | `(Text, Text) -> Array<Text>` | Split string by separator into a Text array (empty separator → per-char) |
+
+## Array
+
+Array type: `DataType::Array { element: Option<Box<DataType>>, element_nullable }`, runtime `Value::Array(Vec<Value>)`. The element type is fixed at compile time and erased at the sink boundary; `[]` has unknown element type and unifies with any. Literal `[a, b, c]`; index `x[i]` (→ `element`); slice `x[a:b]` (→ `slice`); `x in arr` (→ `contains`). See "Arrays" in [SKILL.md](../SKILL.md). Concatenation is capped at `MAX_ARRAY_LEN` (100 000).
+
+| Function | Signature | Description |
+|---|---|---|
+| `len` | `(Text/Bytes/Array/Object/Json) -> Int64` | Element count — chars (Text), bytes (Bytes), elements (Array), pairs (Object), array/object length (Json). A scalar argument is a **compile-time** error; a JSON scalar (number/string/bool) is a **runtime** error. |
+| `slice` | `(Text/Bytes/Array, Int64?, Int64?) -> same` | Python-style slice. Bounds: negative offsets from end, clamp into range, `null` = open (start→0, end→len), `start ≥ end` → empty. Returns the input type. (Subscript `x[a:b]` desugars here.) |
+| `element` | `(Array, Int64) -> T` \| `(Text, Int64) -> Text` \| `(Object/Json, Text) -> Json` | Strict element access. Array/Text: negative index offsets from end, **out of bounds errors**. Object/Json: by key (missing key errors). (Subscript `x[i]` desugars here.) |
+| `arrayGet` | `(Array, Int64, T) -> T` | Soft element access: out-of-range or null index returns the 3rd-arg default instead of erroring. Negative index supported. |
+| `join` | `(Array, Text) -> Text` | Join array elements into a string with the separator; non-text elements render via the canonical `value_to_string`. |
+| `isEmpty` | `(Text/Bytes/Array/Object/Json) -> Bool` | True if the collection has zero elements (same domain and scalar rules as `len`). |
+| `filterNotNull` | `(Array<T?>) -> Array<T>` | Drop the `Null` members; the result element type collapses to non-null (`element_nullable = false`), the array's own nullability is kept. The explicit, lossless way to feed a non-null-element sink (`Array(Int32)`, QuestDB `DOUBLE[]`) from a nullable-element source. A whole-array `Null` → `Null`. |
+
+`split` (String category) is the array producer from text; `concat` / `+` concatenate arrays; `contains` / `indexOf` / `reverse` are polymorphic over arrays (see String). Element-type unification on `concat` / `+` follows `array_element_join` (see [type-algebra.md](type-algebra.md)).
 
 ## Regex
 
@@ -52,7 +69,7 @@ Patterns use the `regex` crate syntax. The pattern compiles on every call (no pe
 
 | Function | Signature | Description |
 |---|---|---|
-| `add` | `(numeric, numeric) -> numeric` | Addition (also works on Text for concat) |
+| `add` | `(numeric, numeric) -> numeric` \| `(Array, Array) -> Array` | Addition. **Polymorphic**: two arrays concatenate (`[1,2] + [3]` → `[1,2,3]`, element types unified via `array_element_join`, capped at `MAX_ARRAY_LEN`). |
 | `subtract` | `(numeric, numeric) -> numeric` | Subtraction |
 | `multiply` | `(numeric, numeric) -> numeric` | Multiplication |
 | `divide` | `(numeric, numeric) -> numeric` | Division (error on zero) |
@@ -193,9 +210,8 @@ The six operators are **total** — they never return null, so they resolve to n
 
 | Function | Signature | Description |
 |---|---|---|
-| `byteLength` | `(Bytes) -> Int64` | Byte count |
+| `byteLength` | `(Bytes) -> Int64` | Byte count (kept; for char count or Array/Object/Json length use `len`) |
 | `byteAt` | `(Bytes, Int64) -> Int64?` | Byte at index (null if out of bounds) |
-| `byteSlice` | `(Bytes, Int64, Int64?) -> Bytes` | Slice from start with optional length |
 | `bytesFromHex` | `(Text) -> Bytes` | Decode hex string to bytes |
 | `bytesFromBase64` | `(Text) -> Bytes` | Decode standard base64 to bytes |
 | `bytesFromUtf8` | `(Text) -> Bytes` | UTF-8 encode text to bytes |
@@ -205,6 +221,8 @@ The six operators are **total** — they never return null, so they resolve to n
 | `bytesEqual` | `(Bytes, Bytes) -> Bool` | Byte-wise equality |
 | `urlEncode` | `(Text) -> Text` | Percent-encode for URLs |
 | `urlDecode` | `(Text) -> Text` | Percent-decode |
+
+`byteSlice` was removed — `slice` handles Bytes (slices by byte).
 
 ## Encoding
 
@@ -239,13 +257,15 @@ The six operators are **total** — they never return null, so they resolve to n
 | `jsPathInt` | `(Json/Object, Text) -> Int64?` | JSONPath query, first result as Int64 |
 | `jsPathFloat` | `(Json/Object, Text) -> Float64?` | JSONPath query, first result as Float64 |
 | `jsPathBool` | `(Json/Object, Text) -> Bool?` | JSONPath query, first result as Bool |
-| `jsonLength` | `(Json) -> Int64` | Length of JSON array or object |
+
+`jsonLength` was removed — use `len` (handles a JSON array/object; a JSON scalar errors at runtime).
 
 ## Object
 
+`objectLength` was removed — use `len` for the key-value pair count.
+
 | Function | Signature | Description |
 |---|---|---|
-| `objectLength` | `(Object) -> Int64` | Number of key-value pairs |
 | `objectKeys` | `(Object) -> Json` | JSON array of keys |
 | `objectValues` | `(Object) -> Json` | JSON array of values |
 | `objectHasKey` | `(Object, Text) -> Bool` | True if key exists |

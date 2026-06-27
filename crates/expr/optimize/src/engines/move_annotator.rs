@@ -118,6 +118,7 @@ impl MoveAnnotator {
             OptNode::Object { values, .. } => {
                 self.analyze_sequential(program, *values, live, to_take)
             }
+            OptNode::Array(values) => self.analyze_sequential(program, *values, live, to_take),
             OptNode::NullIf { value, sentinel } => {
                 // Both always run, value then sentinel ⇒ reverse: sentinel first.
                 let live = self.analyze(program, *sentinel, live, to_take);
@@ -229,7 +230,7 @@ impl MoveAnnotator {
             OptNode::Field(inner) | OptNode::TypeAssert { inner, .. } => {
                 Self::count_register_reads(program, *inner, counts);
             }
-            OptNode::Call { args, .. } | OptNode::Interpolation(args) => {
+            OptNode::Call { args, .. } | OptNode::Interpolation(args) | OptNode::Array(args) => {
                 for child in program.args(*args) {
                     Self::count_register_reads(program, *child, counts);
                 }

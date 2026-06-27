@@ -612,6 +612,87 @@ pub fn convert(
             _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
         },
 
+        // ---- Array → Json --------------------------------------------
+        // Serialise each element through the JSON encoder (lossy for
+        // canonical element types, same as `Object → Json`). Native array
+        // sinks take the `Array → Array` arm instead.
+        (DataType::Array { .. }, DataType::Json) => match value {
+            Value::Array(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    let json_item = crate::json_encode::value_to_json(&item).map_err(|e| {
+                        ConvertError::Custom {
+                            message: format!("array to json: {e}"),
+                        }
+                    })?;
+                    out.push(json_item);
+                }
+                Ok(Value::Json(serde_json::Value::Array(out)))
+            }
+            _ => Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+        },
+
+        // ---- Array → Array (native element conversion) ----------------
+        // Convert each element from the source element type to the sink
+        // element type. A `None` source element resolves per-cell from the
+        // value (schemaless arrays); a `None` sink element has no target,
+        // so the array passes through unchanged. Element narrowing inherits
+        // `ctx.truncate` through the recursive call.
+        //
+        // Element nullability: a non-null sink element cannot hold a `Null`
+        // member. The matrix admits a nullable→non-null element pair only
+        // under `truncate`, whose contract here is to DROP the `Null` members
+        // (the column default applies to the whole array, never to its
+        // elements). A nullable sink element keeps `Null` as-is.
+        (
+            DataType::Array {
+                element: source_element,
+                ..
+            },
+            DataType::Array {
+                element: sink_element,
+                element_nullable: sink_element_nullable,
+            },
+        ) => {
+            let items = match value {
+                Value::Array(items) => items,
+                _ => return Err(ConvertError::ValueShapeMismatch { src: src.clone() }),
+            };
+            let items: Vec<Value> = if *sink_element_nullable {
+                items
+            } else {
+                items
+                    .into_iter()
+                    .filter(|item| !matches!(item, Value::Null))
+                    .collect()
+            };
+            let Some(sink_element) = sink_element else {
+                return Ok(Value::Array(items));
+            };
+            let sink_element_type: &DataType = sink_element;
+            let mut converted = Vec::with_capacity(items.len());
+            for item in items {
+                if matches!(item, Value::Null) {
+                    converted.push(Value::Null);
+                    continue;
+                }
+                let converted_item = match source_element {
+                    // The declared element type is loop-invariant — borrow it, no
+                    // per-element clone.
+                    Some(element) => convert(item, element, sink_element_type, ctx)?,
+                    // Schemaless source: resolve each element's type from the value.
+                    None => {
+                        let item_source = item
+                            .data_type()
+                            .ok_or_else(|| ConvertError::ValueShapeMismatch { src: src.clone() })?;
+                        convert(item, &item_source, sink_element_type, ctx)?
+                    }
+                };
+                converted.push(converted_item);
+            }
+            Ok(Value::Array(converted))
+        }
+
         // ---- * → Text -------------------------------------------------
         // Every type renders to its canonical text form (Uuid hyphenated, IP
         // canonical, Json/Object serialized, Bytes hex, scalars natural). The
@@ -951,6 +1032,113 @@ mod tests {
         let ctx = passthrough().with_default(Value::Int32(99));
         let out = convert(Value::Int32(5), &DataType::Int32, &DataType::Int32, &ctx).unwrap();
         assert_eq!(out, Value::Int32(5));
+    }
+
+    // §6.x Array conversion
+
+    fn dt_arr(element: DataType, nullable: bool) -> DataType {
+        DataType::Array {
+            element: Some(Box::new(element)),
+            element_nullable: nullable,
+        }
+    }
+
+    #[test]
+    fn array_to_json_serializes_elements() {
+        let v = Value::Array(vec![Value::Int64(1), Value::Int64(2)]);
+        let out = convert(
+            v,
+            &dt_arr(DataType::Int64, false),
+            &DataType::Json,
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Json(serde_json::json!([1, 2])));
+    }
+
+    #[test]
+    fn array_element_widening_int8_to_int64() {
+        let v = Value::Array(vec![Value::Int8(1), Value::Int8(2)]);
+        let out = convert(
+            v,
+            &dt_arr(DataType::Int8, false),
+            &dt_arr(DataType::Int64, false),
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Array(vec![Value::Int64(1), Value::Int64(2)]));
+    }
+
+    #[test]
+    fn array_to_text_renders_json() {
+        let v = Value::Array(vec![Value::Int64(1), Value::Text("a".into())]);
+        let out = convert(
+            v,
+            &dt_arr(DataType::Int64, true),
+            &DataType::Text { size: None },
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Text("[1,\"a\"]".into()));
+    }
+
+    #[test]
+    fn array_element_narrowing_needs_truncate() {
+        let v = Value::Array(vec![Value::Int64(70000)]);
+        let res = convert(
+            v,
+            &dt_arr(DataType::Int64, false),
+            &dt_arr(DataType::Int16, false),
+            &passthrough(),
+        );
+        assert!(matches!(res, Err(ConvertError::Unsupported { .. })));
+    }
+
+    #[test]
+    fn array_element_narrowing_with_truncate_saturates() {
+        let v = Value::Array(vec![Value::Int64(70000)]);
+        let out = convert(
+            v,
+            &dt_arr(DataType::Int64, false),
+            &dt_arr(DataType::Int16, false),
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Array(vec![Value::Int16(i16::MAX)]));
+    }
+
+    #[test]
+    fn array_nullable_element_drops_nulls_into_non_null_sink() {
+        // A nullable-element source into a non-null sink element drops the NULL
+        // members (the matrix admits this only under truncate).
+        let v = Value::Array(vec![
+            Value::Int32(1),
+            Value::Null,
+            Value::Int32(2),
+            Value::Null,
+        ]);
+        let out = convert(
+            v,
+            &dt_arr(DataType::Int32, true),
+            &dt_arr(DataType::Int32, false),
+            &truncate_ctx(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Array(vec![Value::Int32(1), Value::Int32(2)]));
+    }
+
+    #[test]
+    fn array_nullable_sink_keeps_null_members() {
+        // A nullable sink element keeps NULL members as-is.
+        let v = Value::Array(vec![Value::Int32(1), Value::Null]);
+        let out = convert(
+            v,
+            &dt_arr(DataType::Int32, true),
+            &dt_arr(DataType::Int32, true),
+            &passthrough(),
+        )
+        .unwrap();
+        assert_eq!(out, Value::Array(vec![Value::Int32(1), Value::Null]));
     }
 
     // §6.3 Text narrowing (UTF-8 boundary)

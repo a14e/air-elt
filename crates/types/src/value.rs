@@ -62,6 +62,13 @@ pub enum Value {
     /// heterogeneous (any `Value` variant). Order matters for
     /// deterministic serialisation.
     Object(Vec<(String, Value)>),
+    /// Homogeneous ordered list — the runtime payload for
+    /// [`crate::DataType::Array`]. Carries canonical typed elements (an
+    /// `Int64` element stays `Int64`, not a JSON number, mirroring
+    /// `Object`). The container is dynamic; the element type is fixed at
+    /// compile time by the expression layer and erased at the sink
+    /// boundary. Never a cursor/switch key (rejected by `Key`).
+    Array(Vec<Value>),
     /// Time span / duration ([`crate::DataType::Interval`]). Carried as a
     /// `std::time::Duration`. Minimal by design: no conversion arms, never
     /// a cursor/switch key, never JSON-encoded. Today it only types the
@@ -124,6 +131,30 @@ impl Value {
             Value::Ipv6(_) => Some(DataType::Ipv6),
             Value::Json(_) => Some(DataType::Json),
             Value::Object(_) => Some(DataType::Object),
+            // Infer the element type from the live items: collapse the
+            // non-null element types via `union` (homogeneous → bare type,
+            // heterogeneous → `Union`, empty → `None`) and mark the
+            // element nullable if any item is `Null`. Used only by the
+            // schemaless / `Union` re-dispatch paths.
+            Value::Array(items) => {
+                let mut element_nullable = false;
+                let mut element_types: Vec<DataType> = Vec::new();
+                for item in items {
+                    match item.data_type() {
+                        None => element_nullable = true,
+                        Some(t) => element_types.push(t),
+                    }
+                }
+                let element = if element_types.is_empty() {
+                    None
+                } else {
+                    Some(Box::new(DataType::union(element_types)))
+                };
+                Some(DataType::Array {
+                    element,
+                    element_nullable,
+                })
+            }
             Value::Interval(_) => Some(DataType::Interval),
             Value::Custom(v) => Some(DataType::Custom(v.dyn_type())),
         }
@@ -162,6 +193,7 @@ impl Value {
             Value::Ipv6(_) => "Ipv6",
             Value::Json(_) => "Json",
             Value::Object(_) => "Object",
+            Value::Array(_) => "Array",
             Value::Interval(_) => "Interval",
             // A connector-specific value names itself by its real kind, not
             // a flat "Custom" — `DynType::kind()` borrows from a temporary
@@ -179,6 +211,7 @@ impl Value {
             | Value::Json(_)
             | Value::Bytes(_)
             | Value::Object(_)
+            | Value::Array(_)
             | Value::Interval(_)
             | Value::Custom(_) => None,
             Value::Bool(b) => Some(toml::Value::Boolean(*b)),
@@ -239,6 +272,7 @@ impl Clone for Value {
             Value::Ipv6(a) => Value::Ipv6(*a),
             Value::Json(j) => Value::Json(j.clone()),
             Value::Object(entries) => Value::Object(entries.clone()),
+            Value::Array(items) => Value::Array(items.clone()),
             Value::Interval(d) => Value::Interval(*d),
             Value::Custom(v) => Value::Custom((**v).clone_box()),
         }
@@ -328,6 +362,18 @@ impl Serialize for Value {
                     })
                     .collect();
                 emit(serializer, "object", &serde_json::Value::Object(json_map))
+            }
+            // Mirrors `Object`: each element is flattened through
+            // `value_to_json` (lossy for canonical types). Arrays are never
+            // cursor keys, so this exists to keep `Serialize` total.
+            Value::Array(items) => {
+                let json_arr: Vec<serde_json::Value> = items
+                    .iter()
+                    .map(|v| {
+                        crate::json_encode::value_to_json(v).unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect();
+                emit(serializer, "array", &serde_json::Value::Array(json_arr))
             }
             // `std::time::Duration` serialises losslessly as `{secs, nanos}`.
             // Intervals are never cursor fields, so this arm is here only to
@@ -480,6 +526,13 @@ impl<'de> Visitor<'de> for ValueVisitor {
                     .map(|(k, val)| Ok((k.clone(), Value::Json(val.clone()))))
                     .collect::<Result<_, A::Error>>()?;
                 Ok(Value::Object(entries))
+            }
+            "array" => {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| de::Error::custom("array value must be a JSON array"))?;
+                let items: Vec<Value> = arr.iter().map(|val| Value::Json(val.clone())).collect();
+                Ok(Value::Array(items))
             }
             "custom" => {
                 // Custom values can't deserialize through the bare
@@ -684,6 +737,26 @@ mod tests {
             let back: Value = serde_json::from_value(expected).unwrap();
             assert_eq!(back, variant, "round-trip mismatch for {variant:?}");
         }
+    }
+
+    /// `Value::Array` serialises to `{type:"array", value:[...]}` with
+    /// each element flattened through `value_to_json` (lossy for canonical
+    /// types, mirroring `Value::Object` — arrays are never cursor keys).
+    /// The bare deserialize path rebuilds elements as `Value::Json`.
+    #[test]
+    fn array_serialize_shape_and_deserialize() {
+        let v = Value::Array(vec![Value::Int64(1), Value::Int64(2), Value::Null]);
+        let got = serde_json::to_value(v).unwrap();
+        assert_eq!(got, serde_json::json!({"type":"array","value":[1,2,null]}));
+        let back: Value = serde_json::from_value(got).unwrap();
+        assert_eq!(
+            back,
+            Value::Array(vec![
+                Value::Json(serde_json::json!(1)),
+                Value::Json(serde_json::json!(2)),
+                Value::Json(serde_json::Value::Null),
+            ])
+        );
     }
 
     /// Test stand-in `DynType` paired with `StubValue` to exercise
@@ -996,6 +1069,7 @@ mod tests {
             Value::Ipv6(_) => prop_assert_eq!(got, Some(DataType::Ipv6)),
             Value::Json(_) => prop_assert_eq!(got, Some(DataType::Json)),
             Value::Object(_) => unreachable!("strategy excludes Object"),
+            Value::Array(_) => unreachable!("strategy excludes Array"),
             Value::Interval(_) => prop_assert_eq!(got, Some(DataType::Interval)),
             Value::Custom(_) => unreachable!("strategy excludes Custom"),
         }

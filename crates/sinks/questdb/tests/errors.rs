@@ -97,3 +97,40 @@ fn ipv6_rejected_no_native_questdb_column() {
         "QuestDB has no IPv6 column type"
     );
 }
+
+#[test]
+fn double_array_is_accepted() {
+    // QuestDB writes 1-D `DOUBLE[]` natively.
+    let dt = DataType::Array {
+        element: Some(Box::new(DataType::Float64)),
+        element_nullable: false,
+    };
+    assert!(
+        type_supported(&dt),
+        "DOUBLE[] (Float64-element array) must be accepted"
+    );
+}
+
+#[test]
+fn non_double_arrays_are_rejected() {
+    // QuestDB stores arrays of DOUBLE only — an Int64-element array has no
+    // native column.
+    let int_array = DataType::Array {
+        element: Some(Box::new(DataType::Int64)),
+        element_nullable: false,
+    };
+    assert!(
+        !type_supported(&int_array),
+        "Int64-element array must be rejected"
+    );
+    // An empty/unknown-element array (`element = None`) is likewise not
+    // natively writable.
+    let unknown_array = DataType::Array {
+        element: None,
+        element_nullable: false,
+    };
+    assert!(
+        !type_supported(&unknown_array),
+        "unknown-element array must be rejected"
+    );
+}

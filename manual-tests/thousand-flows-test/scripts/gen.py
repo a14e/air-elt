@@ -524,12 +524,13 @@ def build_compose(top: dict[str, Any]) -> str:
     def qdb_service(
         name: str, pg_wire_port: int, http_port: int, init_file: str, memory: str
     ) -> str:
-        # QuestDB 8.2.3 is pinned to match the test handle's
-        # `air_elt_commons_testing::questdb::QUESTDB_IMAGE_TAG`. 8.1.1's
-        # pg-wire mis-types extended-protocol bind parameters for any
+        # QuestDB 9.4.3 is pinned to match the test handle's
+        # `air_elt_commons_testing::questdb::QUESTDB_IMAGE_TAG` (native
+        # 1-D DOUBLE[] arrays require >= 9.0). The old 8.1.1 pg-wire
+        # mis-typing of extended-protocol bind parameters for any
         # non-STRING column (`inconvertible types: STRING -> BOOLEAN
-        # [from=$N, to=<col>]` at validate-time); 8.2.3 fixes that, so
-        # the sink's dry-run probe — and every typed INSERT — works.
+        # [from=$N, to=<col>]` at validate-time) was fixed back in 8.2.3,
+        # so the sink's dry-run probe — and every typed INSERT — works.
         # PG-wire credentials match the test's `air:air` convention so the
         # same URL scheme works everywhere. (No tmpfs mount — earlier
         # iterations used one but memory pressure made it unviable at 18+
@@ -537,7 +538,7 @@ def build_compose(top: dict[str, Any]) -> str:
         # writable layer, which `compose down -v` reclaims.)
         return (
             f"  {name}:\n"
-            f"    image: questdb/questdb:8.2.3\n"
+            f"    image: questdb/questdb:9.4.3\n"
             f"    environment:\n"
             f"      QDB_PG_USER: air\n"
             f"      QDB_PG_PASSWORD: air\n"

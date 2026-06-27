@@ -100,6 +100,11 @@ where
                 visit(value)?;
             }
         }
+        OptExpr::Array(_, elements) => {
+            for element in elements {
+                visit(element)?;
+            }
+        }
         OptExpr::Switch {
             inputs,
             table,
@@ -187,6 +192,11 @@ where
         OptExpr::Object(_, entries) => {
             for (_, value) in entries {
                 visit(value)?;
+            }
+        }
+        OptExpr::Array(_, elements) => {
+            for element in elements {
+                visit(element)?;
             }
         }
         OptExpr::Switch {

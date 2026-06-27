@@ -192,6 +192,13 @@ pub fn to_bson(v: &Value) -> RuntimeResult<Bson> {
             }
             Bson::Document(doc)
         }
+        // MongoDB natively supports arrays. Each canonical element is
+        // recursively encoded through the same Value -> Bson codec so
+        // nested arrays/objects/customs round-trip faithfully.
+        Value::Array(items) => {
+            let encoded: Vec<Bson> = items.iter().map(to_bson).collect::<RuntimeResult<_>>()?;
+            Bson::Array(encoded)
+        }
         Value::Interval(_) => {
             return Err(RuntimeError::Other(
                 "Value::Interval (redis-only type) has no BSON encoding".to_string(),
@@ -650,6 +657,55 @@ mod tests {
         assert!(
             matches!(v, Value::Json(_)),
             "Array should remain Value::Json"
+        );
+    }
+
+    #[test]
+    fn value_array_encodes_to_bson_array() {
+        // Mongo natively supports arrays. The Value -> Bson write codec
+        // must recursively encode each canonical element. `from_bson`
+        // intentionally maps `Bson::Array` back to `Value::Json` (the
+        // documented read-path behaviour), so this asserts the write
+        // mapping directly: `Value::Array([Int64, Text])` ->
+        // `Bson::Array([Int64, String])`.
+        let value = Value::Array(vec![Value::Int64(7), Value::Text("hello".into())]);
+        let encoded = to_bson(&value).unwrap();
+        match encoded {
+            Bson::Array(items) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0], Bson::Int64(7));
+                assert_eq!(items[1], Bson::String("hello".into()));
+            }
+            other => panic!("expected Bson::Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn value_array_owned_encodes_to_bson_array() {
+        // `to_bson_owned` forwards arrays through its catch-all to the
+        // borrowed encoder; assert the same recursive shape lands.
+        let value = Value::Array(vec![Value::Bool(true), Value::Int32(3)]);
+        let encoded = to_bson_owned(value).unwrap();
+        assert_eq!(
+            encoded,
+            Bson::Array(vec![Bson::Boolean(true), Bson::Int32(3)])
+        );
+    }
+
+    #[test]
+    fn nested_value_array_encodes_recursively() {
+        // Nested arrays exercise the recursive arm.
+        let value = Value::Array(vec![
+            Value::Array(vec![Value::Int32(1)]),
+            Value::Text("x".into()),
+        ]);
+        let encoded = to_bson(&value).unwrap();
+        assert_eq!(
+            encoded,
+            Bson::Array(vec![
+                Bson::Array(vec![Bson::Int32(1)]),
+                Bson::String("x".into()),
+            ])
         );
     }
 }

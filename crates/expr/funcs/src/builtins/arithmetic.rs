@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 
 use crate::arithmetic_utils::{
-    ArithmeticOp, arithmetic_result_type, comparable_join, concat_result_type,
+    ArithmeticOp, arithmetic_result_type, array_element_join, comparable_join, concat_result_type,
 };
 use air_elt_expr_types::nullable::NullableExprType;
 use air_elt_types::{DataType, Value, compare_values};
@@ -99,7 +99,13 @@ impl ExprFunction for AddFunc {
             (&args[0].data_type, &args[1].data_type),
             (DataType::Text { .. }, DataType::Text { .. })
         );
-        if both_text {
+        let both_array = matches!(
+            (&args[0].data_type, &args[1].data_type),
+            (DataType::Array { .. }, DataType::Array { .. })
+        );
+        if both_array {
+            add_array_result_type(args, nullable)
+        } else if both_text {
             let result_dt =
                 concat_result_type(&[&args[0].data_type, &args[1].data_type]).map_err(|e| {
                     FuncError::TypeMismatch {
@@ -130,6 +136,26 @@ impl ExprFunction for AddFunc {
     ) -> Result<Value, FuncError> {
         if args.read(0).is_null() || args.read(1).is_null() {
             return Ok(Value::Null);
+        }
+        // Array concatenation: `[1,2] + [3]` → `[1,2,3]` (bounded by
+        // MAX_ARRAY_LEN). Both operands are arrays here — `resolve_type` admits
+        // the array branch only for two array types.
+        if matches!(args.read(0), Value::Array(_)) {
+            let left = match args.take(0) {
+                Value::Array(items) => items,
+                other => return Ok(other),
+            };
+            let right = match args.take(1) {
+                Value::Array(items) => items,
+                other => {
+                    return Err(FuncError::TypeMismatch {
+                        function: "add".to_owned(),
+                        expected: "Array".to_owned(),
+                        actual: format!("{:?}", other.data_type()),
+                    });
+                }
+            };
+            return crate::builtins::array::concat_arrays("add", left, right);
         }
         // Take ownership of arg 0 (its buffer is reused for Text concat /
         // BigInt / Decimal). For the Text case arg 1 is only READ —
@@ -1131,6 +1157,43 @@ fn is_numeric_type(dt: &DataType) -> bool {
     )
 }
 
+/// Result type for `add` over two arrays: element type joined via the shared
+/// matrix helper, `element_nullable` the OR of the two sides. An incompatible
+/// element pair is a `TypeMismatch`.
+fn add_array_result_type(
+    args: &[NullableExprType],
+    nullable: bool,
+) -> Result<NullableExprType, FuncError> {
+    let (left_element, left_element_nullable) = match &args[0].data_type {
+        DataType::Array {
+            element,
+            element_nullable,
+        } => (element, *element_nullable),
+        _ => unreachable!("add_array_result_type called with a non-array argument"),
+    };
+    let (right_element, right_element_nullable) = match &args[1].data_type {
+        DataType::Array {
+            element,
+            element_nullable,
+        } => (element, *element_nullable),
+        _ => unreachable!("add_array_result_type called with a non-array argument"),
+    };
+    let element =
+        array_element_join(left_element, right_element).map_err(|e| FuncError::TypeMismatch {
+            function: "add".to_owned(),
+            expected: "arrays with compatible element types".to_owned(),
+            actual: e.to_string(),
+        })?;
+    Ok(NullableExprType {
+        data_type: DataType::Array {
+            element: element.map(Box::new),
+            element_nullable: left_element_nullable || right_element_nullable,
+        },
+        nullable,
+        int_bound: None,
+    })
+}
+
 fn validate_numeric_args(
     function: &str,
     left: &DataType,
@@ -1283,6 +1346,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, Value::Text("hello world".into()));
+    }
+
+    #[test]
+    fn add_array_concat() {
+        let f = AddFunc;
+        let result = eval(
+            &f,
+            smallvec::smallvec![
+                Value::Array(vec![Value::Int64(1), Value::Int64(2)]),
+                Value::Array(vec![Value::Int64(3)]),
+            ],
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            Value::Array(vec![Value::Int64(1), Value::Int64(2), Value::Int64(3)])
+        );
+    }
+
+    #[test]
+    fn add_array_element_type_join() {
+        // Int32 array + Int64 array → element Int64 via the matrix join.
+        let f = AddFunc;
+        let args = [
+            NullableExprType::array(Some(DataType::Int32), false, false),
+            NullableExprType::array(Some(DataType::Int64), true, false),
+        ];
+        let resolved = f.resolve_type(&args).unwrap();
+        assert_eq!(
+            resolved.data_type,
+            DataType::Array {
+                element: Some(Box::new(DataType::Int64)),
+                // element_nullable = a_elem_nullable || b_elem_nullable.
+                element_nullable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn add_array_incompatible_element_type_mismatch() {
+        let f = AddFunc;
+        let args = [
+            NullableExprType::array(Some(DataType::Int64), false, false),
+            NullableExprType::array(Some(DataType::Date), false, false),
+        ];
+        assert!(matches!(
+            f.resolve_type(&args),
+            Err(FuncError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn add_array_max_len_enforced() {
+        let f = AddFunc;
+        let left = Value::Array(vec![
+            Value::Int64(0);
+            air_elt_expr_types::limits::MAX_ARRAY_LEN
+        ]);
+        let right = Value::Array(vec![Value::Int64(0)]);
+        assert!(matches!(
+            eval(&f, smallvec::smallvec![left, right], &ctx()),
+            Err(FuncError::InvalidArgument { .. })
+        ));
     }
 
     #[test]

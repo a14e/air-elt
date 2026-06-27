@@ -207,6 +207,46 @@ pub fn concat_result_type(types: &[&DataType]) -> Result<DataType, ExprTypeError
     Ok(DataType::Text { size: total_size })
 }
 
+/// Unify two array element types for `add`-array / `concat`-array, mirroring
+/// the spirit of [`concat_result_type`] for elements rather than text sizes.
+///
+/// * a `None` side (the empty/unknown element of `[]`) yields the other side;
+/// * identical element types collapse to themselves;
+/// * otherwise the two must be mutually [`is_compatible`](air_elt_types::matrix::is_compatible)
+///   (numeric widening, UUID↔text/bytes, …), in which case the result is the
+///   wider source type taken via the matrix; an incompatible pair returns
+///   `Err`, which the caller turns into a `TypeMismatch`.
+pub fn array_element_join(
+    left: &Option<Box<DataType>>,
+    right: &Option<Box<DataType>>,
+) -> Result<Option<DataType>, ExprTypeError> {
+    match (left, right) {
+        (None, None) => Ok(None),
+        (Some(l), None) => Ok(Some((**l).clone())),
+        (None, Some(r)) => Ok(Some((**r).clone())),
+        (Some(l), Some(r)) => {
+            if l == r {
+                return Ok(Some((**l).clone()));
+            }
+            let left_into_right =
+                air_elt_types::matrix::is_compatible((**l).clone(), (**r).clone());
+            let right_into_left =
+                air_elt_types::matrix::is_compatible((**r).clone(), (**l).clone());
+            if left_into_right {
+                Ok(Some((**r).clone()))
+            } else if right_into_left {
+                Ok(Some((**l).clone()))
+            } else {
+                Err(ExprTypeError::TypeMismatch {
+                    operation: "array concat".to_owned(),
+                    left: format!("{l}"),
+                    right: format!("{r}"),
+                })
+            }
+        }
+    }
+}
+
 fn scalar_arithmetic(
     op: ArithmeticOp,
     left: &DataType,
@@ -429,5 +469,45 @@ mod tests {
         let result = arithmetic_result_type(ArithmeticOp::Multiply, &left, &right).unwrap();
         assert!(matches!(result.data_type, DataType::BigInt { .. }));
         assert_eq!(result.int_bound, None);
+    }
+
+    #[test]
+    fn array_element_join_collapses_identical() {
+        let l = Some(Box::new(DataType::Int64));
+        let r = Some(Box::new(DataType::Int64));
+        assert_eq!(array_element_join(&l, &r).unwrap(), Some(DataType::Int64));
+    }
+
+    #[test]
+    fn array_element_join_none_side_yields_other() {
+        let some = Some(Box::new(DataType::Text { size: None }));
+        assert_eq!(
+            array_element_join(&None, &some).unwrap(),
+            Some(DataType::Text { size: None })
+        );
+        assert_eq!(
+            array_element_join(&some, &None).unwrap(),
+            Some(DataType::Text { size: None })
+        );
+        assert_eq!(array_element_join(&None, &None).unwrap(), None);
+    }
+
+    #[test]
+    fn array_element_join_widens_numeric() {
+        // Int32 widens into Int64 via the compatibility matrix.
+        let l = Some(Box::new(DataType::Int32));
+        let r = Some(Box::new(DataType::Int64));
+        assert_eq!(array_element_join(&l, &r).unwrap(), Some(DataType::Int64));
+    }
+
+    #[test]
+    fn array_element_join_incompatible_errors() {
+        // Int64 and Date have no conversion arm in either direction.
+        let l = Some(Box::new(DataType::Int64));
+        let r = Some(Box::new(DataType::Date));
+        assert!(matches!(
+            array_element_join(&l, &r),
+            Err(ExprTypeError::TypeMismatch { .. })
+        ));
     }
 }

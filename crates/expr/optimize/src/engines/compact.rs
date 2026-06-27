@@ -183,6 +183,10 @@ impl Compactor {
                 let segments = self.compact_run(segments)?;
                 Ok(self.nodes.alloc(OptNode::Interpolation(segments))?)
             }
+            OptExpr::Array(_, elements) => {
+                let elements = self.compact_run(elements)?;
+                Ok(self.nodes.alloc(OptNode::Array(elements))?)
+            }
             OptExpr::Object(_, entries) => {
                 let mut keys = Vec::with_capacity(entries.len());
                 let mut values = Vec::with_capacity(entries.len());

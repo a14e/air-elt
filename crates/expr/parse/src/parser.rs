@@ -55,14 +55,25 @@ impl Parser {
     }
 
     pub fn parse_toml(&self, value: &toml::Value) -> Result<Program, ExprError> {
-        let result = self.parse_toml_expr(value)?;
+        let result = self.parse_toml_expr(value, 0)?;
         Ok(Program {
             statements: vec![],
             result,
         })
     }
 
-    fn parse_toml_expr(&self, value: &toml::Value) -> Result<Expr, ExprError> {
+    /// Lower a TOML value into an `Expr`. `depth` guards a pathological
+    /// deeply-nested inline TOML table/array (a config `default`/`switch`
+    /// value): each `Table`/`Array` level recurses on the native stack — and
+    /// now produces a matching nested `Expr` tree — so the depth is capped at
+    /// `MAX_EXPR_DEPTH` exactly like the token parser, returning a clean error
+    /// instead of overflowing.
+    fn parse_toml_expr(&self, value: &toml::Value, depth: usize) -> Result<Expr, ExprError> {
+        if depth > MAX_EXPR_DEPTH {
+            return Err(ExprError::NestingTooDeep {
+                max: MAX_EXPR_DEPTH,
+            });
+        }
         match value {
             toml::Value::String(s) => Ok(self.parse(s)?.result),
             toml::Value::Integer(n) => Ok(Expr::Literal(LiteralValue::Int(*n))),
@@ -71,18 +82,16 @@ impl Parser {
             toml::Value::Table(t) => {
                 let mut entries = Vec::with_capacity(t.len());
                 for (key, val) in t {
-                    entries.push((key.clone(), self.parse_toml_expr(val)?));
+                    entries.push((key.clone(), self.parse_toml_expr(val, depth + 1)?));
                 }
                 Ok(Expr::Object(entries))
             }
             toml::Value::Array(arr) => {
                 let mut elements = Vec::with_capacity(arr.len());
                 for val in arr {
-                    elements.push(self.parse_toml_expr(val)?);
+                    elements.push(self.parse_toml_expr(val, depth + 1)?);
                 }
-                Ok(Expr::Literal(LiteralValue::String(
-                    toml::Value::Array(arr.clone()).to_string(),
-                )))
+                Ok(Expr::Array(elements))
             }
             _ => Ok(Expr::Literal(LiteralValue::String(value.to_string()))),
         }
@@ -381,7 +390,7 @@ impl ParseState {
             Token::Minus => "negate",
             Token::Not => "not",
             Token::Tilde => "bitNot",
-            _ => return self.parse_call_expr(),
+            _ => return self.parse_postfix_expr(),
         };
 
         self.advance();
@@ -437,6 +446,87 @@ impl ParseState {
         }
 
         self.parse_primary()
+    }
+
+    /// Wrap [`parse_call_expr`](Self::parse_call_expr) with a postfix
+    /// subscript/slice loop — the single place `expr[...]` attaches (to a call,
+    /// a primary, a parenthesised group, anything). Each subscript holds one
+    /// depth unit for the duration so a long chain `a[0][1]…` builds a tree the
+    /// downstream passes can recurse over, exactly like a binary fold chain.
+    fn parse_postfix_expr(&mut self) -> Result<Expr, ExprError> {
+        let mut expr = self.parse_call_expr()?;
+        let mut holds = 0usize;
+        let result = loop {
+            if *self.peek() != Token::LBracket {
+                break Ok(expr);
+            }
+            if let Err(error) = self.increment_depth() {
+                break Err(error);
+            }
+            holds += 1;
+            match self.parse_subscript(expr) {
+                Ok(next) => expr = next,
+                Err(error) => break Err(error),
+            }
+        };
+        for _ in 0..holds {
+            self.decrement_depth();
+        }
+        result
+    }
+
+    /// Parse one `[...]` postfix on `base`. The index form `[i]` desugars to
+    /// `element(base, i)` (strict — out-of-bounds errors at runtime); the slice
+    /// forms `[a:b]` / `[a:]` / `[:b]` / `[:]` desugar to `slice(base, a, b)`
+    /// where an omitted bound becomes a `null` literal (open bound, clamped at
+    /// runtime). A second colon (slice step) is rejected — steps are deferred.
+    fn parse_subscript(&mut self, base: Expr) -> Result<Expr, ExprError> {
+        self.advance(); // consume '['
+
+        let start = if matches!(self.peek(), Token::Colon | Token::RBracket) {
+            None
+        } else {
+            Some(self.parse_expr()?)
+        };
+
+        if *self.peek() == Token::Colon {
+            self.advance(); // consume ':'
+            let end = if *self.peek() == Token::RBracket {
+                None
+            } else {
+                Some(self.parse_expr()?)
+            };
+            if *self.peek() == Token::Colon {
+                return Err(ExprError::Parse {
+                    position: self.pos,
+                    message: "slice step (a second ':') is not supported".to_string(),
+                });
+            }
+            self.expect(&Token::RBracket)?;
+            self.count_node()?;
+            let start_expr = start.unwrap_or(Expr::Literal(LiteralValue::Null));
+            let end_expr = end.unwrap_or(Expr::Literal(LiteralValue::Null));
+            return Ok(Expr::FunctionCall {
+                name: "slice".to_string(),
+                args: vec![base, start_expr, end_expr],
+            });
+        }
+
+        let index = match start {
+            Some(expr) => expr,
+            None => {
+                return Err(ExprError::Parse {
+                    position: self.pos,
+                    message: "empty subscript: expected an index expression".to_string(),
+                });
+            }
+        };
+        self.expect(&Token::RBracket)?;
+        self.count_node()?;
+        Ok(Expr::FunctionCall {
+            name: "element".to_string(),
+            args: vec![base, index],
+        })
     }
 
     /// Parse an `if` in either surface form — the legacy function style
@@ -855,6 +945,7 @@ impl ParseState {
                 Ok(inner)
             }
             Token::LBrace => self.parse_object(),
+            Token::LBracket => self.parse_array(),
             // `if` is normally intercepted by `parse_call_expr`; both keyword
             // arms exist so a stray keyword gets a targeted message instead of
             // a generic "unexpected token".
@@ -866,6 +957,11 @@ impl ParseState {
             Token::Else => Err(ExprError::Parse {
                 position: self.pos,
                 message: "'else' is a reserved keyword and cannot be used as an identifier"
+                    .to_string(),
+            }),
+            Token::In => Err(ExprError::Parse {
+                position: self.pos,
+                message: "'in' is a reserved operator keyword and cannot be used as an identifier"
                     .to_string(),
             }),
             _ => Err(ExprError::Parse {
@@ -897,6 +993,33 @@ impl ParseState {
 
         self.expect(&Token::RBrace)?;
         Ok(Expr::Object(entries))
+    }
+
+    /// Parse an array literal `[a, b, c]` (trailing comma allowed) or `[]`.
+    /// Element nesting is depth-guarded through [`parse_expr`](Self::parse_expr);
+    /// the total element count is bounded by the node cap.
+    fn parse_array(&mut self) -> Result<Expr, ExprError> {
+        self.advance(); // consume '['
+        self.count_node()?;
+
+        if *self.peek() == Token::RBracket {
+            self.advance();
+            return Ok(Expr::Array(Vec::new()));
+        }
+
+        let mut elements = Vec::new();
+        elements.push(self.parse_expr()?);
+
+        while *self.peek() == Token::Comma {
+            self.advance();
+            if *self.peek() == Token::RBracket {
+                break;
+            }
+            elements.push(self.parse_expr()?);
+        }
+
+        self.expect(&Token::RBracket)?;
+        Ok(Expr::Array(elements))
     }
 
     fn parse_object_entry(&mut self) -> Result<(String, Expr), ExprError> {
@@ -1538,6 +1661,157 @@ mod tests {
     fn parse_variable_reference() {
         let program = parse("my_var").unwrap();
         assert_eq!(program.result, Expr::Variable("my_var".to_string()));
+    }
+
+    #[test]
+    fn parse_array_literal_empty() {
+        assert_eq!(parse("[]").unwrap().result, Expr::Array(Vec::new()));
+    }
+
+    #[test]
+    fn parse_array_literal_elements() {
+        assert_eq!(
+            parse("[1, 2, 3]").unwrap().result,
+            Expr::Array(vec![
+                Expr::Literal(LiteralValue::Int(1)),
+                Expr::Literal(LiteralValue::Int(2)),
+                Expr::Literal(LiteralValue::Int(3)),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_array_trailing_comma() {
+        assert_eq!(
+            parse("[1, 2,]").unwrap().result,
+            Expr::Array(vec![
+                Expr::Literal(LiteralValue::Int(1)),
+                Expr::Literal(LiteralValue::Int(2)),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_subscript_index_desugars_to_element() {
+        assert_eq!(
+            parse("arr[0]").unwrap().result,
+            Expr::FunctionCall {
+                name: "element".to_string(),
+                args: vec![
+                    Expr::Variable("arr".to_string()),
+                    Expr::Literal(LiteralValue::Int(0)),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subscript_negative_index() {
+        assert_eq!(
+            parse("arr[-1]").unwrap().result,
+            Expr::FunctionCall {
+                name: "element".to_string(),
+                args: vec![
+                    Expr::Variable("arr".to_string()),
+                    Expr::FunctionCall {
+                        name: "negate".to_string(),
+                        args: vec![Expr::Literal(LiteralValue::Int(1))],
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_chained_subscript_left_nests() {
+        assert_eq!(
+            parse("m[0][1]").unwrap().result,
+            Expr::FunctionCall {
+                name: "element".to_string(),
+                args: vec![
+                    Expr::FunctionCall {
+                        name: "element".to_string(),
+                        args: vec![
+                            Expr::Variable("m".to_string()),
+                            Expr::Literal(LiteralValue::Int(0)),
+                        ],
+                    },
+                    Expr::Literal(LiteralValue::Int(1)),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_slice_forms_with_open_bounds() {
+        let null = || Expr::Literal(LiteralValue::Null);
+        let slice = |start: Expr, end: Expr| Expr::FunctionCall {
+            name: "slice".to_string(),
+            args: vec![Expr::Variable("x".to_string()), start, end],
+        };
+        assert_eq!(parse("x[:]").unwrap().result, slice(null(), null()));
+        assert_eq!(
+            parse("x[1:]").unwrap().result,
+            slice(Expr::Literal(LiteralValue::Int(1)), null())
+        );
+        assert_eq!(
+            parse("x[:2]").unwrap().result,
+            slice(null(), Expr::Literal(LiteralValue::Int(2)))
+        );
+        assert_eq!(
+            parse("x[1:2]").unwrap().result,
+            slice(
+                Expr::Literal(LiteralValue::Int(1)),
+                Expr::Literal(LiteralValue::Int(2)),
+            )
+        );
+    }
+
+    #[test]
+    fn parse_slice_step_is_rejected() {
+        assert!(matches!(parse("x[1:2:3]"), Err(ExprError::Parse { .. })));
+    }
+
+    #[test]
+    fn parse_empty_subscript_is_rejected() {
+        assert!(matches!(parse("x[]"), Err(ExprError::Parse { .. })));
+    }
+
+    #[test]
+    fn parse_in_operator_desugars_to_contains_swapped() {
+        // `x in arr` → `contains(arr, x)` — container first.
+        assert_eq!(
+            parse("x in arr").unwrap().result,
+            Expr::FunctionCall {
+                name: "contains".to_string(),
+                args: vec![
+                    Expr::Variable("arr".to_string()),
+                    Expr::Variable("x".to_string()),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_in_is_non_associative() {
+        assert!(matches!(parse("a in b in c"), Err(ExprError::Parse { .. })));
+    }
+
+    #[test]
+    fn parse_in_reserved_as_identifier() {
+        assert!(matches!(parse("in"), Err(ExprError::Parse { .. })));
+    }
+
+    #[test]
+    fn parse_toml_rejects_deeply_nested_array() {
+        // A pathological deeply-nested inline TOML array must error cleanly,
+        // not overflow the native stack when lowering to a nested `Expr::Array`.
+        let mut value = toml::Value::Integer(1);
+        for _ in 0..(MAX_EXPR_DEPTH + 10) {
+            value = toml::Value::Array(vec![value]);
+        }
+        let result = Parser::create().parse_toml(&value);
+        assert!(matches!(result, Err(ExprError::NestingTooDeep { .. })));
     }
 
     #[test]
